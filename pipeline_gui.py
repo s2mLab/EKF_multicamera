@@ -3219,7 +3219,6 @@ class ModelTab(CommandTab):
         self.max_frames.set_tooltip("Nombre maximal de frames utilisées pour construire le modèle après application de la plage de frames.")
         self.frame_start.set_tooltip("Première frame incluse pour construire le modèle.")
         self.frame_end.set_tooltip("Dernière frame incluse pour construire le modèle.")
-        attach_tooltip(self.model_tree, "Liste des modeles compatibles avec les options 2D et de construction courantes.")
 
         self.state.calib_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
@@ -3268,6 +3267,7 @@ class ModelTab(CommandTab):
         self.model_tree.column("path", width=360, anchor="w")
         self.model_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.model_tree.bind("<<TreeviewSelect>>", lambda _event: self.load_preview(use_selected_model=True))
+        attach_tooltip(self.model_tree, "Liste des modeles compatibles avec les options 2D et de construction courantes.")
 
         preview_box = ttk.LabelFrame(self.main, text="Première frame triangulée / modèle")
         preview_box.grid(row=0, column=1, rowspan=6, sticky="nsew", pady=(0, 8))
@@ -4902,7 +4902,6 @@ class DDTab(ttk.Frame):
         angle_mode_box = ttk.Combobox(row2, textvariable=self.angle_mode, values=["euler", "body_axes"], width=12, state="readonly")
         angle_mode_box.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row2, text="Analyze / refresh", command=self.refresh_analysis).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Button(row2, text="Refresh available", command=self.refresh_available_reconstructions).pack(side=tk.LEFT, padx=(8, 0))
 
         attach_tooltip(self.height_dof_box, "DoF utilisee pour segmenter les sauts. Par défaut, la hauteur de la racine.")
         attach_tooltip(smooth_label, "Fenetre de lissage temporel appliquee a la hauteur avant la segmentation.")
