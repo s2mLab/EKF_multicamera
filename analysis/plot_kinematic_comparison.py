@@ -13,6 +13,11 @@ import json
 import os
 from math import ceil
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)

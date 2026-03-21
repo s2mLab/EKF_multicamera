@@ -1,6 +1,6 @@
 import numpy as np
 
-from plot_kinematic_comparison import (
+from analysis.plot_kinematic_comparison import (
     compute_trunk_dofs_from_triangulation,
     extract_trunk_root_dofs,
     extract_trunk_root_dofs_no_unwrap,

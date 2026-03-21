@@ -2074,7 +2074,7 @@ class DualAnimationTab(CommandTab):
         super().__init__(master, "3D animation")
         self.state = state
         self.bundle: dict[str, object] | None = None
-        form = ttk.LabelFrame(self.main, text="animate_dual_stick_comparison.py")
+        form = ttk.LabelFrame(self.main, text="animation/animate_dual_stick_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
         self.dataset_dir = LabeledEntry(form, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
@@ -2148,7 +2148,7 @@ class DualAnimationTab(CommandTab):
         attach_tooltip(help_label, "Rappel d'usage de la souris dans la vue 3D interactive.")
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 3D.")
         attach_tooltip(self.frame_label, "Index de frame actuellement affiche dans le preview 3D.")
-        self.extra.set_tooltip("Options CLI supplémentaires pour animate_dual_stick_comparison.py, par exemple: --align-root")
+        self.extra.set_tooltip("Options CLI supplémentaires pour animation/animate_dual_stick_comparison.py, par exemple: --align-root")
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
@@ -2240,7 +2240,7 @@ class DualAnimationTab(CommandTab):
         available = {row["name"] for row in discover_reconstruction_catalog(ROOT / self.dataset_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())) if row.get("cached")}
         cmd = [
             sys.executable,
-            "animate_dual_stick_comparison.py",
+            "animation/animate_dual_stick_comparison.py",
             "--dataset-dir",
             self.dataset_dir.get(),
             "--output",
@@ -2353,7 +2353,7 @@ class MultiViewTab(CommandTab):
         self.projected_layers: dict[str, np.ndarray] = {}
         self.crop_limits_cache: dict[str, np.ndarray] = {}
         self.crop_limits_key: tuple[object, ...] | None = None
-        form = ttk.LabelFrame(self.main, text="animate_multiview_2d_comparison.py")
+        form = ttk.LabelFrame(self.main, text="animation/animate_multiview_2d_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
         defaults = [("Output GIF", display_path(current_figures_dir(state) / "multiview_2d_comparison.gif"))]
@@ -2412,7 +2412,7 @@ class MultiViewTab(CommandTab):
         self.crop_margin.set_tooltip("Marge ajoutee autour de la pose quand le crop est actif.")
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 2D.")
         attach_tooltip(self.frame_label, "Index de frame actuellement affiche dans le preview 2D.")
-        self.extra.set_tooltip("Options CLI supplémentaires pour animate_multiview_2d_comparison.py, par exemple: --crop-mode full")
+        self.extra.set_tooltip("Options CLI supplémentaires pour animation/animate_multiview_2d_comparison.py, par exemple: --crop-mode full")
         self.crop_mode.trace_add("write", lambda *_args: self.refresh_preview())
         self.crop_margin.var.trace_add("write", lambda *_args: self.refresh_preview())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
@@ -2482,7 +2482,7 @@ class MultiViewTab(CommandTab):
         available.add("raw")
         cmd = [
             sys.executable,
-            "animate_multiview_2d_comparison.py",
+            "animation/animate_multiview_2d_comparison.py",
             "--dataset-dir",
             display_path(current_dataset_dir(self.state)),
             "--output",
@@ -2648,7 +2648,7 @@ class MultiViewTab(CommandTab):
 class FiguresTab(CommandTab):
     def __init__(self, master):
         super().__init__(master, "Figures")
-        form = ttk.LabelFrame(self.main, text="plot_kinematic_comparison.py")
+        form = ttk.LabelFrame(self.main, text="analysis/plot_kinematic_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
         self.input_dir = LabeledEntry(form, "Input dir", "outputs/vitpose_full", browse=True, directory=True)
@@ -2676,12 +2676,12 @@ class FiguresTab(CommandTab):
         self.top_dofs.set_tooltip("Nombre de DoF mis en avant dans les figures de comparaison.")
         attach_tooltip(variant_label, "Choisit quelle variante EKF 2D comparer a l'EKF 3D.")
         attach_tooltip(variant_box, "Choisit quelle variante EKF 2D comparer a l'EKF 3D.")
-        self.extra.set_tooltip("Arguments CLI additionnels passes a plot_kinematic_comparison.py.")
+        self.extra.set_tooltip("Arguments CLI additionnels passes a analysis/plot_kinematic_comparison.py.")
 
     def build_command(self) -> list[str]:
         cmd = [
             sys.executable,
-            "plot_kinematic_comparison.py",
+            "analysis/plot_kinematic_comparison.py",
             "--input-dir",
             self.input_dir.get(),
             "--output-dir",
@@ -2700,7 +2700,7 @@ class FiguresTab(CommandTab):
 class AnalysisTab(CommandTab):
     def __init__(self, master):
         super().__init__(master, "Analyses")
-        self.script = tk.StringVar(value="analyze_trampoline_jumps.py")
+        self.script = tk.StringVar(value="analysis/analyze_trampoline_jumps.py")
 
         form = ttk.LabelFrame(self.main, text="Scripts d'analyse")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -2712,10 +2712,10 @@ class AnalysisTab(CommandTab):
             top,
             textvariable=self.script,
             values=[
-                "analyze_trampoline_jumps.py",
-                "plot_triangulation_view_usage.py",
-                "plot_triangulated_marker_trajectories.py",
-                "plot_3d_posture_snapshots.py",
+                "analysis/analyze_trampoline_jumps.py",
+                "analysis/plot_triangulation_view_usage.py",
+                "analysis/plot_triangulated_marker_trajectories.py",
+                "analysis/plot_3d_posture_snapshots.py",
             ],
             state="readonly",
             width=42,
@@ -2759,21 +2759,21 @@ class AnalysisTab(CommandTab):
     def _sync_defaults(self) -> None:
         script = self.script.get()
         self.interactive_var.set(False)
-        if script == "analyze_trampoline_jumps.py":
+        if script == "analysis/analyze_trampoline_jumps.py":
             self.entry_a.var.set("outputs/vitpose_full/ekf_states.npz")
             self.entry_b.var.set("outputs/vitpose_full/jump_segmentation.png")
             self.entry_c.var.set("outputs/vitpose_full/jump_rotations.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("0.20")
             self.opt_3.var.set("0.15")
-        elif script == "plot_triangulation_view_usage.py":
+        elif script == "analysis/plot_triangulation_view_usage.py":
             self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
             self.entry_b.var.set("")
             self.entry_c.var.set("outputs/vitpose_full/triangulation_view_usage.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("used")
             self.opt_3.var.set("")
-        elif script == "plot_triangulated_marker_trajectories.py":
+        elif script == "analysis/plot_triangulated_marker_trajectories.py":
             self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
             self.entry_b.var.set("outputs/vitpose_full/summary.json")
             self.entry_c.var.set("outputs/vitpose_full/triangulated_marker_trajectories.png")
@@ -2791,7 +2791,7 @@ class AnalysisTab(CommandTab):
     def build_command(self) -> list[str]:
         script = self.script.get()
         cmd = [sys.executable, script]
-        if script == "analyze_trampoline_jumps.py":
+        if script == "analysis/analyze_trampoline_jumps.py":
             cmd.extend(
                 [
                     "--states",
@@ -2808,7 +2808,7 @@ class AnalysisTab(CommandTab):
                     self.opt_3.get(),
                 ]
             )
-        elif script == "plot_triangulation_view_usage.py":
+        elif script == "analysis/plot_triangulation_view_usage.py":
             cmd.extend(
                 [
                     "--triangulation",
@@ -2821,7 +2821,7 @@ class AnalysisTab(CommandTab):
                     self.opt_2.get() or "used",
                 ]
             )
-        elif script == "plot_triangulated_marker_trajectories.py":
+        elif script == "analysis/plot_triangulated_marker_trajectories.py":
             cmd.extend(
                 [
                     "--triangulation",

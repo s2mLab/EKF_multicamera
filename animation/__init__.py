@@ -1,0 +1,1 @@
+"""Thematic animation scripts package."""

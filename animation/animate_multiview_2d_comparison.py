@@ -20,6 +20,11 @@ import math
 import os
 import tempfile
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
@@ -32,7 +37,7 @@ import numpy as np
 from PIL import Image
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-from animate_dual_stick_comparison import (
+from animation.animate_dual_stick_comparison import (
     KP_INDEX,
     LEFT_KEYPOINTS,
     LOWER_LIMB_EDGES,

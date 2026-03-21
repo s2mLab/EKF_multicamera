@@ -14,6 +14,11 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
@@ -22,8 +27,8 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 
-from animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
-from plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
+from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
+from analysis.plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
 from vitpose_ekf_pipeline import load_calibrations
 
 
