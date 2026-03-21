@@ -43,6 +43,7 @@ from scipy.spatial.transform import Rotation
 
 from dd_analysis import DDSessionAnalysis, analyze_dd_session
 from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from dataset_preview_loader import load_dataset_preview_resources
 from dataset_preview_state import build_dataset_preview_state
 from preview_bundle import (
     align_to_reference,
@@ -81,6 +82,7 @@ from reconstruction_registry import (
     scan_model_dirs,
     scan_reconstruction_dirs,
 )
+from reconstruction_timings import compute_time_seconds, format_reconstruction_timing_details
 from root_kinematics import (
     TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
@@ -1010,6 +1012,7 @@ class ToolTip:
             text=self.text,
             justify=tk.LEFT,
             background="#fffde7",
+            foreground="#1f2328",
             relief=tk.SOLID,
             borderwidth=1,
             wraplength=340,
@@ -2093,29 +2096,26 @@ class DualAnimationTab(CommandTab):
     def load_preview(self) -> None:
         try:
             output_dir = ROOT / self.dataset_dir.get()
-            sources = dataset_source_paths(
+            preview_load = load_dataset_preview_resources(
                 output_dir,
-                pose2sim_trc=optional_root_relative_path(self.state.pose2sim_trc_var.get()),
-            )
-            catalog = discover_reconstruction_catalog(
-                output_dir,
-                optional_root_relative_path(self.state.pose2sim_trc_var.get()),
-            )
-            self.bundle = get_cached_preview_bundle(
-                self.state,
-                output_dir,
-                resolve_preview_biomod(output_dir),
-                Path(sources["pose2sim_trc"]),
-                align_root=False,
-            )
-            preview_state = build_dataset_preview_state(
-                catalog=catalog,
-                bundle=self.bundle,
                 preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
                 fallback_count=4,
+                dataset_source_paths_fn=dataset_source_paths,
+                discover_catalog_fn=discover_reconstruction_catalog,
+                bundle_loader_fn=lambda dataset_dir, biomod_path, pose2sim_trc, align_root: get_cached_preview_bundle(
+                    self.state,
+                    dataset_dir,
+                    biomod_path,
+                    pose2sim_trc,
+                    align_root,
+                ),
+                pose2sim_trc=optional_root_relative_path(self.state.pose2sim_trc_var.get()),
+                biomod_path=resolve_preview_biomod(output_dir),
+                align_root=False,
             )
-            self.show.set_rows(preview_state.rows, preview_state.defaults)
-            self.frame_scale.configure(to=preview_state.max_frame)
+            self.bundle = preview_load.bundle
+            self.show.set_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
+            self.frame_scale.configure(to=preview_load.preview_state.max_frame)
             self.frame_var.set(0)
             self.preview_canvas_widget.focus_set()
             self.refresh_preview()
@@ -2344,12 +2344,27 @@ class MultiViewTab(CommandTab):
     def load_preview(self) -> None:
         try:
             output_dir = current_dataset_dir(self.state)
-            sources = dataset_source_paths(
-                output_dir,
+            preview_load = load_dataset_preview_resources(
+                output_dir=output_dir,
+                preferred_names=["raw", "pose2sim"],
+                fallback_count=2,
+                extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
+                dataset_source_paths_fn=dataset_source_paths,
+                discover_catalog_fn=discover_reconstruction_catalog,
+                bundle_loader_fn=lambda dataset_dir, biomod_path, pose2sim_trc, align_root: get_cached_preview_bundle(
+                    self.state,
+                    dataset_dir,
+                    biomod_path,
+                    pose2sim_trc,
+                    align_root,
+                ),
                 calib=ROOT / self.state.calib_var.get(),
                 keypoints=ROOT / self.state.keypoints_var.get(),
                 pose2sim_trc=optional_root_relative_path(self.state.pose2sim_trc_var.get()),
+                biomod_path=resolve_preview_biomod(output_dir),
+                align_root=False,
             )
+            sources = preview_load.sources
             self.calibrations, self.pose_data = get_cached_pose_data(
                 self.state,
                 keypoints_path=Path(sources["keypoints"]),
@@ -2360,29 +2375,15 @@ class MultiViewTab(CommandTab):
                 lower_percentile=float(self.state.pose_p_low_var.get()),
                 upper_percentile=float(self.state.pose_p_high_var.get()),
             )
-            catalog = discover_reconstruction_catalog(output_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-            self.preview_bundle = get_cached_preview_bundle(
-                self.state,
-                output_dir,
-                resolve_preview_biomod(output_dir),
-                Path(sources["pose2sim_trc"]),
-                align_root=False,
-            )
-            preview_state = build_dataset_preview_state(
-                catalog=catalog,
-                bundle=self.preview_bundle,
-                preferred_names=["raw", "pose2sim"],
-                fallback_count=2,
-                extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
-            )
-            self.show.set_rows(preview_state.rows, preview_state.defaults)
+            self.preview_bundle = preview_load.bundle
+            self.show.set_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
             camera_names = list(self.pose_data.camera_names)
             self.projected_layers = {}
             for name, points_3d in self.preview_bundle["recon_3d"].items():
                 self.projected_layers[name] = project_points_all_cameras(points_3d, self.calibrations, camera_names)
             self.crop_limits_cache = {}
             self.crop_limits_key = None
-            bundle_frames = preview_state.max_frame + 1 if self.preview_bundle is not None else len(self.pose_data.frames)
+            bundle_frames = preview_load.preview_state.max_frame + 1 if self.preview_bundle is not None else len(self.pose_data.frames)
             n_frames = min(len(self.pose_data.frames), bundle_frames)
             self.frame_scale.configure(to=max(n_frames - 1, 0))
             self.frame_var.set(0)
@@ -4339,6 +4340,7 @@ class ReconstructionsTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master, "Reconstructions")
         self.state = state
+        self.status_summaries: dict[str, dict[str, object]] = {}
 
         form = ttk.LabelFrame(self.main, text="Lancer les reconstructions depuis les profils")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -4369,22 +4371,32 @@ class ReconstructionsTab(CommandTab):
 
         status_box = ttk.LabelFrame(self.main, text="Reconstructions disponibles pour le dataset courant")
         status_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
-        cols = ("name", "family", "latest", "frames", "reproj_mean", "reproj_std", "path")
+        cols = ("name", "family", "latest", "frames", "compute_s", "reproj_mean", "reproj_std", "path")
         self.status_tree = ttk.Treeview(status_box, columns=cols, show="headings", height=8)
         headings = {
             "name": "Reconstruction",
             "family": "Family",
             "latest": "A jour",
             "frames": "Frames",
+            "compute_s": "Compute (s)",
             "reproj_mean": "Reproj mean (px)",
             "reproj_std": "Reproj std (px)",
             "path": "Path",
         }
-        widths = {"name": 220, "family": 90, "latest": 70, "frames": 70, "reproj_mean": 110, "reproj_std": 110, "path": 420}
+        widths = {"name": 220, "family": 90, "latest": 70, "frames": 70, "compute_s": 95, "reproj_mean": 110, "reproj_std": 110, "path": 360}
         for col in cols:
             self.status_tree.heading(col, text=headings[col])
             self.status_tree.column(col, width=widths[col], anchor="w")
         self.status_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        attach_tooltip(self.status_tree, "Tableau des reconstructions du dataset courant, avec temps de calcul total et erreurs de reprojection.")
+
+        timing_box = ttk.LabelFrame(self.main, text="Durées détaillées de la reconstruction sélectionnée")
+        timing_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8), before=self.output)
+        self.timing_details = ScrolledText(timing_box, height=10, wrap=tk.WORD)
+        self.timing_details.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.timing_details.insert("1.0", "Select a reconstruction to inspect timing details.")
+        self.timing_details.configure(state=tk.DISABLED)
+        self.status_tree.bind("<<TreeviewSelect>>", lambda _event: self.refresh_timing_details())
 
         self.state.register_profile_listener(self.refresh_profile_tree)
         self.state.register_reconstruction_listener(self.refresh_status_tree)
@@ -4416,8 +4428,11 @@ class ReconstructionsTab(CommandTab):
             self.profile_tree.insert("", "end", iid=str(idx), values=(profile.name, profile.family, profile.pose_data_mode, ",".join(flags)))
 
     def refresh_status_tree(self) -> None:
+        selected = self.status_tree.selection()
+        selected_iid = selected[0] if selected else None
         for item in self.status_tree.get_children():
             self.status_tree.delete(item)
+        self.status_summaries = {}
         dataset_dir = current_dataset_dir(self.state)
         for recon_dir in reconstruction_dirs_for_path(dataset_dir):
             summary = load_bundle_summary(recon_dir)
@@ -4425,19 +4440,44 @@ class ReconstructionsTab(CommandTab):
                 continue
             reproj = summary.get("reprojection_px", {})
             latest = summary.get("is_latest_family_version")
+            compute_s = compute_time_seconds(summary)
+            iid = str(recon_dir)
+            self.status_summaries[iid] = summary
             self.status_tree.insert(
                 "",
                 "end",
+                iid=iid,
                 values=(
                     summary.get("name", recon_dir.name),
                     summary.get("family", "-"),
                     "-" if latest is None else ("oui" if latest else "non"),
                     summary.get("n_frames", "-"),
+                    "-" if compute_s is None else f"{compute_s:.2f}",
                     "-" if reproj.get("mean") is None else f"{float(reproj.get('mean')):.2f}",
                     "-" if reproj.get("std") is None else f"{float(reproj.get('std')):.2f}",
                     str(recon_dir),
                 ),
             )
+        if selected_iid and self.status_tree.exists(selected_iid):
+            self.status_tree.selection_set(selected_iid)
+            self.status_tree.focus(selected_iid)
+        elif self.status_tree.get_children():
+            first = self.status_tree.get_children()[0]
+            self.status_tree.selection_set(first)
+            self.status_tree.focus(first)
+        self.refresh_timing_details()
+
+    def refresh_timing_details(self) -> None:
+        selected = self.status_tree.selection()
+        text = "Select a reconstruction to inspect timing details."
+        if selected:
+            summary = self.status_summaries.get(selected[0], {})
+            if summary:
+                text = format_reconstruction_timing_details(summary)
+        self.timing_details.configure(state=tk.NORMAL)
+        self.timing_details.delete("1.0", tk.END)
+        self.timing_details.insert("1.0", text)
+        self.timing_details.configure(state=tk.DISABLED)
 
     def clear_reconstructions(self) -> None:
         dataset_dir = current_dataset_dir(self.state)
