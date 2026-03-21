@@ -628,6 +628,22 @@ def triangulation_reference_from_other_views(
     return reprojected
 
 
+def project_point_with_projection_matrices(projection_matrices: np.ndarray, point_world: np.ndarray) -> np.ndarray:
+    """Project one 3D point with many `3x4` projection matrices at once."""
+    projection_matrices = np.asarray(projection_matrices, dtype=float)
+    if projection_matrices.ndim != 3 or projection_matrices.shape[1:] != (3, 4):
+        return np.empty((0, 2), dtype=float)
+    point_h = np.append(np.asarray(point_world, dtype=float).reshape(3), 1.0)
+    uv_h = projection_matrices @ point_h
+    z = uv_h[:, 2]
+    projected = np.full((projection_matrices.shape[0], 2), np.nan, dtype=float)
+    valid = np.isfinite(z) & (np.abs(z) > 1e-12)
+    if np.any(valid):
+        projected[valid, 0] = uv_h[valid, 0] / z[valid]
+        projected[valid, 1] = uv_h[valid, 1] / z[valid]
+    return projected
+
+
 def skew(vector: np.ndarray) -> np.ndarray:
     """Construit la matrice antisymetrique associee a un vecteur 3D."""
     x, y, z = np.asarray(vector, dtype=float).reshape(3)
@@ -1181,11 +1197,9 @@ def robust_triangulation_from_best_cameras(
             if not np.all(np.isfinite(point)):
                 continue
 
-            errors = []
-            for i_cam in included_indices:
-                uv_pred = calibrations[i_cam].project_point(point)
-                errors.append(float(np.linalg.norm(observations[i_cam] - uv_pred)))
-            candidate_error = float(np.mean(errors)) if errors else np.inf
+            projected = project_point_with_projection_matrices(np.asarray([projections[i] for i in included_indices], dtype=float), point)
+            errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
+            candidate_error = float(np.mean(errors)) if errors.size else np.inf
 
             if candidate_error < error_min:
                 error_min = candidate_error
@@ -1203,9 +1217,9 @@ def robust_triangulation_from_best_cameras(
     if not np.all(np.isfinite(best_point)):
         return best_point, np.nan, reprojection_error_per_view, coherence_per_view, excluded_views
 
-    for i_cam in np.where(valid)[0]:
-        uv_pred = calibrations[i_cam].project_point(best_point)
-        reprojection_error_per_view[i_cam] = float(np.linalg.norm(observations[i_cam] - uv_pred))
+    valid_indices = np.where(valid)[0]
+    projected_valid = project_point_with_projection_matrices(np.asarray([projections[i] for i in valid_indices], dtype=float), best_point)
+    reprojection_error_per_view[valid_indices] = np.linalg.norm(observations[valid_indices] - projected_valid, axis=1)
 
     excluded_views[:] = True
     excluded_views[best_included] = False
@@ -1253,10 +1267,8 @@ def greedy_triangulation_from_best_cameras(
         if not np.all(np.isfinite(point)):
             break
 
-        errors = np.array(
-            [np.linalg.norm(observations[i_cam] - calibrations[i_cam].project_point(point)) for i_cam in included_indices],
-            dtype=float,
-        )
+        projected = project_point_with_projection_matrices(np.asarray([projections[i] for i in included_indices], dtype=float), point)
+        errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
         mean_error = float(np.mean(errors))
         if mean_error < best_error:
             best_error = mean_error
@@ -1275,9 +1287,9 @@ def greedy_triangulation_from_best_cameras(
     if not np.all(np.isfinite(best_point)):
         return best_point, np.nan, reprojection_error_per_view, coherence_per_view, excluded_views
 
-    for i_cam in np.where(valid)[0]:
-        uv_pred = calibrations[i_cam].project_point(best_point)
-        reprojection_error_per_view[i_cam] = float(np.linalg.norm(observations[i_cam] - uv_pred))
+    valid_indices = np.where(valid)[0]
+    projected_valid = project_point_with_projection_matrices(np.asarray([projections[i] for i in valid_indices], dtype=float), best_point)
+    reprojection_error_per_view[valid_indices] = np.linalg.norm(observations[valid_indices] - projected_valid, axis=1)
 
     excluded_views[best_included] = False
     for i_cam in best_included:

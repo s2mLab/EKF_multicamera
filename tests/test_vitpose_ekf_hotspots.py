@@ -3,6 +3,7 @@ import numpy as np
 from vitpose_ekf_pipeline import (
     CameraCalibration,
     compute_camera_triangulation_cost,
+    project_point_with_projection_matrices,
     triangulation_reference_from_other_views,
     weighted_triangulation,
 )
@@ -47,6 +48,14 @@ def test_triangulation_reference_matches_perfect_reprojection():
     )
     for cam_idx, camera in enumerate(cameras):
         np.testing.assert_allclose(references[cam_idx, 0], camera.project_point(point), atol=1e-8)
+
+
+def test_project_point_with_projection_matrices_matches_camera_projection():
+    point = np.array([0.15, 0.05, 2.5], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0), _make_camera("cam2", -0.8)]
+    projected = project_point_with_projection_matrices(np.asarray([camera.P for camera in cameras], dtype=float), point)
+    expected = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
+    np.testing.assert_allclose(projected, expected, atol=1e-8)
 
 
 def test_precomputed_triangulation_cost_matches_direct_computation():

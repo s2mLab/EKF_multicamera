@@ -57,3 +57,21 @@ def test_analyze_trampoline_contacts_uses_contact_medians_and_sums_penalties():
     assert contacts[0].penalty == 0.0
     assert contacts[1].penalty == 0.1
     assert abs(total_trampoline_penalty(contacts) - 0.1) < 1e-12
+
+
+def test_analyze_trampoline_contacts_from_feet_uses_worst_foot_penalty():
+    session = _fake_session()
+    points = np.full((10, 17, 3), np.nan, dtype=float)
+    points[:, 15, :2] = [0.0, 0.0]
+    points[:, 16, :2] = [0.0, 0.0]
+    points[3:6, 15, :2] = [0.0, 0.0]
+    points[3:6, 16, :2] = [1.4, 0.0]
+    points[7:9, 15, :2] = [1.5, 1.0]
+    points[7:9, 16, :2] = [0.0, 0.0]
+
+    contacts = analyze_trampoline_contacts(session, points)
+    assert len(contacts) == 2
+    assert contacts[0].penalty == 0.1
+    assert abs(contacts[0].x - 1.4) < 1e-12
+    assert contacts[1].penalty == 0.3
+    assert abs(total_trampoline_penalty(contacts) - 0.4) < 1e-12

@@ -5113,9 +5113,9 @@ class CameraToolsTab(ttk.Frame):
         self.flip_camera_box = ttk.Combobox(inspector_controls, textvariable=self.flip_camera_var, width=18, state="readonly")
         self.flip_camera_box.pack(side=tk.LEFT, padx=(0, 8))
         self.flip_applied_var = tk.BooleanVar(value=False)
-        self.flip_check = ttk.Checkbutton(inspector_controls, text="Flip current frame", variable=self.flip_applied_var, command=self.render_flip_preview)
+        self.flip_check = ttk.Checkbutton(inspector_controls, text="Flip raw left/right", variable=self.flip_applied_var, command=self.render_flip_preview)
         self.flip_check.pack(side=tk.LEFT, padx=(0, 8))
-        self.flip_status_var = tk.StringVar(value="Press F to toggle the active hypothesis.")
+        self.flip_status_var = tk.StringVar(value="Press F to swap the raw 2D labels.")
         ttk.Label(inspector_controls, textvariable=self.flip_status_var, foreground="#4f5b66").pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
@@ -5149,7 +5149,7 @@ class CameraToolsTab(ttk.Frame):
         attach_tooltip(self.flip_method_box, "Méthode de diagnostic de flip L/R: cohérence épipolaire ou triangulation/reprojection.")
         attach_tooltip(camera_label, "Caméra isolée à inspecter pour les frames suspectes.")
         attach_tooltip(self.flip_camera_box, "Caméra isolée à inspecter pour les frames suspectes.")
-        attach_tooltip(self.flip_check, "Affiche l'hypothèse swappée gauche/droite comme hypothèse active. Raccourci clavier: F.")
+        attach_tooltip(self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F.")
         attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
         attach_tooltip(self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée.")
 
@@ -5362,6 +5362,24 @@ class CameraToolsTab(ttk.Frame):
                 return self.flip_frame_local_indices[idx]
         return self.flip_frame_local_indices[0] if self.flip_frame_local_indices else None
 
+    def _reference_projection(self, camera_name: str, frame_local_idx: int) -> tuple[np.ndarray | None, str, str]:
+        reference_name = self.reference_name_var.get().strip()
+        if not reference_name:
+            return None, "none", "#444444"
+        recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
+        if recon_dir is None:
+            return None, reference_name, reconstruction_color(reference_name)
+        payload = load_bundle_payload(recon_dir)
+        points_3d = np.asarray(payload.get("points_3d"), dtype=float) if "points_3d" in payload else None
+        if points_3d is None or points_3d.ndim != 3 or frame_local_idx >= points_3d.shape[0]:
+            return None, reconstruction_label(reference_name), reconstruction_color(reference_name)
+        projected = np.full((points_3d.shape[1], 2), np.nan, dtype=float)
+        calibration = self.calibrations[camera_name]
+        for kp_idx, point_3d in enumerate(points_3d[frame_local_idx]):
+            if np.all(np.isfinite(point_3d)):
+                projected[kp_idx] = calibration.project_point(point_3d)
+        return projected, reconstruction_label(reference_name), reconstruction_color(reference_name)
+
     def render_flip_preview(self) -> None:
         self.flip_figure.clear()
         if self.pose_data is None or self.calibrations is None:
@@ -5380,12 +5398,13 @@ class CameraToolsTab(ttk.Frame):
             self.flip_canvas.draw_idle()
             return
         cam_idx = list(self.pose_data.camera_names).index(camera_name)
-        nominal_points = np.asarray(self.pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
-        swapped_points = swap_left_right_keypoints(nominal_points)
+        raw_points = np.asarray(self.pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
+        display_raw_points = swap_left_right_keypoints(raw_points) if self.flip_applied_var.get() else raw_points
+        projected_points, projected_label, projected_color = self._reference_projection(camera_name, frame_local_idx)
         width, height = self.calibrations[camera_name].image_size
-        finite_nominal = nominal_points[np.all(np.isfinite(nominal_points), axis=1)]
-        finite_swapped = swapped_points[np.all(np.isfinite(swapped_points), axis=1)]
-        finite = np.vstack([arr for arr in (finite_nominal, finite_swapped) if arr.size]) if (finite_nominal.size or finite_swapped.size) else np.empty((0, 2))
+        finite_raw = display_raw_points[np.all(np.isfinite(display_raw_points), axis=1)]
+        finite_projected = projected_points[np.all(np.isfinite(projected_points), axis=1)] if projected_points is not None else np.empty((0, 2))
+        finite = np.vstack([arr for arr in (finite_raw, finite_projected) if arr.size]) if (finite_raw.size or finite_projected.size) else np.empty((0, 2))
         if finite.size:
             xmin, ymin = np.min(finite, axis=0)
             xmax, ymax = np.max(finite, axis=0)
@@ -5397,26 +5416,33 @@ class CameraToolsTab(ttk.Frame):
             x_limits = (0.0, float(width))
             y_limits = (float(height), 0.0)
 
-        axes = np.atleast_1d(self.flip_figure.subplots(1, 2))
-        active_index = 1 if self.flip_applied_var.get() else 0
-        for axis_idx, (ax, title, points, color) in enumerate(
-            zip(axes, ("Nominal", "Flipped"), (nominal_points, swapped_points), ("#4c72b0", "#c44e52"))
-        ):
-            draw_skeleton_2d(ax, points, color, title, marker_size=22.0)
-            annotate_flip_keypoints(ax, points)
-            ax.set_xlim(*x_limits)
-            ax.set_ylim(*y_limits)
-            ax.set_title(f"{'ACTIVE | ' if axis_idx == active_index else ''}{title}")
-            ax.grid(alpha=0.18)
-            ax.set_xlabel("x (px)")
-            ax.set_ylabel("y (px)")
+        ax = self.flip_figure.subplots(1, 1)
+        draw_skeleton_2d(ax, display_raw_points, "#000000", "Raw 2D", marker_size=22.0)
+        if projected_points is not None:
+            draw_skeleton_2d(ax, projected_points, projected_color, projected_label, marker_size=20.0)
+        ax.set_xlim(*x_limits)
+        ax.set_ylim(*y_limits)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_title(f"Raw {'(swapped)' if self.flip_applied_var.get() else ''} + reprojection")
+        ax.grid(alpha=0.18)
+        ax.set_xlabel("x (px)")
+        ax.set_ylabel("y (px)")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            uniq = {}
+            for handle, label in zip(handles, labels):
+                uniq[label] = handle
+            ax.legend(list(uniq.values()), list(uniq.keys()), loc="best", fontsize=8)
         detail_arrays = self.flip_detail_arrays.get(method, {})
         suspect = bool(self.flip_masks.get(method, np.zeros((0, 0), dtype=bool))[cam_idx, frame_local_idx])
         frame_number = int(self.pose_data.frames[frame_local_idx])
-        self.flip_figure.suptitle(f"{camera_name} | frame {frame_number} | {method} | suspect={'yes' if suspect else 'no'}")
+        self.flip_figure.suptitle(
+            f"{camera_name} | frame {frame_number} | {method} | suspect={'yes' if suspect else 'no'} | "
+            f"reference={projected_label if projected_points is not None else 'none'}"
+        )
         self.flip_figure.tight_layout()
         self.flip_canvas.draw_idle()
-        self.flip_status_var.set("Press F to toggle the active hypothesis and compare left/right consistency visually.")
+        self.flip_status_var.set("Press F to swap the raw 2D labels and compare them to the reprojection.")
         self.flip_details.delete("1.0", tk.END)
         self.flip_details.insert(
             "1.0",
@@ -5425,6 +5451,8 @@ class CameraToolsTab(ttk.Frame):
                     f"camera={camera_name}",
                     f"frame={frame_number}",
                     f"method={method}",
+                    f"raw_swapped={'yes' if self.flip_applied_var.get() else 'no'}",
+                    f"reference={projected_label if projected_points is not None else 'none'}",
                     f"suspect={'yes' if suspect else 'no'}",
                     f"candidate={'yes' if self._flip_flag(detail_arrays, 'candidate_mask', cam_idx, frame_local_idx) else 'no'}",
                     f"temporal_support={'yes' if self._flip_flag(detail_arrays, 'temporal_support_mask', cam_idx, frame_local_idx) else 'no'}",
@@ -5478,8 +5506,9 @@ class TrampolineTab(ttk.Frame):
         ttk.Label(
             controls,
             text=(
-                "Première version: les coordonnées sur la toile sont approximées avec TRUNK:TransX / TRUNK:TransY, "
-                "et l'analyse s'intéresse uniquement aux phases de contact entre deux sauts détectés par l'onglet DD."
+                "Première version: la position sur la toile est estimée à partir des deux pieds "
+                "(chevilles gauche/droite), et la pénalité retenue correspond au pied le plus pénalisant "
+                "pendant chaque intervalle de contact entre deux sauts détectés par l'onglet DD."
             ),
             foreground="#4f5b66",
             justify=tk.LEFT,
@@ -5568,7 +5597,12 @@ class TrampolineTab(ttk.Frame):
                 height_values=np.asarray(root_q[:, 2], dtype=float),
                 angle_mode="euler",
             )
-            self.contacts = analyze_trampoline_contacts(self.analysis, np.asarray(root_q[:, :2], dtype=float))
+            recon_3d = self.bundle.get("recon_3d", {}) if isinstance(self.bundle, dict) else {}
+            if self.current_reconstruction_name in recon_3d:
+                contact_series = np.asarray(recon_3d[self.current_reconstruction_name], dtype=float)
+            else:
+                contact_series = np.asarray(root_q[:, :2], dtype=float)
+            self.contacts = analyze_trampoline_contacts(self.analysis, contact_series)
             self.render_summary()
             self.refresh_plot()
         except Exception as exc:
@@ -5581,7 +5615,7 @@ class TrampolineTab(ttk.Frame):
             return
         lines = [
             f"Reconstruction: {reconstruction_label(self.current_reconstruction_name)}",
-            "Contact proxy: TRUNK:TransX / TRUNK:TransY",
+            "Contact proxy: ankles on the bed (max penalty of left/right foot)",
             f"Detected jumps: {len(self.analysis.jumps)}",
             f"Contact intervals between jumps: {len(self.contacts)}",
             f"Total penalty: {total_trampoline_penalty(self.contacts):.2f}",
@@ -5590,7 +5624,9 @@ class TrampolineTab(ttk.Frame):
         for contact in self.contacts:
             lines.append(
                 f"C{contact.index}: frames {contact.start}-{contact.end} | center {contact.center_frame} | "
-                f"x={contact.x:.3f} m | y={contact.y:.3f} m | penalty={'-' if contact.penalty is None else f'{contact.penalty:.2f}'}"
+                f"L=({contact.left_x:.3f}, {contact.left_y:.3f}) m | "
+                f"R=({contact.right_x:.3f}, {contact.right_y:.3f}) m | "
+                f"applied=({contact.x:.3f}, {contact.y:.3f}) m | penalty={'-' if contact.penalty is None else f'{contact.penalty:.2f}'}"
             )
         self.summary.insert("1.0", "\n".join(lines))
 
@@ -5606,12 +5642,16 @@ class TrampolineTab(ttk.Frame):
         t = np.arange(root_q.shape[0], dtype=float) / float(self.state.fps_var.get())
         bed_ax, time_ax = np.atleast_1d(self.figure.subplots(1, 2))
         draw_trampoline_bed(bed_ax)
-        bed_ax.plot(root_q[:, 0], root_q[:, 1], color="#4f5b66", linewidth=1.0, alpha=0.35, label="root XY path")
+        bed_ax.plot(root_q[:, 0], root_q[:, 1], color="#4f5b66", linewidth=1.0, alpha=0.25, label="root XY path")
         penalty_colors = {0.0: "#55a868", 0.1: "#dd8452", 0.3: "#c44e52"}
         for contact in self.contacts:
+            color = penalty_colors.get(contact.penalty, "#8172b3")
+            if np.isfinite(contact.left_x) and np.isfinite(contact.left_y):
+                bed_ax.scatter(contact.left_x, contact.left_y, color="#4c72b0", s=36, zorder=3, marker="^")
+            if np.isfinite(contact.right_x) and np.isfinite(contact.right_y):
+                bed_ax.scatter(contact.right_x, contact.right_y, color="#c44e52", s=36, zorder=3, marker="s")
             if np.isfinite(contact.x) and np.isfinite(contact.y):
-                color = penalty_colors.get(contact.penalty, "#8172b3")
-                bed_ax.scatter(contact.x, contact.y, color=color, s=60, zorder=3)
+                bed_ax.scatter(contact.x, contact.y, color=color, s=64, zorder=4, marker="o")
                 bed_ax.text(contact.x, contact.y + 0.08, f"C{contact.index}", ha="center", va="bottom", fontsize=9)
         bed_ax.set_title("Bed coordinates")
         bed_ax.legend(loc="upper right", fontsize=8)
