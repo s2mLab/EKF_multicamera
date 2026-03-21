@@ -47,6 +47,7 @@ from dd_analysis import DDSessionAnalysis, analyze_dd_session
 from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
 from dataset_preview_loader import load_dataset_preview_resources
 from dataset_preview_state import build_dataset_preview_state
+from observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -1014,6 +1015,15 @@ def resolve_preview_biomod(dataset_dir: Path) -> Path | None:
     for model_dir in scan_model_dirs(Path(dataset_dir)):
         candidates.extend(sorted(model_dir.glob("*.bioMod")))
     return candidates[0] if candidates else None
+
+
+def resolve_reconstruction_biomod(dataset_dir: Path, reconstruction_name: str) -> Path | None:
+    recon_dir = reconstruction_dir_by_name(dataset_dir, reconstruction_name)
+    if recon_dir is not None:
+        candidate = recon_dir / "vitpose_chain.bioMod"
+        if candidate.exists():
+            return candidate
+    return resolve_preview_biomod(dataset_dir)
 
 
 def preview_root_series_for_reconstruction(
@@ -5179,6 +5189,177 @@ class JointKinematicsTab(ttk.Frame):
             messagebox.showerror("Autres DoF", str(exc))
 
 
+class ObservabilityTab(ttk.Frame):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master)
+        self.state = state
+        self.bundle = None
+
+        controls = ttk.LabelFrame(self, text="Observabilité du modèle")
+        controls.pack(fill=tk.X, padx=10, pady=10)
+        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
+        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
+
+        row = ttk.Frame(controls)
+        row.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(row, text="Load / refresh", command=self.refresh_plot).pack(side=tk.LEFT)
+        ttk.Button(row, text="Refresh available", command=self.refresh_available_reconstructions).pack(side=tk.LEFT, padx=(8, 0))
+        self.camera_info_var = tk.StringVar(value="Cameras: all available")
+        ttk.Label(row, textvariable=self.camera_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(12, 0))
+
+        self.recon_show = SelectionTable(controls, "Reconstructions q")
+        self.recon_show.pack(fill=tk.BOTH, padx=8, pady=6)
+        attach_tooltip(self.recon_show.tree, "Choisissez une reconstruction avec q pour analyser le rang des jacobiennes des marqueurs 3D et des observations 2D.")
+
+        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=3)
+        body.add(right, weight=2)
+
+        plot_box = ttk.LabelFrame(left, text="Rang des jacobiennes")
+        plot_box.pack(fill=tk.BOTH, expand=True)
+        self.figure = Figure(figsize=(10, 7))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=plot_box)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, plot_box, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill=tk.X)
+
+        summary_box = ttk.LabelFrame(right, text="Résumé")
+        summary_box.pack(fill=tk.BOTH, expand=True)
+        self.summary_text = ScrolledText(summary_box, wrap=tk.WORD, height=20)
+        self.summary_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        attach_tooltip(self.summary_text, "Résumé des rangs min/médiane/max et du pourcentage de frames de plein rang.")
+
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+
+    def sync_dataset_dir(self) -> None:
+        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
+        self.refresh_available_reconstructions()
+
+    def refresh_available_reconstructions(self) -> None:
+        try:
+            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
+            available_q = bundle_available_reconstruction_names(bundle, include_3d=False, include_q=True, include_q_root=False)
+            if available_q:
+                catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
+                rows = catalog_rows_for_names(catalog, available_q)
+                defaults = default_selection(
+                    available_q,
+                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                    fallback_count=1,
+                )
+                self.recon_show.set_rows(rows, defaults[:1])
+                if self.bundle is not None:
+                    self.refresh_plot()
+        except Exception:
+            pass
+
+    def refresh_plot(self) -> None:
+        try:
+            dataset_dir = ROOT / self.output_dir.get()
+            self.bundle = get_cached_preview_bundle(self.state, dataset_dir, None, None, align_root=False)
+            available_q = bundle_available_reconstruction_names(self.bundle, include_3d=False, include_q=True, include_q_root=False)
+            if available_q:
+                catalog = discover_reconstruction_catalog(dataset_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
+                rows = catalog_rows_for_names(catalog, available_q)
+                defaults = default_selection(
+                    available_q,
+                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                    fallback_count=1,
+                )
+                self.recon_show.set_rows(rows, defaults[:1])
+
+            selected_names = self.recon_show.selected_names()
+            selected_name = selected_names[-1] if selected_names else None
+            self.figure.clear()
+            self.summary_text.delete("1.0", tk.END)
+            if selected_name is None:
+                ax = self.figure.subplots(1, 1)
+                ax.text(0.5, 0.5, "No reconstruction with q selected", ha="center", va="center", transform=ax.transAxes)
+                ax.set_axis_off()
+                self.canvas.draw_idle()
+                return
+
+            q = self.bundle.get("recon_q", {}).get(selected_name)
+            if q is None:
+                raise ValueError(f"Aucune trajectoire q disponible pour {selected_name}.")
+
+            biomod_path = resolve_reconstruction_biomod(dataset_dir, selected_name)
+            if biomod_path is None or not biomod_path.exists():
+                raise ValueError(f"Aucun bioMod associé trouvé pour {selected_name}.")
+
+            import biorbd
+
+            model = biorbd.Model(str(biomod_path))
+            calibrations = get_cached_calibrations(self.state, ROOT / self.state.calib_var.get())
+            selected_camera_names = [name for name in current_selected_camera_names(self.state) if name in calibrations]
+            if not selected_camera_names:
+                selected_camera_names = list(calibrations.keys())
+            camera_calibrations = [calibrations[name] for name in selected_camera_names]
+            self.camera_info_var.set(
+                "Cameras: all available" if len(selected_camera_names) == len(calibrations) else f"Cameras: {format_camera_names(selected_camera_names)}"
+            )
+
+            rank_series = compute_observability_rank_series(model, np.asarray(q, dtype=float), camera_calibrations)
+            marker_summary = summarize_rank_series(rank_series.marker_rank, rank_series.marker_full_rank)
+            observation_summary = summarize_rank_series(rank_series.observation_rank, rank_series.observation_full_rank)
+            time_s = np.asarray(self.bundle.get("time_s", np.arange(np.asarray(q).shape[0]) / max(float(self.state.fps_var.get()), 1.0)), dtype=float)
+            if time_s.shape[0] != np.asarray(q).shape[0]:
+                time_s = np.arange(np.asarray(q).shape[0], dtype=float) / max(float(self.state.fps_var.get()), 1.0)
+
+            axes = self.figure.subplots(2, 1, sharex=True)
+            axes = np.atleast_1d(axes)
+            axes[0].plot(time_s, rank_series.marker_rank, color="#1f77b4", linewidth=1.7, label="rank(J_markers_3D)")
+            axes[0].axhline(rank_series.marker_full_rank, color="#1f77b4", linestyle="--", alpha=0.6, label="full rank")
+            axes[0].set_ylabel("3D rank")
+            axes[0].grid(alpha=0.25)
+            axes[0].legend(loc="upper right", fontsize=8)
+
+            axes[1].plot(time_s, rank_series.observation_rank, color="#d62728", linewidth=1.7, label="rank(J_obs_2D)")
+            axes[1].axhline(rank_series.observation_full_rank, color="#d62728", linestyle="--", alpha=0.6, label="full rank")
+            axes[1].set_ylabel("2D rank")
+            axes[1].set_xlabel("Temps (s)")
+            axes[1].grid(alpha=0.25)
+            axes[1].legend(loc="upper right", fontsize=8)
+            self.figure.suptitle(f"Observabilité | {selected_name}")
+            self.figure.tight_layout()
+            self.canvas.draw_idle()
+
+            self.summary_text.insert(
+                "1.0",
+                "\n".join(
+                    [
+                        f"reconstruction={selected_name}",
+                        f"biomod={display_path(biomod_path)}",
+                        f"nq={int(model.nbQ())}",
+                        f"cameras={format_camera_names(selected_camera_names)}",
+                        "",
+                        "J_markers_3D(q)",
+                        f"  full rank target={rank_series.marker_full_rank}",
+                        f"  min={marker_summary['min']:.0f} | median={marker_summary['median']:.1f} | max={marker_summary['max']:.0f}",
+                        f"  full-rank frames={100.0 * marker_summary['full_rank_ratio']:.1f}%",
+                        "",
+                        "J_obs_2D(q)",
+                        f"  full rank target={rank_series.observation_full_rank}",
+                        f"  min={observation_summary['min']:.0f} | median={observation_summary['median']:.1f} | max={observation_summary['max']:.0f}",
+                        f"  full-rank frames={100.0 * observation_summary['full_rank_ratio']:.1f}%",
+                        "",
+                        "Interpretation:",
+                        "  J_markers_3D montre si les marqueurs 3D du modèle contraignent tous les DoF.",
+                        "  J_obs_2D ajoute la projection caméra et montre la perte de rang induite par les observations image.",
+                    ]
+                ),
+            )
+        except Exception as exc:
+            messagebox.showerror("Observabilité", str(exc))
+
+
 class CameraToolsTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
@@ -6343,6 +6524,7 @@ class LauncherApp(tk.Tk):
         notebook.add(TrampolineTab(notebook, state), text="Toile")
         notebook.add(RootKinematicsTab(notebook, state), text="Racine")
         notebook.add(JointKinematicsTab(notebook, state), text="Autres DoF")
+        notebook.add(ObservabilityTab(notebook, state), text="Observabilité")
 
 
 def main() -> None:
