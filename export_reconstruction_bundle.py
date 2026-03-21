@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from camera_selection import parse_camera_names, subset_calibrations
 from reconstruction_bundle import (
     SUPPORTED_EKF2D_3D_SOURCE_MODES,
     build_ekf_2d_bundle,
@@ -49,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
+    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--pose-data-mode", choices=("raw", "filtered", "cleaned"), default="cleaned")
     parser.add_argument("--pose-filter-window", type=int, default=9)
@@ -100,6 +102,9 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     calibrations = load_calibrations(args.calib)
+    selected_camera_names = parse_camera_names(args.camera_names)
+    if selected_camera_names:
+        calibrations = subset_calibrations(calibrations, selected_camera_names)
     if args.family == "pose2sim":
         if args.pose2sim_trc is None:
             raise ValueError("pose2sim reconstruction requires --pose2sim-trc.")

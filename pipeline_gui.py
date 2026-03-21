@@ -41,6 +41,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from scipy.spatial.transform import Rotation
 
+from camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
+from camera_selection import format_camera_names, parse_camera_names
 from dd_analysis import DDSessionAnalysis, analyze_dd_session
 from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
 from dataset_preview_loader import load_dataset_preview_resources
@@ -101,6 +103,14 @@ from root_series import (
     root_series_from_q,
     scale_root_series_rotations,
 )
+from trampoline_displacement import (
+    X_INNER,
+    X_MAX,
+    Y_INNER,
+    Y_MAX,
+    analyze_trampoline_contacts,
+    total_trampoline_penalty,
+)
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_METHOD,
@@ -123,6 +133,7 @@ from vitpose_ekf_pipeline import (
     load_pose_data,
     metadata_cache_matches,
     reconstruction_cache_metadata,
+    swap_left_right_keypoints,
     triangulate_pose2sim_like,
 )
 
@@ -245,6 +256,31 @@ def compute_triangulation_reprojection_stats(npz_path: Path) -> tuple[float | No
 
 def load_bundle_summary(output_dir: Path) -> dict[str, object]:
     return load_json_if_exists(output_dir / "bundle_summary.json")
+
+
+def load_bundle_payload(output_dir: Path) -> dict[str, np.ndarray]:
+    bundle_path = output_dir / "reconstruction_bundle.npz"
+    if not bundle_path.exists():
+        return {}
+    with np.load(bundle_path, allow_pickle=True) as data:
+        return {key: np.asarray(data[key]) for key in data.files}
+
+
+def load_flip_detail_arrays(cache_path: Path) -> dict[str, np.ndarray]:
+    if not cache_path.exists():
+        return {}
+    with np.load(cache_path, allow_pickle=True) as data:
+        return {
+            key: np.asarray(data[key])
+            for key in data.files
+            if key
+            not in {
+                "suspect_mask",
+                "diagnostics",
+                "compute_time_s",
+                "metadata",
+            }
+        }
 
 
 def reconstruction_dirs_for_path(path: Path) -> list[Path]:
@@ -707,6 +743,41 @@ def draw_skeleton_2d(ax, frame_points: np.ndarray, color: str, label: str, marke
             )
 
 
+def annotate_flip_keypoints(ax, frame_points: np.ndarray) -> None:
+    highlight_names = ["left_shoulder", "right_shoulder", "left_hip", "right_hip", "left_wrist", "right_wrist", "left_ankle", "right_ankle"]
+    for kp_name in highlight_names:
+        point = frame_points[KP_INDEX[kp_name]]
+        if not np.all(np.isfinite(point)):
+            continue
+        short = kp_name.replace("left_", "L ").replace("right_", "R ").replace("_", "\n")
+        ax.text(point[0] + 8.0, point[1] - 8.0, short, color="#222222", fontsize=8, alpha=0.85)
+
+
+def draw_trampoline_bed(ax) -> None:
+    ax.set_aspect("equal")
+    outer = plt.Rectangle((-X_MAX, -Y_MAX), 2 * X_MAX, 2 * Y_MAX, fill=False, linewidth=2.0, edgecolor="#2b6cb0")
+    ax.add_patch(outer)
+    inner_x = plt.Rectangle((-X_INNER, -Y_MAX), 2 * X_INNER, 2 * Y_MAX, fill=False, linewidth=1.2, edgecolor="#b56576")
+    inner_y = plt.Rectangle((-X_MAX, -Y_INNER), 2 * X_MAX, 2 * Y_INNER, fill=False, linewidth=1.2, edgecolor="#b56576")
+    center = plt.Rectangle((-X_INNER, -Y_INNER), 2 * X_INNER, 2 * Y_INNER, fill=True, linewidth=1.0, edgecolor="#b56576", facecolor="#f7fafc", alpha=0.55)
+    ax.add_patch(inner_x)
+    ax.add_patch(inner_y)
+    ax.add_patch(center)
+    ax.text(0.0, 0.0, "0.0", ha="center", va="center", fontsize=13, color="#b56576")
+    ax.text(0.0, Y_INNER + 0.05, "0.2", ha="center", va="bottom", fontsize=11, color="#7b341e")
+    ax.text(0.0, -(Y_INNER + 0.05), "0.2", ha="center", va="top", fontsize=11, color="#7b341e")
+    ax.text(X_INNER + 0.05, 0.0, "0.2", ha="left", va="center", fontsize=11, color="#7b341e")
+    ax.text(-(X_INNER + 0.05), 0.0, "0.2", ha="right", va="center", fontsize=11, color="#7b341e")
+    for x_sign in (-1, 1):
+        for y_sign in (-1, 1):
+            ax.text(x_sign * (X_INNER + 0.25), y_sign * (Y_INNER + 0.25), "0.3", ha="center", va="center", fontsize=11, color="#7b341e")
+    ax.set_xlim(-X_MAX - 0.2, X_MAX + 0.2)
+    ax.set_ylim(-Y_MAX - 0.2, Y_MAX + 0.2)
+    ax.grid(alpha=0.18)
+    ax.set_xlabel("X on bed (m)")
+    ax.set_ylabel("Y on bed (m)")
+
+
 def camera_layout(n_cameras: int) -> tuple[int, int]:
     ncols = 4
     nrows = int(math.ceil(n_cameras / ncols))
@@ -902,6 +973,32 @@ def resolve_preview_biomod(dataset_dir: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+def preview_root_series_for_reconstruction(
+    *,
+    bundle: dict[str, object],
+    name: str,
+    initial_rotation_correction: bool,
+) -> tuple[np.ndarray | None, np.ndarray | None, list[str] | None]:
+    recon_q = bundle.get("recon_q", {})
+    recon_q_root = bundle.get("recon_q_root", {})
+    recon_3d = bundle.get("recon_3d", {})
+    q_names = np.asarray(bundle.get("q_names", np.array([], dtype=object)), dtype=object)
+    if name in recon_q:
+        full_q = np.asarray(recon_q[name], dtype=float)
+        root_q = extract_root_from_q(q_names, full_q, unwrap_rotations=False, renormalize_rotations=True)
+        return root_q, full_q, [str(q_name) for q_name in q_names]
+    if name in recon_3d:
+        root_q, _ = extract_root_from_points(
+            np.asarray(recon_3d[name], dtype=float),
+            bool(initial_rotation_correction),
+            False,
+        )
+        return root_q, None, None
+    if name in recon_q_root:
+        return np.asarray(recon_q_root[name], dtype=float), None, None
+    return None, None, None
+
+
 class LabeledEntry(ttk.Frame):
     """Petit composant label + entry + bouton browse optionnel."""
 
@@ -1055,6 +1152,7 @@ class SharedAppState:
     flip_temporal_weight_var: tk.StringVar
     flip_temporal_tau_px_var: tk.StringVar
     initial_rotation_correction_var: tk.BooleanVar
+    selected_camera_names_var: tk.StringVar
     output_root_var: tk.StringVar
     profiles_config_var: tk.StringVar
     profiles: list[ReconstructionProfile] = field(default_factory=list)
@@ -1099,6 +1197,20 @@ def current_dataset_dir(state: SharedAppState) -> Path:
     return ROOT / state.output_root_var.get() / current_dataset_name(state)
 
 
+def current_selected_camera_names(state: SharedAppState) -> list[str]:
+    return parse_camera_names(state.selected_camera_names_var.get())
+
+
+def shared_pose_data_kwargs(state: SharedAppState, *, data_mode: str | None = None) -> dict[str, object]:
+    return {
+        "data_mode": str(data_mode or state.pose_data_mode_var.get()),
+        "smoothing_window": int(state.pose_filter_window_var.get()),
+        "outlier_threshold_ratio": float(state.pose_outlier_ratio_var.get()),
+        "lower_percentile": float(state.pose_p_low_var.get()),
+        "upper_percentile": float(state.pose_p_high_var.get()),
+    }
+
+
 def current_models_dir(state: SharedAppState) -> Path:
     return dataset_models_dir(ROOT / state.output_root_var.get(), current_dataset_name(state))
 
@@ -1109,6 +1221,15 @@ def current_reconstructions_dir(state: SharedAppState) -> Path:
 
 def current_figures_dir(state: SharedAppState) -> Path:
     return dataset_figures_dir(ROOT / state.output_root_var.get(), current_dataset_name(state))
+
+
+def reconstruction_dir_by_name(dataset_dir: Path, reconstruction_name: str) -> Path | None:
+    for recon_dir in reconstruction_dirs_for_path(dataset_dir):
+        summary = load_bundle_summary(recon_dir)
+        summary_name = str(summary.get("name", recon_dir.name))
+        if summary_name == reconstruction_name:
+            return recon_dir
+    return None
 
 
 def preview_bundle_cache_key(
@@ -1853,6 +1974,9 @@ class PipelineTab(CommandTab):
             "--biorbd-kalman-error-factor",
             self.biorbd_error.get(),
         ]
+        selected_cameras = current_selected_camera_names(self.state)
+        if selected_cameras:
+            cmd.extend(["--camera-names", ",".join(selected_cameras)])
         if self.reconstruction_cache.get():
             cmd.extend(["--reconstruction-cache", self.reconstruction_cache.get()])
         if self.model_cache.get():
@@ -2097,7 +2221,7 @@ class DualAnimationTab(CommandTab):
         try:
             output_dir = ROOT / self.dataset_dir.get()
             preview_load = load_dataset_preview_resources(
-                output_dir,
+                output_dir=output_dir,
                 preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
                 fallback_count=4,
                 dataset_source_paths_fn=dataset_source_paths,
@@ -2763,6 +2887,8 @@ class DataExplorer2DTab(ttk.Frame):
         self.initial_rotation_correction_var = state.initial_rotation_correction_var
         self.root_rotfix_check = ttk.Checkbutton(row_shared, text="Root rot-fix", variable=self.initial_rotation_correction_var)
         self.root_rotfix_check.pack(side=tk.LEFT, padx=(8, 0))
+        self.selected_cameras_label_var = tk.StringVar(value="Cameras: all")
+        ttk.Label(row_shared, textvariable=self.selected_cameras_label_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(row_shared, text="Clean trial outputs", command=self.clean_trial_outputs).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(controls, textvariable=self.dataset_summary_var, foreground="#4f5b66", justify=tk.LEFT).pack(fill=tk.X, padx=8, pady=(0, 4))
 
@@ -2909,6 +3035,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.state.flip_temporal_weight_var.trace_add("write", lambda *_args: self.on_flip_settings_changed())
         self.state.flip_temporal_tau_px_var.trace_add("write", lambda *_args: self.on_flip_settings_changed())
         self.state.initial_rotation_correction_var.trace_add("write", lambda *_args: synchronize_profiles_initial_rotation_correction(self.state))
+        self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_dataset_summary())
         self.on_keypoints_changed()
 
     def on_keypoints_changed(self) -> None:
@@ -2997,6 +3124,10 @@ class DataExplorer2DTab(ttk.Frame):
             f"Models: {display_path(models_dir)}\n"
             f"Reconstructions: {display_path(recon_dir)}\n"
             f"Figures: {display_path(figures_dir)}"
+        )
+        selected_cameras = current_selected_camera_names(self.state)
+        self.selected_cameras_label_var.set(
+            "Cameras: all" if not selected_cameras else f"Cameras: {format_camera_names(selected_cameras)}"
         )
 
     def selected_keypoints(self) -> list[str]:
@@ -3540,6 +3671,9 @@ class ModelTab(CommandTab):
             "--biomod",
             self.derived_biomod_path(),
         ]
+        selected_cameras = current_selected_camera_names(self.state)
+        if selected_cameras:
+            cmd.extend(["--camera-names", ",".join(selected_cameras)])
         if self.frame_start.get():
             cmd.extend(["--frame-start", self.frame_start.get()])
         if self.frame_end.get():
@@ -4325,6 +4459,9 @@ class ProfilesTab(CommandTab):
             "--triangulation-workers",
             self.state.workers_var.get(),
         ]
+        selected_cameras = current_selected_camera_names(self.state)
+        if selected_cameras:
+            cmd.extend(["--camera-names", ",".join(selected_cameras)])
         if self.state.pose2sim_trc_var.get().strip():
             cmd.extend(["--pose2sim-trc", self.state.pose2sim_trc_var.get()])
         for profile in self.selected_profiles():
@@ -4878,6 +5015,625 @@ class JointKinematicsTab(ttk.Frame):
             messagebox.showerror("Autres DoF", str(exc))
 
 
+class CameraToolsTab(ttk.Frame):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master)
+        self.state = state
+        self.pose_data = None
+        self.calibrations = None
+        self.metrics_rows = []
+        self.flip_masks: dict[str, np.ndarray] = {}
+        self.flip_diagnostics: dict[str, dict[str, object]] = {}
+        self.flip_detail_arrays: dict[str, dict[str, np.ndarray]] = {}
+        self.flip_frame_local_indices: list[int] = []
+
+        controls = ttk.LabelFrame(self, text="Sélection de caméras + inspection flip L/R")
+        controls.pack(fill=tk.X, padx=10, pady=10)
+        self.dataset_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
+        self.dataset_dir.pack(fill=tk.X, padx=8, pady=4)
+
+        row = ttk.Frame(controls)
+        row.pack(fill=tk.X, padx=8, pady=4)
+        reference_label = ttk.Label(row, text="Reference", width=10)
+        reference_label.pack(side=tk.LEFT)
+        self.reference_name_var = tk.StringVar(value="")
+        self.reference_box = ttk.Combobox(row, textvariable=self.reference_name_var, width=28, state="readonly")
+        self.reference_box.pack(side=tk.LEFT, padx=(0, 8))
+        best_n_label = ttk.Label(row, text="Best N", width=8)
+        best_n_label.pack(side=tk.LEFT)
+        self.best_n_var = tk.StringVar(value="4")
+        best_n_entry = ttk.Entry(row, textvariable=self.best_n_var, width=5)
+        best_n_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row, text="Load / refresh", command=self.load_resources).pack(side=tk.LEFT)
+        ttk.Button(row, text="Use selected cameras", command=self.apply_selected_cameras).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(row, text="Select best", command=self.select_best_cameras).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(row, text="Clear camera filter", command=self.clear_camera_filter).pack(side=tk.LEFT, padx=(8, 0))
+
+        self.camera_filter_status = tk.StringVar(value="Reconstructions will use all cameras.")
+        ttk.Label(controls, textvariable=self.camera_filter_status, foreground="#4f5b66", justify=tk.LEFT).pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(
+            controls,
+            text=(
+                "Scores shown: valid 2D coverage, detector confidence, epipolar coherence, confidence x coherence, "
+                "reprojection quality, triangulation usage, and flip rates.\n"
+                "Additional useful literature criteria: calibration uncertainty, baseline diversity, occlusion persistence, "
+                "view angle to the motion plane, and temporal stability of 2D tracks."
+            ),
+            foreground="#4f5b66",
+            justify=tk.LEFT,
+            wraplength=1200,
+        ).pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=3)
+        body.add(right, weight=2)
+
+        metrics_box = ttk.LabelFrame(left, text="Scores caméra")
+        metrics_box.pack(fill=tk.BOTH, expand=True)
+        self.metrics_tree = ttk.Treeview(
+            metrics_box,
+            columns=("camera", "valid", "score", "epi", "weighted", "reproj", "good", "usage", "flip_epi", "flip_tri"),
+            show="headings",
+            selectmode="extended",
+            height=10,
+        )
+        headings = {
+            "camera": "Camera",
+            "valid": "Valid %",
+            "score": "Score",
+            "epi": "Epi",
+            "weighted": "Conf x Epi",
+            "reproj": "Reproj px",
+            "good": "Good reproj %",
+            "usage": "Triang use %",
+            "flip_epi": "Flip epi %",
+            "flip_tri": "Flip tri %",
+        }
+        widths = {"camera": 120, "valid": 80, "score": 70, "epi": 70, "weighted": 95, "reproj": 85, "good": 95, "usage": 95, "flip_epi": 85, "flip_tri": 85}
+        for column in self.metrics_tree["columns"]:
+            self.metrics_tree.heading(column, text=headings[column])
+            self.metrics_tree.column(column, width=widths[column], anchor="center")
+        self.metrics_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        inspector_box = ttk.LabelFrame(right, text="Flip inspector")
+        inspector_box.pack(fill=tk.BOTH, expand=True)
+        inspector_controls = ttk.Frame(inspector_box)
+        inspector_controls.pack(fill=tk.X, padx=8, pady=4)
+        method_label = ttk.Label(inspector_controls, text="Method", width=9)
+        method_label.pack(side=tk.LEFT)
+        self.flip_method_var = tk.StringVar(value="epipolar")
+        self.flip_method_box = ttk.Combobox(inspector_controls, textvariable=self.flip_method_var, values=["epipolar", "triangulation"], width=16, state="readonly")
+        self.flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
+        camera_label = ttk.Label(inspector_controls, text="Camera", width=8)
+        camera_label.pack(side=tk.LEFT)
+        self.flip_camera_var = tk.StringVar(value="")
+        self.flip_camera_box = ttk.Combobox(inspector_controls, textvariable=self.flip_camera_var, width=18, state="readonly")
+        self.flip_camera_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.flip_applied_var = tk.BooleanVar(value=False)
+        self.flip_check = ttk.Checkbutton(inspector_controls, text="Flip current frame", variable=self.flip_applied_var, command=self.render_flip_preview)
+        self.flip_check.pack(side=tk.LEFT, padx=(0, 8))
+        self.flip_status_var = tk.StringVar(value="Press F to toggle the active hypothesis.")
+        ttk.Label(inspector_controls, textvariable=self.flip_status_var, foreground="#4f5b66").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
+        inspector_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        frame_panel = ttk.Frame(inspector_body)
+        preview_panel = ttk.Frame(inspector_body)
+        inspector_body.add(frame_panel, weight=1)
+        inspector_body.add(preview_panel, weight=2)
+
+        ttk.Label(frame_panel, text="Frames suspectes / candidates").pack(anchor="w", pady=(0, 4))
+        self.flip_frame_list = tk.Listbox(frame_panel, exportselection=False, height=12)
+        self.flip_frame_list.pack(fill=tk.BOTH, expand=True)
+        self.flip_details = ScrolledText(frame_panel, height=9, wrap=tk.WORD)
+        self.flip_details.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        self.flip_figure = Figure(figsize=(7, 6))
+        self.flip_canvas = FigureCanvasTkAgg(self.flip_figure, master=preview_panel)
+        self.flip_canvas_widget = self.flip_canvas.get_tk_widget()
+        self.flip_canvas_widget.pack(fill=tk.BOTH, expand=True)
+        self.flip_toolbar = NavigationToolbar2Tk(self.flip_canvas, preview_panel, pack_toolbar=False)
+        self.flip_toolbar.update()
+        self.flip_toolbar.pack(fill=tk.X)
+
+        self.dataset_dir.set_tooltip("Dataset courant utilise pour calculer les scores caméra et relire les caches de flip.")
+        attach_tooltip(reference_label, "Reconstruction de référence utilisée pour relire epipolar coherence, reprojection per view et usage dans la triangulation.")
+        attach_tooltip(self.reference_box, "Reconstruction de référence utilisée pour relire epipolar coherence, reprojection per view et usage dans la triangulation.")
+        attach_tooltip(best_n_label, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
+        attach_tooltip(best_n_entry, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
+        attach_tooltip(self.metrics_tree, "Scores comparatifs pour choisir un sous-ensemble de caméras plus stable pour la reconstruction.")
+        attach_tooltip(method_label, "Méthode de diagnostic de flip L/R: cohérence épipolaire ou triangulation/reprojection.")
+        attach_tooltip(self.flip_method_box, "Méthode de diagnostic de flip L/R: cohérence épipolaire ou triangulation/reprojection.")
+        attach_tooltip(camera_label, "Caméra isolée à inspecter pour les frames suspectes.")
+        attach_tooltip(self.flip_camera_box, "Caméra isolée à inspecter pour les frames suspectes.")
+        attach_tooltip(self.flip_check, "Affiche l'hypothèse swappée gauche/droite comme hypothèse active. Raccourci clavier: F.")
+        attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
+        attach_tooltip(self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée.")
+
+        self.reference_name_var.trace_add("write", lambda *_args: self.refresh_metrics())
+        self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
+        self.flip_camera_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
+        self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
+        for widget in (self.flip_frame_list, self.flip_canvas_widget, self.flip_method_box, self.flip_camera_box):
+            widget.bind("<KeyPress-f>", self.toggle_flip_current_frame)
+            widget.bind("<Enter>", lambda _event, w=widget: w.focus_set())
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.load_resources())
+        self.state.register_reconstruction_listener(self.refresh_reference_choices)
+        self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_camera_filter_status())
+        self.sync_dataset_dir()
+
+    def toggle_flip_current_frame(self, _event=None) -> str:
+        self.flip_applied_var.set(not self.flip_applied_var.get())
+        self.render_flip_preview()
+        return "break"
+
+    def sync_dataset_dir(self) -> None:
+        self.dataset_dir.var.set(display_path(current_dataset_dir(self.state)))
+        self.refresh_reference_choices()
+        self.update_camera_filter_status()
+        self.load_resources()
+
+    def update_camera_filter_status(self) -> None:
+        selected = current_selected_camera_names(self.state)
+        self.camera_filter_status.set(
+            "Reconstructions will use all cameras."
+            if not selected
+            else f"Reconstructions will use: {format_camera_names(selected)}"
+        )
+        for item in self.metrics_tree.selection():
+            self.metrics_tree.selection_remove(item)
+        for camera_name in selected:
+            if self.metrics_tree.exists(camera_name):
+                self.metrics_tree.selection_add(camera_name)
+
+    def refresh_reference_choices(self) -> None:
+        dataset_dir = current_dataset_dir(self.state)
+        catalog = discover_reconstruction_catalog(dataset_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
+        names = [str(row.get("name")) for row in catalog]
+        self.reference_box.configure(values=[""] + names)
+        current = self.reference_name_var.get()
+        if current in names:
+            return
+        for preferred in ("triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_3d"):
+            if preferred in names:
+                self.reference_name_var.set(preferred)
+                return
+        self.reference_name_var.set("")
+
+    def load_resources(self) -> None:
+        try:
+            self.calibrations, self.pose_data = get_cached_pose_data(
+                self.state,
+                keypoints_path=ROOT / self.state.keypoints_var.get(),
+                calib_path=ROOT / self.state.calib_var.get(),
+                **shared_pose_data_kwargs(self.state),
+            )
+            self.ensure_flip_diagnostics()
+            self.refresh_metrics()
+            self.refresh_flip_controls()
+        except Exception as exc:
+            messagebox.showerror("Caméras", str(exc))
+
+    def ensure_flip_diagnostics(self) -> None:
+        if self.pose_data is None or self.calibrations is None:
+            return
+        dataset_dir = current_dataset_dir(self.state)
+        pose_kwargs = shared_pose_data_kwargs(self.state)
+        for method in ("epipolar", "triangulation"):
+            suspect_mask, diagnostics, _compute_time_s, cache_path = load_or_compute_left_right_flip_cache(
+                output_dir=dataset_dir,
+                pose_data=self.pose_data,
+                calibrations=self.calibrations,
+                method=method,
+                pose_data_mode=str(pose_kwargs["data_mode"]),
+                pose_filter_window=int(pose_kwargs["smoothing_window"]),
+                pose_outlier_threshold_ratio=float(pose_kwargs["outlier_threshold_ratio"]),
+                pose_amplitude_lower_percentile=float(pose_kwargs["lower_percentile"]),
+                pose_amplitude_upper_percentile=float(pose_kwargs["upper_percentile"]),
+                improvement_ratio=float(self.state.flip_improvement_ratio_var.get()),
+                min_gain_px=float(self.state.flip_min_gain_px_var.get()),
+                min_other_cameras=int(self.state.flip_min_other_cameras_var.get()),
+                restrict_to_outliers=bool(self.state.flip_restrict_to_outliers_var.get()),
+                outlier_percentile=float(self.state.flip_outlier_percentile_var.get()),
+                outlier_floor_px=float(self.state.flip_outlier_floor_px_var.get()),
+                tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if method == "epipolar" else DEFAULT_REPROJECTION_THRESHOLD_PX,
+                temporal_weight=float(self.state.flip_temporal_weight_var.get()),
+                temporal_tau_px=float(self.state.flip_temporal_tau_px_var.get()),
+            )
+            self.flip_masks[method] = suspect_mask
+            self.flip_diagnostics[method] = diagnostics
+            self.flip_detail_arrays[method] = load_flip_detail_arrays(cache_path)
+
+    def _reference_payload(self) -> dict[str, np.ndarray]:
+        reference_name = self.reference_name_var.get().strip()
+        if not reference_name:
+            return {}
+        recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
+        return {} if recon_dir is None else load_bundle_payload(recon_dir)
+
+    def refresh_metrics(self) -> None:
+        if self.pose_data is None:
+            return
+        payload = self._reference_payload()
+        self.metrics_rows = compute_camera_metric_rows(
+            self.pose_data,
+            epipolar_coherence=payload.get("epipolar_coherence"),
+            reprojection_error_per_view=payload.get("reprojection_error_per_view"),
+            excluded_views=payload.get("excluded_views"),
+            flip_masks=self.flip_masks,
+            good_reprojection_threshold_px=DEFAULT_REPROJECTION_THRESHOLD_PX,
+        )
+        previous = set(self.metrics_tree.selection())
+        for item in self.metrics_tree.get_children():
+            self.metrics_tree.delete(item)
+        for row in self.metrics_rows:
+            self.metrics_tree.insert(
+                "",
+                "end",
+                iid=row.camera_name,
+                values=(
+                    row.camera_name,
+                    self._fmt_pct(row.valid_ratio),
+                    self._fmt_float(row.mean_score),
+                    self._fmt_float(row.mean_epipolar_coherence),
+                    self._fmt_float(row.weighted_confidence),
+                    self._fmt_float(row.reprojection_mean_px),
+                    self._fmt_pct(row.reprojection_good_frame_ratio),
+                    self._fmt_pct(row.triangulation_usage_ratio),
+                    self._fmt_pct(row.flip_rate_epipolar),
+                    self._fmt_pct(row.flip_rate_triangulation),
+                ),
+            )
+        for camera_name in previous:
+            if self.metrics_tree.exists(camera_name):
+                self.metrics_tree.selection_add(camera_name)
+        self.update_camera_filter_status()
+
+    def apply_selected_cameras(self) -> None:
+        self.state.selected_camera_names_var.set(",".join(self.metrics_tree.selection()))
+
+    def clear_camera_filter(self) -> None:
+        self.state.selected_camera_names_var.set("")
+
+    def select_best_cameras(self) -> None:
+        try:
+            count = int(self.best_n_var.get())
+        except ValueError:
+            count = 4
+        best_names = suggest_best_camera_names(self.metrics_rows, count)
+        for item in self.metrics_tree.selection():
+            self.metrics_tree.selection_remove(item)
+        for camera_name in best_names:
+            if self.metrics_tree.exists(camera_name):
+                self.metrics_tree.selection_add(camera_name)
+
+    def refresh_flip_controls(self) -> None:
+        if self.pose_data is None:
+            return
+        camera_names = list(self.pose_data.camera_names)
+        self.flip_camera_box.configure(values=camera_names)
+        if self.flip_camera_var.get() not in camera_names:
+            self.flip_camera_var.set(camera_names[0] if camera_names else "")
+        self.refresh_flip_frame_list()
+
+    def refresh_flip_frame_list(self) -> None:
+        self.flip_frame_local_indices = []
+        self.flip_frame_list.delete(0, tk.END)
+        self.flip_details.delete("1.0", tk.END)
+        if self.pose_data is None:
+            self.render_flip_preview()
+            return
+        method = self.flip_method_var.get()
+        camera_name = self.flip_camera_var.get()
+        if method not in self.flip_masks or camera_name not in self.pose_data.camera_names:
+            self.render_flip_preview()
+            return
+        cam_idx = list(self.pose_data.camera_names).index(camera_name)
+        detail_arrays = self.flip_detail_arrays.get(method, {})
+        candidate_mask = np.asarray(detail_arrays.get("candidate_mask"), dtype=bool) if "candidate_mask" in detail_arrays else None
+        suspect_mask = self.flip_masks[method]
+        if np.any(suspect_mask[cam_idx]):
+            local_indices = np.flatnonzero(suspect_mask[cam_idx]).tolist()
+        elif candidate_mask is not None and candidate_mask.ndim == 2 and np.any(candidate_mask[cam_idx]):
+            local_indices = np.flatnonzero(candidate_mask[cam_idx]).tolist()
+        else:
+            local_indices = []
+        self.flip_frame_local_indices = local_indices
+        for local_idx in local_indices:
+            frame_number = int(self.pose_data.frames[local_idx])
+            nominal = self._flip_cost(detail_arrays, "nominal_combined_costs", cam_idx, local_idx)
+            swapped = self._flip_cost(detail_arrays, "swapped_combined_costs", cam_idx, local_idx)
+            label = f"{'flip' if suspect_mask[cam_idx, local_idx] else 'candidate'} | frame {frame_number} | {self._fmt_float(nominal)} -> {self._fmt_float(swapped)}"
+            self.flip_frame_list.insert(tk.END, label)
+        if local_indices:
+            self.flip_frame_list.selection_set(0)
+        self.render_flip_preview()
+
+    def _selected_flip_frame_local_idx(self) -> int | None:
+        selection = self.flip_frame_list.curselection()
+        if selection:
+            idx = int(selection[0])
+            if idx < len(self.flip_frame_local_indices):
+                return self.flip_frame_local_indices[idx]
+        return self.flip_frame_local_indices[0] if self.flip_frame_local_indices else None
+
+    def render_flip_preview(self) -> None:
+        self.flip_figure.clear()
+        if self.pose_data is None or self.calibrations is None:
+            ax = self.flip_figure.subplots(1, 1)
+            ax.text(0.5, 0.5, "No 2D data loaded", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            self.flip_canvas.draw_idle()
+            return
+        method = self.flip_method_var.get()
+        camera_name = self.flip_camera_var.get()
+        frame_local_idx = self._selected_flip_frame_local_idx()
+        if frame_local_idx is None or camera_name not in self.pose_data.camera_names:
+            ax = self.flip_figure.subplots(1, 1)
+            ax.text(0.5, 0.5, "No flagged frame for this camera/method", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            self.flip_canvas.draw_idle()
+            return
+        cam_idx = list(self.pose_data.camera_names).index(camera_name)
+        nominal_points = np.asarray(self.pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
+        swapped_points = swap_left_right_keypoints(nominal_points)
+        width, height = self.calibrations[camera_name].image_size
+        finite_nominal = nominal_points[np.all(np.isfinite(nominal_points), axis=1)]
+        finite_swapped = swapped_points[np.all(np.isfinite(swapped_points), axis=1)]
+        finite = np.vstack([arr for arr in (finite_nominal, finite_swapped) if arr.size]) if (finite_nominal.size or finite_swapped.size) else np.empty((0, 2))
+        if finite.size:
+            xmin, ymin = np.min(finite, axis=0)
+            xmax, ymax = np.max(finite, axis=0)
+            margin_x = max(20.0, 0.15 * float(xmax - xmin))
+            margin_y = max(20.0, 0.15 * float(ymax - ymin))
+            x_limits = (max(0.0, float(xmin - margin_x)), min(float(width), float(xmax + margin_x)))
+            y_limits = (min(float(height), float(ymax + margin_y)), max(0.0, float(ymin - margin_y)))
+        else:
+            x_limits = (0.0, float(width))
+            y_limits = (float(height), 0.0)
+
+        axes = np.atleast_1d(self.flip_figure.subplots(1, 2))
+        active_index = 1 if self.flip_applied_var.get() else 0
+        for axis_idx, (ax, title, points, color) in enumerate(
+            zip(axes, ("Nominal", "Flipped"), (nominal_points, swapped_points), ("#4c72b0", "#c44e52"))
+        ):
+            draw_skeleton_2d(ax, points, color, title, marker_size=22.0)
+            annotate_flip_keypoints(ax, points)
+            ax.set_xlim(*x_limits)
+            ax.set_ylim(*y_limits)
+            ax.set_title(f"{'ACTIVE | ' if axis_idx == active_index else ''}{title}")
+            ax.grid(alpha=0.18)
+            ax.set_xlabel("x (px)")
+            ax.set_ylabel("y (px)")
+        detail_arrays = self.flip_detail_arrays.get(method, {})
+        suspect = bool(self.flip_masks.get(method, np.zeros((0, 0), dtype=bool))[cam_idx, frame_local_idx])
+        frame_number = int(self.pose_data.frames[frame_local_idx])
+        self.flip_figure.suptitle(f"{camera_name} | frame {frame_number} | {method} | suspect={'yes' if suspect else 'no'}")
+        self.flip_figure.tight_layout()
+        self.flip_canvas.draw_idle()
+        self.flip_status_var.set("Press F to toggle the active hypothesis and compare left/right consistency visually.")
+        self.flip_details.delete("1.0", tk.END)
+        self.flip_details.insert(
+            "1.0",
+            "\n".join(
+                [
+                    f"camera={camera_name}",
+                    f"frame={frame_number}",
+                    f"method={method}",
+                    f"suspect={'yes' if suspect else 'no'}",
+                    f"candidate={'yes' if self._flip_flag(detail_arrays, 'candidate_mask', cam_idx, frame_local_idx) else 'no'}",
+                    f"temporal_support={'yes' if self._flip_flag(detail_arrays, 'temporal_support_mask', cam_idx, frame_local_idx) else 'no'}",
+                    f"nominal geometric={self._fmt_float(self._flip_cost(detail_arrays, 'nominal_geometric_costs', cam_idx, frame_local_idx))}",
+                    f"swapped geometric={self._fmt_float(self._flip_cost(detail_arrays, 'swapped_geometric_costs', cam_idx, frame_local_idx))}",
+                    f"nominal temporal={self._fmt_float(self._flip_cost(detail_arrays, 'nominal_temporal_costs', cam_idx, frame_local_idx))}",
+                    f"swapped temporal={self._fmt_float(self._flip_cost(detail_arrays, 'swapped_temporal_costs', cam_idx, frame_local_idx))}",
+                    f"nominal combined={self._fmt_float(self._flip_cost(detail_arrays, 'nominal_combined_costs', cam_idx, frame_local_idx))}",
+                    f"swapped combined={self._fmt_float(self._flip_cost(detail_arrays, 'swapped_combined_costs', cam_idx, frame_local_idx))}",
+                ]
+            ),
+        )
+
+    @staticmethod
+    def _flip_cost(detail_arrays: dict[str, np.ndarray], key: str, cam_idx: int, frame_idx: int) -> float | None:
+        values = detail_arrays.get(key)
+        if values is None or values.ndim != 2 or cam_idx >= values.shape[0] or frame_idx >= values.shape[1]:
+            return None
+        value = float(values[cam_idx, frame_idx])
+        return value if np.isfinite(value) else None
+
+    @staticmethod
+    def _flip_flag(detail_arrays: dict[str, np.ndarray], key: str, cam_idx: int, frame_idx: int) -> bool:
+        values = detail_arrays.get(key)
+        if values is None or values.ndim != 2 or cam_idx >= values.shape[0] or frame_idx >= values.shape[1]:
+            return False
+        return bool(values[cam_idx, frame_idx])
+
+    @staticmethod
+    def _fmt_float(value: float | None) -> str:
+        return "-" if value is None else f"{value:.2f}"
+
+    @staticmethod
+    def _fmt_pct(value: float | None) -> str:
+        return "-" if value is None else f"{100.0 * value:.1f}%"
+
+
+class TrampolineTab(ttk.Frame):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master)
+        self.state = state
+        self.bundle = None
+        self.analysis: DDSessionAnalysis | None = None
+        self.contacts = []
+        self.current_reconstruction_name: str | None = None
+
+        controls = ttk.LabelFrame(self, text="Déplacement dans la toile")
+        controls.pack(fill=tk.X, padx=10, pady=10)
+        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
+        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(
+            controls,
+            text=(
+                "Première version: les coordonnées sur la toile sont approximées avec TRUNK:TransX / TRUNK:TransY, "
+                "et l'analyse s'intéresse uniquement aux phases de contact entre deux sauts détectés par l'onglet DD."
+            ),
+            foreground="#4f5b66",
+            justify=tk.LEFT,
+            wraplength=1200,
+        ).pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=2)
+
+        self.recon_show = SelectionTable(left, "Reconstructions disponibles", action_label="Refresh available", action_command=self.refresh_available_reconstructions)
+        self.recon_show.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
+        self.recon_show.tree.configure(selectmode="browse")
+        attach_tooltip(self.recon_show.tree, "Choisissez la reconstruction utilisée pour estimer les contacts et la pénalité de déplacement.")
+        ttk.Button(left, text="Analyze / refresh", command=self.refresh_analysis).pack(anchor="w", pady=(0, 8))
+
+        summary_box = ttk.LabelFrame(left, text="Résumé")
+        summary_box.pack(fill=tk.BOTH, expand=True)
+        self.summary = ScrolledText(summary_box, height=22, wrap=tk.WORD)
+        self.summary.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        figure_box = ttk.LabelFrame(right, text="Toile + contacts")
+        figure_box.pack(fill=tk.BOTH, expand=True)
+        self.figure = Figure(figsize=(11, 7))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=figure_box)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, figure_box, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill=tk.X)
+
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.pose2sim_trc_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.fps_var.trace_add("write", lambda *_args: self.refresh_analysis())
+        self.state.initial_rotation_correction_var.trace_add("write", lambda *_args: self.refresh_analysis())
+        self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+        self.sync_dataset_dir()
+
+    def sync_dataset_dir(self) -> None:
+        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
+        self.refresh_available_reconstructions()
+
+    def refresh_available_reconstructions(self) -> None:
+        try:
+            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
+            available_names = bundle_available_reconstruction_names(bundle, include_3d=True, include_q=True, include_q_root=True)
+            catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
+            rows = catalog_rows_for_names(catalog, available_names)
+            defaults = default_selection(
+                available_names,
+                ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
+                fallback_count=4,
+            )
+            self.recon_show.set_rows(rows, defaults)
+        except Exception:
+            pass
+
+    def _selected_reconstruction(self) -> str | None:
+        selected = self.recon_show.selected_names()
+        return selected[-1] if selected else None
+
+    def refresh_analysis(self) -> None:
+        try:
+            self.bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
+            self.current_reconstruction_name = self._selected_reconstruction()
+            if self.current_reconstruction_name is None:
+                self.analysis = None
+                self.contacts = []
+                self.render_summary()
+                self.refresh_plot()
+                return
+            root_q, _full_q, _q_names = preview_root_series_for_reconstruction(
+                bundle=self.bundle,
+                name=self.current_reconstruction_name,
+                initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+            )
+            if root_q is None:
+                raise ValueError(f"Aucune cinématique racine disponible pour {self.current_reconstruction_name}.")
+            fps = float(self.state.fps_var.get())
+            self.analysis = analyze_dd_session(
+                np.asarray(root_q, dtype=float),
+                fps,
+                height_values=np.asarray(root_q[:, 2], dtype=float),
+                angle_mode="euler",
+            )
+            self.contacts = analyze_trampoline_contacts(self.analysis, np.asarray(root_q[:, :2], dtype=float))
+            self.render_summary()
+            self.refresh_plot()
+        except Exception as exc:
+            messagebox.showerror("Déplacement toile", str(exc))
+
+    def render_summary(self) -> None:
+        self.summary.delete("1.0", tk.END)
+        if self.analysis is None or self.current_reconstruction_name is None:
+            self.summary.insert("1.0", "No trampoline analysis yet.")
+            return
+        lines = [
+            f"Reconstruction: {reconstruction_label(self.current_reconstruction_name)}",
+            "Contact proxy: TRUNK:TransX / TRUNK:TransY",
+            f"Detected jumps: {len(self.analysis.jumps)}",
+            f"Contact intervals between jumps: {len(self.contacts)}",
+            f"Total penalty: {total_trampoline_penalty(self.contacts):.2f}",
+            "",
+        ]
+        for contact in self.contacts:
+            lines.append(
+                f"C{contact.index}: frames {contact.start}-{contact.end} | center {contact.center_frame} | "
+                f"x={contact.x:.3f} m | y={contact.y:.3f} m | penalty={'-' if contact.penalty is None else f'{contact.penalty:.2f}'}"
+            )
+        self.summary.insert("1.0", "\n".join(lines))
+
+    def refresh_plot(self) -> None:
+        self.figure.clear()
+        if self.analysis is None or self.current_reconstruction_name is None:
+            ax = self.figure.subplots(1, 1)
+            ax.text(0.5, 0.5, "No trampoline analysis yet", ha="center", va="center", transform=ax.transAxes)
+            ax.set_axis_off()
+            self.canvas.draw_idle()
+            return
+        root_q = np.asarray(self.analysis.root_q, dtype=float)
+        t = np.arange(root_q.shape[0], dtype=float) / float(self.state.fps_var.get())
+        bed_ax, time_ax = np.atleast_1d(self.figure.subplots(1, 2))
+        draw_trampoline_bed(bed_ax)
+        bed_ax.plot(root_q[:, 0], root_q[:, 1], color="#4f5b66", linewidth=1.0, alpha=0.35, label="root XY path")
+        penalty_colors = {0.0: "#55a868", 0.1: "#dd8452", 0.3: "#c44e52"}
+        for contact in self.contacts:
+            if np.isfinite(contact.x) and np.isfinite(contact.y):
+                color = penalty_colors.get(contact.penalty, "#8172b3")
+                bed_ax.scatter(contact.x, contact.y, color=color, s=60, zorder=3)
+                bed_ax.text(contact.x, contact.y + 0.08, f"C{contact.index}", ha="center", va="bottom", fontsize=9)
+        bed_ax.set_title("Bed coordinates")
+        bed_ax.legend(loc="upper right", fontsize=8)
+
+        time_ax.plot(t, root_q[:, 0], color="#4c72b0", linewidth=1.6, label="TRUNK:TransX")
+        time_ax.plot(t, root_q[:, 1], color="#c44e52", linewidth=1.6, label="TRUNK:TransY")
+        label_y = float(np.nanmax(root_q[:, :2])) if np.any(np.isfinite(root_q[:, :2])) else 0.0
+        for jump in self.analysis.jump_segments:
+            time_ax.axvspan(t[jump.start], t[jump.end], color="#4c72b0", alpha=0.06)
+        for contact in self.contacts:
+            color = penalty_colors.get(contact.penalty, "#8172b3")
+            time_ax.axvspan(t[contact.start], t[contact.end], color=color, alpha=0.10)
+            time_ax.text(t[contact.center_frame], label_y, f"C{contact.index}", color=color, fontsize=8, ha="center", va="bottom")
+        time_ax.set_title("Contact windows between jumps")
+        time_ax.set_xlabel("Time (s)")
+        time_ax.set_ylabel("Bed proxy (m)")
+        time_ax.grid(alpha=0.25)
+        time_ax.legend(loc="upper right", fontsize=8)
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+
 class DDTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
@@ -5074,20 +5830,12 @@ class DDTab(ttk.Frame):
         recon_3d: dict[str, np.ndarray],
         q_names: np.ndarray,
     ) -> tuple[np.ndarray | None, np.ndarray | None, list[str] | None]:
-        if name in recon_q:
-            full_q = np.asarray(recon_q[name], dtype=float)
-            root_q = extract_root_from_q(q_names, full_q, unwrap_rotations=False, renormalize_rotations=True)
-            return root_q, full_q, [str(q_name) for q_name in q_names]
-        if name in recon_3d:
-            root_q, _ = extract_root_from_points(
-                np.asarray(recon_3d[name], dtype=float),
-                bool(self.state.initial_rotation_correction_var.get()),
-                False,
-            )
-            return root_q, None, None
-        if name in recon_q_root:
-            return np.asarray(recon_q_root[name], dtype=float), None, None
-        return None, None, None
+        _ = (recon_q, recon_q_root, recon_3d, q_names)
+        return preview_root_series_for_reconstruction(
+            bundle=self.bundle or {},
+            name=name,
+            initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+        )
 
     def _update_height_dof_choices(self, q_name_list: list[str] | None) -> None:
         values: list[str] = []
@@ -5346,6 +6094,7 @@ class LauncherApp(tk.Tk):
             flip_temporal_weight_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_WEIGHT)),
             flip_temporal_tau_px_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_TAU_PX)),
             initial_rotation_correction_var=tk.BooleanVar(value=True),
+            selected_camera_names_var=tk.StringVar(value=""),
             output_root_var=tk.StringVar(value="outputs"),
             profiles_config_var=tk.StringVar(value="reconstruction_profiles.json"),
         )
@@ -5362,12 +6111,14 @@ class LauncherApp(tk.Tk):
         notebook = ttk.Notebook(self)
         notebook.pack(fill=tk.BOTH, expand=True)
         notebook.add(DataExplorer2DTab(notebook, state), text="2D explorer")
+        notebook.add(CameraToolsTab(notebook, state), text="Caméras")
         notebook.add(ModelTab(notebook, state), text="Modèle")
         notebook.add(ProfilesTab(notebook, state), text="Profiles")
         notebook.add(ReconstructionsTab(notebook, state), text="Reconstructions")
         notebook.add(DualAnimationTab(notebook, state), text="3D animation")
         notebook.add(MultiViewTab(notebook, state), text="2D multiview")
         notebook.add(DDTab(notebook, state), text="DD")
+        notebook.add(TrampolineTab(notebook, state), text="Toile")
         notebook.add(RootKinematicsTab(notebook, state), text="Racine")
         notebook.add(JointKinematicsTab(notebook, state), text="Autres DoF")
 

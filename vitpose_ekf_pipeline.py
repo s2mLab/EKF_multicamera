@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from camera_selection import parse_camera_names, subset_calibrations
 from root_kinematics import root_z_correction_angle_from_points
 
 try:
@@ -3369,6 +3370,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Triangulation 3D initiale + bioMod + EKF multi-vues pour keypoints 2D.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
+    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
     parser.add_argument(
         "--pose-data-mode",
         choices=("raw", "filtered", "cleaned"),
@@ -3619,6 +3621,9 @@ def main() -> None:
     args = parse_args()
     stage_timings_s: dict[str, float] = {}
     calibrations = load_calibrations(args.calib)
+    selected_camera_names = parse_camera_names(args.camera_names)
+    if selected_camera_names:
+        calibrations = subset_calibrations(calibrations, selected_camera_names)
     pose_data = load_pose_data(
         args.keypoints,
         calibrations,

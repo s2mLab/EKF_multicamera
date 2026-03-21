@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=120.0)
     parser.add_argument("--triangulation-workers", type=int, default=1)
+    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
     parser.add_argument("--dataset-name", type=str, default=None, help="Nom du dataset; sinon derive du fichier 2D.")
     parser.add_argument("--profile", action="append", default=None, help="Nom de profil a lancer. Peut etre repete.")
     parser.add_argument("--write-example-config", action="store_true", help="Ecrit un fichier de profils d'exemple puis s'arrete.")
@@ -79,6 +80,7 @@ def main() -> None:
             pose2sim_trc=args.pose2sim_trc,
             dataset_name=dataset_name,
             python_executable=sys.executable,
+            camera_names_override=[name.strip() for name in args.camera_names.split(",") if name.strip()] or None,
         )
         cmd.extend(["--fps", str(args.fps), "--triangulation-workers", str(args.triangulation_workers)])
         print(f"\n[PROFILE {profile_idx}/{len(profiles)}] {profile.name}", flush=True)

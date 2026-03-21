@@ -333,6 +333,7 @@ def build_pipeline_command(
     pose2sim_trc: Path | None = None,
     dataset_name: str | None = None,
     python_executable: str | None = None,
+    camera_names_override: list[str] | None = None,
 ) -> list[str]:
     profile = validate_profile(profile)
     python_executable = python_executable or sys.executable
@@ -383,6 +384,8 @@ def build_pipeline_command(
     ]
     if pose2sim_trc is not None:
         cmd.extend(["--pose2sim-trc", str(pose2sim_trc)])
+    if camera_names_override:
+        cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names_override)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
     if profile.no_root_unwrap:
