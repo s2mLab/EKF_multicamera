@@ -77,6 +77,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("bootstrap1")
         if profile.ekf2d_initial_state_method == "triangulation_ik":
             parts.append("ikq0")
+        elif profile.ekf2d_initial_state_method == "root_pose_bootstrap":
+            parts.append("rootq0")
         if int(profile.ekf2d_bootstrap_passes) != 5:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
         if profile.flip:
@@ -157,7 +159,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             raise ValueError(f"Unsupported predictor: {profile.predictor}")
         if profile.ekf2d_3d_source not in SUPPORTED_EKF2D_3D_SOURCE_MODES:
             raise ValueError(f"Unsupported ekf2d_3d_source: {profile.ekf2d_3d_source}")
-        if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap"):
+        if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"):
             raise ValueError(f"Unsupported ekf2d_initial_state_method: {profile.ekf2d_initial_state_method}")
         profile.ekf2d_bootstrap_passes = max(1, int(profile.ekf2d_bootstrap_passes))
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method != "epipolar":

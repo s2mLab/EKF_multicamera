@@ -35,3 +35,15 @@ def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     assert "--camera-names" in cmd
     camera_names_arg = cmd[cmd.index("--camera-names") + 1]
     assert camera_names_arg == "M11139,M11140"
+
+
+def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            ekf2d_initial_state_method="root_pose_bootstrap",
+        )
+    )
+    assert canonical_profile_name(profile) == "ekf_2d_acc_rootq0"

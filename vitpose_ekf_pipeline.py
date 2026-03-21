@@ -29,7 +29,7 @@ from typing import Iterable
 
 import numpy as np
 from camera_selection import parse_camera_names, subset_calibrations
-from root_kinematics import root_z_correction_angle_from_points
+from root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
 
 try:
     import tomllib
@@ -967,6 +967,33 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
     return float(sorted_values[min(idx, sorted_values.size - 1)])
 
 
+def build_fundamental_matrix_array(
+    calibrations: list[CameraCalibration],
+) -> np.ndarray:
+    """Empile les matrices fondamentales dans un tenseur `(cam_i, cam_j, 3, 3)`."""
+    n_cams = len(calibrations)
+    matrices = np.full((n_cams, n_cams, 3, 3), np.nan, dtype=float)
+    for i_cam in range(n_cams):
+        for j_cam in range(n_cams):
+            if i_cam == j_cam:
+                continue
+            matrices[i_cam, j_cam] = fundamental_matrix(calibrations[i_cam], calibrations[j_cam])
+    return matrices
+
+
+def build_flip_epipolar_pair_weight_array(
+    calibrations: list[CameraCalibration],
+    exponent: float = DEFAULT_FLIP_EPIPOLAR_PAIR_WEIGHT_EXPONENT,
+) -> np.ndarray:
+    """Version tensorielle des poids de paires pour le diagnostic flip épipolaire."""
+    weight_dict = build_flip_epipolar_pair_weights(calibrations, exponent=exponent)
+    n_cams = len(calibrations)
+    weights = np.zeros((n_cams, n_cams), dtype=float)
+    for (i_cam, j_cam), value in weight_dict.items():
+        weights[i_cam, j_cam] = float(value)
+    return weights
+
+
 def smooth_camera_time_series(values: np.ndarray, window: int = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW) -> np.ndarray:
     """Lisse chaque serie camera dans le temps par moyenne locale robuste aux NaN."""
     values = np.asarray(values, dtype=float)
@@ -990,6 +1017,96 @@ def smooth_camera_time_series(values: np.ndarray, window: int = DEFAULT_FLIP_EPI
             else:
                 smoothed[cam_idx, frame_idx] = float(np.mean(finite_values))
     return smoothed
+
+
+def sampson_error_pixels_vectorized(
+    candidate_points: np.ndarray,
+    other_points: np.ndarray,
+    fundamental_matrices: np.ndarray,
+) -> np.ndarray:
+    """Calcule l'erreur de Sampson pour toutes les paires `(autre camera, keypoint)`."""
+    candidate_points = np.asarray(candidate_points, dtype=float)
+    other_points = np.asarray(other_points, dtype=float)
+    fundamental_matrices = np.asarray(fundamental_matrices, dtype=float)
+    if candidate_points.ndim != 2 or candidate_points.shape[1] != 2:
+        raise ValueError("candidate_points must have shape (n_keypoints, 2).")
+    if other_points.ndim != 3 or other_points.shape[2] != 2:
+        raise ValueError("other_points must have shape (n_other_cams, n_keypoints, 2).")
+    if fundamental_matrices.ndim != 3 or fundamental_matrices.shape[1:] != (3, 3):
+        raise ValueError("fundamental_matrices must have shape (n_other_cams, 3, 3).")
+
+    n_other_cams, n_keypoints = other_points.shape[:2]
+    candidate_h = np.concatenate((candidate_points, np.ones((n_keypoints, 1), dtype=float)), axis=1)
+    other_h = np.concatenate((other_points, np.ones((n_other_cams, n_keypoints, 1), dtype=float)), axis=2)
+    Fx1 = np.einsum("oab,kb->oka", fundamental_matrices, candidate_h, optimize=True)
+    Ftx2 = np.einsum("oba,okb->oka", fundamental_matrices, other_h, optimize=True)
+    numerator = np.abs(np.einsum("okb,okb->ok", other_h, Fx1, optimize=True))
+    denominator = np.sqrt(
+        Fx1[..., 0] ** 2
+        + Fx1[..., 1] ** 2
+        + Ftx2[..., 0] ** 2
+        + Ftx2[..., 1] ** 2
+    )
+    errors = np.full((n_other_cams, n_keypoints), np.nan, dtype=float)
+    valid = np.isfinite(numerator) & np.isfinite(denominator) & (denominator > 1e-12)
+    errors[valid] = numerator[valid] / denominator[valid]
+    return errors
+
+
+def compute_camera_epipolar_costs_vectorized(
+    camera_idx: int,
+    candidate_points: np.ndarray,
+    raw_2d_frame: np.ndarray,
+    raw_scores_frame: np.ndarray,
+    fundamental_matrices_array: np.ndarray,
+    *,
+    pair_weights_array: np.ndarray | None = None,
+    keypoint_weights: np.ndarray | None = None,
+    min_other_cameras: int = DEFAULT_FLIP_MIN_OTHER_CAMERAS,
+) -> tuple[float, float]:
+    """Retourne les coûts épipolaires pondéré et legacy pour une caméra candidate."""
+    n_cams = raw_2d_frame.shape[0]
+    other_indices = [idx for idx in range(n_cams) if idx != camera_idx]
+    if not other_indices:
+        return np.nan, np.nan
+
+    candidate_points = np.asarray(candidate_points, dtype=float)
+    candidate_valid = np.all(np.isfinite(candidate_points), axis=1) & (raw_scores_frame[camera_idx] > 0)
+    if not np.any(candidate_valid):
+        return np.nan, np.nan
+
+    other_points = np.asarray(raw_2d_frame[other_indices], dtype=float)
+    other_scores = np.asarray(raw_scores_frame[other_indices], dtype=float)
+    other_valid = np.all(np.isfinite(other_points), axis=2) & (other_scores > 0)
+    valid_mask = other_valid & candidate_valid[np.newaxis, :]
+    informative_camera_mask = np.any(valid_mask, axis=1)
+    if int(np.count_nonzero(informative_camera_mask)) < max(1, int(min_other_cameras)):
+        return np.nan, np.nan
+
+    errors = sampson_error_pixels_vectorized(
+        candidate_points,
+        other_points,
+        fundamental_matrices_array[camera_idx, other_indices],
+    )
+    valid_mask &= np.isfinite(errors)
+    if not np.any(valid_mask):
+        return np.nan, np.nan
+
+    if keypoint_weights is None:
+        kp_weights = np.ones(candidate_points.shape[0], dtype=float)
+    else:
+        kp_weights = np.asarray(keypoint_weights, dtype=float)
+    if pair_weights_array is None:
+        pair_weights = np.ones(len(other_indices), dtype=float)
+    else:
+        pair_weights = np.asarray(pair_weights_array[camera_idx, other_indices], dtype=float)
+
+    confidence_weights = np.minimum(raw_scores_frame[camera_idx][np.newaxis, :], other_scores)
+    combined_weights = pair_weights[:, np.newaxis] * kp_weights[np.newaxis, :] * np.maximum(confidence_weights, 1e-6)
+    valid_weights = combined_weights[valid_mask]
+    weighted_cost = weighted_median(errors[valid_mask], np.maximum(valid_weights, 1e-9))
+    legacy_cost = float(np.median(errors[valid_mask])) if np.any(valid_mask) else np.nan
+    return weighted_cost, legacy_cost
 
 
 def compute_camera_temporal_cost(
@@ -1215,13 +1332,8 @@ def detect_left_right_flip_diagnostics(
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
     smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if method == "epipolar" else 1
     if method == "epipolar":
-        fundamental_matrices = {
-            (i_cam, j_cam): fundamental_matrix(ordered_calibrations[i_cam], ordered_calibrations[j_cam])
-            for i_cam in range(n_cams)
-            for j_cam in range(n_cams)
-            if i_cam != j_cam
-        }
-        pair_weights = build_flip_epipolar_pair_weights(ordered_calibrations)
+        fundamental_matrices = build_fundamental_matrix_array(ordered_calibrations)
+        pair_weights = build_flip_epipolar_pair_weight_array(ordered_calibrations)
     elif method != "triangulation":
         raise ValueError(f"Unknown flip diagnostic method: {method}")
     nominal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
@@ -1247,22 +1359,15 @@ def detect_left_right_flip_diagnostics(
         )
         for cam_idx in range(n_cams):
             if method == "epipolar":
-                nominal_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost(
+                nominal_costs[cam_idx, frame_idx], nominal_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
                     cam_idx,
                     raw_points_frame[cam_idx],
                     raw_points_frame,
                     raw_scores_frame,
                     fundamental_matrices,
-                    pair_weights=pair_weights,
+                    pair_weights_array=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
-                )
-                nominal_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost_legacy(
-                    cam_idx,
-                    raw_points_frame[cam_idx],
-                    raw_points_frame,
-                    raw_scores_frame,
-                    fundamental_matrices,
                 )
             else:
                 nominal_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1343,22 +1448,15 @@ def detect_left_right_flip_diagnostics(
                 continue
             swapped_candidate = swap_left_right_keypoints(raw_points_frame[cam_idx])
             if method == "epipolar":
-                swapped_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost(
+                swapped_costs[cam_idx, frame_idx], swapped_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
                     cam_idx,
                     swapped_candidate,
                     raw_points_frame,
                     raw_scores_frame,
                     fundamental_matrices,
-                    pair_weights=pair_weights,
+                    pair_weights_array=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
-                )
-                swapped_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost_legacy(
-                    cam_idx,
-                    swapped_candidate,
-                    raw_points_frame,
-                    raw_scores_frame,
-                    fundamental_matrices,
                 )
             else:
                 swapped_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -2837,6 +2935,15 @@ def first_valid_root_translation_from_triangulation(reconstruction: Reconstructi
     return None, None
 
 
+def first_valid_root_pose_from_triangulation(reconstruction: ReconstructionResult) -> tuple[int | None, np.ndarray | None]:
+    """Estime les 6 DoF de la racine a partir du tronc triangule."""
+    root_q = compute_trunk_dofs_from_points(reconstruction.points_3d, unwrap_rotations=False)
+    for frame_idx in range(root_q.shape[0]):
+        if np.all(np.isfinite(root_q[frame_idx])):
+            return frame_idx, np.asarray(root_q[frame_idx], dtype=float)
+    return None, None
+
+
 def apply_root_translation_guess_to_state(model, state: np.ndarray, translation_xyz: np.ndarray | None) -> np.ndarray:
     """Injecte une translation racine estimee dans un etat `[q, qdot, qddot]`."""
     if translation_xyz is None or not np.all(np.isfinite(translation_xyz)):
@@ -2847,6 +2954,21 @@ def apply_root_translation_guess_to_state(model, state: np.ndarray, translation_
         target_name = f"TRUNK:{axis_name}"
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(translation_xyz[axis_idx])
+    return updated_state
+
+
+def apply_root_pose_guess_to_state(model, state: np.ndarray, root_pose: np.ndarray | None) -> np.ndarray:
+    """Injecte une pose racine `[TransX, TransY, TransZ, RotY, RotX, RotZ]` dans l'etat."""
+    if root_pose is None:
+        return np.array(state, copy=True)
+    root_pose = np.asarray(root_pose, dtype=float).reshape(-1)
+    if root_pose.size < 6 or not np.all(np.isfinite(root_pose[:6])):
+        return np.array(state, copy=True)
+    q_names = q_names_from_model(model)
+    updated_state = np.array(state, copy=True)
+    for value, target_name in zip(root_pose[:6], ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ", "TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ")):
+        if target_name in q_names:
+            updated_state[q_names.index(target_name)] = float(value)
     return updated_state
 
 
@@ -2972,6 +3094,71 @@ def initial_state_from_ekf_bootstrap(
     return state, diagnostics
 
 
+def initial_state_from_root_pose_bootstrap(
+    model,
+    calibrations: dict[str, CameraCalibration],
+    pose_data: PoseData,
+    reconstruction: ReconstructionResult,
+    fps: float,
+    measurement_noise_scale: float = 1.0,
+    process_noise_scale: float = 1.0,
+    min_frame_coherence_for_update: float = DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
+    skip_low_coherence_updates: bool = False,
+    coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+    enable_dof_locking: bool = False,
+    passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
+    zero_state = np.zeros(3 * model.nbQ(), dtype=float)
+    frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+    diagnostics_seed = {
+        "method": "root_pose_bootstrap",
+        "root_pose_frame_idx": None if frame_idx is None else int(frame_idx),
+        "used_root_pose_guess": bool(root_pose is not None),
+        "used_fallback": False,
+    }
+    if root_pose is None:
+        diagnostics_seed["used_fallback"] = True
+        diagnostics_seed["fallback_reason"] = "no_valid_root_pose"
+        return initial_state_from_ekf_bootstrap(
+            model=model,
+            calibrations=calibrations,
+            pose_data=pose_data,
+            reconstruction=reconstruction,
+            fps=fps,
+            measurement_noise_scale=measurement_noise_scale,
+            process_noise_scale=process_noise_scale,
+            min_frame_coherence_for_update=min_frame_coherence_for_update,
+            skip_low_coherence_updates=skip_low_coherence_updates,
+            coherence_confidence_floor=coherence_confidence_floor,
+            enable_dof_locking=enable_dof_locking,
+            passes=passes,
+        )
+
+    root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
+    state, diagnostics = initial_state_from_ekf_bootstrap(
+        model=model,
+        calibrations=calibrations,
+        pose_data=pose_data,
+        reconstruction=reconstruction,
+        fps=fps,
+        measurement_noise_scale=measurement_noise_scale,
+        process_noise_scale=process_noise_scale,
+        min_frame_coherence_for_update=min_frame_coherence_for_update,
+        skip_low_coherence_updates=skip_low_coherence_updates,
+        coherence_confidence_floor=coherence_confidence_floor,
+        enable_dof_locking=enable_dof_locking,
+        passes=passes,
+        initial_state=root_seed_state,
+    )
+    diagnostics = dict(diagnostics)
+    diagnostics["method"] = "root_pose_bootstrap"
+    diagnostics["root_pose_frame_idx"] = None if frame_idx is None else int(frame_idx)
+    diagnostics["used_root_pose_guess"] = True
+    diagnostics.setdefault("fallback_method", "triangulation_ik")
+    return state, diagnostics
+
+
 def compute_ekf2d_initial_state(
     model,
     calibrations: dict[str, CameraCalibration],
@@ -3003,6 +3190,21 @@ def compute_ekf2d_initial_state(
         }
     if method == "ekf_bootstrap":
         return initial_state_from_ekf_bootstrap(
+            model=model,
+            calibrations=calibrations,
+            pose_data=pose_data,
+            reconstruction=reconstruction,
+            fps=fps,
+            measurement_noise_scale=measurement_noise_scale,
+            process_noise_scale=process_noise_scale,
+            min_frame_coherence_for_update=min_frame_coherence_for_update,
+            skip_low_coherence_updates=skip_low_coherence_updates,
+            coherence_confidence_floor=coherence_confidence_floor,
+            enable_dof_locking=enable_dof_locking,
+            passes=bootstrap_passes,
+        )
+    if method == "root_pose_bootstrap":
+        return initial_state_from_root_pose_bootstrap(
             model=model,
             calibrations=calibrations,
             pose_data=pose_data,
@@ -3945,9 +4147,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ekf2d-initial-state-method",
-        choices=("triangulation_ik", "ekf_bootstrap"),
+        choices=("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"),
         default=DEFAULT_EKF2D_INITIAL_STATE_METHOD,
-        help="Methode pour initialiser q0 de l'EKF 2D: IK 3D sur la triangulation ou bootstrap par corrections EKF repetees sur une frame.",
+        help="Methode pour initialiser q0 de l'EKF 2D: IK 3D sur la triangulation, bootstrap EKF sur une frame, ou bootstrap depuis une pose racine geometrique (hanches/epaules).",
     )
     parser.add_argument(
         "--ekf2d-bootstrap-passes",
@@ -4122,7 +4324,7 @@ def main() -> None:
             restrict_to_outliers=not args.flip_test_all_camera_frames,
             outlier_percentile=args.flip_outlier_percentile,
             outlier_floor_px=args.flip_outlier_floor_px,
-            tau_px=args.epipolar_threshold_px if flip_method == "epipolar" else args.reprojection_threshold_px,
+            geometry_tau_px=args.epipolar_threshold_px if flip_method == "epipolar" else args.reprojection_threshold_px,
             method=flip_method,
             temporal_weight=args.flip_temporal_weight,
             temporal_tau_px=args.flip_temporal_tau_px,
@@ -4238,8 +4440,9 @@ def main() -> None:
             reconstruction=reconstruction,
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
         )
-        save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=t_model)
-        stage_timings_s["model_stage_s"] = time.perf_counter() - t0
+        model_compute_time_s = time.perf_counter() - t0
+        save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=model_compute_time_s)
+        stage_timings_s["model_stage_s"] = model_compute_time_s
 
     if args.model_only:
         print(f"Cache triangulation utilise: {selected_reconstruction_cache_path}")
@@ -4290,7 +4493,7 @@ def main() -> None:
     stage_timings_s["ekf_initial_state_s"] = time.perf_counter() - t0
     shared_initial_state_flip_acc = shared_initial_state
     shared_initial_state_flip_acc_diagnostics = shared_initial_state_diagnostics
-    if args.run_ekf_2d_flip_acc and args.ekf2d_initial_state_method == "ekf_bootstrap":
+    if args.run_ekf_2d_flip_acc and args.ekf2d_initial_state_method in {"ekf_bootstrap", "root_pose_bootstrap"}:
         t0 = time.perf_counter()
         shared_initial_state_flip_acc, shared_initial_state_flip_acc_diagnostics = compute_ekf2d_initial_state(
             model=shared_biorbd_model,

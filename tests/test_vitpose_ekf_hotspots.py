@@ -1,13 +1,21 @@
 import numpy as np
+import vitpose_ekf_pipeline
 
 from vitpose_ekf_pipeline import (
     CameraCalibration,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
+    apply_root_pose_guess_to_state,
+    build_fundamental_matrix_array,
     build_flip_epipolar_pair_weights,
+    build_flip_epipolar_pair_weight_array,
+    compute_camera_epipolar_costs_vectorized,
     compute_camera_triangulation_cost,
     compute_camera_epipolar_cost,
+    compute_camera_epipolar_cost_legacy,
     project_point_with_projection_matrices,
+    q_names_from_model,
+    sampson_error_pixels_vectorized,
     smooth_camera_time_series,
     triangulation_reference_from_other_views,
     weighted_triangulation,
@@ -195,8 +203,126 @@ def test_compute_camera_epipolar_cost_uses_pair_and_keypoint_weights(monkeypatch
     assert abs(cost - 1.0) < 1e-12
 
 
+def test_sampson_error_pixels_vectorized_matches_scalar():
+    point_a = np.array([[0.2, -0.1], [0.5, 0.3]], dtype=float)
+    other_points = np.array([[[0.1, 0.4], [0.6, -0.2]]], dtype=float)
+    F = np.array([[[0.0, -1.0, 0.2], [1.0, 0.0, -0.1], [-0.2, 0.1, 0.0]]], dtype=float)
+
+    vectorized = sampson_error_pixels_vectorized(point_a, other_points, F)
+    scalar = np.array(
+        [
+            [
+                vitpose_ekf_pipeline.sampson_error_pixels(point_a[0], other_points[0, 0], F[0]),
+                vitpose_ekf_pipeline.sampson_error_pixels(point_a[1], other_points[0, 1], F[0]),
+            ]
+        ],
+        dtype=float,
+    )
+    np.testing.assert_allclose(vectorized, scalar, atol=1e-12)
+
+
+def test_vectorized_epipolar_cost_matches_scalar_versions():
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
+    point = np.array([0.2, -0.1, 2.5], dtype=float)
+    raw_2d_frame = np.stack([[camera.project_point(point) for _ in range(17)] for camera in cameras], axis=0)
+    raw_scores_frame = np.ones((3, 17), dtype=float)
+    candidate_points = raw_2d_frame[0]
+    fundamental_matrices = {
+        (i_cam, j_cam): vitpose_ekf_pipeline.fundamental_matrix(cameras[i_cam], cameras[j_cam])
+        for i_cam in range(3)
+        for j_cam in range(3)
+        if i_cam != j_cam
+    }
+    weighted_scalar = compute_camera_epipolar_cost(
+        0,
+        candidate_points,
+        raw_2d_frame,
+        raw_scores_frame,
+        fundamental_matrices,
+        pair_weights=build_flip_epipolar_pair_weights(cameras),
+        keypoint_weights=np.ones(17, dtype=float),
+        min_other_cameras=2,
+    )
+    legacy_scalar = compute_camera_epipolar_cost_legacy(
+        0,
+        candidate_points,
+        raw_2d_frame,
+        raw_scores_frame,
+        fundamental_matrices,
+    )
+    weighted_vectorized, legacy_vectorized = compute_camera_epipolar_costs_vectorized(
+        0,
+        candidate_points,
+        raw_2d_frame,
+        raw_scores_frame,
+        build_fundamental_matrix_array(cameras),
+        pair_weights_array=build_flip_epipolar_pair_weight_array(cameras),
+        keypoint_weights=np.ones(17, dtype=float),
+        min_other_cameras=2,
+    )
+    np.testing.assert_allclose(weighted_vectorized, weighted_scalar, atol=1e-12)
+    np.testing.assert_allclose(legacy_vectorized, legacy_scalar, atol=1e-12)
+
+
 def test_smooth_camera_time_series_reduces_isolated_spike():
     series = np.array([[0.0, 9.0, 0.0, 0.0]], dtype=float)
     smoothed = smooth_camera_time_series(series, window=3)
     assert smoothed[0, 1] < series[0, 1]
     assert abs(smoothed[0, 1] - 3.0) < 1e-12
+
+
+class _FakeName:
+    def __init__(self, value: str):
+        self._value = value
+
+    def to_string(self) -> str:
+        return self._value
+
+
+class _FakeSegment:
+    def __init__(self, name: str, dof_names: list[str]):
+        self._name = name
+        self._dof_names = list(dof_names)
+
+    def name(self):
+        return _FakeName(self._name)
+
+    def nbDof(self) -> int:
+        return len(self._dof_names)
+
+    def nameDof(self, idx: int):
+        return _FakeName(self._dof_names[idx])
+
+
+class _FakeModel:
+    def __init__(self):
+        self._segments = [
+            _FakeSegment("TRUNK", ["TransX", "TransY", "TransZ", "RotY", "RotX", "RotZ"]),
+            _FakeSegment("LEFT_THIGH", ["RotY"]),
+        ]
+
+    def nbSegment(self) -> int:
+        return len(self._segments)
+
+    def segment(self, idx: int):
+        return self._segments[idx]
+
+    def nbQ(self) -> int:
+        return sum(segment.nbDof() for segment in self._segments)
+
+
+def test_apply_root_pose_guess_to_state_sets_root_dofs_only():
+    model = _FakeModel()
+    state = np.zeros(3 * model.nbQ(), dtype=float)
+    root_pose = np.array([1.0, 2.0, 3.0, 0.4, -0.2, 1.1], dtype=float)
+
+    updated = apply_root_pose_guess_to_state(model, state, root_pose)
+    q_names = q_names_from_model(model)
+
+    assert updated[q_names.index("TRUNK:TransX")] == 1.0
+    assert updated[q_names.index("TRUNK:TransY")] == 2.0
+    assert updated[q_names.index("TRUNK:TransZ")] == 3.0
+    assert updated[q_names.index("TRUNK:RotY")] == 0.4
+    assert updated[q_names.index("TRUNK:RotX")] == -0.2
+    assert updated[q_names.index("TRUNK:RotZ")] == 1.1
+    assert updated[q_names.index("LEFT_THIGH:RotY")] == 0.0

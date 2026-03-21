@@ -249,7 +249,7 @@ def flip_cache_metadata(
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
         "epipolar_pair_weighting": "baseline_confidence_weighted",
         "epipolar_keypoint_weighting": "torso_proximal_priority",
-        "epipolar_flip_scoring_version": 3 if str(method) == "epipolar" else 1,
+        "epipolar_flip_scoring_version": 4 if str(method) == "epipolar" else 1,
         "temporal_smoothing_window": 5 if str(method) == "epipolar" else 1,
     }
 
@@ -1824,7 +1824,7 @@ def build_ekf_2d_bundle(
 ) -> BundleBuildResult:
     if ekf2d_3d_source not in SUPPORTED_EKF2D_3D_SOURCE_MODES:
         raise ValueError(f"Unsupported ekf2d_3d_source: {ekf2d_3d_source}")
-    if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap"}:
+    if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"}:
         raise ValueError(f"Unsupported ekf2d_initial_state_method: {ekf2d_initial_state_method}")
     if ekf2d_3d_source == "first_frame_only" and coherence_method != "epipolar":
         raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method=epipolar.")

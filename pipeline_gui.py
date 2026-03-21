@@ -4445,7 +4445,7 @@ class ProfilesTab(CommandTab):
         q0_method_box = ttk.Combobox(
             self.ekf2d_params_frame,
             textvariable=self.ekf2d_initial_state_method,
-            values=["ekf_bootstrap", "triangulation_ik"],
+            values=["ekf_bootstrap", "root_pose_bootstrap", "triangulation_ik"],
             width=16,
             state="readonly",
         )
@@ -4495,7 +4495,7 @@ class ProfilesTab(CommandTab):
         attach_tooltip(coherence_label, "Pondération multivue de l'EKF 2D: épipolaire ou basée triangulation.")
         attach_tooltip(coherence_box, "Pondération multivue de l'EKF 2D: épipolaire ou basée triangulation.")
         attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
-        attach_tooltip(q0_method_label, "Methode pour trouver q0: IK 3D sur la triangulation ou corrections EKF 2D repetees en remettant qdot/qddot a zero.")
+        attach_tooltip(q0_method_label, "Methode pour trouver q0: IK 3D sur la triangulation, bootstrap EKF classique, ou bootstrap depuis une pose racine geometrique extraite des hanches/epaules.")
         attach_tooltip(q0_method_box, "Methode pour trouver q0: IK 3D sur la triangulation ou corrections EKF 2D repetees en remettant qdot/qddot a zero.")
         self.ekf2d_bootstrap_passes.set_tooltip("Nombre de passes EKF 2D utilisees pour affiner q0 quand le bootstrap est actif.")
         self.measurement_noise.set_tooltip("Bruit de mesure de l'EKF 2D. Plus grand = moins de confiance dans les keypoints 2D.")
@@ -4695,6 +4695,8 @@ class ProfilesTab(CommandTab):
                 flags.append("bootstrap1")
             if getattr(profile, "ekf2d_initial_state_method", "ekf_bootstrap") == "triangulation_ik":
                 flags.append("ikq0")
+            elif getattr(profile, "ekf2d_initial_state_method", "ekf_bootstrap") == "root_pose_bootstrap":
+                flags.append("rootq0")
             elif int(getattr(profile, "ekf2d_bootstrap_passes", 5)) != 5:
                 flags.append(f"boot{int(getattr(profile, 'ekf2d_bootstrap_passes', 5))}")
             if profile.initial_rotation_correction:

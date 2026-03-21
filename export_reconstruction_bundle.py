@@ -75,7 +75,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--predictor", choices=("acc", "dyn"), default="acc")
     parser.add_argument("--ekf2d-3d-source", choices=SUPPORTED_EKF2D_3D_SOURCE_MODES, default="full_triangulation")
-    parser.add_argument("--ekf2d-initial-state-method", choices=("triangulation_ik", "ekf_bootstrap"), default="ekf_bootstrap")
+    parser.add_argument(
+        "--ekf2d-initial-state-method",
+        choices=("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"),
+        default="ekf_bootstrap",
+    )
     parser.add_argument("--ekf2d-bootstrap-passes", type=int, default=5)
     parser.add_argument("--flip-left-right", action="store_true")
     parser.add_argument("--flip-improvement-ratio", type=float, default=0.7)
