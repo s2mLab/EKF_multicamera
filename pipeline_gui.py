@@ -49,6 +49,11 @@ from preview_bundle import (
     project_points_all_cameras,
     root_center,
 )
+from reconstruction_presenter import (
+    bundle_available_reconstruction_names,
+    catalog_rows_for_names,
+    default_selection,
+)
 from reconstruction_bundle import extract_root_from_points, load_or_compute_left_right_flip_cache, load_or_compute_triangulation_cache, slice_pose_data
 from reconstruction_profiles import (
     ReconstructionProfile,
@@ -2223,9 +2228,13 @@ class MultiViewTab(CommandTab):
     def refresh_available_reconstructions(self) -> None:
         output_dir = current_dataset_dir(self.state)
         catalog = discover_reconstruction_catalog(output_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-        rows = [{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}]
-        rows.extend([row for row in catalog if row.get("cached")])
-        self.show.set_rows(rows, ["raw", "pose2sim"])
+        rows = catalog_rows_for_names(
+            catalog,
+            [row.get("name") for row in catalog],
+            extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
+        )
+        defaults = default_selection([row.get("name") for row in rows], ["raw", "pose2sim"], fallback_count=2)
+        self.show.set_rows(rows, defaults)
         if self.pose_data is not None and self.calibrations is not None:
             try:
                 self.load_preview()
@@ -2283,9 +2292,13 @@ class MultiViewTab(CommandTab):
                 upper_percentile=float(self.state.pose_p_high_var.get()),
             )
             catalog = discover_reconstruction_catalog(output_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-            rows = [{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}]
-            rows.extend([row for row in catalog if row.get("cached")])
-            self.show.set_rows(rows, ["raw", "pose2sim"])
+            rows = catalog_rows_for_names(
+                catalog,
+                [row.get("name") for row in catalog],
+                extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
+            )
+            defaults = default_selection([row.get("name") for row in rows], ["raw", "pose2sim"], fallback_count=2)
+            self.show.set_rows(rows, defaults)
             self.preview_bundle = get_cached_preview_bundle(
                 self.state,
                 output_dir,
@@ -4435,12 +4448,16 @@ class RootKinematicsTab(ttk.Frame):
     def refresh_available_reconstructions(self) -> None:
         try:
             bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = sorted(set(bundle["recon_3d"].keys()) | set(bundle["recon_q"].keys()))
+            available_names = bundle_available_reconstruction_names(bundle, include_3d=True, include_q=True, include_q_root=False)
             if available_names:
                 catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = [row for row in catalog if row.get("name") in available_names and row.get("cached")]
-                defaults = [name for name in ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"] if name in available_names]
-                self.recon_show.set_rows(rows, defaults or available_names[:4])
+                rows = catalog_rows_for_names(catalog, available_names)
+                defaults = default_selection(
+                    available_names,
+                    ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
+                    fallback_count=4,
+                )
+                self.recon_show.set_rows(rows, defaults)
                 if self.bundle is not None:
                     self.refresh_plot()
         except Exception:
@@ -4449,12 +4466,16 @@ class RootKinematicsTab(ttk.Frame):
     def refresh_plot(self) -> None:
         try:
             self.bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = sorted(set(self.bundle["recon_3d"].keys()) | set(self.bundle["recon_q"].keys()))
+            available_names = bundle_available_reconstruction_names(self.bundle, include_3d=True, include_q=True, include_q_root=False)
             if available_names:
                 catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = [row for row in catalog if row.get("name") in available_names and row.get("cached")]
-                defaults = [name for name in ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"] if name in available_names]
-                self.recon_show.set_rows(rows, defaults or available_names[:4])
+                rows = catalog_rows_for_names(catalog, available_names)
+                defaults = default_selection(
+                    available_names,
+                    ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
+                    fallback_count=4,
+                )
+                self.recon_show.set_rows(rows, defaults)
             recon_3d = self.bundle["recon_3d"]
             recon_q = self.bundle["recon_q"]
             recon_qdot = self.bundle["recon_qdot"]
@@ -4593,12 +4614,16 @@ class JointKinematicsTab(ttk.Frame):
     def refresh_available_reconstructions(self) -> None:
         try:
             bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_q = list(bundle["recon_q"].keys())
+            available_q = bundle_available_reconstruction_names(bundle, include_3d=False, include_q=True, include_q_root=False)
             if available_q:
                 catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = [row for row in catalog if row.get("name") in available_q and row.get("cached")]
-                defaults = [name for name in ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"] if name in available_q]
-                self.recon_show.set_rows(rows, defaults or available_q[:3])
+                rows = catalog_rows_for_names(catalog, available_q)
+                defaults = default_selection(
+                    available_q,
+                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                    fallback_count=3,
+                )
+                self.recon_show.set_rows(rows, defaults)
                 if self.bundle is not None:
                     self.refresh_plot()
         except Exception:
@@ -4608,12 +4633,16 @@ class JointKinematicsTab(ttk.Frame):
         try:
             self.bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
             self.q_names = self.bundle["q_names"]
-            available_q = list(self.bundle["recon_q"].keys())
+            available_q = bundle_available_reconstruction_names(self.bundle, include_3d=False, include_q=True, include_q_root=False)
             if available_q:
                 catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = [row for row in catalog if row.get("name") in available_q and row.get("cached")]
-                defaults = [name for name in ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"] if name in available_q]
-                self.recon_show.set_rows(rows, defaults or available_q[:3])
+                rows = catalog_rows_for_names(catalog, available_q)
+                defaults = default_selection(
+                    available_q,
+                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                    fallback_count=3,
+                )
+                self.recon_show.set_rows(rows, defaults)
             pairs = pair_dof_names(self.q_names)
             current_labels = [self.pair_list.get(idx) for idx in range(self.pair_list.size())]
             new_labels = [pair_label for pair_label, _, _ in pairs]
@@ -4803,15 +4832,15 @@ class DDTab(ttk.Frame):
         try:
             gui_debug(f"DD refresh_available_reconstructions start dataset={ROOT / self.output_dir.get()}")
             bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = sorted(
-                set(bundle.get("recon_q", {}).keys())
-                | set(bundle.get("recon_q_root", {}).keys())
-                | set(bundle.get("recon_3d", {}).keys())
-            )
+            available_names = bundle_available_reconstruction_names(bundle, include_3d=True, include_q=True, include_q_root=True)
             catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-            rows = [row for row in catalog if row.get("name") in available_names and row.get("cached")]
-            defaults = [name for name in ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"] if name in available_names]
-            self._set_reconstruction_rows(rows, defaults or available_names[:5])
+            rows = catalog_rows_for_names(catalog, available_names)
+            defaults = default_selection(
+                available_names,
+                ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
+                fallback_count=5,
+            )
+            self._set_reconstruction_rows(rows, defaults)
             gui_debug(
                 "DD refresh_available_reconstructions done "
                 f"available={len(available_names)} rows={len(rows)}"
