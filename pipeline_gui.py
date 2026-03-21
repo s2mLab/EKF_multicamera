@@ -43,6 +43,7 @@ from scipy.spatial.transform import Rotation
 
 from dd_analysis import DDSessionAnalysis, analyze_dd_session
 from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from dataset_preview_state import build_dataset_preview_state
 from preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -2033,8 +2034,13 @@ class DualAnimationTab(CommandTab):
             output_dir,
             optional_root_relative_path(self.state.pose2sim_trc_var.get()),
         )
-        rows = [row for row in catalog if row.get("cached")]
-        self.show.set_rows(rows, ["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"])
+        preview_state = build_dataset_preview_state(
+            catalog=catalog,
+            bundle=self.bundle,
+            preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
+            fallback_count=4,
+        )
+        self.show.set_rows(preview_state.rows, preview_state.defaults)
         if self.bundle is not None:
             try:
                 sources = dataset_source_paths(
@@ -2048,8 +2054,14 @@ class DualAnimationTab(CommandTab):
                     Path(sources["pose2sim_trc"]),
                     align_root=False,
                 )
-                n_frames = 0 if self.bundle is None else len(self.bundle["frames"])
-                self.frame_scale.configure(to=max(n_frames - 1, 0))
+                preview_state = build_dataset_preview_state(
+                    catalog=catalog,
+                    bundle=self.bundle,
+                    preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
+                    fallback_count=4,
+                )
+                self.show.set_rows(preview_state.rows, preview_state.defaults)
+                self.frame_scale.configure(to=preview_state.max_frame)
                 self.refresh_preview()
             except Exception:
                 pass
@@ -2089,8 +2101,6 @@ class DualAnimationTab(CommandTab):
                 output_dir,
                 optional_root_relative_path(self.state.pose2sim_trc_var.get()),
             )
-            rows = [row for row in catalog if row.get("cached")]
-            self.show.set_rows(rows, ["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"])
             self.bundle = get_cached_preview_bundle(
                 self.state,
                 output_dir,
@@ -2098,8 +2108,14 @@ class DualAnimationTab(CommandTab):
                 Path(sources["pose2sim_trc"]),
                 align_root=False,
             )
-            n_frames = 0 if self.bundle is None else len(self.bundle["frames"])
-            self.frame_scale.configure(to=max(n_frames - 1, 0))
+            preview_state = build_dataset_preview_state(
+                catalog=catalog,
+                bundle=self.bundle,
+                preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
+                fallback_count=4,
+            )
+            self.show.set_rows(preview_state.rows, preview_state.defaults)
+            self.frame_scale.configure(to=preview_state.max_frame)
             self.frame_var.set(0)
             self.preview_canvas_widget.focus_set()
             self.refresh_preview()
@@ -2280,13 +2296,14 @@ class MultiViewTab(CommandTab):
     def refresh_available_reconstructions(self) -> None:
         output_dir = current_dataset_dir(self.state)
         catalog = discover_reconstruction_catalog(output_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-        rows = catalog_rows_for_names(
-            catalog,
-            [row.get("name") for row in catalog],
+        preview_state = build_dataset_preview_state(
+            catalog=catalog,
+            bundle=self.preview_bundle,
+            preferred_names=["raw", "pose2sim"],
+            fallback_count=2,
             extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
         )
-        defaults = default_selection([row.get("name") for row in rows], ["raw", "pose2sim"], fallback_count=2)
-        self.show.set_rows(rows, defaults)
+        self.show.set_rows(preview_state.rows, preview_state.defaults)
         if self.pose_data is not None and self.calibrations is not None:
             try:
                 self.load_preview()
@@ -2344,13 +2361,6 @@ class MultiViewTab(CommandTab):
                 upper_percentile=float(self.state.pose_p_high_var.get()),
             )
             catalog = discover_reconstruction_catalog(output_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-            rows = catalog_rows_for_names(
-                catalog,
-                [row.get("name") for row in catalog],
-                extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
-            )
-            defaults = default_selection([row.get("name") for row in rows], ["raw", "pose2sim"], fallback_count=2)
-            self.show.set_rows(rows, defaults)
             self.preview_bundle = get_cached_preview_bundle(
                 self.state,
                 output_dir,
@@ -2358,13 +2368,22 @@ class MultiViewTab(CommandTab):
                 Path(sources["pose2sim_trc"]),
                 align_root=False,
             )
+            preview_state = build_dataset_preview_state(
+                catalog=catalog,
+                bundle=self.preview_bundle,
+                preferred_names=["raw", "pose2sim"],
+                fallback_count=2,
+                extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
+            )
+            self.show.set_rows(preview_state.rows, preview_state.defaults)
             camera_names = list(self.pose_data.camera_names)
             self.projected_layers = {}
             for name, points_3d in self.preview_bundle["recon_3d"].items():
                 self.projected_layers[name] = project_points_all_cameras(points_3d, self.calibrations, camera_names)
             self.crop_limits_cache = {}
             self.crop_limits_key = None
-            n_frames = min(len(self.pose_data.frames), len(self.preview_bundle["frames"])) if len(self.preview_bundle["frames"]) else len(self.pose_data.frames)
+            bundle_frames = preview_state.max_frame + 1 if self.preview_bundle is not None else len(self.pose_data.frames)
+            n_frames = min(len(self.pose_data.frames), bundle_frames)
             self.frame_scale.configure(to=max(n_frames - 1, 0))
             self.frame_var.set(0)
             self.preview_canvas_widget.focus_set()
