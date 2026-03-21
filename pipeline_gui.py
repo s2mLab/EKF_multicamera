@@ -60,7 +60,13 @@ from reconstruction_presenter import (
     catalog_rows_for_names,
     default_selection,
 )
-from reconstruction_bundle import extract_root_from_points, load_or_compute_left_right_flip_cache, load_or_compute_triangulation_cache, slice_pose_data
+from reconstruction_bundle import (
+    extract_root_from_points,
+    load_or_compute_left_right_flip_cache,
+    load_or_compute_pose_data_variant_cache,
+    load_or_compute_triangulation_cache,
+    slice_pose_data,
+)
 from reconstruction_profiles import (
     ReconstructionProfile,
     build_pipeline_command,
@@ -1204,6 +1210,7 @@ class SharedAppState:
     flip_restrict_to_outliers_var: tk.BooleanVar
     flip_temporal_weight_var: tk.StringVar
     flip_temporal_tau_px_var: tk.StringVar
+    calibration_correction_var: tk.StringVar
     initial_rotation_correction_var: tk.BooleanVar
     selected_camera_names_var: tk.StringVar
     output_root_var: tk.StringVar
@@ -1252,6 +1259,16 @@ def current_dataset_dir(state: SharedAppState) -> Path:
 
 def current_selected_camera_names(state: SharedAppState) -> list[str]:
     return parse_camera_names(state.selected_camera_names_var.get())
+
+
+def current_calibration_correction_mode(state: SharedAppState) -> str:
+    raw = state.calibration_correction_var.get().strip()
+    return raw if raw in {"none", "flip_epipolar", "flip_triangulation"} else "none"
+
+
+def normalize_pose_correction_mode(raw: str) -> str:
+    value = str(raw).strip()
+    return value if value in {"none", "flip_epipolar", "flip_triangulation"} else "none"
 
 
 def shared_pose_data_kwargs(state: SharedAppState, *, data_mode: str | None = None) -> dict[str, object]:
@@ -1439,12 +1456,100 @@ def get_cached_pose_data(
     return calibrations, pose_data
 
 
+def get_pose_data_with_correction(
+    state: SharedAppState,
+    *,
+    keypoints_path: Path,
+    calib_path: Path,
+    max_frames: int | None = None,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+    data_mode: str = "cleaned",
+    smoothing_window: int = 9,
+    outlier_threshold_ratio: float = 0.10,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
+    correction_mode: str = "none",
+):
+    calibrations, pose_data = get_cached_pose_data(
+        state,
+        keypoints_path=keypoints_path,
+        calib_path=calib_path,
+        max_frames=max_frames,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        data_mode=data_mode,
+        smoothing_window=smoothing_window,
+        outlier_threshold_ratio=outlier_threshold_ratio,
+        lower_percentile=lower_percentile,
+        upper_percentile=upper_percentile,
+    )
+    correction_mode = normalize_pose_correction_mode(correction_mode)
+    if correction_mode == "none":
+        return calibrations, pose_data, None
+
+    flip_method = "epipolar" if correction_mode == "flip_epipolar" else "triangulation"
+    corrected_pose_data, diagnostics, _compute_time_s, _cache_path, _source = load_or_compute_pose_data_variant_cache(
+        output_dir=current_dataset_dir(state),
+        pose_data=pose_data,
+        calibrations=calibrations,
+        correction_mode="flip",
+        flip_method=flip_method,
+        pose_data_mode=str(data_mode),
+        pose_filter_window=int(smoothing_window),
+        pose_outlier_threshold_ratio=float(outlier_threshold_ratio),
+        pose_amplitude_lower_percentile=float(lower_percentile),
+        pose_amplitude_upper_percentile=float(upper_percentile),
+        improvement_ratio=float(state.flip_improvement_ratio_var.get()),
+        min_gain_px=float(state.flip_min_gain_px_var.get()),
+        min_other_cameras=int(state.flip_min_other_cameras_var.get()),
+        restrict_to_outliers=bool(state.flip_restrict_to_outliers_var.get()),
+        outlier_percentile=float(state.flip_outlier_percentile_var.get()),
+        outlier_floor_px=float(state.flip_outlier_floor_px_var.get()),
+        tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if flip_method == "epipolar" else DEFAULT_REPROJECTION_THRESHOLD_PX,
+        temporal_weight=float(state.flip_temporal_weight_var.get()),
+        temporal_tau_px=float(state.flip_temporal_tau_px_var.get()),
+    )
+    return calibrations, corrected_pose_data, diagnostics
+
+
+def get_calibration_pose_data(
+    state: SharedAppState,
+    *,
+    keypoints_path: Path,
+    calib_path: Path,
+    max_frames: int | None = None,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+    data_mode: str = "cleaned",
+    smoothing_window: int = 9,
+    outlier_threshold_ratio: float = 0.10,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 95.0,
+):
+    return get_pose_data_with_correction(
+        state,
+        keypoints_path=keypoints_path,
+        calib_path=calib_path,
+        max_frames=max_frames,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        data_mode=data_mode,
+        smoothing_window=smoothing_window,
+        outlier_threshold_ratio=outlier_threshold_ratio,
+        lower_percentile=lower_percentile,
+        upper_percentile=upper_percentile,
+        correction_mode=current_calibration_correction_mode(state),
+    )
+
+
 def model_preview_cache_metadata(
     *,
     biomod_path: Path,
     keypoints_path: Path,
     calib_path: Path,
     pose_data_mode: str,
+    pose_correction_mode: str,
     triangulation_method: str,
     max_frames: int | None,
     frame_start: int | None,
@@ -1463,6 +1568,7 @@ def model_preview_cache_metadata(
         "keypoints_path": str(keypoints_path.resolve()),
         "calib_path": str(calib_path.resolve()),
         "pose_data_mode": pose_data_mode,
+        "pose_correction_mode": pose_correction_mode,
         "triangulation_method": triangulation_method,
         "max_frames": None if max_frames is None else int(max_frames),
         "frame_start": None if frame_start is None else int(frame_start),
@@ -2956,6 +3062,17 @@ class DataExplorer2DTab(ttk.Frame):
         self.initial_rotation_correction_var = state.initial_rotation_correction_var
         self.root_rotfix_check = ttk.Checkbutton(row_shared, text="Root rot-fix", variable=self.initial_rotation_correction_var)
         self.root_rotfix_check.pack(side=tk.LEFT, padx=(8, 0))
+        calib_correction_label = ttk.Label(row_shared, text="Calib 2D corr", width=12)
+        calib_correction_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.calibration_correction = state.calibration_correction_var
+        self.calibration_correction_box = ttk.Combobox(
+            row_shared,
+            textvariable=self.calibration_correction,
+            values=["none", "flip_epipolar", "flip_triangulation"],
+            width=18,
+            state="readonly",
+        )
+        self.calibration_correction_box.pack(side=tk.LEFT, padx=(0, 6))
         self.selected_cameras_label_var = tk.StringVar(value="Cameras: all")
         ttk.Label(row_shared, textvariable=self.selected_cameras_label_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(row_shared, text="Clean trial outputs", command=self.clean_trial_outputs).pack(side=tk.LEFT, padx=(8, 0))
@@ -3071,6 +3188,8 @@ class DataExplorer2DTab(ttk.Frame):
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
         attach_tooltip(self.root_rotfix_check, "Si coché, la racine est réalignée en lacet autour de Z à partir de l'axe médio-latéral du tronc à t0. L'angle est arrondi au multiple de pi/2 le plus proche, puis partagé par le modèle, les reconstructions et les analyses.")
+        attach_tooltip(calib_correction_label, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire, ou flip détecté par triangulation.")
+        attach_tooltip(self.calibration_correction_box, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire, ou flip détecté par triangulation.")
         attach_tooltip(component_label, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(component_box, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(view_mode_label, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
@@ -3380,13 +3499,25 @@ class ModelTab(CommandTab):
         self.frame_end = LabeledEntry(row2, "End frame", "", label_width=8, entry_width=6)
         self.frame_end.pack(side=tk.LEFT, padx=(0, 8))
         default_model_pose_mode = state.pose_data_mode_var.get().strip()
-        if default_model_pose_mode not in ("raw", "cleaned"):
+        if default_model_pose_mode not in ("raw", "filtered", "cleaned"):
             default_model_pose_mode = "cleaned"
         self.pose_data_mode = tk.StringVar(value=default_model_pose_mode)
         pose_mode_label = ttk.Label(row2, text="2D source", width=10)
         pose_mode_label.pack(side=tk.LEFT)
-        pose_mode_box = ttk.Combobox(row2, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=10, state="readonly")
+        pose_mode_box = ttk.Combobox(row2, textvariable=self.pose_data_mode, values=["raw", "filtered", "cleaned"], width=10, state="readonly")
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
+        default_pose_correction_mode = current_calibration_correction_mode(state)
+        self.pose_correction_mode = tk.StringVar(value=default_pose_correction_mode)
+        pose_correction_label = ttk.Label(row2, text="L/R corr", width=8)
+        pose_correction_label.pack(side=tk.LEFT)
+        pose_correction_box = ttk.Combobox(
+            row2,
+            textvariable=self.pose_correction_mode,
+            values=["none", "flip_epipolar", "flip_triangulation"],
+            width=16,
+            state="readonly",
+        )
+        pose_correction_box.pack(side=tk.LEFT, padx=(0, 8))
         self.model_info_var = tk.StringVar(value="")
         ttk.Label(row2, textvariable=self.model_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(6, 0))
 
@@ -3414,8 +3545,10 @@ class ModelTab(CommandTab):
         self.subject_mass.set_tooltip("Masse du sujet utilisée pour les paramètres inertiels du modèle.")
         attach_tooltip(triang_label, "Méthode de triangulation utilisée pour construire le modèle: exhaustive teste plus de combinaisons, greedy est plus rapide.")
         attach_tooltip(triang_box, "Méthode de triangulation utilisée pour construire le modèle: exhaustive teste plus de combinaisons, greedy est plus rapide.")
-        attach_tooltip(pose_mode_label, "Choix des 2D utilisées pour construire le modèle: raw ou cleaned.")
-        attach_tooltip(pose_mode_box, "Choix des 2D utilisées pour construire le modèle: raw ou cleaned. `cleaned` applique le rejet des points aberrants.")
+        attach_tooltip(pose_mode_label, "Choix de la version de base des 2D utilisées pour construire le modèle: raw, filtered ou cleaned.")
+        attach_tooltip(pose_mode_box, "Choix de la version de base des 2D utilisées pour construire le modèle. `cleaned` applique le rejet des points aberrants.")
+        attach_tooltip(pose_correction_label, "Correction optionnelle des labels gauche/droite avant la triangulation du modèle.")
+        attach_tooltip(pose_correction_box, "Utilise les 2D telles quelles (`none`), ou une version corrigée des flips L/R estimée par l'approche épipolaire ou par triangulation/reprojection.")
         attach_tooltip(initial_rot_check, "Estime l'orientation horizontale de l'axe y du tronc à t0, l'arrondit au multiple de pi/2 le plus proche, puis applique cette correction autour de Z dans le bioMod.")
         self.max_frames.set_tooltip("Nombre maximal de frames utilisées pour construire le modèle après application de la plage de frames.")
         self.frame_start.set_tooltip("Première frame incluse pour construire le modèle.")
@@ -3427,6 +3560,7 @@ class ModelTab(CommandTab):
         self.state.register_reconstruction_listener(self.refresh_existing_models)
         self.triang_method.trace_add("write", lambda *_args: self.update_details())
         self.pose_data_mode.trace_add("write", lambda *_args: self.update_details())
+        self.pose_correction_mode.trace_add("write", lambda *_args: self.update_details())
         self.initial_rot_var.trace_add("write", lambda *_args: self.update_details())
         self.state.pose_filter_window_var.trace_add("write", lambda *_args: self.refresh_existing_models())
         self.state.pose_outlier_ratio_var.trace_add("write", lambda *_args: self.refresh_existing_models())
@@ -3537,12 +3671,21 @@ class ModelTab(CommandTab):
         self.sync_paths_from_state()
         self.refresh_existing_models()
 
+    def current_pose_correction_mode(self) -> str:
+        return normalize_pose_correction_mode(self.pose_correction_mode.get())
+
+    def current_pose_source_label(self) -> str:
+        correction_mode = self.current_pose_correction_mode()
+        if correction_mode == "none":
+            return self.pose_data_mode.get()
+        return f"{self.pose_data_mode.get()} + {correction_mode}"
+
     def update_details(self) -> None:
         max_frames = self.max_frames.get() or "all"
         frame_start = self.frame_start.get() or "-"
         frame_end = self.frame_end.get() or "-"
         self.details_var.set(
-            f"Model creation will use: {self.pose_data_mode.get()} 2D data, "
+            f"Model creation will use: {self.current_pose_source_label()} 2D data, "
             f"frames {frame_start} -> {frame_end}, max {max_frames}, "
             f"triangulation {self.triang_method.get()}, "
             f"root rot-fix {'on' if self.initial_rot_var.get() else 'off'}, "
@@ -3569,6 +3712,7 @@ class ModelTab(CommandTab):
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
             frame_start=frame_start,
@@ -3584,6 +3728,7 @@ class ModelTab(CommandTab):
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
             frame_start=frame_start,
@@ -3604,7 +3749,8 @@ class ModelTab(CommandTab):
         biomod_paths: list[Path] = []
         for model_dir in scan_model_dirs(dataset_dir):
             biomod_paths.extend(sorted(model_dir.glob("*.bioMod")))
-        expected_mode = self.state.pose_data_mode_var.get()
+        expected_mode = self.pose_data_mode.get()
+        expected_correction = self.current_pose_correction_mode()
         expected_window = int(self.state.pose_filter_window_var.get())
         expected_ratio = float(self.state.pose_outlier_ratio_var.get())
         expected_p_low = float(self.state.pose_p_low_var.get())
@@ -3615,14 +3761,22 @@ class ModelTab(CommandTab):
             if biomod_path in seen:
                 continue
             seen.add(biomod_path)
-            if not self._model_matches_selected_2d_data(biomod_path.parent, expected_mode, expected_window, expected_ratio, expected_p_low, expected_p_high):
+            if not self._model_matches_selected_2d_data(
+                biomod_path.parent,
+                expected_mode,
+                expected_correction,
+                expected_window,
+                expected_ratio,
+                expected_p_low,
+                expected_p_high,
+            ):
                 continue
             parent_name = biomod_path.parent.name
             biomod_display_path = display_path(biomod_path)
             self.model_tree.insert("", "end", values=(parent_name, biomod_display_path))
             matched += 1
         if matched == 0:
-            self.model_tree.insert("", "end", values=("-", f"No existing bioMod matches current 2D data settings ({expected_mode})"))
+            self.model_tree.insert("", "end", values=("-", f"No existing bioMod matches current 2D data settings ({self.current_pose_source_label()})"))
 
     def clear_models(self) -> None:
         selected = self.model_tree.selection()
@@ -3687,6 +3841,7 @@ class ModelTab(CommandTab):
         self,
         model_dir: Path,
         expected_mode: str,
+        expected_correction: str,
         expected_window: int,
         expected_ratio: float,
         expected_p_low: float,
@@ -3702,6 +3857,7 @@ class ModelTab(CommandTab):
             return False
         return (
             reconstruction_metadata.get("pose_data_mode") == expected_mode
+            and str(reconstruction_metadata.get("pose_correction_mode", "none")) == expected_correction
             and int(reconstruction_metadata.get("pose_filter_window", -1)) == expected_window
             and math.isclose(float(reconstruction_metadata.get("pose_outlier_threshold_ratio", math.nan)), expected_ratio, rel_tol=1e-9, abs_tol=1e-9)
             and math.isclose(float(reconstruction_metadata.get("pose_amplitude_lower_percentile", math.nan)), expected_p_low, rel_tol=1e-9, abs_tol=1e-9)
@@ -3719,6 +3875,8 @@ class ModelTab(CommandTab):
             self.state.keypoints_var.get(),
             "--pose-data-mode",
             self.pose_data_mode.get(),
+            "--pose-correction-mode",
+            self.current_pose_correction_mode(),
             "--pose-filter-window",
             self.state.pose_filter_window_var.get(),
             "--pose-outlier-threshold-ratio",
@@ -3762,6 +3920,7 @@ class ModelTab(CommandTab):
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
             frame_start=int(self.frame_start.get()) if self.frame_start.get() else None,
@@ -3782,6 +3941,7 @@ class ModelTab(CommandTab):
                 dataset_name,
                 pose_data_mode=self.pose_data_mode.get(),
                 triangulation_method=self.triang_method.get(),
+                pose_correction_mode=self.current_pose_correction_mode(),
                 initial_rotation_correction=self.initial_rot_var.get(),
                 max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
                 frame_start=int(self.frame_start.get()) if self.frame_start.get() else None,
@@ -3819,6 +3979,7 @@ class ModelTab(CommandTab):
             keypoints_path=ROOT / self.state.keypoints_var.get(),
             calib_path=ROOT / self.state.calib_var.get(),
             pose_data_mode=self.pose_data_mode.get(),
+            pose_correction_mode=self.current_pose_correction_mode(),
             triangulation_method=self.triang_method.get(),
             max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
             frame_start=int(self.frame_start.get()) if self.frame_start.get() else None,
@@ -3844,16 +4005,17 @@ class ModelTab(CommandTab):
         if not cache_path.exists():
             return None
         metadata = reconstruction_cache_metadata(
-            pose_data,
-            DEFAULT_REPROJECTION_THRESHOLD_PX,
-            DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
-            DEFAULT_EPIPOLAR_THRESHOLD_PX,
-            self.triang_method.get(),
-            self.pose_data_mode.get(),
-            int(self.state.pose_filter_window_var.get()),
-            float(self.state.pose_outlier_ratio_var.get()),
-            float(self.state.pose_p_low_var.get()),
-            float(self.state.pose_p_high_var.get()),
+            pose_data=pose_data,
+            error_threshold_px=DEFAULT_REPROJECTION_THRESHOLD_PX,
+            min_cameras_for_triangulation=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
+            epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
+            triangulation_method=self.triang_method.get(),
+            pose_data_mode=self.pose_data_mode.get(),
+            pose_filter_window=int(self.state.pose_filter_window_var.get()),
+            pose_outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
+            pose_amplitude_lower_percentile=float(self.state.pose_p_low_var.get()),
+            pose_amplitude_upper_percentile=float(self.state.pose_p_high_var.get()),
+            pose_correction_mode=self.current_pose_correction_mode(),
         )
         if not metadata_cache_matches(cache_path, metadata):
             return None
@@ -4017,7 +4179,7 @@ class ModelTab(CommandTab):
                     preview_kind = "triangulation_cached"
                 self.preview_metadata = {
                     "n_frames": "?",
-                    "pose_data_mode": self.pose_data_mode.get(),
+                    "pose_data_mode": self.current_pose_source_label(),
                     "triangulation_method": self.triang_method.get(),
                     "preview_frame_idx": int(preview_frame_number),
                     "preview_kind": preview_kind,
@@ -4026,7 +4188,7 @@ class ModelTab(CommandTab):
                 self.refresh_preview()
                 return
 
-            calibrations, pose_data = get_cached_pose_data(
+            calibrations, pose_data, _diagnostics = get_pose_data_with_correction(
                 self.state,
                 keypoints_path=ROOT / self.state.keypoints_var.get(),
                 calib_path=ROOT / self.state.calib_var.get(),
@@ -4038,6 +4200,7 @@ class ModelTab(CommandTab):
                 outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
                 lower_percentile=float(self.state.pose_p_low_var.get()),
                 upper_percentile=float(self.state.pose_p_high_var.get()),
+                correction_mode=self.current_pose_correction_mode(),
             )
             reconstruction, preview_local_idx = self._first_valid_preview_reconstruction(calibrations, pose_data, biomod_path.parent)
             if reconstruction is None or preview_local_idx is None:
@@ -4086,7 +4249,7 @@ class ModelTab(CommandTab):
                 preview_kind = "triangulation_only"
             self.preview_metadata = {
                 "n_frames": int(pose_data.frames.shape[0]),
-                "pose_data_mode": self.pose_data_mode.get(),
+                "pose_data_mode": self.current_pose_source_label(),
                 "triangulation_method": self.triang_method.get(),
                 "preview_frame_idx": int(preview_frame_number),
                 "preview_kind": preview_kind,
@@ -4149,7 +4312,7 @@ class ModelTab(CommandTab):
                     alpha=0.75,
                 )
         n_frames = self.preview_metadata.get("n_frames", "?")
-        pose_data_mode = self.preview_metadata.get("pose_data_mode", self.pose_data_mode.get())
+        pose_data_mode = self.preview_metadata.get("pose_data_mode", self.current_pose_source_label())
         triangulation_method = self.preview_metadata.get("triangulation_method", self.triang_method.get())
         preview_frame_idx = self.preview_metadata.get("preview_frame_idx", 0)
         preview_kind = self.preview_metadata.get("preview_kind", "model")
@@ -5364,6 +5527,7 @@ class CameraToolsTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
         self.state = state
+        self.base_pose_data = None
         self.pose_data = None
         self.calibrations = None
         self.metrics_rows = []
@@ -5395,7 +5559,9 @@ class CameraToolsTab(ttk.Frame):
         ttk.Button(row, text="Clear camera filter", command=self.clear_camera_filter).pack(side=tk.LEFT, padx=(8, 0))
 
         self.camera_filter_status = tk.StringVar(value="Reconstructions will use all cameras.")
+        self.calibration_pose_status_var = tk.StringVar(value="Calibration 2D data: none")
         ttk.Label(controls, textvariable=self.camera_filter_status, foreground="#4f5b66", justify=tk.LEFT).pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(controls, textvariable=self.calibration_pose_status_var, foreground="#4f5b66", justify=tk.LEFT).pack(fill=tk.X, padx=8, pady=(0, 2))
         ttk.Label(
             controls,
             text=(
@@ -5509,6 +5675,7 @@ class CameraToolsTab(ttk.Frame):
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.load_resources())
+        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.load_resources())
         self.state.register_reconstruction_listener(self.refresh_reference_choices)
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_camera_filter_status())
         self.sync_dataset_dir()
@@ -5559,12 +5726,27 @@ class CameraToolsTab(ttk.Frame):
 
     def load_resources(self) -> None:
         try:
-            self.calibrations, self.pose_data = get_cached_pose_data(
+            self.calibrations, self.base_pose_data = get_cached_pose_data(
                 self.state,
                 keypoints_path=ROOT / self.state.keypoints_var.get(),
                 calib_path=ROOT / self.state.calib_var.get(),
                 **shared_pose_data_kwargs(self.state),
             )
+            self.calibrations, self.pose_data, correction_diagnostics = get_calibration_pose_data(
+                self.state,
+                keypoints_path=ROOT / self.state.keypoints_var.get(),
+                calib_path=ROOT / self.state.calib_var.get(),
+                **shared_pose_data_kwargs(self.state),
+            )
+            correction_mode = current_calibration_correction_mode(self.state)
+            if correction_mode == "none":
+                self.calibration_pose_status_var.set("Calibration 2D data: none")
+            else:
+                method = "epipolar" if correction_mode == "flip_epipolar" else "triangulation"
+                suspect_count = int(correction_diagnostics.get("n_camera_frame_flip_suspects", 0)) if correction_diagnostics else 0
+                self.calibration_pose_status_var.set(
+                    f"Calibration 2D data: flip {method} ({suspect_count} camera-frames suspectes)"
+                )
             self.ensure_flip_diagnostics()
             self.refresh_metrics()
             self.refresh_flip_controls()
@@ -5572,14 +5754,14 @@ class CameraToolsTab(ttk.Frame):
             messagebox.showerror("Caméras", str(exc))
 
     def ensure_flip_diagnostics(self) -> None:
-        if self.pose_data is None or self.calibrations is None:
+        if self.base_pose_data is None or self.calibrations is None:
             return
         dataset_dir = current_dataset_dir(self.state)
         pose_kwargs = shared_pose_data_kwargs(self.state)
         for method in ("epipolar", "triangulation"):
             suspect_mask, diagnostics, _compute_time_s, cache_path, _flip_source = load_or_compute_left_right_flip_cache(
                 output_dir=dataset_dir,
-                pose_data=self.pose_data,
+                pose_data=self.base_pose_data,
                 calibrations=self.calibrations,
                 method=method,
                 pose_data_mode=str(pose_kwargs["data_mode"]),
@@ -5665,9 +5847,9 @@ class CameraToolsTab(ttk.Frame):
                 self.metrics_tree.selection_add(camera_name)
 
     def refresh_flip_controls(self) -> None:
-        if self.pose_data is None:
+        if self.base_pose_data is None:
             return
-        camera_names = list(self.pose_data.camera_names)
+        camera_names = list(self.base_pose_data.camera_names)
         self.flip_camera_box.configure(values=camera_names)
         if self.flip_camera_var.get() not in camera_names:
             self.flip_camera_var.set(camera_names[0] if camera_names else "")
@@ -5677,15 +5859,15 @@ class CameraToolsTab(ttk.Frame):
         self.flip_frame_local_indices = []
         self.flip_frame_list.delete(0, tk.END)
         self.flip_details.delete("1.0", tk.END)
-        if self.pose_data is None:
+        if self.base_pose_data is None:
             self.render_flip_preview()
             return
         method = self.flip_method_var.get()
         camera_name = self.flip_camera_var.get()
-        if method not in self.flip_masks or camera_name not in self.pose_data.camera_names:
+        if method not in self.flip_masks or camera_name not in self.base_pose_data.camera_names:
             self.render_flip_preview()
             return
-        cam_idx = list(self.pose_data.camera_names).index(camera_name)
+        cam_idx = list(self.base_pose_data.camera_names).index(camera_name)
         detail_arrays = self.flip_detail_arrays.get(method, {})
         candidate_mask = np.asarray(detail_arrays.get("candidate_mask"), dtype=bool) if "candidate_mask" in detail_arrays else None
         suspect_mask = self.flip_masks[method]
@@ -5697,7 +5879,7 @@ class CameraToolsTab(ttk.Frame):
             local_indices = []
         self.flip_frame_local_indices = local_indices
         for local_idx in local_indices:
-            frame_number = int(self.pose_data.frames[local_idx])
+            frame_number = int(self.base_pose_data.frames[local_idx])
             nominal = self._flip_cost(detail_arrays, "nominal_combined_costs", cam_idx, local_idx)
             swapped = self._flip_cost(detail_arrays, "swapped_combined_costs", cam_idx, local_idx)
             label = f"{'flip' if suspect_mask[cam_idx, local_idx] else 'candidate'} | frame {frame_number} | {self._fmt_float(nominal)} -> {self._fmt_float(swapped)}"
@@ -5734,7 +5916,7 @@ class CameraToolsTab(ttk.Frame):
 
     def render_flip_preview(self) -> None:
         self.flip_figure.clear()
-        if self.pose_data is None or self.calibrations is None:
+        if self.base_pose_data is None or self.calibrations is None:
             ax = self.flip_figure.subplots(1, 1)
             ax.text(0.5, 0.5, "No 2D data loaded", ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
@@ -5743,14 +5925,14 @@ class CameraToolsTab(ttk.Frame):
         method = self.flip_method_var.get()
         camera_name = self.flip_camera_var.get()
         frame_local_idx = self._selected_flip_frame_local_idx()
-        if frame_local_idx is None or camera_name not in self.pose_data.camera_names:
+        if frame_local_idx is None or camera_name not in self.base_pose_data.camera_names:
             ax = self.flip_figure.subplots(1, 1)
             ax.text(0.5, 0.5, "No flagged frame for this camera/method", ha="center", va="center", transform=ax.transAxes)
             ax.set_axis_off()
             self.flip_canvas.draw_idle()
             return
-        cam_idx = list(self.pose_data.camera_names).index(camera_name)
-        raw_points = np.asarray(self.pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
+        cam_idx = list(self.base_pose_data.camera_names).index(camera_name)
+        raw_points = np.asarray(self.base_pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
         display_raw_points = swap_left_right_keypoints(raw_points) if self.flip_applied_var.get() else raw_points
         projected_points, projected_label, projected_color = self._reference_projection(camera_name, frame_local_idx)
         width, height = self.calibrations[camera_name].image_size
@@ -5798,7 +5980,7 @@ class CameraToolsTab(ttk.Frame):
             ax.legend(list(uniq.values()), list(uniq.keys()), loc="best", fontsize=8)
         detail_arrays = self.flip_detail_arrays.get(method, {})
         suspect = bool(self.flip_masks.get(method, np.zeros((0, 0), dtype=bool))[cam_idx, frame_local_idx])
-        frame_number = int(self.pose_data.frames[frame_local_idx])
+        frame_number = int(self.base_pose_data.frames[frame_local_idx])
         self.flip_figure.suptitle(
             f"{camera_name} | frame {frame_number} | {method} | suspect={'yes' if suspect else 'no'} | "
             f"reference={projected_label if projected_points is not None else 'none'}"
@@ -6496,6 +6678,7 @@ class LauncherApp(tk.Tk):
             flip_restrict_to_outliers_var=tk.BooleanVar(value=DEFAULT_FLIP_RESTRICT_TO_OUTLIERS),
             flip_temporal_weight_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_WEIGHT)),
             flip_temporal_tau_px_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_TAU_PX)),
+            calibration_correction_var=tk.StringVar(value="none"),
             initial_rotation_correction_var=tk.BooleanVar(value=True),
             selected_camera_names_var=tk.StringVar(value=""),
             output_root_var=tk.StringVar(value="outputs"),

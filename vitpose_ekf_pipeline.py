@@ -3313,6 +3313,7 @@ def reconstruction_cache_metadata(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
+    pose_correction_mode: str = "none",
 ) -> dict[str, object]:
     """Construit les metadonnees necessaires pour valider un cache de triangulation."""
     return {
@@ -3325,6 +3326,7 @@ def reconstruction_cache_metadata(
         "epipolar_threshold_px": float(epipolar_threshold_px),
         "triangulation_method": triangulation_method,
         "pose_data_mode": pose_data_mode,
+        "pose_correction_mode": str(pose_correction_mode),
         "pose_filter_window": int(pose_filter_window),
         "pose_outlier_threshold_ratio": float(pose_outlier_threshold_ratio),
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
@@ -3843,6 +3845,12 @@ def parse_args() -> argparse.Namespace:
         default="cleaned",
         help="Source 2D utilisee apres chargement: brut, filtre lisse, ou nettoye avec rejet des outliers.",
     )
+    parser.add_argument(
+        "--pose-correction-mode",
+        choices=("none", "flip_epipolar", "flip_triangulation"),
+        default="none",
+        help="Correction optionnelle des 2D apres chargement: aucune, flip L/R detecte par epipolaire, ou flip L/R detecte par triangulation/reprojection.",
+    )
     parser.add_argument("--pose-filter-window", type=int, default=9, help="Fenetre de lissage temporel utilisee pour construire la reference filtree des 2D.")
     parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10, help="Seuil de rejet des outliers 2D, exprime comme fraction de l'amplitude robuste.")
     parser.add_argument("--pose-amplitude-lower-percentile", type=float, default=5.0, help="Percentile inferieur utilise pour definir l'amplitude robuste des 2D.")
@@ -4102,6 +4110,26 @@ def main() -> None:
         lower_percentile=args.pose_amplitude_lower_percentile,
         upper_percentile=args.pose_amplitude_upper_percentile,
     )
+    if args.pose_correction_mode != "none":
+        flip_method = "epipolar" if args.pose_correction_mode == "flip_epipolar" else "triangulation"
+        t0 = time.perf_counter()
+        left_right_flip_suspect_mask, _left_right_flip_diagnostics, _left_right_flip_details = detect_left_right_flip_diagnostics(
+            pose_data,
+            calibrations,
+            improvement_ratio=args.flip_improvement_ratio,
+            min_gain_px=args.flip_min_gain_px,
+            min_other_cameras=args.flip_min_other_cameras,
+            restrict_to_outliers=not args.flip_test_all_camera_frames,
+            outlier_percentile=args.flip_outlier_percentile,
+            outlier_floor_px=args.flip_outlier_floor_px,
+            tau_px=args.epipolar_threshold_px if flip_method == "epipolar" else args.reprojection_threshold_px,
+            method=flip_method,
+            temporal_weight=args.flip_temporal_weight,
+            temporal_tau_px=args.flip_temporal_tau_px,
+            temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+        )
+        pose_data = apply_left_right_flip_corrections(pose_data, left_right_flip_suspect_mask)
+        stage_timings_s["pose_correction_s"] = time.perf_counter() - t0
 
     output_dir = args.output_dir
     reconstruction_cache_path = args.reconstruction_cache or (args.output_dir / "triangulation_pose2sim_like.npz")
@@ -4115,6 +4143,7 @@ def main() -> None:
         epipolar_threshold_px=args.epipolar_threshold_px,
         triangulation_method="exhaustive",
         pose_data_mode=args.pose_data_mode,
+        pose_correction_mode=args.pose_correction_mode,
         pose_filter_window=args.pose_filter_window,
         pose_outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,
@@ -4127,6 +4156,7 @@ def main() -> None:
         epipolar_threshold_px=args.epipolar_threshold_px,
         triangulation_method="greedy",
         pose_data_mode=args.pose_data_mode,
+        pose_correction_mode=args.pose_correction_mode,
         pose_filter_window=args.pose_filter_window,
         pose_outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,

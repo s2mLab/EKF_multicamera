@@ -82,6 +82,7 @@ def default_model_stem(
     pose_data_mode: str,
     triangulation_method: str,
     *,
+    pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
     frame_start: int | None = None,
@@ -93,6 +94,8 @@ def default_model_stem(
     pose_amplitude_upper_percentile: float = DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE,
 ) -> str:
     tokens = ["model", "2d", slugify(pose_data_mode), slugify(triangulation_method)]
+    if str(pose_correction_mode).strip() not in ("", "none"):
+        tokens.append(slugify(str(pose_correction_mode)))
     if initial_rotation_correction:
         tokens.append("rotfix")
     if frame_start is not None or frame_end is not None:
@@ -125,6 +128,7 @@ def model_output_dir(
     *,
     pose_data_mode: str,
     triangulation_method: str,
+    pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
     frame_start: int | None = None,
@@ -138,6 +142,7 @@ def model_output_dir(
     stem = default_model_stem(
         pose_data_mode,
         triangulation_method,
+        pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,
         frame_start=frame_start,
@@ -157,6 +162,7 @@ def model_biomod_path(
     *,
     pose_data_mode: str,
     triangulation_method: str,
+    pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
     frame_start: int | None = None,
@@ -172,6 +178,7 @@ def model_biomod_path(
         dataset_name,
         pose_data_mode=pose_data_mode,
         triangulation_method=triangulation_method,
+        pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,
         frame_start=frame_start,
