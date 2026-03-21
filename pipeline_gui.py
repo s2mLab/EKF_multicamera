@@ -63,6 +63,7 @@ from reconstruction_bundle import extract_root_from_points, load_or_compute_left
 from reconstruction_profiles import (
     ReconstructionProfile,
     build_pipeline_command,
+    canonical_profile_name,
     example_profiles,
     generate_supported_profiles,
     load_profiles_json,
@@ -722,14 +723,55 @@ def draw_coordinate_system(
             ax.text(endpoint[0], endpoint[1], endpoint[2], f"{prefix}{labels[axis_idx]}", color=colors[axis_idx], fontsize=8)
 
 
-def draw_skeleton_2d(ax, frame_points: np.ndarray, color: str, label: str, marker_size: float = 12.0) -> None:
+def draw_skeleton_2d(
+    ax,
+    frame_points: np.ndarray,
+    color: str,
+    label: str,
+    marker_size: float = 12.0,
+    marker_fill: bool = True,
+    marker_edge_width: float = 1.4,
+    line_alpha: float = 0.85,
+    line_style: str = "-",
+    line_width_scale: float = 1.0,
+) -> None:
     grouped = keypoint_groups(frame_points)
+    facecolors = color if marker_fill else "none"
+    edgecolors = color
     if grouped["center"].size:
-        ax.scatter(grouped["center"][:, 0], grouped["center"][:, 1], s=marker_size, c=color, marker="o", label=label, alpha=0.85)
+        ax.scatter(
+            grouped["center"][:, 0],
+            grouped["center"][:, 1],
+            s=marker_size,
+            facecolors=facecolors,
+            edgecolors=edgecolors,
+            linewidths=marker_edge_width,
+            marker="o",
+            label=label,
+            alpha=0.85,
+        )
     if grouped["left"].size:
-        ax.scatter(grouped["left"][:, 0], grouped["left"][:, 1], s=marker_size * 1.25, c=color, marker="^", alpha=0.85)
+        ax.scatter(
+            grouped["left"][:, 0],
+            grouped["left"][:, 1],
+            s=marker_size * 1.25,
+            facecolors=facecolors,
+            edgecolors=edgecolors,
+            linewidths=marker_edge_width,
+            marker="^",
+            alpha=0.85,
+        )
     if grouped["right"].size:
-        ax.scatter(grouped["right"][:, 0], grouped["right"][:, 1], s=marker_size * 1.25, c=color, marker="s", alpha=0.85)
+        ax.scatter(
+            grouped["right"][:, 0],
+            grouped["right"][:, 1],
+            s=marker_size * 1.25,
+            facecolors=facecolors,
+            edgecolors=edgecolors,
+            linewidths=marker_edge_width,
+            marker="s",
+            alpha=0.85,
+        )
     for start_name, end_name in SKELETON_EDGES:
         p0 = frame_points[KP_INDEX[start_name]]
         p1 = frame_points[KP_INDEX[end_name]]
@@ -738,8 +780,9 @@ def draw_skeleton_2d(ax, frame_points: np.ndarray, color: str, label: str, marke
                 [p0[0], p1[0]],
                 [p0[1], p1[1]],
                 color=color,
-                linewidth=edge_linewidth(start_name, end_name, base=1.6),
-                alpha=0.85,
+                linewidth=line_width_scale * edge_linewidth(start_name, end_name, base=1.6),
+                alpha=line_alpha,
+                linestyle=line_style,
             )
 
 
@@ -4109,6 +4152,7 @@ class ProfilesTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master, "Profiles")
         self.state = state
+        self._updating_profile_name = False
 
         form = ttk.LabelFrame(self.main, text="Profils de reconstruction")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -4134,6 +4178,20 @@ class ProfilesTab(CommandTab):
         self.family = tk.StringVar(value="ekf_2d")
         family_box = ttk.Combobox(header, textvariable=self.family, values=["pose2sim", "triangulation", "ekf_3d", "ekf_2d"], width=14, state="readonly")
         family_box.pack(side=tk.LEFT)
+
+        self.cameras_frame = ttk.Frame(form)
+        cameras_header = ttk.Frame(self.cameras_frame)
+        cameras_header.pack(fill=tk.X)
+        cameras_label = ttk.Label(cameras_header, text="Cameras", width=10)
+        cameras_label.pack(side=tk.LEFT)
+        ttk.Button(cameras_header, text="Use current selection", command=self.use_current_camera_selection).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(cameras_header, text="All cameras", command=self.clear_profile_camera_selection).pack(side=tk.LEFT)
+        self.profile_cameras_summary = tk.StringVar(value="all cameras")
+        ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, foreground="#4f5b66").pack(side=tk.LEFT, padx=(8, 0))
+        cameras_body = ttk.Frame(self.cameras_frame)
+        cameras_body.pack(fill=tk.X, pady=(4, 0))
+        self.profile_cameras_list = tk.Listbox(cameras_body, selectmode="extended", exportselection=False, height=4)
+        self.profile_cameras_list.pack(fill=tk.X, expand=True)
 
         self.pose_mode_frame = ttk.Frame(form)
         mode_label = ttk.Label(self.pose_mode_frame, text="2D mode", width=10)
@@ -4229,6 +4287,8 @@ class ProfilesTab(CommandTab):
         self.profile_name.set_tooltip("Nom lisible du profil de reconstruction.")
         attach_tooltip(family_label, "Famille d'algorithme a configurer dans le profil.")
         attach_tooltip(family_box, "Famille d'algorithme a configurer dans le profil.")
+        attach_tooltip(cameras_label, "Sous-ensemble de caméras sauvegardé dans le profil. Laisser vide pour utiliser toutes les caméras.")
+        attach_tooltip(self.profile_cameras_list, "Sélectionnez les caméras à utiliser pour ce profil. Le nom canonique du profil inclura ce choix.")
         attach_tooltip(mode_label, "Version des donnees 2D consommee par la reconstruction.")
         attach_tooltip(pose_mode_box, "Version des donnees 2D consommee par la reconstruction.")
         attach_tooltip(initial_rot_check, "Active l'alignement horizontal de la racine autour de Z avant generation du modele ou extraction geometrique.")
@@ -4286,17 +4346,41 @@ class ProfilesTab(CommandTab):
         self.variant_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
+        self.family.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.pose_data_mode.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ekf2d_3d_source.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.flip_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_improvement_ratio_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_min_gain_px_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_min_other_cameras_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_restrict_to_outliers_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_outlier_percentile_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_outlier_floor_px_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_temporal_weight_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.flip_temporal_tau_px_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.state.calib_var.trace_add("write", lambda *_args: self.refresh_profile_camera_choices())
+        self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_profile_camera_summary())
+        self.profile_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_camera_selection_changed())
         self.state.register_profile_listener(self.refresh_profile_tree)
         self.state.register_reconstruction_listener(self.refresh_variant_tree)
+        self.refresh_profile_camera_choices()
         self.update_family_controls()
+        self.sync_profile_name()
         self.refresh_profile_tree()
         self.refresh_variant_tree()
         self.hide_command_controls()
 
     def update_family_controls(self) -> None:
-        for frame in [self.pose_mode_frame, self.triang_frame, self.flip_frame, self.ekf2d_frame, self.ekf2d_params_frame, self.ekf3d_frame, self.clean_frame]:
+        for frame in [self.cameras_frame, self.pose_mode_frame, self.triang_frame, self.flip_frame, self.ekf2d_frame, self.ekf2d_params_frame, self.ekf3d_frame, self.clean_frame]:
             frame.pack_forget()
         family = self.family.get()
+        self.cameras_frame.pack(fill=tk.X, padx=8, pady=4)
         if family in ("triangulation", "ekf_3d", "ekf_2d"):
             self.pose_mode_frame.pack(fill=tk.X, padx=8, pady=4)
             self.clean_frame.pack(fill=tk.X, padx=8, pady=4)
@@ -4310,11 +4394,60 @@ class ProfilesTab(CommandTab):
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
 
-    def current_profile(self) -> ReconstructionProfile:
+    def selected_profile_camera_names(self) -> list[str] | None:
+        indices = [int(index) for index in self.profile_cameras_list.curselection()]
+        if not indices:
+            return None
+        camera_names = [str(self.profile_cameras_list.get(index)) for index in indices]
+        return camera_names or None
+
+    def _set_profile_camera_selection(self, camera_names: list[str] | None) -> None:
+        requested = set(camera_names or [])
+        self.profile_cameras_list.selection_clear(0, tk.END)
+        for index in range(self.profile_cameras_list.size()):
+            if str(self.profile_cameras_list.get(index)) in requested:
+                self.profile_cameras_list.selection_set(index)
+        self.update_profile_camera_summary()
+
+    def refresh_profile_camera_choices(self) -> None:
+        selected_before = self.selected_profile_camera_names() or current_selected_camera_names(self.state)
+        camera_names: list[str] = []
+        calib_raw = self.state.calib_var.get().strip()
+        if calib_raw:
+            try:
+                camera_names = list(load_calibrations(ROOT / calib_raw).keys())
+            except Exception:
+                camera_names = []
+        self.profile_cameras_list.delete(0, tk.END)
+        for camera_name in camera_names:
+            self.profile_cameras_list.insert(tk.END, camera_name)
+        self._set_profile_camera_selection(selected_before if camera_names else None)
+        self.sync_profile_name()
+
+    def update_profile_camera_summary(self) -> None:
+        selected = self.selected_profile_camera_names()
+        self.profile_cameras_summary.set(
+            "all cameras" if not selected else f"profile cameras: {format_camera_names(selected)}"
+        )
+
+    def use_current_camera_selection(self) -> None:
+        self._set_profile_camera_selection(current_selected_camera_names(self.state))
+        self.sync_profile_name()
+
+    def clear_profile_camera_selection(self) -> None:
+        self._set_profile_camera_selection(None)
+        self.sync_profile_name()
+
+    def on_profile_camera_selection_changed(self) -> None:
+        self.update_profile_camera_summary()
+        self.sync_profile_name()
+
+    def current_profile(self, *, include_name: bool = True) -> ReconstructionProfile:
         family = self.family.get()
         profile = ReconstructionProfile(
-            name=self.profile_name.get(),
+            name=self.profile_name.get() if include_name else "",
             family=family,
+            camera_names=self.selected_profile_camera_names(),
             predictor=self.predictor.get() if family == "ekf_2d" else None,
             ekf2d_3d_source=self.ekf2d_3d_source.get() if family == "ekf_2d" else "full_triangulation",
             ekf2d_initial_state_method=self.ekf2d_initial_state_method.get() if family == "ekf_2d" else "ekf_bootstrap",
@@ -4346,6 +4479,19 @@ class ProfilesTab(CommandTab):
         )
         return validate_profile(profile)
 
+    def sync_profile_name(self) -> None:
+        if self._updating_profile_name:
+            return
+        try:
+            canonical_name = canonical_profile_name(self.current_profile(include_name=False))
+        except Exception:
+            return
+        self._updating_profile_name = True
+        try:
+            self.profile_name.var.set(canonical_name)
+        finally:
+            self._updating_profile_name = False
+
     def refresh_profile_tree(self) -> None:
         for item in self.profile_tree.get_children():
             self.profile_tree.delete(item)
@@ -4367,6 +4513,8 @@ class ProfilesTab(CommandTab):
                 flags.append("lock")
             if profile.no_root_unwrap:
                 flags.append("no_unwrap")
+            if getattr(profile, "camera_names", None):
+                flags.append(f"cams[{format_camera_names(profile.camera_names)}]")
             if profile.family in ("triangulation", "ekf_3d", "ekf_2d") and profile.pose_data_mode != "cleaned":
                 flags.append(profile.pose_data_mode)
             mode_value = profile.pose_data_mode if profile.family in ("triangulation", "ekf_3d", "ekf_2d") else "-"
@@ -5417,7 +5565,18 @@ class CameraToolsTab(ttk.Frame):
             y_limits = (float(height), 0.0)
 
         ax = self.flip_figure.subplots(1, 1)
-        draw_skeleton_2d(ax, display_raw_points, "#000000", "Raw 2D", marker_size=22.0)
+        draw_skeleton_2d(
+            ax,
+            display_raw_points,
+            "#000000",
+            "Raw 2D",
+            marker_size=28.0,
+            marker_fill=False,
+            marker_edge_width=1.9,
+            line_alpha=0.55,
+            line_style=(0, (2.0, 2.2)),
+            line_width_scale=0.6,
+        )
         if projected_points is not None:
             draw_skeleton_2d(ax, projected_points, projected_color, projected_label, marker_size=20.0)
         ax.set_xlim(*x_limits)

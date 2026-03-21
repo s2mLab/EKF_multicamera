@@ -31,6 +31,7 @@ DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
 class ReconstructionProfile:
     name: str
     family: str
+    camera_names: list[str] | None = None
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
     ekf2d_initial_state_method: str = "ekf_bootstrap"
@@ -114,6 +115,9 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if profile.camera_names:
+        parts.append("cams")
+        parts.extend(str(name) for name in profile.camera_names)
     return slugify("_".join(parts))
 
 
@@ -126,6 +130,16 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported triangulation_method: {profile.triangulation_method}")
     if profile.coherence_method not in SUPPORTED_COHERENCE_METHODS:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
+    if profile.camera_names is not None:
+        normalized_camera_names: list[str] = []
+        seen_camera_names: set[str] = set()
+        for camera_name in profile.camera_names:
+            name = str(camera_name).strip()
+            if not name or name in seen_camera_names:
+                continue
+            seen_camera_names.add(name)
+            normalized_camera_names.append(name)
+        profile.camera_names = normalized_camera_names or None
     profile.pose_filter_window = max(3, int(profile.pose_filter_window))
     if profile.pose_filter_window % 2 == 0:
         profile.pose_filter_window += 1
@@ -384,8 +398,9 @@ def build_pipeline_command(
     ]
     if pose2sim_trc is not None:
         cmd.extend(["--pose2sim-trc", str(pose2sim_trc)])
-    if camera_names_override:
-        cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names_override)])
+    camera_names = profile.camera_names or camera_names_override
+    if camera_names:
+        cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
     if profile.no_root_unwrap:
