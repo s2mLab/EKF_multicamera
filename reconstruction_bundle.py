@@ -16,6 +16,16 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
+from root_kinematics import (
+    ROOT_Q_NAMES,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    build_root_rotation_matrices,
+    centered_finite_difference,
+    extract_root_from_q,
+    normalize,
+    root_z_correction_angle_from_points,
+    unwrap_with_gaps,
+)
 from vitpose_ekf_pipeline import (
     COCO17,
     KP_INDEX,
@@ -77,19 +87,6 @@ from vitpose_ekf_pipeline import (
 
 
 DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
-ROOT_Q_NAMES = np.asarray(
-    [
-        "TRUNK:TransX",
-        "TRUNK:TransY",
-        "TRUNK:TransZ",
-        "TRUNK:RotX",
-        "TRUNK:RotY",
-        "TRUNK:RotZ",
-    ],
-    dtype=object,
-)
-ROOT_ROTATION_SEQUENCE = "xyz"
-RZ_PI = Rotation.from_euler("z", np.pi, degrees=False).as_matrix()
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 
 
@@ -545,15 +542,6 @@ def with_version_info(summary: dict[str, object], family: str) -> dict[str, obje
     enriched["is_latest_family_version"] = True
     return enriched
 
-
-def normalize(vector: np.ndarray) -> np.ndarray:
-    array = np.asarray(vector, dtype=float).reshape(3)
-    norm = float(np.linalg.norm(array))
-    if not np.isfinite(norm) or norm < 1e-12:
-        return np.full(3, np.nan)
-    return array / norm
-
-
 def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     with trc_path.open("r", encoding="utf-8") as file:
         lines = [line.rstrip("\n") for line in file]
@@ -601,26 +589,6 @@ def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
         points_3d[:, KP_INDEX[coco_name], :] = xyz_values[:, 3 * marker_idx : 3 * marker_idx + 3]
     return frames, time_s, points_3d, data_rate
 
-
-def centered_finite_difference(values: np.ndarray, dt: float) -> np.ndarray:
-    derivative = np.full_like(values, np.nan, dtype=float)
-    if values.shape[0] == 0:
-        return derivative
-    if values.shape[0] == 1:
-        return derivative
-
-    for col_idx in range(values.shape[1]):
-        column = values[:, col_idx]
-        if np.isfinite(column[0]) and np.isfinite(column[1]):
-            derivative[0, col_idx] = (column[1] - column[0]) / dt
-        if np.isfinite(column[-1]) and np.isfinite(column[-2]):
-            derivative[-1, col_idx] = (column[-1] - column[-2]) / dt
-        for frame_idx in range(1, values.shape[0] - 1):
-            if np.isfinite(column[frame_idx - 1]) and np.isfinite(column[frame_idx + 1]):
-                derivative[frame_idx, col_idx] = (column[frame_idx + 1] - column[frame_idx - 1]) / (2.0 * dt)
-    return derivative
-
-
 def q_names_from_model(model) -> np.ndarray:
     names = [
         f"{model.segment(i_seg).name().to_string()}:{model.segment(i_seg).nameDof(i_dof).to_string()}"
@@ -629,97 +597,36 @@ def q_names_from_model(model) -> np.ndarray:
     ]
     return np.asarray(names, dtype=object)
 
-
-def build_root_rotation_matrices(points_3d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    translations = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
-    rotation_matrices = np.full((points_3d.shape[0], 3, 3), np.nan, dtype=float)
-
-    left_hip = points_3d[:, KP_INDEX["left_hip"], :]
-    right_hip = points_3d[:, KP_INDEX["right_hip"], :]
-    left_shoulder = points_3d[:, KP_INDEX["left_shoulder"], :]
-    right_shoulder = points_3d[:, KP_INDEX["right_shoulder"], :]
-
-    for frame_idx in range(points_3d.shape[0]):
-        if not (
-            np.all(np.isfinite(left_hip[frame_idx]))
-            and np.all(np.isfinite(right_hip[frame_idx]))
-            and np.all(np.isfinite(left_shoulder[frame_idx]))
-            and np.all(np.isfinite(right_shoulder[frame_idx]))
-        ):
-            continue
-
-        hip_center = 0.5 * (left_hip[frame_idx] + right_hip[frame_idx])
-        shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
-        z_axis = normalize(shoulder_center - hip_center)
-        y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
-        y_axis_seed = normalize(y_seed)
-        x_axis = normalize(np.cross(y_axis_seed, z_axis))
-        y_axis = normalize(np.cross(z_axis, x_axis))
-        if not (np.all(np.isfinite(x_axis)) and np.all(np.isfinite(y_axis)) and np.all(np.isfinite(z_axis))):
-            continue
-
-        translations[frame_idx] = hip_center
-        rotation_matrices[frame_idx] = np.column_stack((x_axis, y_axis, z_axis))
-
-    return translations, rotation_matrices
-
-
 def should_apply_initial_rotation_correction(points_3d: np.ndarray) -> bool:
-    global_x = np.array([1.0, 0.0, 0.0], dtype=float)
-    global_y = np.array([0.0, 1.0, 0.0], dtype=float)
-    _, rotation_matrices = build_root_rotation_matrices(points_3d)
-    for frame_idx in range(rotation_matrices.shape[0]):
-        matrix = rotation_matrices[frame_idx]
-        if not np.all(np.isfinite(matrix)):
-            continue
-        x_axis = matrix[:, 0]
-        y_axis = matrix[:, 1]
-        return float(np.dot(x_axis, global_x)) < -0.7 and float(np.dot(y_axis, global_y)) < -0.7
-    return False
-
-
-def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    squeeze = array.ndim == 1
-    if squeeze:
-        array = array[:, np.newaxis]
-    unwrapped = np.array(array, copy=True)
-    for col_idx in range(unwrapped.shape[1]):
-        column = unwrapped[:, col_idx]
-        valid_idx = np.flatnonzero(np.isfinite(column))
-        if valid_idx.size == 0:
-            continue
-        split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-        segments = np.split(valid_idx, split_points)
-        for segment in segments:
-            if segment.size == 0:
-                continue
-            unwrapped[segment, col_idx] = np.unwrap(column[segment])
-    return unwrapped[:, 0] if squeeze else unwrapped
-
-
-def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str) -> np.ndarray:
-    array = np.asarray(rotations, dtype=float)
-    reextracted = np.full_like(array, np.nan, dtype=float)
-    valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
-    if valid_idx.size == 0:
-        return reextracted
-    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-    segments = np.split(valid_idx, split_points)
-    for segment in segments:
-        for frame_idx in segment:
-            rotation_matrix = Rotation.from_euler(sequence, array[frame_idx], degrees=False).as_matrix()
-            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(sequence, degrees=False)
-    return reextracted
-
+    angle = root_z_correction_angle_from_points(
+        points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
+    return abs(angle) > 1e-8
 
 def extract_root_from_points(
     points_3d: np.ndarray,
     apply_initial_rotation_correction: bool,
     unwrap_rotations: bool,
 ) -> tuple[np.ndarray, bool]:
-    translations, rotation_matrices = build_root_rotation_matrices(points_3d)
-    correction_detected = should_apply_initial_rotation_correction(points_3d)
+    correction_angle = root_z_correction_angle_from_points(
+        points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
+    translations, rotation_matrices = build_root_rotation_matrices(
+        points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
+    correction_detected = abs(correction_angle) > 1e-8
     correction_applied = bool(apply_initial_rotation_correction and correction_detected)
 
     root_q = np.full((points_3d.shape[0], 6), np.nan, dtype=float)
@@ -729,32 +636,12 @@ def extract_root_from_points(
         if not np.all(np.isfinite(matrix)):
             continue
         if correction_applied:
-            matrix = matrix @ RZ_PI
-        root_q[frame_idx, 3:6] = Rotation.from_matrix(matrix).as_euler(ROOT_ROTATION_SEQUENCE, degrees=False)
+            matrix = matrix @ Rotation.from_euler("z", correction_angle, degrees=False).as_matrix()
+        root_q[frame_idx, 3:6] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
 
     if unwrap_rotations:
         root_q[:, 3:6] = unwrap_with_gaps(root_q[:, 3:6])
     return root_q, correction_applied
-
-
-def extract_root_from_q(
-    q_names: np.ndarray,
-    q_trajectory: np.ndarray,
-    unwrap_rotations: bool,
-    renormalize_rotations: bool = True,
-) -> np.ndarray:
-    name_to_index = {str(name): idx for idx, name in enumerate(np.asarray(q_names, dtype=object))}
-    root_q = np.full((q_trajectory.shape[0], len(ROOT_Q_NAMES)), np.nan, dtype=float)
-    for out_idx, dof_name in enumerate(ROOT_Q_NAMES):
-        if dof_name in name_to_index:
-            root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
-
-    if renormalize_rotations:
-        root_q[:, 3:6] = reextract_euler_with_gaps(root_q[:, 3:6], ROOT_ROTATION_SEQUENCE)
-
-    if unwrap_rotations:
-        root_q[:, 3:6] = unwrap_with_gaps(root_q[:, 3:6])
-    return root_q
 
 
 def align_points_to_frames(points_3d: np.ndarray, point_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
@@ -1078,6 +965,13 @@ def build_pose2sim_bundle(
     qdot_root = centered_finite_difference(q_root, 1.0 / fps)
     reprojection_errors = compute_points_reprojection_error_per_view(points_3d, frames, calibrations, pose_data)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
+    correction_angle = root_z_correction_angle_from_points(
+        points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
     summary = {
         "name": name,
         "family": "pose2sim",
@@ -1087,8 +981,9 @@ def build_pose2sim_bundle(
         "n_frames": int(len(frames)),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
-        "initial_rotation_correction_detected": bool(should_apply_initial_rotation_correction(points_3d)),
+        "initial_rotation_correction_detected": bool(abs(correction_angle) > 1e-8),
         "initial_rotation_correction_applied": bool(correction_applied),
+        "initial_rotation_correction_angle_rad": float(correction_angle),
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],
             "std": reprojection_stats["std_px"],
@@ -1218,6 +1113,13 @@ def build_triangulation_bundle(
     qdot_root = centered_finite_difference(q_root, 1.0 / fps)
     reprojection_errors = reconstruction.reprojection_error_per_view
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
+    correction_angle = root_z_correction_angle_from_points(
+        reconstruction.points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
     print_step(3, 3, "Export bundle triangulation")
     summary = {
         "name": name,
@@ -1226,8 +1128,9 @@ def build_triangulation_bundle(
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
-        "initial_rotation_correction_detected": bool(should_apply_initial_rotation_correction(reconstruction.points_3d)),
+        "initial_rotation_correction_detected": bool(abs(correction_angle) > 1e-8),
         "initial_rotation_correction_applied": bool(correction_applied),
+        "initial_rotation_correction_angle_rad": float(correction_angle),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": triangulation_method,
         "coherence_method": coherence_method,
@@ -1402,6 +1305,13 @@ def build_ekf_3d_bundle(
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
     q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
     qdot_root = extract_root_from_q(result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False)
+    correction_angle = root_z_correction_angle_from_points(
+        reconstruction.points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
     reprojection_errors = compute_points_reprojection_error_per_view(model_points_3d, reconstruction.frames, calibrations, pose_data_used)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
     save_legacy_ekf_3d(output_dir, result, reprojection_stats, model_points_3d)
@@ -1415,8 +1325,9 @@ def build_ekf_3d_bundle(
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
-        "initial_rotation_correction_detected": bool(should_apply_initial_rotation_correction(reconstruction.points_3d)),
-        "initial_rotation_correction_applied": bool(initial_rotation_correction and should_apply_initial_rotation_correction(reconstruction.points_3d)),
+        "initial_rotation_correction_detected": bool(abs(correction_angle) > 1e-8),
+        "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
+        "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": triangulation_method,
@@ -1685,6 +1596,13 @@ def build_ekf_2d_bundle(
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
     q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
     qdot_root = extract_root_from_q(result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False)
+    correction_angle = root_z_correction_angle_from_points(
+        reconstruction.points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
     reprojection_errors = compute_points_reprojection_error_per_view(model_points_3d, reconstruction.frames, calibrations, pose_data_used)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
     save_legacy_ekf_2d(output_dir, result, predictor, flip_left_right, model_points_3d)
@@ -1698,8 +1616,9 @@ def build_ekf_2d_bundle(
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
-        "initial_rotation_correction_detected": bool(should_apply_initial_rotation_correction(reconstruction.points_3d)),
-        "initial_rotation_correction_applied": bool(initial_rotation_correction and should_apply_initial_rotation_correction(reconstruction.points_3d)),
+        "initial_rotation_correction_detected": bool(abs(correction_angle) > 1e-8),
+        "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
+        "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
         "triangulation_method": triangulation_method,
         "coherence_method": coherence_method,

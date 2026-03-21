@@ -9,10 +9,10 @@ Le script:
 
 Hypotheses par defaut pour le modele courant:
 - hauteur racine: `TRUNK:TransZ`,
-- axe de salto: `TRUNK:RotX`,
+- axe de salto: `TRUNK:RotY`,
 - axe de vrille: `TRUNK:RotZ`,
-- flexion hanches: `LEFT_THIGH:RotX` et `RIGHT_THIGH:RotX`,
-- flexion genoux: `LEFT_SHANK:RotX` et `RIGHT_SHANK:RotX`.
+- flexion hanches: `LEFT_THIGH:RotY` et `RIGHT_THIGH:RotY`,
+- flexion genoux: `LEFT_SHANK:RotY` et `RIGHT_SHANK:RotY`.
 
 Le code produit suit une convention simplifiee:
 - premier chiffre: `8` pour un salto arriere, `4` pour un salto avant,
@@ -77,18 +77,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-peak-prominence-m", type=float, default=0.35, help="Proeminence minimale du pic de hauteur par rapport aux points bas")
     parser.add_argument("--contact-window-s", type=float, default=0.35, help="Fenetre de recherche locale pour les minima de contact")
     parser.add_argument("--height-dof", type=str, default="TRUNK:TransZ", help="DoF de hauteur de la racine")
-    parser.add_argument("--salto-dof", type=str, default="TRUNK:RotX", help="DoF racine utilise pour compter les saltos")
+    parser.add_argument("--salto-dof", type=str, default="TRUNK:RotY", help="DoF racine utilise pour compter les saltos")
     parser.add_argument("--twist-dof", type=str, default="TRUNK:RotZ", help="DoF racine utilise pour compter les vrilles")
     parser.add_argument(
         "--hip-dofs",
         nargs="+",
-        default=("LEFT_THIGH:RotX", "RIGHT_THIGH:RotX"),
+        default=("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY"),
         help="DoF de flexion des hanches",
     )
     parser.add_argument(
         "--knee-dofs",
         nargs="+",
-        default=("LEFT_SHANK:RotX", "RIGHT_SHANK:RotX"),
+        default=("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY"),
         help="DoF de flexion des genoux",
     )
     parser.add_argument(

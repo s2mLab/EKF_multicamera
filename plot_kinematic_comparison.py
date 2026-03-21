@@ -20,8 +20,13 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.spatial.transform import Rotation
 
+from root_kinematics import (
+    TRUNK_ROTATION_NAMES,
+    centered_finite_difference,
+    compute_trunk_dofs_from_points,
+    extract_root_from_q,
+)
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
@@ -32,15 +37,13 @@ from vitpose_ekf_pipeline import (
 DEFAULT_CAMERA_FPS = 120.0
 DEFAULT_CALIB = Path("inputs/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
-TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
-TRUNK_ROTATION_NAMES = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
 TRIANGULATION_ROOT_LABELS = np.asarray(
     [
         "Triangulation:TRUNK:TransX",
         "Triangulation:TRUNK:TransY",
         "Triangulation:TRUNK:TransZ",
-        "Triangulation:TRUNK:RotX",
         "Triangulation:TRUNK:RotY",
+        "Triangulation:TRUNK:RotX",
         "Triangulation:TRUNK:RotZ",
     ],
     dtype=object,
@@ -50,13 +53,12 @@ TRIANGULATION_ROOT_VELOCITY_LABELS = np.asarray(
         "Triangulation:TRUNK:VelX",
         "Triangulation:TRUNK:VelY",
         "Triangulation:TRUNK:VelZ",
-        "Triangulation:TRUNK:VelRotX",
         "Triangulation:TRUNK:VelRotY",
+        "Triangulation:TRUNK:VelRotX",
         "Triangulation:TRUNK:VelRotZ",
     ],
     dtype=object,
 )
-TRUNK_ROOT_ROTATION_SEQUENCE = "xyz"
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,93 +206,10 @@ def add_phase_background(ax, t: np.ndarray, airborne_mask: np.ndarray) -> None:
         ax.axvspan(t[start], t[stop - 1] if stop - 1 < n else t[-1], color=color, alpha=alpha, zorder=0)
 
 
-def normalize(vector: np.ndarray) -> np.ndarray:
-    """Normalise un vecteur 3D en conservant NaN si la norme est degenerate."""
-    norm = np.linalg.norm(vector)
-    if not np.isfinite(norm) or norm < 1e-12:
-        return np.full(3, np.nan)
-    return vector / norm
-
-
-def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
-    """Applique un unwrap par composante sans propager les NaN entre segments."""
-    array = np.asarray(values, dtype=float)
-    squeeze = array.ndim == 1
-    if squeeze:
-        array = array[:, np.newaxis]
-    unwrapped = np.array(array, copy=True)
-    for col_idx in range(unwrapped.shape[1]):
-        column = unwrapped[:, col_idx]
-        valid_idx = np.flatnonzero(np.isfinite(column))
-        if valid_idx.size == 0:
-            continue
-        split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-        segments = np.split(valid_idx, split_points)
-        for segment in segments:
-            if segment.size == 0:
-                continue
-            unwrapped[segment, col_idx] = np.unwrap(column[segment])
-    return unwrapped[:, 0] if squeeze else unwrapped
-
-
-def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str) -> np.ndarray:
-    array = np.asarray(rotations, dtype=float)
-    reextracted = np.full_like(array, np.nan, dtype=float)
-    valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
-    if valid_idx.size == 0:
-        return reextracted
-    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-    segments = np.split(valid_idx, split_points)
-    for segment in segments:
-        for frame_idx in segment:
-            rotation_matrix = Rotation.from_euler(sequence, array[frame_idx], degrees=False).as_matrix()
-            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(sequence, degrees=False)
-    return reextracted
-
-
 def compute_trunk_dofs_from_triangulation(points_3d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Reconstruit les 6 DoF du tronc a partir des keypoints triangules.
-
-    Le repere suit la logique utilisee pour le `.bioMod`:
-    - origine: centre des hanches,
-    - axe local `z`: des hanches vers les epaules,
-    - axe local `y`: droite vers gauche,
-    - axe local `x`: complete le triedre direct.
-    """
-    left_hip = points_3d[:, 11]
-    right_hip = points_3d[:, 12]
-    left_shoulder = points_3d[:, 5]
-    right_shoulder = points_3d[:, 6]
-
-    translations = 0.5 * (left_hip + right_hip)
-    rotations_xyz = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
-
-    for frame_idx in range(points_3d.shape[0]):
-        if not (
-            np.all(np.isfinite(left_hip[frame_idx]))
-            and np.all(np.isfinite(right_hip[frame_idx]))
-            and np.all(np.isfinite(left_shoulder[frame_idx]))
-            and np.all(np.isfinite(right_shoulder[frame_idx]))
-        ):
-            continue
-
-        hip_center = translations[frame_idx]
-        shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
-        z_axis = normalize(shoulder_center - hip_center)
-        y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
-        y_axis_seed = normalize(y_seed)
-        x_axis = normalize(np.cross(y_axis_seed, z_axis))
-        if not np.all(np.isfinite(x_axis)):
-            continue
-        y_axis = normalize(np.cross(z_axis, x_axis))
-        if not np.all(np.isfinite(y_axis)):
-            continue
-
-        rotation_matrix = np.column_stack((x_axis, y_axis, z_axis))
-        rotations_xyz[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler("xyz", degrees=False)
-
-    rotations_xyz = unwrap_with_gaps(rotations_xyz)
-    return translations, rotations_xyz
+    """Reconstruit les 6 DoF du tronc a partir des keypoints triangules."""
+    root_q = compute_trunk_dofs_from_points(np.asarray(points_3d, dtype=float), unwrap_rotations=True)
+    return root_q[:, :3], root_q[:, 3:6]
 
 
 def extract_trunk_root_dofs(q_names: np.ndarray, q_trajectory: np.ndarray) -> np.ndarray:
@@ -298,7 +217,7 @@ def extract_trunk_root_dofs(q_names: np.ndarray, q_trajectory: np.ndarray) -> np
 
     Pour les rotations de la racine, on ne compare pas directement les angles
     extraits du filtre. On repasse d'abord par une matrice de rotation en
-    utilisant la sequence du modele (`xyz` pour le tronc), puis on re-decompose
+    utilisant la sequence du modele (`yxz` pour le tronc), puis on re-decompose
     cette matrice avec la meme sequence avant d'appliquer l'unwrap temporel.
 
     Cela limite les ecarts artificiels lies a une representation Euler brute
@@ -314,29 +233,15 @@ def extract_trunk_root_dofs(q_names: np.ndarray, q_trajectory: np.ndarray) -> np
     Autrement dit, un tilt eleve apres unwrap ne signifie pas automatiquement
     une grande inclinaison physique. Cela peut aussi refleter:
     - l'accumulation de tours mathematiquement equivalents,
-    - ou la sensibilite de la decomposition Euler `xyz` pres de certaines
+    - ou la sensibilite de la decomposition Euler `yxz` pres de certaines
       configurations de la racine.
     """
-    name_to_index = {str(name): idx for idx, name in enumerate(q_names)}
-    ordered_names = TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES
-    root = np.full((q_trajectory.shape[0], len(ordered_names)), np.nan, dtype=float)
-    for out_idx, dof_name in enumerate(ordered_names):
-        if dof_name in name_to_index:
-            root[:, out_idx] = q_trajectory[:, name_to_index[dof_name]]
-
-    rotations = root[:, 3:6]
-    # La re-extraction via matrice est elle aussi faite uniquement sur les
-    # segments temporels valides, pour ne pas laisser un trou (NaN) perturber
-    # la branche Euler retenue de part et d'autre du gap.
-    normalized_rotations = reextract_euler_with_gaps(rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
-    # `unwrap` impose une continuite temporelle en ajoutant/retirant des
-    # multiples de 2*pi quand un saut brutal apparait entre deux frames.
-    # C'est utile pour eviter les faux pics dus a la coupure +/-pi, mais cela
-    # peut aussi produire un angle `RotY` (tilt) de grande amplitude si la
-    # trajectoire reste sur une branche decomposee qui accumule des tours.
-    normalized_rotations = unwrap_with_gaps(normalized_rotations)
-    root[:, 3:6] = normalized_rotations
-    return root
+    return extract_root_from_q(
+        np.asarray(q_names, dtype=object),
+        np.asarray(q_trajectory, dtype=float),
+        unwrap_rotations=True,
+        renormalize_rotations=True,
+    )
 
 
 def extract_trunk_root_dofs_no_unwrap(q_names: np.ndarray, q_trajectory: np.ndarray) -> np.ndarray:
@@ -346,50 +251,12 @@ def extract_trunk_root_dofs_no_unwrap(q_names: np.ndarray, q_trajectory: np.ndar
     angles Euler, en particulier le tilt (`RotY`), viennent de l'etape
     d'unwrap ou existent deja dans la decomposition Euler elle-meme.
     """
-    name_to_index = {str(name): idx for idx, name in enumerate(q_names)}
-    ordered_names = TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES
-    root = np.full((q_trajectory.shape[0], len(ordered_names)), np.nan, dtype=float)
-    for out_idx, dof_name in enumerate(ordered_names):
-        if dof_name in name_to_index:
-            root[:, out_idx] = q_trajectory[:, name_to_index[dof_name]]
-
-    rotations = root[:, 3:6]
-    normalized_rotations = np.full_like(rotations, np.nan)
-    for frame_idx in range(rotations.shape[0]):
-        if not np.all(np.isfinite(rotations[frame_idx])):
-            continue
-        rotation_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, rotations[frame_idx], degrees=False).as_matrix()
-        normalized_rotations[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(
-            TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False
-        )
-    root[:, 3:6] = normalized_rotations
-    return root
-
-
-def centered_finite_difference(values: np.ndarray, dt: float) -> np.ndarray:
-    """Calcule une derivee temporelle par difference finie centree.
-
-    Formule interne:
-        v(i) = (p(i+1) - p(i-1)) / (2 * dt)
-    Les bords utilisent une difference avant/arriere simple. Si un voisin
-    necessaire manque (`NaN`), la vitesse reste `NaN`.
-    """
-    derivative = np.full_like(values, np.nan, dtype=float)
-    if values.shape[0] == 0:
-        return derivative
-    if values.shape[0] == 1:
-        return derivative
-
-    for col_idx in range(values.shape[1]):
-        column = values[:, col_idx]
-        if np.isfinite(column[0]) and np.isfinite(column[1]):
-            derivative[0, col_idx] = (column[1] - column[0]) / dt
-        if np.isfinite(column[-1]) and np.isfinite(column[-2]):
-            derivative[-1, col_idx] = (column[-1] - column[-2]) / dt
-        for frame_idx in range(1, values.shape[0] - 1):
-            if np.isfinite(column[frame_idx - 1]) and np.isfinite(column[frame_idx + 1]):
-                derivative[frame_idx, col_idx] = (column[frame_idx + 1] - column[frame_idx - 1]) / (2.0 * dt)
-    return derivative
+    return extract_root_from_q(
+        np.asarray(q_names, dtype=object),
+        np.asarray(q_trajectory, dtype=float),
+        unwrap_rotations=False,
+        renormalize_rotations=True,
+    )
 
 
 def save_figure(fig: plt.Figure, path: Path) -> None:
@@ -684,7 +551,7 @@ def plot_trunk_root_velocity_comparison(
 
     n_frames = min(triangulation_root_vel.shape[0], ekf_2d_root_vel.shape[0], ekf_3d_root_vel.shape[0])
     t = time_vector(n_frames, fps)
-    labels = ["RotX (salto)", "RotY (tilt)", "RotZ (twist)"]
+    labels = ["RotY (salto)", "RotX (tilt)", "RotZ (twist)"]
 
     fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
     for row, label in enumerate(labels):
@@ -843,7 +710,7 @@ def plot_root_rotations_no_unwrap(
     ekf_3d_root = extract_trunk_root_dofs_no_unwrap(q_names, q_ekf_3d)
     n_frames = min(ekf_2d_root.shape[0], ekf_3d_root.shape[0])
     t = time_vector(n_frames, fps)
-    labels = ["RotX (salto)", "RotY (tilt)", "RotZ (twist)"]
+    labels = ["RotY (salto)", "RotX (tilt)", "RotZ (twist)"]
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
     for row, label in enumerate(labels):

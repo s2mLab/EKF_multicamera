@@ -9,12 +9,12 @@ from pathlib import Path
 
 BUNDLE_SCHEMA_VERSION = 1
 ALGORITHM_VERSIONS = {
-    "pose2sim": 1,
-    "triangulation": 3,
-    "ekf_3d": 5,
-    "ekf_2d": 5,
+    "pose2sim": 3,
+    "triangulation": 5,
+    "ekf_3d": 8,
+    "ekf_2d": 8,
     "pose_cleaning": 1,
-    "root_rotation_correction": 1,
+    "root_rotation_correction": 3,
 }
 
 DEFAULT_MODEL_SUBJECT_MASS_KG = 55.0

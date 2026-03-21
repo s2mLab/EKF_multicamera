@@ -8,12 +8,15 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from datetime import datetime
-
-
-TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
-TRUNK_ROTATION_NAMES = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
-DEFAULT_HIP_DOFS = ("LEFT_THIGH:RotX", "RIGHT_THIGH:RotX")
-DEFAULT_KNEE_DOFS = ("LEFT_SHANK:RotX", "RIGHT_SHANK:RotX")
+from root_kinematics import (
+    TRUNK_ROTATION_NAMES,
+    TRUNK_TRANSLATION_NAMES,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    reextract_euler_with_gaps,
+    unwrap_with_gaps,
+)
+DEFAULT_HIP_DOFS = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
+DEFAULT_KNEE_DOFS = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 
 
 def dd_debug(message: str) -> None:
@@ -39,6 +42,9 @@ class DDJumpAnalysis:
     body_shape: str | None
     code: str | None
     twists_per_salto: list[float]
+    full_salto_event_indices: list[int]
+    quarter_salto_event_indices: list[int]
+    half_twist_event_indices: list[int]
     somersault_curve_turns: np.ndarray
     twist_curve_turns: np.ndarray
     tilt_curve_rad: np.ndarray
@@ -54,24 +60,6 @@ class DDSessionAnalysis:
     airborne_regions: list[tuple[int, int]]
     jump_segments: list[JumpSegment]
     jumps: list[DDJumpAnalysis]
-
-
-def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    squeeze = array.ndim == 1
-    if squeeze:
-        array = array[:, np.newaxis]
-    unwrapped = np.array(array, copy=True)
-    for col_idx in range(unwrapped.shape[1]):
-        column = unwrapped[:, col_idx]
-        valid_idx = np.flatnonzero(np.isfinite(column))
-        if valid_idx.size == 0:
-            continue
-        split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-        for segment in np.split(valid_idx, split_points):
-            if segment.size:
-                unwrapped[segment, col_idx] = np.unwrap(column[segment])
-    return unwrapped[:, 0] if squeeze else unwrapped
 
 
 def smooth_signal(signal: np.ndarray, window_frames: int) -> np.ndarray:
@@ -172,7 +160,12 @@ def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
     return out
 
 
-def compute_angles_over_jump_from_axes(root_q: np.ndarray, start: int, end: int, rotation_sequence: str = "xyz") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_angles_over_jump_from_axes(
+    root_q: np.ndarray,
+    start: int,
+    end: int,
+    rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window = np.asarray(root_q[start : end + 1], dtype=float)
     rotations = window[:, 3:6]
     z_axes = np.full((window.shape[0], 3), np.nan, dtype=float)
@@ -207,16 +200,15 @@ def compute_angles_over_jump_from_axes(root_q: np.ndarray, start: int, end: int,
     return somersault_angle, twist_angle, tilt_angle
 
 
-def compute_angles_over_jump_from_euler(root_q: np.ndarray, start: int, end: int, rotation_sequence: str = "xyz") -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def compute_angles_over_jump_from_euler(
+    root_q: np.ndarray,
+    start: int,
+    end: int,
+    rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window = np.asarray(root_q[start : end + 1], dtype=float)
     raw_rotations = np.asarray(window[:, 3:6], dtype=float)
-    rotations = np.full_like(raw_rotations, np.nan, dtype=float)
-    for idx, angles in enumerate(raw_rotations):
-        if not np.all(np.isfinite(angles)):
-            continue
-        # Re-pass through a rotation matrix to stay on a coherent Euler branch.
-        rotation_matrix = R.from_euler(rotation_sequence, angles, degrees=False).as_matrix()
-        rotations[idx] = R.from_matrix(rotation_matrix).as_euler(rotation_sequence, degrees=False)
+    rotations = reextract_euler_with_gaps(raw_rotations, rotation_sequence)
     rotations = unwrap_with_gaps(rotations)
     somersault_angle = rotations[:, 0]
     tilt_angle = rotations[:, 1]
@@ -228,7 +220,7 @@ def compute_angles_over_jump(
     root_q: np.ndarray,
     start: int,
     end: int,
-    rotation_sequence: str = "xyz",
+    rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
     angle_mode: str = "euler",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if angle_mode == "body_axes":
@@ -243,6 +235,47 @@ def round_to_nearest(value: float, step: float) -> float:
 def crossing_index(cumulative_turns: np.ndarray, target: float) -> int | None:
     hits = np.where(np.asarray(cumulative_turns, dtype=float) >= float(target))[0]
     return int(hits[0]) if hits.size else None
+
+
+def signed_threshold_crossing_indices(cumulative_turns: np.ndarray, step: float) -> list[int]:
+    curve = np.asarray(cumulative_turns, dtype=float)
+    valid = np.flatnonzero(np.isfinite(curve))
+    if valid.size == 0:
+        return []
+    final_value = float(curve[valid[-1]])
+    direction = 1.0 if final_value >= 0.0 else -1.0
+    target_count = int(np.floor(abs(final_value) / float(step) + 1e-9))
+    if target_count <= 0:
+        return []
+    directed_curve = direction * curve
+    indices: list[int] = []
+    previous_idx = -1
+    for target_idx in range(1, target_count + 1):
+        target = float(target_idx) * float(step)
+        crossing = np.where(directed_curve >= target)[0]
+        if crossing.size == 0:
+            continue
+        index = int(crossing[0])
+        if index != previous_idx:
+            indices.append(index)
+            previous_idx = index
+    return indices
+
+
+def twists_per_completed_salto(
+    cumulative_salto_turns: np.ndarray,
+    cumulative_twist_turns: np.ndarray,
+) -> tuple[list[float], list[int]]:
+    twists_per_salto: list[float] = []
+    full_salto_event_indices = signed_threshold_crossing_indices(cumulative_salto_turns, 1.0)
+    segment_start = 0
+    for end_idx in full_salto_event_indices:
+        if end_idx <= segment_start:
+            continue
+        twist_delta = cumulative_twist_turns[end_idx] - cumulative_twist_turns[segment_start]
+        twists_per_salto.append(abs(round_to_nearest(twist_delta, 0.5)))
+        segment_start = end_idx
+    return twists_per_salto, full_salto_event_indices
 
 
 def detect_body_shape(
@@ -314,18 +347,15 @@ def analyze_single_jump(
     total_saltos = abs(round_to_nearest(som_turns, 0.25)) if np.isfinite(som_turns) else float("nan")
     direction_prefix = "8" if np.isfinite(som_turns) and som_turns >= 0 else "4"
     twists_per_salto: list[float] = []
+    full_salto_event_indices: list[int] = []
+    quarter_salto_event_indices: list[int] = []
+    half_twist_event_indices: list[int] = []
+    somersault_curve_turns = (som - som[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(som)) else np.full_like(som, np.nan)
+    twist_curve_turns = (tw - tw[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(tw)) else np.full_like(tw, np.nan)
     if np.isfinite(som_turns) and np.isfinite(twist_turns):
-        cumulative_salto_turns = np.abs((som - som[0]) / (2.0 * np.pi))
-        cumulative_twist_turns = (tw - tw[0]) / (2.0 * np.pi)
-        completed_saltos = int(np.floor(total_saltos + 1e-9))
-        segment_start = 0
-        for salto_number in range(1, completed_saltos + 1):
-            end_idx = crossing_index(cumulative_salto_turns, float(salto_number))
-            if end_idx is None or end_idx <= segment_start:
-                break
-            twist_delta = cumulative_twist_turns[end_idx] - cumulative_twist_turns[segment_start]
-            twists_per_salto.append(abs(round_to_nearest(twist_delta, 0.5)))
-            segment_start = end_idx
+        quarter_salto_event_indices = signed_threshold_crossing_indices(somersault_curve_turns, 0.25)
+        half_twist_event_indices = signed_threshold_crossing_indices(twist_curve_turns, 0.5)
+        twists_per_salto, full_salto_event_indices = twists_per_completed_salto(somersault_curve_turns, twist_curve_turns)
 
     body_shape = None
     code = None
@@ -351,8 +381,11 @@ def analyze_single_jump(
         body_shape=body_shape,
         code=code,
         twists_per_salto=twists_per_salto,
-        somersault_curve_turns=(som - som[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(som)) else np.full_like(som, np.nan),
-        twist_curve_turns=(tw - tw[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(tw)) else np.full_like(tw, np.nan),
+        full_salto_event_indices=full_salto_event_indices,
+        quarter_salto_event_indices=quarter_salto_event_indices,
+        half_twist_event_indices=half_twist_event_indices,
+        somersault_curve_turns=somersault_curve_turns,
+        twist_curve_turns=twist_curve_turns,
         tilt_curve_rad=tilt,
         angle_mode=angle_mode,
     )

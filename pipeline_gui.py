@@ -42,6 +42,13 @@ from matplotlib.figure import Figure
 from scipy.spatial.transform import Rotation
 
 from dd_analysis import DDSessionAnalysis, analyze_dd_session
+from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from preview_bundle import (
+    align_to_reference,
+    load_dataset_preview_bundle,
+    project_points_all_cameras,
+    root_center,
+)
 from reconstruction_bundle import extract_root_from_points, load_or_compute_left_right_flip_cache, load_or_compute_triangulation_cache, slice_pose_data
 from reconstruction_profiles import (
     ReconstructionProfile,
@@ -66,6 +73,24 @@ from reconstruction_registry import (
     model_output_dir,
     scan_model_dirs,
     scan_reconstruction_dirs,
+)
+from root_kinematics import (
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    TRUNK_ROTATION_NAMES,
+    TRUNK_TRANSLATION_NAMES,
+    centered_finite_difference,
+    compute_trunk_dofs_from_points,
+    extract_root_from_q,
+    normalize,
+)
+from root_series import (
+    quantity_unit_label,
+    root_axis_labels,
+    root_ordered_names,
+    root_series_from_points,
+    root_series_from_precomputed,
+    root_series_from_q,
+    scale_root_series_rotations,
 )
 from vitpose_ekf_pipeline import (
     COCO17,
@@ -137,9 +162,6 @@ LOWER_LIMB_EDGES = {
     ("right_hip", "right_knee"),
     ("right_knee", "right_ankle"),
 }
-TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
-TRUNK_ROTATION_NAMES = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
-TRUNK_ROOT_ROTATION_SEQUENCE = "xyz"
 RECONSTRUCTION_ORDER = [
     "pose2sim",
     "triangulation_adaptive",
@@ -528,178 +550,6 @@ def single_frame_reconstruction(reconstruction: ReconstructionResult, frame_idx:
     )
 
 
-def align_series_to_frames(array: np.ndarray, source_frames: np.ndarray, target_frames: np.ndarray, fill_value: float = np.nan) -> np.ndarray:
-    source_frames = np.asarray(source_frames, dtype=int)
-    target_frames = np.asarray(target_frames, dtype=int)
-    if np.array_equal(source_frames, target_frames):
-        return np.asarray(array, dtype=float)
-    aligned_shape = (len(target_frames),) + tuple(array.shape[1:])
-    aligned = np.full(aligned_shape, fill_value, dtype=float)
-    frame_to_index = {int(frame): idx for idx, frame in enumerate(source_frames)}
-    for out_idx, frame in enumerate(target_frames):
-        source_idx = frame_to_index.get(int(frame))
-        if source_idx is not None:
-            aligned[out_idx] = array[source_idx]
-    return aligned
-
-
-def root_center(points: np.ndarray) -> np.ndarray:
-    left = points[:, KP_INDEX["left_hip"], :]
-    right = points[:, KP_INDEX["right_hip"], :]
-    return 0.5 * (left + right)
-
-
-def align_to_reference(reference: np.ndarray, moving: np.ndarray) -> np.ndarray:
-    ref_root = root_center(reference)
-    mov_root = root_center(moving)
-    valid = np.where(np.all(np.isfinite(ref_root), axis=1) & np.all(np.isfinite(mov_root), axis=1))[0]
-    if valid.size == 0:
-        return moving
-    delta = ref_root[valid[0]] - mov_root[valid[0]]
-    return moving + delta[np.newaxis, np.newaxis, :]
-
-
-def project_points_all_cameras(points_3d: np.ndarray, calibrations: dict, camera_names: list[str]) -> np.ndarray:
-    n_frames, n_points, _ = points_3d.shape
-    projections = np.full((len(camera_names), n_frames, n_points, 2), np.nan, dtype=float)
-    for cam_idx, cam_name in enumerate(camera_names):
-        calibration = calibrations[cam_name]
-        for frame_idx in range(n_frames):
-            for point_idx in range(n_points):
-                point = points_3d[frame_idx, point_idx]
-                if np.all(np.isfinite(point)):
-                    projections[cam_idx, frame_idx, point_idx] = calibration.project_point(point)
-    return projections
-
-
-def normalize(vector: np.ndarray) -> np.ndarray:
-    norm = np.linalg.norm(vector)
-    if not np.isfinite(norm) or norm < 1e-12:
-        return np.full(3, np.nan)
-    return vector / norm
-
-
-def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values, dtype=float)
-    squeeze = array.ndim == 1
-    if squeeze:
-        array = array[:, np.newaxis]
-    unwrapped = np.array(array, copy=True)
-    for col_idx in range(unwrapped.shape[1]):
-        column = unwrapped[:, col_idx]
-        valid_idx = np.flatnonzero(np.isfinite(column))
-        if valid_idx.size == 0:
-            continue
-        split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-        segments = np.split(valid_idx, split_points)
-        for segment in segments:
-            if segment.size == 0:
-                continue
-            unwrapped[segment, col_idx] = np.unwrap(column[segment])
-    return unwrapped[:, 0] if squeeze else unwrapped
-
-
-def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str) -> np.ndarray:
-    array = np.asarray(rotations, dtype=float)
-    reextracted = np.full_like(array, np.nan, dtype=float)
-    valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
-    if valid_idx.size == 0:
-        return reextracted
-    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
-    segments = np.split(valid_idx, split_points)
-    for segment in segments:
-        for frame_idx in segment:
-            rotation_matrix = Rotation.from_euler(sequence, array[frame_idx], degrees=False).as_matrix()
-            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(sequence, degrees=False)
-    return reextracted
-
-
-def compute_trunk_dofs_from_points(points_3d: np.ndarray, unwrap: bool = True) -> np.ndarray:
-    left_hip = points_3d[:, 11]
-    right_hip = points_3d[:, 12]
-    left_shoulder = points_3d[:, 5]
-    right_shoulder = points_3d[:, 6]
-    translations = 0.5 * (left_hip + right_hip)
-    rotations_xyz = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
-    for frame_idx in range(points_3d.shape[0]):
-        if not (
-            np.all(np.isfinite(left_hip[frame_idx]))
-            and np.all(np.isfinite(right_hip[frame_idx]))
-            and np.all(np.isfinite(left_shoulder[frame_idx]))
-            and np.all(np.isfinite(right_shoulder[frame_idx]))
-        ):
-            continue
-        hip_center = translations[frame_idx]
-        shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
-        z_axis = normalize(shoulder_center - hip_center)
-        y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
-        y_axis_seed = normalize(y_seed)
-        x_axis = normalize(np.cross(y_axis_seed, z_axis))
-        if not np.all(np.isfinite(x_axis)):
-            continue
-        y_axis = normalize(np.cross(z_axis, x_axis))
-        if not np.all(np.isfinite(y_axis)):
-            continue
-        rotation_matrix = np.column_stack((x_axis, y_axis, z_axis))
-        rotations_xyz[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
-    if unwrap:
-        rotations_xyz = unwrap_with_gaps(rotations_xyz)
-    return np.hstack((translations, rotations_xyz))
-
-
-def extract_root_from_q(
-    q_names: np.ndarray,
-    q_trajectory: np.ndarray,
-    unwrap: bool = True,
-    renormalize_rotations: bool = True,
-) -> np.ndarray:
-    name_to_index = {str(name): idx for idx, name in enumerate(q_names)}
-    ordered_names = TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES
-    root = np.full((q_trajectory.shape[0], len(ordered_names)), np.nan, dtype=float)
-    for out_idx, dof_name in enumerate(ordered_names):
-        if dof_name in name_to_index:
-            root[:, out_idx] = q_trajectory[:, name_to_index[dof_name]]
-    rotations = np.array(root[:, 3:6], copy=True)
-    if renormalize_rotations:
-        rotations = reextract_euler_with_gaps(rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
-    if unwrap:
-        rotations = unwrap_with_gaps(rotations)
-    root[:, 3:6] = rotations
-    return root
-
-
-def rotation_unit_scale(unit: str) -> float:
-    if unit == "deg":
-        return 180.0 / math.pi
-    if unit == "turns":
-        return 1.0 / (2.0 * math.pi)
-    return 1.0
-
-
-def rotation_unit_label(unit: str, quantity: str) -> str:
-    if unit == "deg":
-        return "deg" if quantity == "q" else "deg/s"
-    if unit == "turns":
-        return "turn" if quantity == "q" else "turn/s"
-    return "rad" if quantity == "q" else "rad/s"
-
-
-def centered_finite_difference(values: np.ndarray, dt: float) -> np.ndarray:
-    derivative = np.full_like(values, np.nan, dtype=float)
-    if values.shape[0] < 2:
-        return derivative
-    for col_idx in range(values.shape[1]):
-        column = values[:, col_idx]
-        if np.isfinite(column[0]) and np.isfinite(column[1]):
-            derivative[0, col_idx] = (column[1] - column[0]) / dt
-        if np.isfinite(column[-1]) and np.isfinite(column[-2]):
-            derivative[-1, col_idx] = (column[-1] - column[-2]) / dt
-        for frame_idx in range(1, values.shape[0] - 1):
-            if np.isfinite(column[frame_idx - 1]) and np.isfinite(column[frame_idx + 1]):
-                derivative[frame_idx, col_idx] = (column[frame_idx + 1] - column[frame_idx - 1]) / (2.0 * dt)
-    return derivative
-
-
 def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str]]:
     names = [str(name) for name in q_names]
     pairs = []
@@ -936,85 +786,7 @@ def load_preview_bundle(
     )
     bundle_dirs = reconstruction_dirs_for_path(output_dir)
     if bundle_dirs:
-        bundle: dict[str, object] = {
-            "frames": np.array([], dtype=int),
-            "time_s": np.array([], dtype=float),
-            "q_names": np.array([], dtype=object),
-            "recon_3d": {},
-            "recon_q": {},
-            "recon_qdot": {},
-            "recon_q_root": {},
-            "recon_qdot_root": {},
-            "recon_summary": {},
-        }
-        master_frames = None
-        master_time = None
-        preferred_names = ["pose2sim", "triangulation_exhaustive", "triangulation_greedy", "ekf_2d_acc", "ekf_3d"]
-        ordered_dirs = sorted(bundle_dirs, key=lambda path: preferred_names.index(path.name) if path.name in preferred_names else 999)
-        entries: list[dict[str, object]] = []
-        for recon_dir in ordered_dirs:
-            bundle_path = recon_dir / "reconstruction_bundle.npz"
-            if not bundle_path.exists():
-                continue
-            data = np.load(bundle_path, allow_pickle=True)
-            name = str(np.asarray(data["bundle_name"]).item()) if "bundle_name" in data else recon_dir.name
-            frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(np.asarray(data["points_3d"]).shape[0], dtype=int)
-            time_s = np.asarray(data["time_s"], dtype=float) if "time_s" in data else frames / 120.0
-            if master_frames is None or name == "pose2sim":
-                master_frames = frames
-                master_time = time_s
-            q = np.asarray(data["q"], dtype=float) if "q" in data else np.empty((len(frames), 0), dtype=float)
-            qdot = np.asarray(data["qdot"], dtype=float) if "qdot" in data else np.empty((len(frames), 0), dtype=float)
-            q_names = np.asarray(data["q_names"], dtype=object) if "q_names" in data else np.array([], dtype=object)
-            q_root = np.asarray(data["q_root"], dtype=float) if "q_root" in data else np.empty((len(frames), 0), dtype=float)
-            qdot_root = np.asarray(data["qdot_root"], dtype=float) if "qdot_root" in data else np.empty((len(frames), 0), dtype=float)
-            summary = load_json_if_exists(recon_dir / "bundle_summary.json")
-            entries.append(
-                {
-                    "name": name,
-                    "frames": frames,
-                    "points_3d": np.asarray(data["points_3d"], dtype=float),
-                    "points_3d_source": str(summary.get("points_3d_source", "")),
-                    "summary": summary,
-                    "q": q,
-                    "qdot": qdot,
-                    "q_names": q_names,
-                    "q_root": q_root,
-                    "qdot_root": qdot_root,
-                }
-            )
-        if master_frames is None:
-            return bundle
-        bundle["frames"] = master_frames if master_frames is not None else np.array([], dtype=int)
-        bundle["time_s"] = master_time if master_time is not None else (bundle["frames"] / 120.0 if bundle["frames"].size else np.array([], dtype=float))
-        for entry in entries:
-            name = str(entry["name"])
-            frames = np.asarray(entry["frames"], dtype=int)
-            q = np.asarray(entry["q"], dtype=float)
-            qdot = np.asarray(entry["qdot"], dtype=float)
-            q_names = np.asarray(entry["q_names"], dtype=object)
-            q_root = np.asarray(entry["q_root"], dtype=float)
-            qdot_root = np.asarray(entry["qdot_root"], dtype=float)
-            points_3d = np.asarray(entry["points_3d"], dtype=float)
-            bundle["recon_summary"][name] = dict(entry.get("summary", {}))
-            if (
-                biomod_path is not None
-                and q.ndim == 2
-                and q.shape[1] > len(TRUNK_TRANSLATION_NAMES) + len(TRUNK_ROTATION_NAMES)
-                and (entry.get("points_3d_source") != "model_forward_kinematics" or not np.any(np.isfinite(points_3d)))
-            ):
-                points_3d = biorbd_markers_from_q(biomod_path, q)
-            bundle["recon_3d"][name] = align_series_to_frames(points_3d, frames, bundle["frames"])
-            if q.size:
-                bundle["recon_q"][name] = align_series_to_frames(q, frames, bundle["frames"])
-                if qdot.size:
-                    bundle["recon_qdot"][name] = align_series_to_frames(qdot, frames, bundle["frames"])
-                if bundle["q_names"].size == 0 and q_names.size:
-                    bundle["q_names"] = q_names
-            if q_root.size:
-                bundle["recon_q_root"][name] = align_series_to_frames(q_root, frames, bundle["frames"])
-            if qdot_root.size:
-                bundle["recon_qdot_root"][name] = align_series_to_frames(qdot_root, frames, bundle["frames"])
+        bundle = load_dataset_preview_bundle(output_dir, biomod_path, biorbd_markers_from_q)
         gui_debug(
             "load_preview_bundle done "
             f"bundle_mode=dataset recon3d={len(bundle['recon_3d'])} "
@@ -2999,7 +2771,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.output_root.set_tooltip("Dossier racine partagé des sorties. Le dataset sera créé automatiquement dessous.")
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
-        attach_tooltip(self.root_rotfix_check, "Si coché, la racine est tournée de pi autour de Z quand le repère à t0 est opposé au repère global. Cette convention est partagée pour le modèle, les reconstructions et les analyses.")
+        attach_tooltip(self.root_rotfix_check, "Si coché, la racine est réalignée en lacet autour de Z à partir de l'axe médio-latéral du tronc à t0. L'angle est arrondi au multiple de pi/2 le plus proche, puis partagé par le modèle, les reconstructions et les analyses.")
         attach_tooltip(component_label, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(component_box, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(view_mode_label, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
@@ -3320,7 +3092,7 @@ class ModelTab(CommandTab):
         self.initial_rot_var = state.initial_rotation_correction_var
         initial_rot_check = ttk.Checkbutton(
             row3,
-            text="Rotate root by pi around Z if t0 is opposite to the global frame",
+            text="Align root to global",
             variable=self.initial_rot_var,
         )
         initial_rot_check.pack(side=tk.LEFT)
@@ -3340,7 +3112,7 @@ class ModelTab(CommandTab):
         attach_tooltip(triang_box, "Méthode de triangulation utilisée pour construire le modèle: exhaustive teste plus de combinaisons, greedy est plus rapide.")
         attach_tooltip(pose_mode_label, "Choix des 2D utilisées pour construire le modèle: raw ou cleaned.")
         attach_tooltip(pose_mode_box, "Choix des 2D utilisées pour construire le modèle: raw ou cleaned. `cleaned` applique le rejet des points aberrants.")
-        attach_tooltip(initial_rot_check, "Si le repère racine reconstruit à t0 est opposé au repère global, applique une rotation de pi autour de Z dans le bioMod.")
+        attach_tooltip(initial_rot_check, "Estime l'orientation horizontale de l'axe y du tronc à t0, l'arrondit au multiple de pi/2 le plus proche, puis applique cette correction autour de Z dans le bioMod.")
         self.max_frames.set_tooltip("Nombre maximal de frames utilisées pour construire le modèle après application de la plage de frames.")
         self.frame_start.set_tooltip("Première frame incluse pour construire le modèle.")
         self.frame_end.set_tooltip("Dernière frame incluse pour construire le modèle.")
@@ -4693,13 +4465,10 @@ class RootKinematicsTab(ttk.Frame):
             dt = 1.0 / float(self.state.fps_var.get())
             family_is_translation = self.family.get() == "translations"
             family_slice = slice(0, 3) if family_is_translation else slice(3, 6)
-            axis_labels = TRUNK_TRANSLATION_NAMES if family_is_translation else TRUNK_ROTATION_NAMES
+            axis_labels = root_axis_labels(self.family.get())
             quantity = self.quantity.get()
             rotation_unit = self.rotation_unit.get()
-            scale = rotation_unit_scale(rotation_unit) if not family_is_translation else 1.0
-            unit_label = (
-                "m" if quantity == "q" else "m/s"
-            ) if family_is_translation else rotation_unit_label(rotation_unit, quantity)
+            unit_label = quantity_unit_label(quantity, family_is_translation, rotation_unit)
 
             self.figure.clear()
             axes = self.figure.subplots(3, 1, sharex=True)
@@ -4717,55 +4486,43 @@ class RootKinematicsTab(ttk.Frame):
                     if applied is not None:
                         geometric_rotfix_mismatch = bool(applied) != bool(self.state.initial_rotation_correction_var.get())
                 if geometric_family and name in recon_3d:
-                    root_q, _correction_applied = extract_root_from_points(
+                    series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
-                        bool(self.state.initial_rotation_correction_var.get()),
-                        bool(self.unwrap_var.get()),
+                        quantity=quantity,
+                        dt=dt,
+                        initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+                        unwrap_rotations=bool(self.unwrap_var.get()),
                     )
-                    series = root_q if self.quantity.get() == "q" else centered_finite_difference(root_q, dt)
                 elif name in recon_q:
-                    root_q = extract_root_from_q(
+                    series = root_series_from_q(
                         q_names,
                         recon_q[name],
-                        unwrap=self.unwrap_var.get(),
-                        renormalize_rotations=self.reextract_var.get(),
+                        quantity=quantity,
+                        dt=dt,
+                        qdot=recon_qdot.get(name),
+                        fd_qdot=bool(self.fd_qdot_var.get()),
+                        unwrap_rotations=bool(self.unwrap_var.get()),
+                        renormalize_rotations=bool(self.reextract_var.get()),
                     )
-                    if self.quantity.get() == "q":
-                        series = root_q
-                    else:
-                        if self.fd_qdot_var.get() or name not in recon_qdot:
-                            series = centered_finite_difference(root_q, dt)
-                        else:
-                            raw_qdot = recon_qdot[name]
-                            name_to_index = {str(qname): idx for idx, qname in enumerate(q_names)}
-                            ordered = TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES
-                            root_qdot = np.full((raw_qdot.shape[0], 6), np.nan)
-                            for out_idx, dof_name in enumerate(ordered):
-                                if dof_name in name_to_index:
-                                    root_qdot[:, out_idx] = raw_qdot[:, name_to_index[dof_name]]
-                            series = root_qdot
                 elif name in recon_3d:
-                    root_q, _correction_applied = extract_root_from_points(
+                    series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
-                        bool(self.state.initial_rotation_correction_var.get()),
-                        bool(self.unwrap_var.get()),
+                        quantity=quantity,
+                        dt=dt,
+                        initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+                        unwrap_rotations=bool(self.unwrap_var.get()),
                     )
-                    series = root_q if self.quantity.get() == "q" else centered_finite_difference(root_q, dt)
                 elif name in recon_q_root and not geometric_rotfix_mismatch:
-                    root_q = np.asarray(recon_q_root[name], dtype=float)
-                    if self.quantity.get() == "q":
-                        series = root_q
-                    else:
-                        if self.fd_qdot_var.get() or name not in recon_qdot_root:
-                            series = centered_finite_difference(root_q, dt)
-                        else:
-                            series = np.asarray(recon_qdot_root[name], dtype=float)
+                    series = root_series_from_precomputed(
+                        np.asarray(recon_q_root[name], dtype=float),
+                        quantity=quantity,
+                        dt=dt,
+                        qdot_root=recon_qdot_root.get(name),
+                        fd_qdot=bool(self.fd_qdot_var.get()),
+                    )
                 if series is None:
                     continue
-                series_to_plot = np.asarray(series, dtype=float)
-                if not family_is_translation:
-                    series_to_plot = np.array(series_to_plot, copy=True)
-                    series_to_plot[:, 3:6] *= scale
+                series_to_plot = scale_root_series_rotations(np.asarray(series, dtype=float), family_is_translation, rotation_unit)
                 t = np.arange(series.shape[0]) * dt
                 for axis_idx, ax in enumerate(axes):
                     ax.plot(
@@ -5080,7 +4837,7 @@ class DDTab(ttk.Frame):
     ) -> tuple[np.ndarray | None, np.ndarray | None, list[str] | None]:
         if name in recon_q:
             full_q = np.asarray(recon_q[name], dtype=float)
-            root_q = extract_root_from_q(q_names, full_q, unwrap=False, renormalize_rotations=True)
+            root_q = extract_root_from_q(q_names, full_q, unwrap_rotations=False, renormalize_rotations=True)
             return root_q, full_q, [str(q_name) for q_name in q_names]
         if name in recon_3d:
             root_q, _ = extract_root_from_points(
@@ -5111,7 +4868,7 @@ class DDTab(ttk.Frame):
         dof_name = self.height_dof.get().strip() or "TRUNK:TransZ"
         if q_name_list is not None and full_q is not None and dof_name in q_name_list:
             return np.asarray(full_q[:, q_name_list.index(dof_name)], dtype=float)
-        ordered = TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES
+        ordered = [str(name) for name in root_ordered_names()]
         if dof_name in ordered:
             return np.asarray(root_q[:, ordered.index(dof_name)], dtype=float)
         return np.asarray(root_q[:, 2], dtype=float)
@@ -5192,10 +4949,7 @@ class DDTab(ttk.Frame):
             if self.analysis is None:
                 return
             for idx, jump in enumerate(self.analysis.jumps, start=1):
-                self.jump_list.insert(
-                    tk.END,
-                    f"S{idx} | som {jump.somersault_turns:.2f} | tw {jump.twist_turns:.2f}",
-                )
+                self.jump_list.insert(tk.END, jump_list_label(idx, jump))
             if self.analysis.jumps:
                 self._set_jump_selection(min(previous, len(self.analysis.jumps) - 1))
         finally:
@@ -5204,44 +4958,18 @@ class DDTab(ttk.Frame):
     def render_summary(self) -> None:
         gui_debug("DD render_summary")
         self.summary.delete("1.0", tk.END)
-        if self.analysis is None or self.current_reconstruction_name is None:
-            self.summary.insert(tk.END, "Aucune reconstruction sélectionnée.\n")
-            return
-        fps = float(self.state.fps_var.get())
-        self.summary.insert(tk.END, f"Reconstruction: {reconstruction_label(self.current_reconstruction_name)}\n")
-        self.summary.insert(tk.END, f"Height DoF: {self.height_dof.get()}\n")
-        self.summary.insert(tk.END, f"Angle mode: {self.angle_mode.get()}\n")
-        self.summary.insert(tk.END, f"Threshold: {self.analysis.height_threshold:.3f}\n")
-        self.summary.insert(tk.END, f"Jumps detected: {len(self.analysis.jumps)}\n\n")
-        for idx, jump in enumerate(self.analysis.jumps, start=1):
-            start_t = jump.segment.start / fps
-            end_t = jump.segment.end / fps
-            peak_h = float(np.nanmax(self.analysis.height[jump.segment.start : jump.segment.end + 1]))
-            self.summary.insert(
-                tk.END,
-                (
-                    f"S{idx}: frames {jump.segment.start}-{jump.segment.end} "
-                    f"({start_t:.2f}-{end_t:.2f} s), peak {peak_h:.2f} m\n"
-                ),
-            )
-            self.summary.insert(
-                tk.END,
-                (
-                    f"  somersault={jump.somersault_turns:.2f} turns | "
-                    f"twist={jump.twist_turns:.2f} turns | "
-                    f"tilt max={np.rad2deg(jump.max_tilt_rad):.1f} deg | "
-                    f"{jump.classification}\n"
-                ),
-            )
-            code_text = jump.code if jump.code is not None else "-"
-            if jump.body_shape is not None:
-                self.summary.insert(tk.END, f"  body shape={jump.body_shape} | code={code_text}\n")
-            else:
-                self.summary.insert(tk.END, f"  body shape=- | code={code_text}\n")
-            if jump.twists_per_salto:
-                twists_str = ", ".join(f"{value:.1f}" for value in jump.twists_per_salto)
-                self.summary.insert(tk.END, f"  twists/salto=[{twists_str}]\n")
-            self.summary.insert(tk.END, "\n")
+        summary_text = format_dd_summary(
+            self.analysis,
+            reconstruction_label_text=(
+                reconstruction_label(self.current_reconstruction_name)
+                if self.current_reconstruction_name is not None
+                else None
+            ),
+            height_dof=self.height_dof.get(),
+            angle_mode=self.angle_mode.get(),
+            fps=float(self.state.fps_var.get()),
+        )
+        self.summary.insert(tk.END, summary_text)
 
     def refresh_plot(self) -> None:
         gui_debug("DD refresh_plot start")
@@ -5286,15 +5014,55 @@ class DDTab(ttk.Frame):
         axes[0].legend(loc="best", fontsize=8)
 
         if selected_jump is not None:
-            local_t = np.arange(selected_jump.somersault_curve_turns.shape[0], dtype=float) / fps
-            axes[1].plot(local_t, selected_jump.somersault_curve_turns, color="#4c72b0", linewidth=1.8, label="somersault")
-            axes[1].plot(local_t, selected_jump.twist_curve_turns, color="#c44e52", linewidth=1.8, label="twist")
+            plot_data = build_jump_plot_data(selected_jump, fps)
+            for event_idx, event_time in enumerate(plot_data.full_salto_times):
+                    axes[1].axvline(
+                        event_time,
+                        color="#777777",
+                        linestyle=":",
+                        linewidth=1.2,
+                        alpha=0.8,
+                        label="full salto" if event_idx == 0 else None,
+                    )
+                    axes[2].axvline(
+                        event_time,
+                        color="#777777",
+                        linestyle=":",
+                        linewidth=1.2,
+                        alpha=0.8,
+                    )
+            axes[1].plot(plot_data.local_t, selected_jump.somersault_curve_turns, color="#4c72b0", linewidth=1.8, label="somersault")
+            axes[1].plot(plot_data.local_t, selected_jump.twist_curve_turns, color="#c44e52", linewidth=1.8, label="twist")
+            if plot_data.quarter_salto_times.size:
+                axes[1].scatter(
+                    plot_data.quarter_salto_times,
+                    plot_data.quarter_salto_values,
+                    marker="s",
+                    s=26,
+                    facecolors="white",
+                    edgecolors="#4c72b0",
+                    linewidths=1.2,
+                    zorder=4,
+                    label="1/4 salto",
+                )
+            if plot_data.half_twist_times.size:
+                axes[1].scatter(
+                    plot_data.half_twist_times,
+                    plot_data.half_twist_values,
+                    marker="o",
+                    s=24,
+                    facecolors="white",
+                    edgecolors="#c44e52",
+                    linewidths=1.2,
+                    zorder=4,
+                    label="1/2 twist",
+                )
             axes[1].set_title(f"S{jump_idx + 1} rotations ({selected_jump.angle_mode})")
             axes[1].set_ylabel("Turns")
             axes[1].grid(alpha=0.25)
             axes[1].legend(loc="best", fontsize=8)
 
-            axes[2].plot(local_t, np.rad2deg(selected_jump.tilt_curve_rad), color="#55a868", linewidth=1.8, label="tilt")
+            axes[2].plot(plot_data.local_t, np.rad2deg(selected_jump.tilt_curve_rad), color="#55a868", linewidth=1.8, label="tilt")
             axes[2].set_title(f"S{jump_idx + 1} tilt ({selected_jump.angle_mode})")
             axes[2].set_ylabel("deg")
             axes[2].set_xlabel("Time within jump (s)")

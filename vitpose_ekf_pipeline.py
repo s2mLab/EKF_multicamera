@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from root_kinematics import root_z_correction_angle_from_points
 
 try:
     import tomllib
@@ -70,7 +71,7 @@ DEFAULT_FLIP_OUTLIER_FLOOR_PX = 5.0
 DEFAULT_FLIP_TEMPORAL_WEIGHT = 0.35
 DEFAULT_FLIP_TEMPORAL_TAU_PX = 20.0
 DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS = 4
-MODEL_STAGE_VERSION = 3
+MODEL_STAGE_VERSION = 7
 
 COCO17 = [
     "nose",
@@ -1622,7 +1623,7 @@ def build_biomod(
         SegmentReal(
             name="TRUNK",
             translations=Translations.XYZ,
-            rotations=Rotations.XYZ,
+            rotations=Rotations.YXZ,
             inertia_parameters=inertia["TRUNK"],
             mesh=mesh_with_axes(
                 [
@@ -1679,7 +1680,7 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.asarray(shoulder_offset, dtype=float), is_scs_local=True
                 ),
-                rotations=Rotations.XY,
+                rotations=Rotations.YX,
                 inertia_parameters=inertia["UPPER_ARM"],
                 mesh=mesh_with_axes(
                     [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.upper_arm_length)],
@@ -1697,7 +1698,7 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.array([0, 0, -lengths.upper_arm_length]), is_scs_local=True
                 ),
-                rotations=Rotations.ZX,
+                rotations=Rotations.ZY,
                 inertia_parameters=inertia["FOREARM"],
                 mesh=mesh_with_axes(
                     [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.forearm_length)],
@@ -1715,7 +1716,7 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.asarray(hip_offset, dtype=float), is_scs_local=True
                 ),
-                rotations=Rotations.XYZ,
+                rotations=Rotations.YXZ,
                 inertia_parameters=inertia["THIGH"],
                 mesh=mesh_with_axes(
                     [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.thigh_length)],
@@ -1733,7 +1734,7 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.array([0, 0, -lengths.thigh_length]), is_scs_local=True
                 ),
-                rotations=Rotations.X,
+                rotations=Rotations.Y,
                 inertia_parameters=inertia["SHANK"],
                 mesh=mesh_with_axes(
                     [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.shank_length)],
@@ -1747,11 +1748,12 @@ def build_biomod(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.to_biomod(str(output_path), with_mesh=True)
     remove_ghost_root_segment_from_biomod(output_path)
-    # Si le repere tronc initial ressort globalement retourne de pi autour de z
-    # par rapport au repere monde, on applique cette rotation directement dans
-    # le bloc RT du TRUNK pour garder un repere racine plus intuitif.
-    if apply_initial_root_rotation_correction and should_flip_trunk_root_coordinate_system(reconstruction):
-        rotate_trunk_rt_pi_about_z_in_biomod(output_path)
+    # Si le repere tronc initial est mal aligne en lacet par rapport au repere
+    # global, on applique directement dans le bloc RT du TRUNK une rotation
+    # autour de Z arrondie au multiple de pi/2 le plus proche.
+    correction_angle = trunk_root_z_correction_angle(reconstruction)
+    if apply_initial_root_rotation_correction and abs(correction_angle) > 1e-8:
+        rotate_trunk_rt_about_z_in_biomod(output_path, correction_angle)
     return output_path
 
 
@@ -1780,66 +1782,29 @@ def remove_ghost_root_segment_from_biomod(biomod_path: Path) -> None:
     biomod_path.write_text(text)
 
 
-def should_flip_trunk_root_coordinate_system(reconstruction: ReconstructionResult | None) -> bool:
-    """Detecte si le repere tronc initial est presque oppose au repere global.
+def trunk_root_z_correction_angle(reconstruction: ReconstructionResult | None) -> float:
+    """Calcule une correction de lacet de la racine, arrondie au pi/2 le plus proche.
 
-    La decision est prise sur la premiere frame triangulee valide, avec la meme
-    logique de repere que dans les figures:
-    - origine au centre des hanches
-    - z des hanches vers les epaules
-    - y droite vers gauche
-    - x complete le triedre direct
+    L'angle est estime a partir de l'axe medio-lateral du tronc (axe `y`
+    reconstruit avec les hanches et les epaules), projete dans le plan
+    horizontal. On arrondit ensuite cet angle au multiple de pi/2 le plus
+    proche pour garder un repere cardinal simple.
     """
     if reconstruction is None or reconstruction.points_3d.shape[0] == 0:
-        return False
-
-    global_x = np.array([1.0, 0.0, 0.0], dtype=float)
-    global_y = np.array([0.0, 1.0, 0.0], dtype=float)
-    for frame_idx in range(reconstruction.points_3d.shape[0]):
-        frame = reconstruction.points_3d[frame_idx]
-        left_hip = frame[KP_INDEX["left_hip"]]
-        right_hip = frame[KP_INDEX["right_hip"]]
-        left_shoulder = frame[KP_INDEX["left_shoulder"]]
-        right_shoulder = frame[KP_INDEX["right_shoulder"]]
-        if not (
-            np.all(np.isfinite(left_hip))
-            and np.all(np.isfinite(right_hip))
-            and np.all(np.isfinite(left_shoulder))
-            and np.all(np.isfinite(right_shoulder))
-        ):
-            continue
-
-        hip_center = 0.5 * (left_hip + right_hip)
-        shoulder_center = 0.5 * (left_shoulder + right_shoulder)
-        z_axis = shoulder_center - hip_center
-        z_norm = np.linalg.norm(z_axis)
-        if not np.isfinite(z_norm) or z_norm < 1e-12:
-            continue
-        z_axis = z_axis / z_norm
-
-        y_seed = 0.5 * ((left_hip - right_hip) + (left_shoulder - right_shoulder))
-        y_norm = np.linalg.norm(y_seed)
-        if not np.isfinite(y_norm) or y_norm < 1e-12:
-            continue
-        y_axis_seed = y_seed / y_norm
-        x_axis = np.cross(y_axis_seed, z_axis)
-        x_norm = np.linalg.norm(x_axis)
-        if not np.isfinite(x_norm) or x_norm < 1e-12:
-            continue
-        x_axis = x_axis / x_norm
-        y_axis = np.cross(z_axis, x_axis)
-        y_norm = np.linalg.norm(y_axis)
-        if not np.isfinite(y_norm) or y_norm < 1e-12:
-            continue
-        y_axis = y_axis / y_norm
-
-        return float(np.dot(x_axis, global_x)) < -0.7 and float(np.dot(y_axis, global_y)) < -0.7
-
-    return False
+        return 0.0
+    return root_z_correction_angle_from_points(
+        reconstruction.points_3d,
+        left_hip_idx=KP_INDEX["left_hip"],
+        right_hip_idx=KP_INDEX["right_hip"],
+        left_shoulder_idx=KP_INDEX["left_shoulder"],
+        right_shoulder_idx=KP_INDEX["right_shoulder"],
+    )
 
 
-def rotate_trunk_rt_pi_about_z_in_biomod(biomod_path: Path) -> None:
-    """Applique au segment TRUNK une rotation de pi autour de z dans son bloc RT."""
+def rotate_trunk_rt_about_z_in_biomod(biomod_path: Path, angle_rad: float) -> None:
+    """Applique au segment TRUNK une rotation autour de z dans son bloc RT."""
+    cos_a = math.cos(float(angle_rad))
+    sin_a = math.sin(float(angle_rad))
     text = biomod_path.read_text()
     old_block = (
         "segment\tTRUNK\n"
@@ -1856,8 +1821,8 @@ def rotate_trunk_rt_pi_about_z_in_biomod(biomod_path: Path) -> None:
         "\tparent\tbase\n"
         "\tRTinMatrix\t1\n"
         "\tRT\n"
-        "\t\t-1.000000\t0.000000\t0.000000\t0.000000\n"
-        "\t\t0.000000\t-1.000000\t0.000000\t0.000000\n"
+        f"\t\t{cos_a:.6f}\t{-sin_a:.6f}\t0.000000\t0.000000\n"
+        f"\t\t{sin_a:.6f}\t{cos_a:.6f}\t0.000000\t0.000000\n"
         "\t\t0.000000\t0.000000\t1.000000\t0.000000\n"
         "\t\t0.000000\t0.000000\t0.000000\t1.000000\n"
     )
@@ -2204,7 +2169,7 @@ class MultiViewKinematicEKF:
             return
         deg5 = np.deg2rad(5.0)
         for side in ("LEFT", "RIGHT"):
-            flex_name = f"{side}_FOREARM:RotX"
+            flex_name = f"{side}_FOREARM:RotY"
             rot_name = f"{side}_FOREARM:RotZ"
             if flex_name in self.lock_map and rot_name in self.lock_map:
                 flex_idx = self.lock_map[flex_name]

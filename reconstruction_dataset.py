@@ -209,6 +209,8 @@ def load_bundle_entries(path: Path) -> list[dict[str, object]]:
         frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(np.asarray(data["points_3d"]).shape[0], dtype=int)
         time_s = np.asarray(data["time_s"], dtype=float) if "time_s" in data else frames.astype(float) / 120.0
         q_names = np.asarray(data["q_names"], dtype=object) if "q_names" in data else np.array([], dtype=object)
+        q_root = np.asarray(data["q_root"], dtype=float) if "q_root" in data else np.empty((len(frames), 0), dtype=float)
+        qdot_root = np.asarray(data["qdot_root"], dtype=float) if "qdot_root" in data else np.empty((len(frames), 0), dtype=float)
         summary = load_json_if_exists(bundle_dir / "bundle_summary.json")
         points_3d = np.asarray(data["points_3d"], dtype=float) if "points_3d" in data else np.empty((len(frames), 0, 3), dtype=float)
         support_points_3d = np.asarray(data["support_points_3d"], dtype=float) if "support_points_3d" in data else np.empty((len(frames), 0, 3), dtype=float)
@@ -225,7 +227,10 @@ def load_bundle_entries(path: Path) -> list[dict[str, object]]:
                 "support_points_3d": support_points_3d,
                 "q": q,
                 "qdot": qdot,
+                "q_root": q_root,
+                "qdot_root": qdot_root,
                 "q_names": q_names,
+                "points_3d_source": str(summary.get("points_3d_source", "")),
             }
         )
     entries.sort(key=lambda entry: list(PREFERRED_MASTER_NAMES).index(entry["name"]) if entry["name"] in PREFERRED_MASTER_NAMES else 999)

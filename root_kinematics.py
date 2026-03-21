@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Shared helpers for root kinematics extraction and conversion."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+
+TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
+TRUNK_ROTATION_NAMES = ["TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ"]
+TRUNK_ROOT_ROTATION_SEQUENCE = "yxz"
+ROOT_Q_NAMES = np.asarray(TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES, dtype=object)
+RIGHT_ANGLE_RAD = 0.5 * math.pi
+
+
+def normalize(vector: np.ndarray) -> np.ndarray:
+    norm = np.linalg.norm(vector)
+    if not np.isfinite(norm) or norm < 1e-12:
+        return np.full(3, np.nan)
+    return np.asarray(vector, dtype=float) / norm
+
+
+def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=float)
+    squeeze = array.ndim == 1
+    if squeeze:
+        array = array[:, np.newaxis]
+    unwrapped = np.array(array, copy=True)
+    for col_idx in range(unwrapped.shape[1]):
+        column = unwrapped[:, col_idx]
+        valid_idx = np.flatnonzero(np.isfinite(column))
+        if valid_idx.size == 0:
+            continue
+        split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
+        for segment in np.split(valid_idx, split_points):
+            if segment.size:
+                unwrapped[segment, col_idx] = np.unwrap(column[segment])
+    return unwrapped[:, 0] if squeeze else unwrapped
+
+
+def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE) -> np.ndarray:
+    array = np.asarray(rotations, dtype=float)
+    reextracted = np.full_like(array, np.nan, dtype=float)
+    valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
+    if valid_idx.size == 0:
+        return reextracted
+    split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
+    for segment in np.split(valid_idx, split_points):
+        for frame_idx in segment:
+            rotation_matrix = Rotation.from_euler(sequence, array[frame_idx], degrees=False).as_matrix()
+            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(sequence, degrees=False)
+    return reextracted
+
+
+def build_root_rotation_matrices(
+    points_3d: np.ndarray,
+    left_hip_idx: int = 11,
+    right_hip_idx: int = 12,
+    left_shoulder_idx: int = 5,
+    right_shoulder_idx: int = 6,
+) -> tuple[np.ndarray, np.ndarray]:
+    translations = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
+    rotation_matrices = np.full((points_3d.shape[0], 3, 3), np.nan, dtype=float)
+
+    left_hip = points_3d[:, left_hip_idx]
+    right_hip = points_3d[:, right_hip_idx]
+    left_shoulder = points_3d[:, left_shoulder_idx]
+    right_shoulder = points_3d[:, right_shoulder_idx]
+
+    for frame_idx in range(points_3d.shape[0]):
+        if not (
+            np.all(np.isfinite(left_hip[frame_idx]))
+            and np.all(np.isfinite(right_hip[frame_idx]))
+            and np.all(np.isfinite(left_shoulder[frame_idx]))
+            and np.all(np.isfinite(right_shoulder[frame_idx]))
+        ):
+            continue
+        hip_center = 0.5 * (left_hip[frame_idx] + right_hip[frame_idx])
+        shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
+        z_axis = normalize(shoulder_center - hip_center)
+        y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
+        y_axis_seed = normalize(y_seed)
+        x_axis = normalize(np.cross(y_axis_seed, z_axis))
+        y_axis = normalize(np.cross(z_axis, x_axis))
+        if not (np.all(np.isfinite(x_axis)) and np.all(np.isfinite(y_axis)) and np.all(np.isfinite(z_axis))):
+            continue
+        translations[frame_idx] = hip_center
+        rotation_matrices[frame_idx] = np.column_stack((x_axis, y_axis, z_axis))
+    return translations, rotation_matrices
+
+
+def wrap_angle_pi(angle_rad: float) -> float:
+    wrapped = (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
+    if abs(wrapped + math.pi) < 1e-12:
+        return math.pi
+    return wrapped
+
+
+def root_z_correction_angle_from_rotation_matrices(rotation_matrices: np.ndarray) -> float:
+    for matrix in np.asarray(rotation_matrices, dtype=float):
+        if not np.all(np.isfinite(matrix)):
+            continue
+        y_axis = matrix[:, 1]
+        horizontal_y = np.asarray([y_axis[0], y_axis[1]], dtype=float)
+        norm = np.linalg.norm(horizontal_y)
+        if not np.isfinite(norm) or norm < 1e-12:
+            continue
+        heading = math.atan2(float(horizontal_y[0]), float(horizontal_y[1]))
+        snapped = round(heading / RIGHT_ANGLE_RAD) * RIGHT_ANGLE_RAD
+        return wrap_angle_pi(snapped)
+    return 0.0
+
+
+def root_z_correction_angle_from_points(
+    points_3d: np.ndarray,
+    left_hip_idx: int = 11,
+    right_hip_idx: int = 12,
+    left_shoulder_idx: int = 5,
+    right_shoulder_idx: int = 6,
+) -> float:
+    _, rotation_matrices = build_root_rotation_matrices(
+        points_3d,
+        left_hip_idx=left_hip_idx,
+        right_hip_idx=right_hip_idx,
+        left_shoulder_idx=left_shoulder_idx,
+        right_shoulder_idx=right_shoulder_idx,
+    )
+    return root_z_correction_angle_from_rotation_matrices(rotation_matrices)
+
+
+def compute_trunk_dofs_from_points(points_3d: np.ndarray, unwrap_rotations: bool = True) -> np.ndarray:
+    translations, rotation_matrices = build_root_rotation_matrices(points_3d)
+    rotations_xyz = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
+    for frame_idx in range(points_3d.shape[0]):
+        matrix = rotation_matrices[frame_idx]
+        if np.all(np.isfinite(matrix)):
+            rotations_xyz[frame_idx] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
+    if unwrap_rotations:
+        rotations_xyz = unwrap_with_gaps(rotations_xyz)
+    return np.hstack((translations, rotations_xyz))
+
+
+def extract_root_from_q(
+    q_names: np.ndarray,
+    q_trajectory: np.ndarray,
+    unwrap_rotations: bool = True,
+    renormalize_rotations: bool = True,
+) -> np.ndarray:
+    name_to_index = {str(name): idx for idx, name in enumerate(np.asarray(q_names, dtype=object))}
+    root_q = np.full((q_trajectory.shape[0], len(ROOT_Q_NAMES)), np.nan, dtype=float)
+    for out_idx, dof_name in enumerate(ROOT_Q_NAMES):
+        if str(dof_name) in name_to_index:
+            root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
+    if renormalize_rotations:
+        root_q[:, 3:6] = reextract_euler_with_gaps(root_q[:, 3:6], TRUNK_ROOT_ROTATION_SEQUENCE)
+    if unwrap_rotations:
+        root_q[:, 3:6] = unwrap_with_gaps(root_q[:, 3:6])
+    return root_q
+
+
+def rotation_unit_scale(unit: str) -> float:
+    if unit == "deg":
+        return 180.0 / math.pi
+    if unit == "turns":
+        return 1.0 / (2.0 * math.pi)
+    return 1.0
+
+
+def rotation_unit_label(unit: str, quantity: str) -> str:
+    if unit == "deg":
+        return "deg" if quantity == "q" else "deg/s"
+    if unit == "turns":
+        return "turn" if quantity == "q" else "turn/s"
+    return "rad" if quantity == "q" else "rad/s"
+
+
+def centered_finite_difference(values: np.ndarray, dt: float) -> np.ndarray:
+    derivative = np.full_like(values, np.nan, dtype=float)
+    if values.shape[0] < 2:
+        return derivative
+    for col_idx in range(values.shape[1]):
+        column = values[:, col_idx]
+        if np.isfinite(column[0]) and np.isfinite(column[1]):
+            derivative[0, col_idx] = (column[1] - column[0]) / dt
+        if np.isfinite(column[-1]) and np.isfinite(column[-2]):
+            derivative[-1, col_idx] = (column[-1] - column[-2]) / dt
+        for frame_idx in range(1, values.shape[0] - 1):
+            if np.isfinite(column[frame_idx - 1]) and np.isfinite(column[frame_idx + 1]):
+                derivative[frame_idx, col_idx] = (column[frame_idx + 1] - column[frame_idx - 1]) / (2.0 * dt)
+    return derivative
