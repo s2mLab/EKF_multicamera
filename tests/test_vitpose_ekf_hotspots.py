@@ -60,6 +60,20 @@ def test_project_point_with_projection_matrices_matches_camera_projection():
     np.testing.assert_allclose(projected, expected, atol=1e-8)
 
 
+def test_project_points_and_jacobians_matches_scalar_projection():
+    camera = _make_camera("cam0", 0.2)
+    points = np.array([[0.15, 0.05, 2.5], [0.1, -0.2, 3.0]], dtype=float)
+    projected_batch, jac_batch = camera.project_points_and_jacobians(points)
+    projected_scalar = []
+    jac_scalar = []
+    for point in points:
+        uv, jac = camera.project_point_and_jacobian(point)
+        projected_scalar.append(uv)
+        jac_scalar.append(jac)
+    np.testing.assert_allclose(projected_batch, np.asarray(projected_scalar), atol=1e-8)
+    np.testing.assert_allclose(jac_batch, np.asarray(jac_scalar), atol=1e-8)
+
+
 def test_precomputed_triangulation_cost_matches_direct_computation():
     point = np.array([0.1, -0.2, 3.0], dtype=float)
     cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.8), _make_camera("cam2", -0.9)]

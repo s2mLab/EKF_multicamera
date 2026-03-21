@@ -160,6 +160,25 @@ class CameraCalibration:
         uv_h = self.K @ np.array([point_cam[0] / z, point_cam[1] / z, 1.0])
         return uv_h[:2], self.projection_jacobian_from_camera_point(point_cam)
 
+    def project_points_and_jacobians(self, points_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Projette plusieurs points 3D et leurs jacobiennes en une seule passe."""
+        points_world = np.asarray(points_world, dtype=float)
+        if points_world.ndim != 2 or points_world.shape[1] != 3:
+            return np.empty((0, 2), dtype=float), np.empty((0, 2, 3), dtype=float)
+        point_cam = points_world @ self.R.T + self.tvec.reshape(1, 3)
+        z = np.maximum(point_cam[:, 2], 1e-9)
+        normalized = np.column_stack((point_cam[:, 0] / z, point_cam[:, 1] / z, np.ones(point_cam.shape[0], dtype=float)))
+        uv_h = normalized @ self.K.T
+        fx = float(self.K[0, 0])
+        fy = float(self.K[1, 1])
+        jac_cam = np.zeros((points_world.shape[0], 2, 3), dtype=float)
+        jac_cam[:, 0, 0] = fx / z
+        jac_cam[:, 0, 2] = -fx * point_cam[:, 0] / (z * z)
+        jac_cam[:, 1, 1] = fy / z
+        jac_cam[:, 1, 2] = -fy * point_cam[:, 1] / (z * z)
+        jac_world = np.einsum("mab,bc->mac", jac_cam, self.R)
+        return uv_h[:, :2], jac_world
+
 
 @dataclass
 class PoseData:
@@ -2217,6 +2236,7 @@ class MultiViewKinematicEKF:
         self.identity_x = np.eye(self.nx)
         self.marker_names = marker_name_list(model)
         self.marker_pairs = [(marker_idx, KP_INDEX[marker_name]) for marker_idx, marker_name in enumerate(self.marker_names) if marker_name in KP_INDEX]
+        self.marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in self.marker_pairs], dtype=int)
         self.camera_order = pose_data.camera_names
         self.camera_calibrations = [self.calibrations[cam_name] for cam_name in self.camera_order]
         self.q_names = self._make_q_names()
@@ -2453,6 +2473,9 @@ class MultiViewKinematicEKF:
         for marker_idx, _ in self.marker_pairs:
             marker_points.append(marker_positions_all[marker_idx].to_array())
             marker_jacobians.append(marker_jacobians_all[marker_idx].to_array())
+        marker_points_array = np.asarray(marker_points, dtype=float)
+        marker_jacobians_array = np.asarray(marker_jacobians, dtype=float)
+        finite_marker_points = np.all(np.isfinite(marker_points_array), axis=1)
 
         measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         locked_indices = tuple(self.locked_q_indices)
@@ -2465,51 +2488,31 @@ class MultiViewKinematicEKF:
             valid_keypoints = np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
             if not np.any(valid_keypoints):
                 continue
-            z_cam = []
-            h_cam = []
-            H_q_rows_cam = []
-            R_diag_cam = []
-
-            for pair_idx, (_, kp_idx) in enumerate(self.marker_pairs):
-                if not valid_keypoints[kp_idx]:
-                    continue
-                point_3d = marker_points[pair_idx]
-                if not np.all(np.isfinite(point_3d)):
-                    continue
-                z_uv = frame_keypoints[kp_idx]
-                h_uv, J_proj = calibration.project_point_and_jacobian(point_3d)
-                J_marker = marker_jacobians[pair_idx]
-                H_q = J_proj @ J_marker
-                if locked_q_columns.size:
-                    H_q = np.array(H_q, copy=True)
-                    H_q[:, locked_q_columns] = 0.0
-                if not (np.all(np.isfinite(h_uv)) and np.all(np.isfinite(H_q))):
-                    continue
-                z_cam.append(z_uv)
-                h_cam.append(h_uv)
-                H_q_rows_cam.append(H_q)
-                sigma2 = float(frame_variances[kp_idx])
-                R_diag_cam.extend([sigma2, sigma2])
-            if H_q_rows_cam:
-                z_block = np.concatenate(z_cam)
-                h_block = np.concatenate(h_cam)
-                H_q_block = np.vstack(H_q_rows_cam)
-                R_diag_block = np.asarray(R_diag_cam, dtype=float)
-                finite_measurements = (
-                    np.isfinite(z_block)
-                    & np.isfinite(h_block)
-                    & np.isfinite(R_diag_block)
-                    & np.all(np.isfinite(H_q_block), axis=1)
+            valid_pairs = finite_marker_points & valid_keypoints[self.marker_pair_keypoint_indices]
+            if not np.any(valid_pairs):
+                continue
+            pair_indices = np.flatnonzero(valid_pairs)
+            keypoint_indices = self.marker_pair_keypoint_indices[pair_indices]
+            projected_uv, projected_jac = calibration.project_points_and_jacobians(marker_points_array[pair_indices])
+            H_q_blocks = np.einsum("mab,mbq->maq", projected_jac, marker_jacobians_array[pair_indices], optimize=True)
+            if locked_q_columns.size:
+                H_q_blocks = np.array(H_q_blocks, copy=True)
+                H_q_blocks[:, :, locked_q_columns] = 0.0
+            finite_pairs = (
+                np.all(np.isfinite(projected_uv), axis=1)
+                & np.all(np.isfinite(H_q_blocks.reshape(H_q_blocks.shape[0], -1)), axis=1)
+            )
+            if not np.any(finite_pairs):
+                continue
+            keypoint_indices = keypoint_indices[finite_pairs]
+            measurement_blocks.append(
+                (
+                    frame_keypoints[keypoint_indices].reshape(-1),
+                    projected_uv[finite_pairs].reshape(-1),
+                    H_q_blocks[finite_pairs].reshape(-1, self.nq),
+                    np.repeat(frame_variances[keypoint_indices], 2).astype(float, copy=False),
                 )
-                if np.any(finite_measurements):
-                    measurement_blocks.append(
-                        (
-                            z_block[finite_measurements],
-                            h_block[finite_measurements],
-                            H_q_block[finite_measurements, :],
-                            R_diag_block[finite_measurements],
-                        )
-                    )
+            )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
         if not measurement_blocks:
