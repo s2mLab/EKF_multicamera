@@ -46,6 +46,8 @@ DEFAULT_CALIB = Path("inputs/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
 LOCAL_BIOBUDDY = Path("/Users/mickaelbegon/Documents/GIT/biobuddy")
 LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 DEFAULT_CAMERA_FPS = 120.0
 DEFAULT_REPROJECTION_THRESHOLD_PX = 15.0
 DEFAULT_EPIPOLAR_THRESHOLD_PX = 15.0
@@ -544,7 +546,7 @@ def load_pose_data(
     if frame_end is not None:
         frames = frames[frames <= int(frame_end)]
     if max_frames is not None:
-        frames = frames[:max_frames]
+        frames = sample_frames_uniformly(frames, int(max_frames))
     n_frames = len(frames)
     if n_frames == 0:
         raise ValueError("No 2D frames remain after applying frame_start/frame_end/max_frames.")
@@ -597,6 +599,28 @@ def load_pose_data(
         raw_keypoints=raw_keypoints,
         filtered_keypoints=filtered_keypoints,
     )
+
+
+def sample_frames_uniformly(frames: np.ndarray, max_frames: int | None) -> np.ndarray:
+    """Sous-échantillonne uniformément des frames déjà triées."""
+    frames = np.asarray(frames, dtype=int)
+    if max_frames is None:
+        return np.array(frames, copy=True)
+    max_frames = int(max_frames)
+    if max_frames <= 0 or frames.size <= max_frames:
+        return np.array(frames, copy=True)
+    sample_idx = np.linspace(0, frames.size - 1, num=max_frames)
+    sample_idx = np.asarray(np.round(sample_idx), dtype=int)
+    sample_idx = np.clip(sample_idx, 0, frames.size - 1)
+    sample_idx = np.unique(sample_idx)
+    if sample_idx.size < max_frames:
+        missing = max_frames - sample_idx.size
+        remaining = np.setdiff1d(np.arange(frames.size, dtype=int), sample_idx, assume_unique=False)
+        if remaining.size:
+            extra_positions = np.linspace(0, remaining.size - 1, num=min(missing, remaining.size))
+            extra_idx = remaining[np.asarray(np.round(extra_positions), dtype=int)]
+            sample_idx = np.sort(np.concatenate((sample_idx, extra_idx)))
+    return frames[sample_idx[:max_frames]]
 
 
 def weighted_triangulation(projections: Iterable[np.ndarray], observations: np.ndarray, confidences: np.ndarray) -> np.ndarray:
@@ -2997,6 +3021,14 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
         return apply_root_translation_guess_to_state(model, state, root_translation), diagnostics
+    if method == "root_pose_zero_rest":
+        zero_state = np.zeros(3 * model.nbQ())
+        frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+        diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
+        diagnostics["used_triangulation_ik"] = False
+        diagnostics["used_root_translation_mid_hips"] = bool(root_pose is not None)
+        diagnostics["used_root_pose_guess"] = bool(root_pose is not None)
+        return apply_root_pose_guess_to_state(model, zero_state, root_pose), diagnostics
     if method == "root_translation_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
         frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
@@ -4273,7 +4305,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--biorbd-kalman-init-method",
-        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest"),
+        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest"),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
         help="Strategie de warm-start du Kalman marqueurs `biorbd` via setInitState.",
     )

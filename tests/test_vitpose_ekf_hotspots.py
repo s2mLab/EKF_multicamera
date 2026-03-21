@@ -5,6 +5,7 @@ from vitpose_ekf_pipeline import (
     CameraCalibration,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
+    compute_biorbd_kalman_initial_state,
     apply_root_pose_guess_to_state,
     build_fundamental_matrix_array,
     build_flip_epipolar_pair_weights,
@@ -16,6 +17,7 @@ from vitpose_ekf_pipeline import (
     project_point_with_projection_matrices,
     q_names_from_model,
     sampson_error_pixels_vectorized,
+    sample_frames_uniformly,
     smooth_camera_time_series,
     triangulation_reference_from_other_views,
     weighted_triangulation,
@@ -326,3 +328,38 @@ def test_apply_root_pose_guess_to_state_sets_root_dofs_only():
     assert updated[q_names.index("TRUNK:RotX")] == -0.2
     assert updated[q_names.index("TRUNK:RotZ")] == 1.1
     assert updated[q_names.index("LEFT_THIGH:RotY")] == 0.0
+
+
+def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
+    model = _FakeModel()
+    reconstruction = object()
+    triangulation_state = np.full(3 * model.nbQ(), 7.0, dtype=float)
+    root_pose = np.array([1.0, 2.0, 3.0, 0.4, -0.2, 1.1], dtype=float)
+
+    monkeypatch.setattr(vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda _model, _reconstruction: triangulation_state)
+    monkeypatch.setattr(vitpose_ekf_pipeline, "first_valid_root_pose_from_triangulation", lambda _reconstruction: (12, root_pose))
+
+    state, diagnostics = compute_biorbd_kalman_initial_state(
+        model,
+        reconstruction,
+        method="root_pose_zero_rest",
+    )
+    q_names = q_names_from_model(model)
+
+    assert diagnostics["method"] == "root_pose_zero_rest"
+    assert diagnostics["used_triangulation_ik"] is False
+    assert diagnostics["used_root_pose_guess"] is True
+    assert diagnostics["bootstrap_frame_idx"] == 12
+    assert state[q_names.index("TRUNK:TransX")] == 1.0
+    assert state[q_names.index("TRUNK:TransY")] == 2.0
+    assert state[q_names.index("TRUNK:TransZ")] == 3.0
+    assert state[q_names.index("TRUNK:RotY")] == 0.4
+    assert state[q_names.index("TRUNK:RotX")] == -0.2
+    assert state[q_names.index("TRUNK:RotZ")] == 1.1
+    assert state[q_names.index("LEFT_THIGH:RotY")] == 0.0
+
+
+def test_sample_frames_uniformly_spreads_indices_over_range():
+    frames = np.arange(100, 110, dtype=int)
+    sampled = sample_frames_uniformly(frames, 4)
+    np.testing.assert_array_equal(sampled, np.array([100, 103, 106, 109], dtype=int))

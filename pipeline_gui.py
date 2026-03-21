@@ -3489,15 +3489,16 @@ class ModelTab(CommandTab):
         triang_label.pack(side=tk.LEFT)
         triang_box = ttk.Combobox(row, textvariable=self.triang_method, values=["exhaustive", "greedy"], width=12, state="readonly")
         triang_box.pack(side=tk.LEFT, padx=(0, 8))
-        self.max_frames = LabeledEntry(row, "Max frames", "", label_width=9, entry_width=6)
-        self.max_frames.pack(side=tk.LEFT, padx=(0, 8))
 
         row2 = ttk.Frame(form)
         row2.pack(fill=tk.X, padx=8, pady=4)
-        self.frame_start = LabeledEntry(row2, "Start frame", "", label_width=10, entry_width=6)
+        ttk.Label(row2, text="Frames", width=10).pack(side=tk.LEFT)
+        self.frame_start = LabeledEntry(row2, "Start", "", label_width=5, entry_width=6)
         self.frame_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.frame_end = LabeledEntry(row2, "End frame", "", label_width=8, entry_width=6)
+        self.frame_end = LabeledEntry(row2, "End", "", label_width=4, entry_width=6)
         self.frame_end.pack(side=tk.LEFT, padx=(0, 8))
+        self.max_frames = LabeledEntry(row2, "Nb", "", label_width=3, entry_width=6)
+        self.max_frames.pack(side=tk.LEFT, padx=(0, 8))
 
         row2b = ttk.Frame(form)
         row2b.pack(fill=tk.X, padx=8, pady=4)
@@ -3553,7 +3554,7 @@ class ModelTab(CommandTab):
         attach_tooltip(pose_correction_label, "Correction optionnelle des labels gauche/droite avant la triangulation du modèle.")
         attach_tooltip(pose_correction_box, "Utilise les 2D telles quelles (`none`), ou une version corrigée des flips L/R estimée par l'approche épipolaire ou par triangulation/reprojection.")
         attach_tooltip(initial_rot_check, "Estime l'orientation horizontale de l'axe y du tronc à t0, l'arrondit au multiple de pi/2 le plus proche, puis applique cette correction autour de Z dans le bioMod.")
-        self.max_frames.set_tooltip("Nombre maximal de frames utilisées pour construire le modèle après application de la plage de frames.")
+        self.max_frames.set_tooltip("Nombre de frames a prendre uniformement entre Start et End. Laisser vide pour garder toute la plage.")
         self.frame_start.set_tooltip("Première frame incluse pour construire le modèle.")
         self.frame_end.set_tooltip("Dernière frame incluse pour construire le modèle.")
 
@@ -3689,7 +3690,7 @@ class ModelTab(CommandTab):
         frame_end = self.frame_end.get() or "-"
         self.details_var.set(
             f"Model creation will use: {self.current_pose_source_label()} 2D data, "
-            f"frames {frame_start} -> {frame_end}, max {max_frames}, "
+            f"frames {frame_start} -> {frame_end}, nb {max_frames}, "
             f"triangulation {self.triang_method.get()}, "
             f"root rot-fix {'on' if self.initial_rot_var.get() else 'off'}, "
             f"subject mass {self.subject_mass.get()} kg."
@@ -4460,6 +4461,17 @@ class ProfilesTab(CommandTab):
         self.coherence_floor.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf3d_frame = ttk.Frame(form)
+        ekf3d_init_label = ttk.Label(self.ekf3d_frame, text="q0 init", width=10)
+        ekf3d_init_label.pack(side=tk.LEFT)
+        self.biorbd_kalman_init_method = tk.StringVar(value="triangulation_ik_root_translation")
+        ekf3d_init_box = ttk.Combobox(
+            self.ekf3d_frame,
+            textvariable=self.biorbd_kalman_init_method,
+            values=["triangulation_ik_root_translation", "root_pose_zero_rest", "root_translation_zero_rest", "triangulation_ik", "none"],
+            width=24,
+            state="readonly",
+        )
+        ekf3d_init_box.pack(side=tk.LEFT, padx=(0, 8))
         self.biorbd_noise = LabeledEntry(self.ekf3d_frame, "EKF3D noise", "1e-8")
         self.biorbd_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.biorbd_error = LabeledEntry(self.ekf3d_frame, "EKF3D error", "1e-4")
@@ -4501,6 +4513,8 @@ class ProfilesTab(CommandTab):
         self.measurement_noise.set_tooltip("Bruit de mesure de l'EKF 2D. Plus grand = moins de confiance dans les keypoints 2D.")
         self.process_noise.set_tooltip("Bruit du modèle de prédiction de l'EKF 2D.")
         self.coherence_floor.set_tooltip("Plancher appliqué à la cohérence avant pondération des mesures 2D.")
+        attach_tooltip(ekf3d_init_label, "Initialisation de l'EKF 3D biorbd: IK sur triangulation, translation racine seule, ou pose racine géométrique complète avec le reste du corps à zéro.")
+        attach_tooltip(ekf3d_init_box, "root_pose_zero_rest reproduit l'idée du q0 2D amélioré: racine géométrique depuis hanches/épaules, reste du corps à q=0.")
         self.biorbd_noise.set_tooltip("Bruit des marqueurs 3D pour l'EKF 3D.")
         self.biorbd_error.set_tooltip("Erreur d'état initiale du Kalman 3D.")
         self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour la référence filtrée 2D.")
@@ -4544,6 +4558,7 @@ class ProfilesTab(CommandTab):
         self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_3d_source.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.flip_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -4661,6 +4676,7 @@ class ProfilesTab(CommandTab):
             no_root_unwrap=self.unwrap_var.get(),
             biorbd_kalman_noise_factor=float(self.biorbd_noise.get()),
             biorbd_kalman_error_factor=float(self.biorbd_error.get()),
+            biorbd_kalman_init_method=self.biorbd_kalman_init_method.get() if family == "ekf_3d" else "triangulation_ik_root_translation",
             measurement_noise_scale=float(self.measurement_noise.get()),
             process_noise_scale=float(self.process_noise.get()),
             coherence_confidence_floor=float(self.coherence_floor.get()),
@@ -4699,6 +4715,14 @@ class ProfilesTab(CommandTab):
                 flags.append("rootq0")
             elif int(getattr(profile, "ekf2d_bootstrap_passes", 5)) != 5:
                 flags.append(f"boot{int(getattr(profile, 'ekf2d_bootstrap_passes', 5))}")
+            if profile.family == "ekf_3d":
+                init_method = getattr(profile, "biorbd_kalman_init_method", "triangulation_ik_root_translation")
+                if init_method == "triangulation_ik":
+                    flags.append("ikq0")
+                elif init_method == "root_translation_zero_rest":
+                    flags.append("roottransq0")
+                elif init_method == "root_pose_zero_rest":
+                    flags.append("rootq0")
             if profile.initial_rotation_correction:
                 flags.append("rotfix")
             if profile.flip:

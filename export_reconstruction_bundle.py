@@ -4,8 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import time
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
+LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 from camera_selection import parse_camera_names, subset_calibrations
 from reconstruction_bundle import (
@@ -70,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--biorbd-kalman-error-factor", type=float, default=DEFAULT_BIORBD_KALMAN_ERROR_FACTOR)
     parser.add_argument(
         "--biorbd-kalman-init-method",
-        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest"),
+        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest"),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     )
     parser.add_argument("--predictor", choices=("acc", "dyn"), default="acc")

@@ -24,6 +24,7 @@ SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
 SUPPORTED_TRIANGULATION_METHODS = ("exhaustive", "greedy")
 SUPPORTED_COHERENCE_METHODS = ("epipolar", "triangulation")
+SUPPORTED_BIORBD_KALMAN_INIT_METHODS = ("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest")
 DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
 
 
@@ -56,6 +57,7 @@ class ReconstructionProfile:
     no_root_unwrap: bool = False
     biorbd_kalman_noise_factor: float = 1e-8
     biorbd_kalman_error_factor: float = 1e-4
+    biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
     coherence_confidence_floor: float = 0.35
@@ -88,6 +90,12 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
         if profile.initial_rotation_correction:
             parts.append("rotfix")
     elif profile.family == "ekf_3d":
+        if profile.biorbd_kalman_init_method == "triangulation_ik":
+            parts.append("ikq0")
+        elif profile.biorbd_kalman_init_method == "root_translation_zero_rest":
+            parts.append("roottransq0")
+        elif profile.biorbd_kalman_init_method == "root_pose_zero_rest":
+            parts.append("rootq0")
         if profile.flip:
             parts.append("flip")
         if profile.initial_rotation_correction:
@@ -132,6 +140,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported triangulation_method: {profile.triangulation_method}")
     if profile.coherence_method not in SUPPORTED_COHERENCE_METHODS:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
+    if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
+        raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
     if profile.camera_names is not None:
         normalized_camera_names: list[str] = []
         seen_camera_names: set[str] = set()
@@ -170,6 +180,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
         profile.dof_locking = False
+    if profile.family != "ekf_3d":
+        profile.biorbd_kalman_init_method = "triangulation_ik_root_translation"
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -420,6 +432,7 @@ def build_pipeline_command(
         if profile.flip:
             cmd.append("--flip-left-right")
     elif profile.family == "ekf_3d":
+        cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")
     if profile.family in ("triangulation", "ekf_2d", "ekf_3d"):

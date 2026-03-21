@@ -47,3 +47,34 @@ def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
         )
     )
     assert canonical_profile_name(profile) == "ekf_2d_acc_rootq0"
+
+
+def test_canonical_profile_name_includes_ekf3d_root_pose_flag():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_3d",
+            biorbd_kalman_init_method="root_pose_zero_rest",
+        )
+    )
+    assert canonical_profile_name(profile) == "ekf_3d_rootq0"
+
+
+def test_build_pipeline_command_includes_ekf3d_init_method():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf3d_rootq0",
+            family="ekf_3d",
+            biorbd_kalman_init_method="root_pose_zero_rest",
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/Calib.toml"),
+        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        python_executable="python",
+    )
+    assert "--biorbd-kalman-init-method" in cmd
+    assert cmd[cmd.index("--biorbd-kalman-init-method") + 1] == "root_pose_zero_rest"
