@@ -4,10 +4,15 @@ from vitpose_ekf_pipeline import (
     CameraCalibration,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
+    build_flip_epipolar_pair_weights,
     compute_camera_triangulation_cost,
+    compute_camera_epipolar_cost,
     project_point_with_projection_matrices,
+    smooth_camera_time_series,
     triangulation_reference_from_other_views,
     weighted_triangulation,
+    weighted_median,
+    KP_INDEX,
 )
 
 
@@ -143,3 +148,55 @@ def test_sequential_measurement_update_matches_batch_update():
     sequential_state, sequential_covariance = sequential
     np.testing.assert_allclose(sequential_state, batch_state, atol=1e-8, rtol=1e-8)
     np.testing.assert_allclose(sequential_covariance, batch_covariance, atol=1e-8, rtol=1e-8)
+
+
+def test_weighted_median_prefers_heavily_weighted_values():
+    values = np.array([1.0, 10.0, 100.0], dtype=float)
+    weights = np.array([5.0, 1.0, 1.0], dtype=float)
+    assert weighted_median(values, weights) == 1.0
+
+
+def test_build_flip_epipolar_pair_weights_reflects_baseline_strength():
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
+    weights = build_flip_epipolar_pair_weights(cameras)
+    assert weights[(0, 2)] > weights[(0, 1)]
+    assert weights[(2, 0)] > weights[(1, 0)]
+
+
+def test_compute_camera_epipolar_cost_uses_pair_and_keypoint_weights(monkeypatch):
+    candidate_points = np.full((17, 2), np.nan, dtype=float)
+    raw_2d_frame = np.full((3, 17, 2), np.nan, dtype=float)
+    raw_scores_frame = np.ones((3, 17), dtype=float)
+    shoulder_idx = KP_INDEX["left_shoulder"]
+    wrist_idx = KP_INDEX["left_wrist"]
+
+    candidate_points[shoulder_idx] = [0.0, 0.0]
+    candidate_points[wrist_idx] = [0.0, 0.0]
+    raw_2d_frame[0] = candidate_points
+    raw_2d_frame[1, shoulder_idx] = [1.0, 0.0]
+    raw_2d_frame[2, shoulder_idx] = [10.0, 0.0]
+    raw_2d_frame[1, wrist_idx] = [100.0, 0.0]
+    raw_2d_frame[2, wrist_idx] = [100.0, 0.0]
+
+    def fake_sampson(_point_i, point_j, _f_matrix):
+        return float(point_j[0])
+
+    monkeypatch.setattr("vitpose_ekf_pipeline.sampson_error_pixels", fake_sampson)
+    cost = compute_camera_epipolar_cost(
+        0,
+        candidate_points,
+        raw_2d_frame,
+        raw_scores_frame,
+        {(0, 1): np.eye(3), (0, 2): np.eye(3)},
+        pair_weights={(0, 1): 10.0, (0, 2): 1.0},
+        keypoint_weights=np.array([0.0] * shoulder_idx + [2.0] + [0.0] * (wrist_idx - shoulder_idx - 1) + [0.5] + [0.0] * (16 - wrist_idx), dtype=float),
+        min_other_cameras=2,
+    )
+    assert abs(cost - 1.0) < 1e-12
+
+
+def test_smooth_camera_time_series_reduces_isolated_spike():
+    series = np.array([[0.0, 9.0, 0.0, 0.0]], dtype=float)
+    smoothed = smooth_camera_time_series(series, window=3)
+    assert smoothed[0, 1] < series[0, 1]
+    assert abs(smoothed[0, 1] - 3.0) < 1e-12

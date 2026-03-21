@@ -246,6 +246,9 @@ def flip_cache_metadata(
         "temporal_weight": float(temporal_weight),
         "temporal_tau_px": float(temporal_tau_px),
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
+        "epipolar_pair_weighting": "baseline_confidence_weighted",
+        "epipolar_keypoint_weighting": "torso_proximal_priority",
+        "temporal_smoothing_window": 5 if str(method) == "epipolar" else 1,
     }
 
 

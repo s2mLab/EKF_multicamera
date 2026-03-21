@@ -73,6 +73,8 @@ DEFAULT_FLIP_OUTLIER_FLOOR_PX = 5.0
 DEFAULT_FLIP_TEMPORAL_WEIGHT = 0.35
 DEFAULT_FLIP_TEMPORAL_TAU_PX = 20.0
 DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS = 4
+DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW = 5
+DEFAULT_FLIP_EPIPOLAR_PAIR_WEIGHT_EXPONENT = 0.5
 MODEL_STAGE_VERSION = 7
 
 COCO17 = [
@@ -105,6 +107,25 @@ LEFT_RIGHT_SWAP_PAIRS = [
     ("left_knee", "right_knee"),
     ("left_ankle", "right_ankle"),
 ]
+FLIP_PROXIMAL_KEYPOINT_WEIGHTS = {
+    "left_shoulder": 2.0,
+    "right_shoulder": 2.0,
+    "left_hip": 2.0,
+    "right_hip": 2.0,
+    "left_elbow": 1.5,
+    "right_elbow": 1.5,
+    "left_knee": 1.5,
+    "right_knee": 1.5,
+    "left_wrist": 0.75,
+    "right_wrist": 0.75,
+    "left_ankle": 0.75,
+    "right_ankle": 0.75,
+    "nose": 0.5,
+    "left_eye": 0.4,
+    "right_eye": 0.4,
+    "left_ear": 0.3,
+    "right_ear": 0.3,
+}
 
 
 @dataclass
@@ -897,6 +918,79 @@ def build_temporal_reference_points(pose_data: PoseData) -> tuple[np.ndarray, np
     return references, support_counts
 
 
+def camera_center_world(calibration: CameraCalibration) -> np.ndarray:
+    """Retourne le centre camera dans le repere monde."""
+    return -(calibration.R.T @ calibration.tvec.reshape(3))
+
+
+def build_flip_epipolar_pair_weights(
+    calibrations: list[CameraCalibration],
+    exponent: float = DEFAULT_FLIP_EPIPOLAR_PAIR_WEIGHT_EXPONENT,
+) -> dict[tuple[int, int], float]:
+    """Construit des poids de paires favorisant les baselines informatives."""
+    centers = np.asarray([camera_center_world(calibration) for calibration in calibrations], dtype=float)
+    weights: dict[tuple[int, int], float] = {}
+    baselines = []
+    for i_cam in range(len(calibrations)):
+        for j_cam in range(len(calibrations)):
+            if i_cam == j_cam:
+                continue
+            baseline = float(np.linalg.norm(centers[i_cam] - centers[j_cam]))
+            baselines.append(baseline)
+            weights[(i_cam, j_cam)] = baseline
+    if not baselines:
+        return weights
+    baseline_scale = max(float(np.median(np.asarray(baselines, dtype=float))), 1e-9)
+    exponent = float(max(exponent, 0.0))
+    for key, baseline in list(weights.items()):
+        normalized = max(baseline / baseline_scale, 1e-6)
+        weights[key] = float(normalized ** exponent)
+    return weights
+
+
+def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """Calcule une mediane ponderee robuste."""
+    values = np.asarray(values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    valid = np.isfinite(values) & np.isfinite(weights) & (weights > 0)
+    if not np.any(valid):
+        return np.nan
+    valid_values = values[valid]
+    valid_weights = weights[valid]
+    order = np.argsort(valid_values)
+    sorted_values = valid_values[order]
+    sorted_weights = valid_weights[order]
+    cumulative = np.cumsum(sorted_weights)
+    threshold = 0.5 * cumulative[-1]
+    idx = int(np.searchsorted(cumulative, threshold, side="left"))
+    return float(sorted_values[min(idx, sorted_values.size - 1)])
+
+
+def smooth_camera_time_series(values: np.ndarray, window: int = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW) -> np.ndarray:
+    """Lisse chaque serie camera dans le temps par moyenne locale robuste aux NaN."""
+    values = np.asarray(values, dtype=float)
+    if values.ndim != 2:
+        raise ValueError("Expected a 2D array shaped (n_cams, n_frames).")
+    window = max(1, int(window))
+    if window % 2 == 0:
+        window += 1
+    if window <= 1:
+        return np.array(values, copy=True)
+    half_window = window // 2
+    smoothed = np.array(values, copy=True)
+    for cam_idx in range(values.shape[0]):
+        for frame_idx in range(values.shape[1]):
+            start = max(0, frame_idx - half_window)
+            stop = min(values.shape[1], frame_idx + half_window + 1)
+            local_values = values[cam_idx, start:stop]
+            finite_values = local_values[np.isfinite(local_values)]
+            if finite_values.size == 0:
+                smoothed[cam_idx, frame_idx] = np.nan
+            else:
+                smoothed[cam_idx, frame_idx] = float(np.mean(finite_values))
+    return smoothed
+
+
 def compute_camera_temporal_cost(
     camera_idx: int,
     frame_idx: int,
@@ -955,14 +1049,23 @@ def compute_camera_epipolar_cost(
     raw_2d_frame: np.ndarray,
     raw_scores_frame: np.ndarray,
     fundamental_matrices: dict[tuple[int, int], np.ndarray],
+    *,
+    pair_weights: dict[tuple[int, int], float] | None = None,
+    keypoint_weights: np.ndarray | None = None,
+    min_other_cameras: int = DEFAULT_FLIP_MIN_OTHER_CAMERAS,
 ) -> float:
     """Mesure la coherence epipolaire d'une camera candidate avec les autres vues."""
     errors = []
+    weights = []
     valid_candidate = np.all(np.isfinite(candidate_points), axis=1) & (raw_scores_frame[camera_idx] > 0)
+    informative_other_cameras: set[int] = set()
     for kp_idx in range(candidate_points.shape[0]):
         if not valid_candidate[kp_idx]:
             continue
         point_i = candidate_points[kp_idx]
+        kp_weight = 1.0 if keypoint_weights is None else float(keypoint_weights[kp_idx])
+        if kp_weight <= 0:
+            continue
         for other_idx in range(raw_2d_frame.shape[0]):
             if other_idx == camera_idx:
                 continue
@@ -974,9 +1077,15 @@ def compute_camera_epipolar_cost(
             err = sampson_error_pixels(point_i, point_j, fundamental_matrices[(camera_idx, other_idx)])
             if np.isfinite(err):
                 errors.append(err)
+                informative_other_cameras.add(other_idx)
+                pair_weight = 1.0 if pair_weights is None else float(pair_weights.get((camera_idx, other_idx), 1.0))
+                confidence_weight = float(min(raw_scores_frame[camera_idx, kp_idx], raw_scores_frame[other_idx, kp_idx]))
+                weights.append(max(pair_weight * kp_weight * max(confidence_weight, 1e-6), 1e-9))
+    if len(informative_other_cameras) < max(1, int(min_other_cameras)):
+        return np.nan
     if not errors:
         return np.nan
-    return float(np.median(np.asarray(errors, dtype=float)))
+    return weighted_median(np.asarray(errors, dtype=float), np.asarray(weights, dtype=float))
 
 
 def compute_camera_triangulation_cost(
@@ -1071,6 +1180,9 @@ def detect_left_right_flip_diagnostics(
     n_cams, n_frames = pose_data.keypoints.shape[:2]
     ordered_calibrations = [calibrations[name] for name in pose_data.camera_names]
     fundamental_matrices = None
+    pair_weights = None
+    keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
+    smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if method == "epipolar" else 1
     if method == "epipolar":
         fundamental_matrices = {
             (i_cam, j_cam): fundamental_matrix(ordered_calibrations[i_cam], ordered_calibrations[j_cam])
@@ -1078,9 +1190,9 @@ def detect_left_right_flip_diagnostics(
             for j_cam in range(n_cams)
             if i_cam != j_cam
         }
+        pair_weights = build_flip_epipolar_pair_weights(ordered_calibrations)
     elif method != "triangulation":
         raise ValueError(f"Unknown flip diagnostic method: {method}")
-    suspect_mask = np.zeros((n_cams, n_frames), dtype=bool)
     nominal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     nominal_temporal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     swapped_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
@@ -1103,7 +1215,14 @@ def detect_left_right_flip_diagnostics(
         for cam_idx in range(n_cams):
             if method == "epipolar":
                 nominal_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost(
-                    cam_idx, raw_points_frame[cam_idx], raw_points_frame, raw_scores_frame, fundamental_matrices
+                    cam_idx,
+                    raw_points_frame[cam_idx],
+                    raw_points_frame,
+                    raw_scores_frame,
+                    fundamental_matrices,
+                    pair_weights=pair_weights,
+                    keypoint_weights=keypoint_weights,
+                    min_other_cameras=min_other_cameras,
                 )
             else:
                 nominal_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1132,26 +1251,36 @@ def detect_left_right_flip_diagnostics(
         temporal_tau_px=temporal_tau_px,
         temporal_weight=temporal_weight,
     )
+    smoothed_nominal_costs = smooth_camera_time_series(effective_nominal_costs, window=smoothing_window)
 
     outlier_thresholds_by_camera = np.full(n_cams, float(outlier_floor_px), dtype=float)
-    candidate_mask = np.isfinite(effective_nominal_costs)
+    candidate_mask = np.isfinite(smoothed_nominal_costs)
     if restrict_to_outliers:
         candidate_mask[:] = False
         for cam_idx in range(n_cams):
-            valid_costs = effective_nominal_costs[cam_idx, np.isfinite(effective_nominal_costs[cam_idx])]
+            valid_costs = smoothed_nominal_costs[cam_idx, np.isfinite(smoothed_nominal_costs[cam_idx])]
             if valid_costs.size == 0:
                 continue
             threshold = max(float(outlier_floor_px), float(np.percentile(valid_costs, float(outlier_percentile))))
             outlier_thresholds_by_camera[cam_idx] = threshold
-            candidate_mask[cam_idx] = np.isfinite(effective_nominal_costs[cam_idx]) & (effective_nominal_costs[cam_idx] >= threshold)
+            candidate_mask[cam_idx] = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
 
     for frame_idx in range(n_frames):
         raw_points_frame = pose_data.keypoints[:, frame_idx]
         raw_scores_frame = pose_data.scores[:, frame_idx]
+        triangulation_references = (
+            triangulation_reference_from_other_views(
+                raw_points_frame,
+                raw_scores_frame,
+                ordered_calibrations,
+                min_other_cameras=min_other_cameras,
+            )
+            if method == "triangulation"
+            else None
+        )
         for cam_idx in range(n_cams):
             if not candidate_mask[cam_idx, frame_idx]:
                 continue
-            nominal_cost = effective_nominal_costs[cam_idx, frame_idx]
             swapped_candidate = swap_left_right_keypoints(raw_points_frame[cam_idx])
             if method == "epipolar":
                 swapped_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost(
@@ -1160,6 +1289,9 @@ def detect_left_right_flip_diagnostics(
                     raw_points_frame,
                     raw_scores_frame,
                     fundamental_matrices,
+                    pair_weights=pair_weights,
+                    keypoint_weights=keypoint_weights,
+                    min_other_cameras=min_other_cameras,
                 )
             else:
                 swapped_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1187,10 +1319,6 @@ def detect_left_right_flip_diagnostics(
                 temporal_tau_px=temporal_tau_px,
                 temporal_weight=temporal_weight,
             )
-            if not (np.isfinite(nominal_cost) and np.isfinite(swapped_cost)):
-                continue
-            if nominal_cost > 0 and swapped_cost < improvement_ratio * nominal_cost and (nominal_cost - swapped_cost) >= min_gain_px:
-                suspect_mask[cam_idx, frame_idx] = True
 
     effective_swapped_costs = combine_flip_costs(
         swapped_costs,
@@ -1199,6 +1327,15 @@ def detect_left_right_flip_diagnostics(
         temporal_tau_px=temporal_tau_px,
         temporal_weight=temporal_weight,
     )
+    gain_margin_px = effective_nominal_costs - effective_swapped_costs - float(min_gain_px)
+    ratio_margin_px = float(improvement_ratio) * effective_nominal_costs - effective_swapped_costs
+    decision_score = np.minimum(gain_margin_px, ratio_margin_px)
+    decision_score[~candidate_mask] = np.nan
+    smoothed_decision_score = smooth_camera_time_series(
+        np.where(np.isfinite(decision_score), decision_score, 0.0),
+        window=smoothing_window,
+    )
+    suspect_mask = candidate_mask & np.isfinite(decision_score) & (decision_score > 0.0) & (smoothed_decision_score > 0.0)
     frames_with_any_suspect = np.any(suspect_mask, axis=0)
     temporal_support_mask = np.isfinite(nominal_temporal_costs)
     candidate_temporal_support_mask = candidate_mask & temporal_support_mask
@@ -1218,6 +1355,9 @@ def detect_left_right_flip_diagnostics(
         "temporal_weight": float(temporal_weight),
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
         "combination_method": "weighted_normalized_cost",
+        "epipolar_pair_weighting": "baseline_confidence_weighted" if method == "epipolar" else "n/a",
+        "epipolar_keypoint_weighting": "torso_proximal_priority" if method == "epipolar" else "n/a",
+        "temporal_smoothing_window": int(smoothing_window),
         "n_camera_frame_temporal_support": int(np.count_nonzero(temporal_support_mask)),
         "n_candidate_camera_frames_with_temporal_support": int(np.count_nonzero(candidate_temporal_support_mask)),
         "outlier_thresholds_by_camera": {
@@ -1240,8 +1380,12 @@ def detect_left_right_flip_diagnostics(
             "geometric_nominal_median": float(np.nanmedian(nominal_costs)) if np.isfinite(nominal_costs).any() else None,
             "temporal_nominal_median": float(np.nanmedian(nominal_temporal_costs)) if np.isfinite(nominal_temporal_costs).any() else None,
             "combined_nominal_median": float(np.nanmedian(effective_nominal_costs)) if np.isfinite(effective_nominal_costs).any() else None,
+            "combined_nominal_smoothed_median": float(np.nanmedian(smoothed_nominal_costs)) if np.isfinite(smoothed_nominal_costs).any() else None,
             "combined_swapped_candidate_median": float(np.nanmedian(effective_swapped_costs[candidate_mask]))
             if np.isfinite(effective_swapped_costs[candidate_mask]).any()
+            else None,
+            "decision_score_median": float(np.nanmedian(decision_score[candidate_mask]))
+            if np.isfinite(decision_score[candidate_mask]).any()
             else None,
         },
     }
@@ -1249,9 +1393,12 @@ def detect_left_right_flip_diagnostics(
         "nominal_geometric_costs": nominal_costs,
         "nominal_temporal_costs": nominal_temporal_costs,
         "nominal_combined_costs": effective_nominal_costs,
+        "nominal_combined_costs_smoothed": smoothed_nominal_costs,
         "swapped_geometric_costs": swapped_costs,
         "swapped_temporal_costs": swapped_temporal_costs,
         "swapped_combined_costs": effective_swapped_costs,
+        "decision_scores": decision_score,
+        "decision_scores_smoothed": smoothed_decision_score,
         "candidate_mask": candidate_mask.astype(bool),
         "temporal_support_mask": temporal_support_mask.astype(bool),
     }
