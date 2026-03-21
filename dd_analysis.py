@@ -301,11 +301,9 @@ def body_shape_suffix(body_shape: str) -> str:
     return {"grouped": "o", "piked": "<", "straight": "/"}.get(body_shape, "?")
 
 
-def salto_count_token(total_saltos: float) -> str:
-    integer_part = int(total_saltos)
-    quarter_map = {0.0: "", 0.25: ".", 0.5: "+", 0.75: "-"}
-    fraction = round(total_saltos - integer_part, 2)
-    return f"{integer_part}{quarter_map.get(fraction, '')}"
+def quarter_salto_count_token(total_saltos: float) -> str:
+    quarter_count = int(round(float(total_saltos) * 4.0))
+    return str(quarter_count)
 
 
 def classify_jump(som_turns: float, twist_turns: float) -> str:
@@ -345,7 +343,6 @@ def analyze_single_jump(
     classification = classify_jump(som_turns, twist_turns) if np.isfinite(som_turns) and np.isfinite(twist_turns) else "unknown"
 
     total_saltos = abs(round_to_nearest(som_turns, 0.25)) if np.isfinite(som_turns) else float("nan")
-    direction_prefix = "8" if np.isfinite(som_turns) and som_turns >= 0 else "4"
     twists_per_salto: list[float] = []
     full_salto_event_indices: list[int] = []
     quarter_salto_event_indices: list[int] = []
@@ -367,7 +364,7 @@ def analyze_single_jump(
             body_shape = detect_body_shape(q_segment, hip_indices, knee_indices)
     if np.isfinite(total_saltos):
         twist_tokens = "".join(str(int(round(value * 2.0))) for value in twists_per_salto) if twists_per_salto else "0"
-        code = f"{direction_prefix}{salto_count_token(total_saltos)}{twist_tokens}"
+        code = f"{quarter_salto_count_token(total_saltos)}{twist_tokens}"
         if body_shape is not None:
             code = f"{code}{body_shape_suffix(body_shape)}"
 

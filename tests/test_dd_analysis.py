@@ -29,8 +29,9 @@ def test_signed_threshold_crossing_indices_tracks_quarters_and_halves():
 
 
 def test_analyze_single_jump_code_uses_half_twists_per_completed_salto(monkeypatch):
-    som_curve = np.array([0.0, 0.60, 1.05, 1.70, 2.02, 2.26], dtype=float) * (2.0 * np.pi)
-    tw_curve = np.array([0.0, 0.30, 0.74, 1.30, 2.00, 2.05], dtype=float) * (2.0 * np.pi)
+    som_curve = np.array([0.0, -0.60, -1.05, -1.70, -2.02], dtype=float) * (2.0 * np.pi)
+    tw_curve = np.array([0.0, 0.60, 1.52, 1.80, 2.01, 2.05], dtype=float) * (2.0 * np.pi)
+    tw_curve = tw_curve[: som_curve.shape[0]]
     tilt_curve = np.zeros_like(som_curve)
 
     def fake_compute_angles_over_jump(_root_q, _start, _end, rotation_sequence="yxz", angle_mode="euler"):
@@ -38,8 +39,8 @@ def test_analyze_single_jump_code_uses_half_twists_per_completed_salto(monkeypat
 
     monkeypatch.setattr("dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
     jump = analyze_single_jump(np.zeros((6, 6)), JumpSegment(start=0, end=5, peak_index=3))
-    assert jump.twists_per_salto == [0.5, 1.5]
-    assert jump.code == "82.13"
+    assert jump.twists_per_salto == [1.5, 0.5]
+    assert jump.code == "831"
     assert jump.full_salto_event_indices == [2, 4]
-    assert jump.quarter_salto_event_indices == [1, 2, 3, 4, 5]
-    assert jump.half_twist_event_indices == [2, 3, 4]
+    assert jump.quarter_salto_event_indices == [1, 2, 3, 4]
+    assert jump.half_twist_event_indices == [1, 2, 4]
