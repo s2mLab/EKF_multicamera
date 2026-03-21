@@ -3498,20 +3498,23 @@ class ModelTab(CommandTab):
         self.frame_start.pack(side=tk.LEFT, padx=(0, 8))
         self.frame_end = LabeledEntry(row2, "End frame", "", label_width=8, entry_width=6)
         self.frame_end.pack(side=tk.LEFT, padx=(0, 8))
+
+        row2b = ttk.Frame(form)
+        row2b.pack(fill=tk.X, padx=8, pady=4)
         default_model_pose_mode = state.pose_data_mode_var.get().strip()
         if default_model_pose_mode not in ("raw", "filtered", "cleaned"):
             default_model_pose_mode = "cleaned"
         self.pose_data_mode = tk.StringVar(value=default_model_pose_mode)
-        pose_mode_label = ttk.Label(row2, text="2D source", width=10)
+        pose_mode_label = ttk.Label(row2b, text="2D source", width=10)
         pose_mode_label.pack(side=tk.LEFT)
-        pose_mode_box = ttk.Combobox(row2, textvariable=self.pose_data_mode, values=["raw", "filtered", "cleaned"], width=10, state="readonly")
+        pose_mode_box = ttk.Combobox(row2b, textvariable=self.pose_data_mode, values=["raw", "filtered", "cleaned"], width=10, state="readonly")
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
         default_pose_correction_mode = current_calibration_correction_mode(state)
         self.pose_correction_mode = tk.StringVar(value=default_pose_correction_mode)
-        pose_correction_label = ttk.Label(row2, text="L/R corr", width=8)
+        pose_correction_label = ttk.Label(row2b, text="L/R corr", width=8)
         pose_correction_label.pack(side=tk.LEFT)
         pose_correction_box = ttk.Combobox(
-            row2,
+            row2b,
             textvariable=self.pose_correction_mode,
             values=["none", "flip_epipolar", "flip_triangulation"],
             width=16,
@@ -3519,7 +3522,7 @@ class ModelTab(CommandTab):
         )
         pose_correction_box.pack(side=tk.LEFT, padx=(0, 8))
         self.model_info_var = tk.StringVar(value="")
-        ttk.Label(row2, textvariable=self.model_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(row2b, textvariable=self.model_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(6, 0))
 
         row3 = ttk.Frame(form)
         row3.pack(fill=tk.X, padx=8, pady=4)
