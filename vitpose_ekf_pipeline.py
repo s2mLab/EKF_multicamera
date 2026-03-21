@@ -1254,16 +1254,21 @@ def detect_left_right_flip_diagnostics(
     smoothed_nominal_costs = smooth_camera_time_series(effective_nominal_costs, window=smoothing_window)
 
     outlier_thresholds_by_camera = np.full(n_cams, float(outlier_floor_px), dtype=float)
-    candidate_mask = np.isfinite(smoothed_nominal_costs)
+    candidate_mask = np.isfinite(effective_nominal_costs)
     if restrict_to_outliers:
         candidate_mask[:] = False
         for cam_idx in range(n_cams):
-            valid_costs = smoothed_nominal_costs[cam_idx, np.isfinite(smoothed_nominal_costs[cam_idx])]
+            valid_costs = effective_nominal_costs[cam_idx, np.isfinite(effective_nominal_costs[cam_idx])]
             if valid_costs.size == 0:
                 continue
             threshold = max(float(outlier_floor_px), float(np.percentile(valid_costs, float(outlier_percentile))))
             outlier_thresholds_by_camera[cam_idx] = threshold
-            candidate_mask[cam_idx] = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
+            raw_outliers = np.isfinite(effective_nominal_costs[cam_idx]) & (effective_nominal_costs[cam_idx] >= threshold)
+            if method == "epipolar":
+                smooth_outliers = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
+                candidate_mask[cam_idx] = raw_outliers | smooth_outliers
+            else:
+                candidate_mask[cam_idx] = raw_outliers
 
     for frame_idx in range(n_frames):
         raw_points_frame = pose_data.keypoints[:, frame_idx]
@@ -1335,7 +1340,11 @@ def detect_left_right_flip_diagnostics(
         np.where(np.isfinite(decision_score), decision_score, 0.0),
         window=smoothing_window,
     )
-    suspect_mask = candidate_mask & np.isfinite(decision_score) & (decision_score > 0.0) & (smoothed_decision_score > 0.0)
+    strong_positive_margin = 0.5 * float(min_gain_px) if method == "epipolar" else 0.0
+    suspect_mask = candidate_mask & np.isfinite(decision_score) & (
+        ((decision_score > 0.0) & (smoothed_decision_score > 0.0))
+        | (decision_score >= strong_positive_margin)
+    )
     frames_with_any_suspect = np.any(suspect_mask, axis=0)
     temporal_support_mask = np.isfinite(nominal_temporal_costs)
     candidate_temporal_support_mask = candidate_mask & temporal_support_mask
@@ -1399,6 +1408,7 @@ def detect_left_right_flip_diagnostics(
         "swapped_combined_costs": effective_swapped_costs,
         "decision_scores": decision_score,
         "decision_scores_smoothed": smoothed_decision_score,
+        "strong_positive_margin": np.full_like(decision_score, strong_positive_margin, dtype=float),
         "candidate_mask": candidate_mask.astype(bool),
         "temporal_support_mask": temporal_support_mask.astype(bool),
     }

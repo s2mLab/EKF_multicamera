@@ -5301,7 +5301,8 @@ class CameraToolsTab(ttk.Frame):
         attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
         attach_tooltip(self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée.")
 
-        self.reference_name_var.trace_add("write", lambda *_args: self.refresh_metrics())
+        self.reference_name_var.trace_add("write", lambda *_args: self.on_reference_changed())
+        self.reference_box.bind("<<ComboboxSelected>>", lambda _event: self.on_reference_changed())
         self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.flip_camera_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
@@ -5352,6 +5353,12 @@ class CameraToolsTab(ttk.Frame):
                 self.reference_name_var.set(preferred)
                 return
         self.reference_name_var.set("")
+
+    def on_reference_changed(self) -> None:
+        if self.pose_data is None:
+            return
+        self.refresh_metrics()
+        self.refresh_flip_frame_list()
 
     def load_resources(self) -> None:
         try:
