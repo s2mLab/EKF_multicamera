@@ -2,6 +2,8 @@ import numpy as np
 
 from vitpose_ekf_pipeline import (
     CameraCalibration,
+    apply_measurement_update_batch,
+    apply_measurement_update_sequential,
     compute_camera_triangulation_cost,
     project_point_with_projection_matrices,
     triangulation_reference_from_other_views,
@@ -83,3 +85,47 @@ def test_precomputed_triangulation_cost_matches_direct_computation():
         precomputed_reprojected_points=references,
     )
     assert abs(direct - cached) < 1e-12
+
+
+def test_sequential_measurement_update_matches_batch_update():
+    rng = np.random.default_rng(42)
+    nq = 5
+    nx = 3 * nq
+    identity_x = np.eye(nx, dtype=float)
+    predicted_state = rng.normal(size=nx)
+    base = rng.normal(size=(nx, nx))
+    predicted_covariance = base @ base.T + 1e-3 * np.eye(nx)
+
+    H1 = rng.normal(size=(6, nq))
+    H2 = rng.normal(size=(4, nq))
+    z1 = rng.normal(size=6)
+    z2 = rng.normal(size=4)
+    h1 = rng.normal(size=6)
+    h2 = rng.normal(size=4)
+    R1 = 0.1 + rng.random(6)
+    R2 = 0.1 + rng.random(4)
+
+    batch = apply_measurement_update_batch(
+        predicted_state=predicted_state,
+        predicted_covariance=predicted_covariance,
+        z=np.concatenate((z1, z2)),
+        h=np.concatenate((h1, h2)),
+        H_q=np.vstack((H1, H2)),
+        R_diag_array=np.concatenate((R1, R2)),
+        nq=nq,
+        identity_x=identity_x,
+    )
+    sequential = apply_measurement_update_sequential(
+        predicted_state=predicted_state,
+        predicted_covariance=predicted_covariance,
+        measurement_blocks=[(z1, h1, H1, R1), (z2, h2, H2, R2)],
+        nq=nq,
+        identity_x=identity_x,
+    )
+
+    assert batch is not None
+    assert sequential is not None
+    batch_state, batch_covariance = batch
+    sequential_state, sequential_covariance = sequential
+    np.testing.assert_allclose(sequential_state, batch_state, atol=1e-8, rtol=1e-8)
+    np.testing.assert_allclose(sequential_covariance, batch_covariance, atol=1e-8, rtol=1e-8)

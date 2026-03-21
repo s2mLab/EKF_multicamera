@@ -644,6 +644,126 @@ def project_point_with_projection_matrices(projection_matrices: np.ndarray, poin
     return projected
 
 
+def solve_regularized_kalman_gain(
+    predicted_covariance: np.ndarray,
+    H_q: np.ndarray,
+    R_diag_array: np.ndarray,
+    nq: int,
+) -> np.ndarray | None:
+    """Solve the Kalman gain for one linearized measurement block."""
+    if H_q.size == 0 or R_diag_array.size == 0:
+        return None
+    P_q = predicted_covariance[:, :nq]
+    P_qq = predicted_covariance[:nq, :nq]
+    PHT = P_q @ H_q.T
+    S = H_q @ P_qq @ H_q.T
+    diag_idx = np.diag_indices_from(S)
+    S[diag_idx] += R_diag_array
+    S = 0.5 * (S + S.T)
+    if not np.all(np.isfinite(S)):
+        return None
+    regularization_values = (0.0, 1e-9, 1e-7, 1e-5, 1e-3)
+    K = None
+    for regularization in regularization_values:
+        S_reg = np.array(S, copy=True)
+        if regularization > 0.0:
+            S_reg[diag_idx] += regularization
+        try:
+            chol = np.linalg.cholesky(S_reg)
+            y = np.linalg.solve(chol, PHT.T)
+            K = np.linalg.solve(chol.T, y).T
+            break
+        except np.linalg.LinAlgError:
+            try:
+                K = PHT @ np.linalg.pinv(S_reg, rcond=1e-10)
+                if np.all(np.isfinite(K)):
+                    break
+            except np.linalg.LinAlgError:
+                K = None
+    if K is None or not np.all(np.isfinite(K)):
+        return None
+    return K
+
+
+def apply_joseph_measurement_update(
+    predicted_state: np.ndarray,
+    predicted_covariance: np.ndarray,
+    K: np.ndarray,
+    innovation: np.ndarray,
+    H_q: np.ndarray,
+    R_diag_array: np.ndarray,
+    nq: int,
+    identity_x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply one Joseph-form covariance update for a measurement block."""
+    updated_state = predicted_state + K @ innovation
+    I_minus_KH = np.array(identity_x, copy=True)
+    I_minus_KH[:, :nq] -= K @ H_q
+    updated_covariance = I_minus_KH @ predicted_covariance @ I_minus_KH.T
+    updated_covariance += (K * R_diag_array[np.newaxis, :]) @ K.T
+    updated_covariance = 0.5 * (updated_covariance + updated_covariance.T)
+    return updated_state, updated_covariance
+
+
+def apply_measurement_update_batch(
+    predicted_state: np.ndarray,
+    predicted_covariance: np.ndarray,
+    z: np.ndarray,
+    h: np.ndarray,
+    H_q: np.ndarray,
+    R_diag_array: np.ndarray,
+    nq: int,
+    identity_x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Apply one batch Kalman correction over all frame measurements."""
+    K = solve_regularized_kalman_gain(predicted_covariance, H_q, R_diag_array, nq)
+    if K is None:
+        return None
+    return apply_joseph_measurement_update(
+        predicted_state=predicted_state,
+        predicted_covariance=predicted_covariance,
+        K=K,
+        innovation=z - h,
+        H_q=H_q,
+        R_diag_array=R_diag_array,
+        nq=nq,
+        identity_x=identity_x,
+    )
+
+
+def apply_measurement_update_sequential(
+    predicted_state: np.ndarray,
+    predicted_covariance: np.ndarray,
+    measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    nq: int,
+    identity_x: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Apply sequential Kalman corrections over measurement blocks."""
+    state = np.array(predicted_state, copy=True)
+    covariance = np.array(predicted_covariance, copy=True)
+    reference_q = np.asarray(predicted_state[:nq], dtype=float)
+    applied = False
+    for z, h, H_q, R_diag_array in measurement_blocks:
+        if z.size == 0 or H_q.size == 0:
+            continue
+        current_h = h + H_q @ (np.asarray(state[:nq], dtype=float) - reference_q)
+        K = solve_regularized_kalman_gain(covariance, H_q, R_diag_array, nq)
+        if K is None:
+            return None
+        state, covariance = apply_joseph_measurement_update(
+            predicted_state=state,
+            predicted_covariance=covariance,
+            K=K,
+            innovation=z - current_h,
+            H_q=H_q,
+            R_diag_array=R_diag_array,
+            nq=nq,
+            identity_x=identity_x,
+        )
+        applied = True
+    return (state, covariance) if applied else None
+
+
 def skew(vector: np.ndarray) -> np.ndarray:
     """Construit la matrice antisymetrique associee a un vecteur 3D."""
     x, y, z = np.asarray(vector, dtype=float).reshape(3)
@@ -2334,10 +2454,7 @@ class MultiViewKinematicEKF:
             marker_points.append(marker_positions_all[marker_idx].to_array())
             marker_jacobians.append(marker_jacobians_all[marker_idx].to_array())
 
-        z_list = []
-        h_list = []
-        H_q_rows = []
-        R_diag = []
+        measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
         locked_indices = tuple(self.locked_q_indices)
         locked_q_columns = np.asarray(locked_indices, dtype=int) if locked_indices else np.empty(0, dtype=int)
         t_assembly = time.perf_counter()
@@ -2348,6 +2465,10 @@ class MultiViewKinematicEKF:
             valid_keypoints = np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
             if not np.any(valid_keypoints):
                 continue
+            z_cam = []
+            h_cam = []
+            H_q_rows_cam = []
+            R_diag_cam = []
 
             for pair_idx, (_, kp_idx) in enumerate(self.marker_pairs):
                 if not valid_keypoints[kp_idx]:
@@ -2364,86 +2485,52 @@ class MultiViewKinematicEKF:
                     H_q[:, locked_q_columns] = 0.0
                 if not (np.all(np.isfinite(h_uv)) and np.all(np.isfinite(H_q))):
                     continue
-                z_list.append(z_uv)
-                h_list.append(h_uv)
-                H_q_rows.append(H_q)
+                z_cam.append(z_uv)
+                h_cam.append(h_uv)
+                H_q_rows_cam.append(H_q)
                 sigma2 = float(frame_variances[kp_idx])
-                R_diag.extend([sigma2, sigma2])
+                R_diag_cam.extend([sigma2, sigma2])
+            if H_q_rows_cam:
+                z_block = np.concatenate(z_cam)
+                h_block = np.concatenate(h_cam)
+                H_q_block = np.vstack(H_q_rows_cam)
+                R_diag_block = np.asarray(R_diag_cam, dtype=float)
+                finite_measurements = (
+                    np.isfinite(z_block)
+                    & np.isfinite(h_block)
+                    & np.isfinite(R_diag_block)
+                    & np.all(np.isfinite(H_q_block), axis=1)
+                )
+                if np.any(finite_measurements):
+                    measurement_blocks.append(
+                        (
+                            z_block[finite_measurements],
+                            h_block[finite_measurements],
+                            H_q_block[finite_measurements, :],
+                            R_diag_block[finite_measurements],
+                        )
+                    )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
-        if not H_q_rows:
+        if not measurement_blocks:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
-        z = np.concatenate(z_list)
-        h = np.concatenate(h_list)
-        H_q = np.vstack(H_q_rows)
-        R_diag_array = np.asarray(R_diag, dtype=float)
-
-        finite_measurements = (
-            np.isfinite(z)
-            & np.isfinite(h)
-            & np.isfinite(R_diag_array)
-            & np.all(np.isfinite(H_q), axis=1)
-        )
-        if not np.all(finite_measurements):
-            z = z[finite_measurements]
-            h = h[finite_measurements]
-            H_q = H_q[finite_measurements, :]
-            R_diag_array = R_diag_array[finite_measurements]
-        if z.size == 0 or H_q.shape[0] == 0:
-            self.update_status["pred_only_no_measurement"] += 1
-            self.profiling["update_s"] += time.perf_counter() - t_update
-            return predicted_state, predicted_covariance, "pred_only_no_measurement"
-
-        innovation = z - h
         t_solve = time.perf_counter()
-        P_q = predicted_covariance[:, : self.nq]
-        P_qq = predicted_covariance[: self.nq, : self.nq]
-        PHT = P_q @ H_q.T
-        S = H_q @ P_qq @ H_q.T
-        diag_idx = np.diag_indices_from(S)
-        S[diag_idx] += R_diag_array
-        # Symmetrisation defensive pour limiter les derives numeriques avant
-        # la resolution du systeme de Kalman.
-        S = 0.5 * (S + S.T)
-        if not np.all(np.isfinite(S)):
+        update_result = apply_measurement_update_sequential(
+            predicted_state=predicted_state,
+            predicted_covariance=predicted_covariance,
+            measurement_blocks=measurement_blocks,
+            nq=self.nq,
+            identity_x=self.identity_x,
+        )
+        if update_result is None:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["solve_s"] += time.perf_counter() - t_solve
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
-
-        K = None
-        regularization_values = (0.0, 1e-9, 1e-7, 1e-5, 1e-3)
-        for regularization in regularization_values:
-            S_reg = np.array(S, copy=True)
-            if regularization > 0.0:
-                S_reg[diag_idx] += regularization
-            try:
-                chol = np.linalg.cholesky(S_reg)
-                y = np.linalg.solve(chol, PHT.T)
-                K = np.linalg.solve(chol.T, y).T
-                break
-            except np.linalg.LinAlgError:
-                try:
-                    K = PHT @ np.linalg.pinv(S_reg, rcond=1e-10)
-                    if np.all(np.isfinite(K)):
-                        break
-                except np.linalg.LinAlgError:
-                    K = None
-        if K is None or not np.all(np.isfinite(K)):
-            self.update_status["pred_only_no_measurement"] += 1
-            self.profiling["solve_s"] += time.perf_counter() - t_solve
-            self.profiling["update_s"] += time.perf_counter() - t_update
-            return predicted_state, predicted_covariance, "pred_only_no_measurement"
-        updated_state = predicted_state + K @ innovation
-        # Forme de Joseph: plus stable numeriquement que (I-KH)P seule.
-        I_minus_KH = np.array(self.identity_x, copy=True)
-        I_minus_KH[:, : self.nq] -= K @ H_q
-        updated_covariance = I_minus_KH @ predicted_covariance @ I_minus_KH.T
-        updated_covariance += (K * R_diag_array[np.newaxis, :]) @ K.T
-        updated_covariance = 0.5 * (updated_covariance + updated_covariance.T)
+        updated_state, updated_covariance = update_result
         self.profiling["solve_s"] += time.perf_counter() - t_solve
         self._apply_lock_constraints(updated_state, updated_covariance)
         self.update_status["corrected"] += 1
