@@ -104,11 +104,11 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
         call_count["count"] += 1
         suspect_mask = np.array([[True, False]], dtype=bool)
         diagnostics = {"method": "epipolar", "n_suspects": 1}
-        return suspect_mask, diagnostics, 0.123, tmp_path / "flip_cache.npz"
+        return suspect_mask, diagnostics, 0.123, tmp_path / "flip_cache.npz", "computed_now"
 
     monkeypatch.setattr("reconstruction_bundle.load_or_compute_left_right_flip_cache", fake_flip_cache)
 
-    corrected_a, diagnostics_a, compute_time_a, cache_path = load_or_compute_pose_data_variant_cache(
+    corrected_a, diagnostics_a, compute_time_a, cache_path, source_a = load_or_compute_pose_data_variant_cache(
         output_dir=tmp_path,
         pose_data=pose_data,
         calibrations={},
@@ -120,7 +120,7 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
     )
-    corrected_b, diagnostics_b, compute_time_b, cache_path_b = load_or_compute_pose_data_variant_cache(
+    corrected_b, diagnostics_b, compute_time_b, cache_path_b, source_b = load_or_compute_pose_data_variant_cache(
         output_dir=tmp_path,
         pose_data=pose_data,
         calibrations={},
@@ -135,9 +135,14 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
 
     assert call_count["count"] == 1
     assert cache_path == cache_path_b
+    assert source_a == "computed_now"
+    assert source_b == "cache"
     assert abs(compute_time_a - 0.123) < 1e-12
     assert abs(compute_time_b - 0.123) < 1e-12
-    assert diagnostics_a == diagnostics_b
+    assert diagnostics_a["method"] == diagnostics_b["method"]
+    assert diagnostics_a["n_suspects"] == diagnostics_b["n_suspects"]
+    assert diagnostics_a["source"] == "computed_now"
+    assert diagnostics_b["source"] == "cache"
     left_idx = KP_INDEX["left_shoulder"]
     right_idx = KP_INDEX["right_shoulder"]
     np.testing.assert_allclose(corrected_a.keypoints[0, 0, left_idx], [20.0, 2.0])

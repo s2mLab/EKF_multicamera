@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 from camera_selection import parse_camera_names, subset_calibrations
@@ -113,6 +114,7 @@ def main() -> None:
         print("[STEP 1/3] Load 2D data", flush=True)
     else:
         print("[STEP 1/5] Load 2D data", flush=True)
+    pose_data_start = time.perf_counter()
     pose_data = build_pose_data(
         keypoints_path=args.keypoints,
         calibrations=calibrations,
@@ -123,6 +125,7 @@ def main() -> None:
         pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile=args.pose_amplitude_upper_percentile,
     )
+    pose_data_compute_time_s = time.perf_counter() - pose_data_start
 
     if args.family == "pose2sim":
         build_pose2sim_bundle(
@@ -131,6 +134,7 @@ def main() -> None:
             pose2sim_trc=args.pose2sim_trc,
             calibrations=calibrations,
             pose_data=pose_data,
+            pose_data_compute_time_s=pose_data_compute_time_s,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
             unwrap_root=not args.no_root_unwrap,
@@ -140,6 +144,7 @@ def main() -> None:
             name=args.name,
             output_dir=args.output_dir,
             pose_data=pose_data,
+            pose_data_compute_time_s=pose_data_compute_time_s,
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
@@ -171,6 +176,7 @@ def main() -> None:
             name=args.name,
             output_dir=args.output_dir,
             pose_data=pose_data,
+            pose_data_compute_time_s=pose_data_compute_time_s,
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
@@ -206,6 +212,7 @@ def main() -> None:
             name=args.name,
             output_dir=args.output_dir,
             pose_data=pose_data,
+            pose_data_compute_time_s=pose_data_compute_time_s,
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,

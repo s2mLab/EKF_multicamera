@@ -16,6 +16,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
+from reconstruction_timings import make_timing_stage
 from root_kinematics import (
     ROOT_Q_NAMES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
@@ -175,7 +176,7 @@ def load_or_compute_epipolar_cache(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
-) -> tuple[np.ndarray, float, Path]:
+) -> tuple[np.ndarray, float, Path, str]:
     metadata = epipolar_cache_metadata(
         pose_data,
         epipolar_threshold_px,
@@ -189,7 +190,7 @@ def load_or_compute_epipolar_cache(
     cache_path = cache_dir / "epipolar_coherence.npz"
     if metadata_cache_matches(cache_path, metadata):
         coherence, compute_time_s = load_epipolar_cache(cache_path)
-        return coherence, compute_time_s, cache_path
+        return coherence, compute_time_s, cache_path, "cache"
 
     ordered_calibrations = [calibrations[name] for name in pose_data.camera_names]
     fundamental_matrices = {
@@ -202,7 +203,7 @@ def load_or_compute_epipolar_cache(
     coherence = compute_epipolar_coherence(pose_data, fundamental_matrices, threshold_px=epipolar_threshold_px)
     compute_time_s = time.perf_counter() - t0
     save_epipolar_cache(cache_path, coherence, metadata, compute_time_s)
-    return coherence, compute_time_s, cache_path
+    return coherence, compute_time_s, cache_path, "computed_now"
 
 
 def flip_cache_metadata(
@@ -248,6 +249,7 @@ def flip_cache_metadata(
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
         "epipolar_pair_weighting": "baseline_confidence_weighted",
         "epipolar_keypoint_weighting": "torso_proximal_priority",
+        "epipolar_flip_scoring_version": 3 if str(method) == "epipolar" else 1,
         "temporal_smoothing_window": 5 if str(method) == "epipolar" else 1,
     }
 
@@ -302,7 +304,7 @@ def load_or_compute_left_right_flip_cache(
     temporal_weight: float = DEFAULT_FLIP_TEMPORAL_WEIGHT,
     temporal_tau_px: float = DEFAULT_FLIP_TEMPORAL_TAU_PX,
     temporal_min_valid_keypoints: int = DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
-) -> tuple[np.ndarray, dict[str, object], float, Path]:
+) -> tuple[np.ndarray, dict[str, object], float, Path, str]:
     metadata = flip_cache_metadata(
         pose_data,
         method=method,
@@ -326,7 +328,7 @@ def load_or_compute_left_right_flip_cache(
     cache_path = cache_dir / "flip_diagnostics.npz"
     if metadata_cache_matches(cache_path, metadata):
         suspect_mask, diagnostics, compute_time_s = load_flip_cache(cache_path)
-        return suspect_mask, diagnostics, compute_time_s, cache_path
+        return suspect_mask, diagnostics, compute_time_s, cache_path, "cache"
 
     t0 = time.perf_counter()
     suspect_mask, diagnostics, detail_arrays = detect_left_right_flip_diagnostics(
@@ -351,7 +353,7 @@ def load_or_compute_left_right_flip_cache(
     diagnostics["temporal_min_valid_keypoints"] = int(temporal_min_valid_keypoints)
     compute_time_s = time.perf_counter() - t0
     save_flip_cache(cache_path, suspect_mask, diagnostics, metadata, compute_time_s, detail_arrays=detail_arrays)
-    return suspect_mask, diagnostics, compute_time_s, cache_path
+    return suspect_mask, diagnostics, compute_time_s, cache_path, "computed_now"
 
 
 def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) -> PoseData:
@@ -485,7 +487,7 @@ def load_or_compute_pose_data_variant_cache(
     temporal_weight: float = DEFAULT_FLIP_TEMPORAL_WEIGHT,
     temporal_tau_px: float = DEFAULT_FLIP_TEMPORAL_TAU_PX,
     temporal_min_valid_keypoints: int = DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
-) -> tuple[PoseData, dict[str, object] | None, float, Path]:
+) -> tuple[PoseData, dict[str, object] | None, float, Path, str]:
     metadata = pose_variant_cache_metadata(
         pose_data,
         correction_mode=correction_mode,
@@ -510,7 +512,10 @@ def load_or_compute_pose_data_variant_cache(
     cache_path = cache_dir / "pose_data_variant.npz"
     if metadata_cache_matches(cache_path, metadata):
         corrected_pose_data, diagnostics, _suspect_mask, compute_time_s = load_pose_variant_cache(cache_path)
-        return corrected_pose_data, (diagnostics or None), compute_time_s, cache_path
+        if diagnostics:
+            diagnostics = dict(diagnostics)
+            diagnostics.setdefault("source", "cache")
+        return corrected_pose_data, (diagnostics or None), compute_time_s, cache_path, "cache"
 
     if correction_mode == "none":
         t0 = time.perf_counter()
@@ -524,14 +529,14 @@ def load_or_compute_pose_data_variant_cache(
         )
         compute_time_s = time.perf_counter() - t0
         save_pose_variant_cache(cache_path, corrected_pose_data, metadata, compute_time_s=compute_time_s)
-        return corrected_pose_data, None, compute_time_s, cache_path
+        return corrected_pose_data, None, compute_time_s, cache_path, "computed_now"
 
     if correction_mode != "flip":
         raise ValueError(f"Unsupported pose-data correction mode: {correction_mode}")
     if flip_method is None:
         raise ValueError("flip_method is required when correction_mode='flip'.")
 
-    suspect_mask, diagnostics, flip_compute_time_s, flip_cache_path = load_or_compute_left_right_flip_cache(
+    suspect_mask, diagnostics, flip_compute_time_s, flip_cache_path, flip_source = load_or_compute_left_right_flip_cache(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -564,7 +569,8 @@ def load_or_compute_pose_data_variant_cache(
         suspect_mask=suspect_mask,
         compute_time_s=float(flip_compute_time_s),
     )
-    return corrected_pose_data, diagnostics, float(flip_compute_time_s), cache_path
+    diagnostics["source"] = str(flip_source)
+    return corrected_pose_data, diagnostics, float(flip_compute_time_s), cache_path, "computed_now"
 
 
 def reconstruction_with_full_frame_support(
@@ -609,6 +615,7 @@ def reconstruction_with_full_frame_support(
         excluded_views=excluded_views,
         coherence_method=coherence_method,
         epipolar_coherence_compute_time_s=float(epipolar_compute_time_s),
+        triangulation_compute_time_s=float(bootstrap_reconstruction.triangulation_compute_time_s),
     )
 
 
@@ -628,6 +635,7 @@ def estimate_segment_lengths_first_frame(reconstruction: ReconstructionResult) -
                 excluded_views=reconstruction.excluded_views[frame_idx : frame_idx + 1],
                 coherence_method=reconstruction.coherence_method,
                 epipolar_coherence_compute_time_s=reconstruction.epipolar_coherence_compute_time_s,
+                triangulation_compute_time_s=reconstruction.triangulation_compute_time_s,
             )
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -653,7 +661,7 @@ def load_or_compute_triangulation_cache(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
-) -> tuple[ReconstructionResult, Path, Path]:
+) -> tuple[ReconstructionResult, Path, Path, str]:
     metadata = reconstruction_cache_metadata(
         pose_data,
         reprojection_threshold_px,
@@ -668,7 +676,7 @@ def load_or_compute_triangulation_cache(
     )
     cache_dir = cache_entry_dir(output_dir, "triangulation", metadata, prefix=f"triang_{triangulation_method}")
     cache_path = cache_dir / "reconstruction.npz"
-    epipolar_coherence, epipolar_compute_time_s, epipolar_cache_path = load_or_compute_epipolar_cache(
+    epipolar_coherence, epipolar_compute_time_s, epipolar_cache_path, epipolar_source = load_or_compute_epipolar_cache(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -680,8 +688,11 @@ def load_or_compute_triangulation_cache(
         pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
     )
     if metadata_cache_matches(cache_path, metadata):
-        return load_reconstruction_cache(cache_path, coherence_method=coherence_method), cache_path, epipolar_cache_path
+        reconstruction = load_reconstruction_cache(cache_path, coherence_method=coherence_method)
+        reconstruction.epipolar_coherence_compute_time_s = float(epipolar_compute_time_s)
+        return reconstruction, cache_path, epipolar_cache_path, "cache"
 
+    triangulation_start = time.perf_counter()
     reconstruction = triangulate_pose2sim_like(
         pose_data,
         calibrations,
@@ -694,8 +705,9 @@ def load_or_compute_triangulation_cache(
         precomputed_epipolar_coherence=epipolar_coherence,
         precomputed_epipolar_time_s=epipolar_compute_time_s,
     )
+    reconstruction.triangulation_compute_time_s = time.perf_counter() - triangulation_start
     save_reconstruction_cache(cache_path, reconstruction, metadata)
-    return reconstruction, cache_path, epipolar_cache_path
+    return reconstruction, cache_path, epipolar_cache_path, "computed_now"
 
 
 def load_or_build_model_cache(
@@ -707,7 +719,7 @@ def load_or_build_model_cache(
     subject_mass_kg: float,
     initial_rotation_correction: bool,
     lengths_mode: str,
-) -> tuple[SegmentLengths, Path, Path, int]:
+) -> tuple[SegmentLengths, Path, Path, int, float, str]:
     if lengths_mode == "first_frame_only":
         lengths, bootstrap_frame_idx = estimate_segment_lengths_first_frame(reconstruction)
     else:
@@ -727,9 +739,10 @@ def load_or_build_model_cache(
     cache_path = cache_dir / "model_stage.npz"
     biomod_cache_path = cache_dir / "vitpose_chain.bioMod"
     if metadata_cache_matches(cache_path, metadata) and biomod_cache_path.exists():
-        cached_lengths, _ = load_model_stage(cache_path)
-        return cached_lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx)
+        cached_lengths, _biomod_path, compute_time_s = load_model_stage(cache_path)
+        return cached_lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx), float(compute_time_s), "cache"
 
+    build_start = time.perf_counter()
     build_biomod(
         lengths,
         biomod_cache_path,
@@ -737,8 +750,9 @@ def load_or_build_model_cache(
         reconstruction=reconstruction,
         apply_initial_root_rotation_correction=initial_rotation_correction,
     )
-    save_model_stage(cache_path, lengths, biomod_cache_path, metadata)
-    return lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx)
+    compute_time_s = time.perf_counter() - build_start
+    save_model_stage(cache_path, lengths, biomod_cache_path, metadata, compute_time_s=compute_time_s)
+    return lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx), float(compute_time_s), "computed_now"
 
 
 def prepare_pose_data_for_reconstruction(
@@ -764,12 +778,12 @@ def prepare_pose_data_for_reconstruction(
     flip_temporal_weight: float,
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
-) -> tuple[PoseData, dict[str, object] | None, Path | None]:
+) -> tuple[PoseData, dict[str, object] | None, Path | None, str]:
     if not flip_left_right:
-        return pose_data, None, None
+        return pose_data, None, None, "computed_now"
 
     flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
-    pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path = load_or_compute_pose_data_variant_cache(
+    pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path, pose_variant_source = load_or_compute_pose_data_variant_cache(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -795,7 +809,7 @@ def prepare_pose_data_for_reconstruction(
         flip_diagnostics = dict(flip_diagnostics)
         flip_diagnostics["cache_path"] = str(pose_variant_cache_path)
         flip_diagnostics["pose_data_signature"] = pose_data_signature(pose_data_used)
-    return pose_data_used, flip_diagnostics, pose_variant_cache_path
+    return pose_data_used, flip_diagnostics, pose_variant_cache_path, str(pose_variant_source)
 
 def with_version_info(summary: dict[str, object], family: str) -> dict[str, object]:
     latest = latest_version_for_family(family)
@@ -1036,6 +1050,7 @@ def make_reconstruction_from_points(
         excluded_views=np.ones((n_frames, len(COCO17), n_cameras), dtype=bool),
         coherence_method=coherence_method,
         epipolar_coherence_compute_time_s=0.0,
+        triangulation_compute_time_s=0.0,
     )
 
 
@@ -1218,6 +1233,7 @@ def build_pose2sim_bundle(
     pose2sim_trc: Path,
     calibrations: dict[str, CameraCalibration],
     pose_data: PoseData,
+    pose_data_compute_time_s: float | None = None,
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
@@ -1236,6 +1252,13 @@ def build_pose2sim_bundle(
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
     )
+    pipeline_stages = []
+    if pose_data_compute_time_s is not None:
+        pipeline_stages.append(
+            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+        )
+    pipeline_stages.append(make_timing_stage("pose2sim", "Load Pose2Sim 3D", compute_time_s=time.perf_counter() - t0, source="computed_now"))
+
     summary = {
         "name": name,
         "family": "pose2sim",
@@ -1256,6 +1279,12 @@ def build_pose2sim_bundle(
         },
         "stage_timings_s": {
             "total_s": time.perf_counter() - t0,
+        },
+        "pipeline_timing": {
+            "diagram": [str(stage["id"]) for stage in pipeline_stages],
+            "stages": pipeline_stages,
+            "objective_total_s": float(sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))),
+            "current_run_wall_s": float((pose_data_compute_time_s or 0.0) + (time.perf_counter() - t0)),
         },
     }
     summary = with_version_info(summary, "triangulation")
@@ -1284,6 +1313,7 @@ def build_triangulation_bundle(
     name: str,
     output_dir: Path,
     pose_data: PoseData,
+    pose_data_compute_time_s: float | None = None,
     calibrations: dict[str, CameraCalibration],
     fps: float,
     initial_rotation_correction: bool,
@@ -1310,7 +1340,7 @@ def build_triangulation_bundle(
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
 ) -> tuple[BundleBuildResult, ReconstructionResult]:
-    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -1336,7 +1366,7 @@ def build_triangulation_bundle(
 
     print_step(2, 3, "Triangulation 3D")
     t0 = time.perf_counter()
-    reconstruction, reconstruction_cache_path, epipolar_cache_path = load_or_compute_triangulation_cache(
+    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
         output_dir=output_dir,
         pose_data=pose_data_used,
         calibrations=calibrations,
@@ -1379,6 +1409,50 @@ def build_triangulation_bundle(
         right_shoulder_idx=KP_INDEX["right_shoulder"],
     )
     print_step(3, 3, "Export bundle triangulation")
+    pipeline_stages = []
+    if pose_data_compute_time_s is not None:
+        pipeline_stages.append(
+            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+        )
+    if flip_diagnostics is not None:
+        flip_method_label = str(flip_diagnostics.get("method", "unknown"))
+        pipeline_stages.extend(
+            [
+                make_timing_stage(
+                    "flip_diagnostics",
+                    f"Determine flipped frames ({flip_method_label})",
+                    compute_time_s=flip_diagnostics.get("compute_time_s"),
+                    source=pose_variant_source,
+                    cache_path=str(flip_diagnostics.get("flip_cache_path") or flip_diagnostics.get("cache_path") or ""),
+                ),
+                make_timing_stage(
+                    "flip_application",
+                    "Apply flip to 2D data",
+                    compute_time_s=0.0,
+                    source=pose_variant_source,
+                    include_in_total=False,
+                ),
+            ]
+        )
+    pipeline_stages.append(
+        make_timing_stage(
+            "epipolar_coherence",
+            "Epipolar coherence",
+            compute_time_s=reconstruction.epipolar_coherence_compute_time_s,
+            source="cache" if str(triangulation_source) == "cache" else "computed_now",
+            cache_path=str(epipolar_cache_path),
+        )
+    )
+    pipeline_stages.append(
+        make_timing_stage(
+            "triangulation",
+            f"{triangulation_method.title()} triangulation",
+            compute_time_s=reconstruction.triangulation_compute_time_s,
+            source=str(triangulation_source),
+            cache_path=str(reconstruction_cache_path),
+        )
+    )
+
     summary = {
         "name": name,
         "family": "triangulation",
@@ -1410,6 +1484,14 @@ def build_triangulation_bundle(
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
             "total_s": time.perf_counter() - t0,
         },
+        "pipeline_timing": {
+            "diagram": [str(stage["id"]) for stage in pipeline_stages],
+            "stages": pipeline_stages,
+            "objective_total_s": float(
+                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+            ),
+            "current_run_wall_s": float(time.perf_counter() - t0),
+        },
     }
     summary = with_version_info(summary, "triangulation")
     payload = build_bundle_payload(
@@ -1437,6 +1519,7 @@ def build_ekf_3d_bundle(
     name: str,
     output_dir: Path,
     pose_data: PoseData,
+    pose_data_compute_time_s: float | None = None,
     calibrations: dict[str, CameraCalibration],
     fps: float,
     initial_rotation_correction: bool,
@@ -1467,7 +1550,7 @@ def build_ekf_3d_bundle(
     biorbd_kalman_error_factor: float,
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> BundleBuildResult:
-    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -1493,7 +1576,7 @@ def build_ekf_3d_bundle(
 
     print_step(2, 5, "Triangulation 3D")
     tri_start = time.perf_counter()
-    reconstruction, reconstruction_cache_path, epipolar_cache_path = load_or_compute_triangulation_cache(
+    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
         output_dir=output_dir,
         pose_data=pose_data_used,
         calibrations=calibrations,
@@ -1526,7 +1609,7 @@ def build_ekf_3d_bundle(
     )
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
-    lengths, biomod_cache_path, model_cache_path, _ = load_or_build_model_cache(
+    lengths, biomod_cache_path, model_cache_path, _, model_compute_time_s, model_source = load_or_build_model_cache(
         output_dir=output_dir,
         reconstruction=reconstruction,
         reconstruction_cache_path=reconstruction_cache_path,
@@ -1571,6 +1654,57 @@ def build_ekf_3d_bundle(
     print_step(5, 5, "Export bundle EKF 3D")
 
     time_s = reconstruction.frames / float(fps)
+    pipeline_stages = []
+    if pose_data_compute_time_s is not None:
+        pipeline_stages.append(
+            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+        )
+    if flip_diagnostics is not None:
+        flip_method_label = str(flip_diagnostics.get("method", "unknown"))
+        pipeline_stages.extend(
+            [
+                make_timing_stage(
+                    "flip_diagnostics",
+                    f"Determine flipped frames ({flip_method_label})",
+                    compute_time_s=flip_diagnostics.get("compute_time_s"),
+                    source=pose_variant_source,
+                    cache_path=str(flip_diagnostics.get("flip_cache_path") or flip_diagnostics.get("cache_path") or ""),
+                ),
+                make_timing_stage("flip_application", "Apply flip to 2D data", compute_time_s=0.0, source="cache", include_in_total=False),
+            ]
+        )
+    pipeline_stages.extend(
+        [
+            make_timing_stage(
+                "epipolar_coherence",
+                "Epipolar coherence",
+                compute_time_s=reconstruction.epipolar_coherence_compute_time_s,
+                source="cache" if str(triangulation_source) == "cache" else "computed_now",
+                cache_path=str(epipolar_cache_path),
+            ),
+            make_timing_stage(
+                "triangulation",
+                f"{triangulation_method.title()} triangulation",
+                compute_time_s=reconstruction.triangulation_compute_time_s,
+                source=str(triangulation_source),
+                cache_path=str(reconstruction_cache_path),
+            ),
+            make_timing_stage(
+                "model_creation",
+                "Model creation",
+                compute_time_s=model_compute_time_s,
+                source=str(model_source),
+                cache_path=str(model_cache_path),
+            ),
+            make_timing_stage(
+                "ekf_3d",
+                "EKF 3D",
+                compute_time_s=ekf3d_s,
+                source="computed_now",
+            ),
+        ]
+    )
+
     summary = {
         "name": name,
         "family": "ekf_3d",
@@ -1611,6 +1745,14 @@ def build_ekf_3d_bundle(
             "ekf_3d_s": ekf3d_s,
             "total_s": triangulation_s + model_s + ekf3d_s,
         },
+        "pipeline_timing": {
+            "diagram": [str(stage["id"]) for stage in pipeline_stages],
+            "stages": pipeline_stages,
+            "objective_total_s": float(
+                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+            ),
+            "current_run_wall_s": float(triangulation_s + model_s + ekf3d_s),
+        },
         "points_3d_source": "model_forward_kinematics",
     }
     summary = with_version_info(summary, "ekf_3d")
@@ -1640,6 +1782,7 @@ def build_ekf_2d_bundle(
     name: str,
     output_dir: Path,
     pose_data: PoseData,
+    pose_data_compute_time_s: float | None = None,
     calibrations: dict[str, CameraCalibration],
     fps: float,
     initial_rotation_correction: bool,
@@ -1686,7 +1829,7 @@ def build_ekf_2d_bundle(
     if ekf2d_3d_source == "first_frame_only" and coherence_method != "epipolar":
         raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method=epipolar.")
 
-    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
@@ -1713,7 +1856,7 @@ def build_ekf_2d_bundle(
     print_step(2, 5, "Triangulation 3D")
     tri_start = time.perf_counter()
     if ekf2d_3d_source == "full_triangulation":
-        reconstruction, reconstruction_cache_path, epipolar_cache_path = load_or_compute_triangulation_cache(
+        reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
             output_dir=output_dir,
             pose_data=pose_data_used,
             calibrations=calibrations,
@@ -1745,7 +1888,7 @@ def build_ekf_2d_bundle(
         )
         bootstrap_frame_idx = 0
     else:
-        epipolar_coherence, epipolar_time_s, epipolar_cache_path = load_or_compute_epipolar_cache(
+        epipolar_coherence, epipolar_time_s, epipolar_cache_path, epipolar_source = load_or_compute_epipolar_cache(
             output_dir=output_dir,
             pose_data=pose_data_used,
             calibrations=calibrations,
@@ -1757,7 +1900,7 @@ def build_ekf_2d_bundle(
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
         )
         bootstrap_pose_data = slice_pose_data(pose_data_used, [0])
-        bootstrap_reconstruction, reconstruction_cache_path, _ = load_or_compute_triangulation_cache(
+        bootstrap_reconstruction, reconstruction_cache_path, _, triangulation_source = load_or_compute_triangulation_cache(
             output_dir=output_dir,
             pose_data=bootstrap_pose_data,
             calibrations=calibrations,
@@ -1786,7 +1929,7 @@ def build_ekf_2d_bundle(
 
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
-    lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx = load_or_build_model_cache(
+    lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx, model_compute_time_s, model_source = load_or_build_model_cache(
         output_dir=output_dir,
         reconstruction=reconstruction,
         reconstruction_cache_path=reconstruction_cache_path,
@@ -1857,6 +2000,95 @@ def build_ekf_2d_bundle(
     print_step(5, 5, "Export bundle EKF 2D")
 
     time_s = reconstruction.frames / float(fps)
+    pipeline_stages = []
+    if pose_data_compute_time_s is not None:
+        pipeline_stages.append(
+            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+        )
+    if flip_diagnostics is not None:
+        flip_method_label = str(flip_diagnostics.get("method", "unknown"))
+        pipeline_stages.extend(
+            [
+                make_timing_stage(
+                    "flip_diagnostics",
+                    f"Determine flipped frames ({flip_method_label})",
+                    compute_time_s=flip_diagnostics.get("compute_time_s"),
+                    source=pose_variant_source,
+                    cache_path=str(flip_diagnostics.get("flip_cache_path") or flip_diagnostics.get("cache_path") or ""),
+                ),
+                make_timing_stage("flip_application", "Apply flip to 2D data", compute_time_s=0.0, source="cache", include_in_total=False),
+            ]
+        )
+    if ekf2d_3d_source == "first_frame_only":
+        pipeline_stages.append(
+            make_timing_stage(
+                "epipolar_coherence",
+                "Epipolar coherence",
+                compute_time_s=float(epipolar_time_s),
+                source="cache" if str(triangulation_source) == "cache" else "computed_now",
+                cache_path=str(epipolar_cache_path),
+            )
+        )
+        pipeline_stages.append(
+            make_timing_stage(
+                "triangulation",
+                f"Bootstrap {triangulation_method} triangulation",
+                compute_time_s=bootstrap_reconstruction.triangulation_compute_time_s,
+                source=str(triangulation_source),
+                cache_path=str(reconstruction_cache_path),
+            )
+        )
+    else:
+        pipeline_stages.append(
+            make_timing_stage(
+                "epipolar_coherence",
+                "Epipolar coherence",
+                compute_time_s=reconstruction.epipolar_coherence_compute_time_s,
+                source="cache" if str(triangulation_source) == "cache" else "computed_now",
+                cache_path=str(epipolar_cache_path),
+            )
+        )
+        pipeline_stages.append(
+            make_timing_stage(
+                "triangulation",
+                f"{triangulation_method.title()} triangulation",
+                compute_time_s=reconstruction.triangulation_compute_time_s,
+                source=str(triangulation_source),
+                cache_path=str(reconstruction_cache_path),
+            )
+        )
+    pipeline_stages.extend(
+        [
+            make_timing_stage(
+                "model_creation",
+                "Model creation",
+                compute_time_s=model_compute_time_s,
+                source=str(model_source),
+                cache_path=str(model_cache_path),
+            ),
+            make_timing_stage(
+                "ekf_2d_initial_state",
+                "EKF 2D initial state",
+                compute_time_s=initial_state_s,
+                source="computed_now",
+            ),
+            make_timing_stage(
+                "ekf_2d",
+                "EKF 2D",
+                compute_time_s=ekf_s,
+                source="computed_now",
+            ),
+            make_timing_stage("ekf_2d_init", "EKF 2D init", compute_time_s=float(ekf_timings["init_s"]), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_loop", "EKF 2D loop", compute_time_s=float(ekf_timings["loop_s"]), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_predict", "EKF 2D predict", compute_time_s=float(ekf_timings.get("predict_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_update", "EKF 2D update", compute_time_s=float(ekf_timings.get("update_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_markers", "EKF 2D markers", compute_time_s=float(ekf_timings.get("markers_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_marker_jacobians", "EKF 2D marker jacobians", compute_time_s=float(ekf_timings.get("marker_jacobians_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_assembly", "EKF 2D assembly", compute_time_s=float(ekf_timings.get("assembly_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage("ekf_2d_solve", "EKF 2D solve", compute_time_s=float(ekf_timings.get("solve_s", 0.0)), source="computed_now", include_in_total=False),
+        ]
+    )
+
     summary = {
         "name": name,
         "family": "ekf_2d",
@@ -1916,6 +2148,14 @@ def build_ekf_2d_bundle(
             "ekf_2d_assembly_s": float(ekf_timings.get("assembly_s", 0.0)),
             "ekf_2d_solve_s": float(ekf_timings.get("solve_s", 0.0)),
             "total_s": triangulation_s + model_s + initial_state_s + ekf_s,
+        },
+        "pipeline_timing": {
+            "diagram": [str(stage["id"]) for stage in pipeline_stages if str(stage["id"]) not in {"ekf_2d_init", "ekf_2d_loop", "ekf_2d_predict", "ekf_2d_update", "ekf_2d_markers", "ekf_2d_marker_jacobians", "ekf_2d_assembly", "ekf_2d_solve"}],
+            "stages": pipeline_stages,
+            "objective_total_s": float(
+                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+            ),
+            "current_run_wall_s": float(triangulation_s + model_s + initial_state_s + ekf_s),
         },
         "points_3d_source": "model_forward_kinematics",
     }

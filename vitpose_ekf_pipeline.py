@@ -242,6 +242,7 @@ class ReconstructionResult:
     excluded_views: np.ndarray  # (n_frames, 17, n_cam)
     coherence_method: str
     epipolar_coherence_compute_time_s: float = 0.0
+    triangulation_compute_time_s: float = 0.0
 
 
 @dataclass
@@ -1088,6 +1089,36 @@ def compute_camera_epipolar_cost(
     return weighted_median(np.asarray(errors, dtype=float), np.asarray(weights, dtype=float))
 
 
+def compute_camera_epipolar_cost_legacy(
+    camera_idx: int,
+    candidate_points: np.ndarray,
+    raw_2d_frame: np.ndarray,
+    raw_scores_frame: np.ndarray,
+    fundamental_matrices: dict[tuple[int, int], np.ndarray],
+) -> float:
+    """Version non pondérée, conservée comme garde-fou pour ne pas sous-détecter."""
+    errors = []
+    valid_candidate = np.all(np.isfinite(candidate_points), axis=1) & (raw_scores_frame[camera_idx] > 0)
+    for kp_idx in range(candidate_points.shape[0]):
+        if not valid_candidate[kp_idx]:
+            continue
+        point_i = candidate_points[kp_idx]
+        for other_idx in range(raw_2d_frame.shape[0]):
+            if other_idx == camera_idx:
+                continue
+            if raw_scores_frame[other_idx, kp_idx] <= 0:
+                continue
+            point_j = raw_2d_frame[other_idx, kp_idx]
+            if not np.all(np.isfinite(point_j)):
+                continue
+            err = sampson_error_pixels(point_i, point_j, fundamental_matrices[(camera_idx, other_idx)])
+            if np.isfinite(err):
+                errors.append(err)
+    if not errors:
+        return np.nan
+    return float(np.median(np.asarray(errors, dtype=float)))
+
+
 def compute_camera_triangulation_cost(
     camera_idx: int,
     candidate_points: np.ndarray,
@@ -1194,8 +1225,10 @@ def detect_left_right_flip_diagnostics(
     elif method != "triangulation":
         raise ValueError(f"Unknown flip diagnostic method: {method}")
     nominal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
+    nominal_legacy_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     nominal_temporal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     swapped_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
+    swapped_legacy_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     swapped_temporal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     temporal_references, temporal_support_counts = build_temporal_reference_points(pose_data)
 
@@ -1223,6 +1256,13 @@ def detect_left_right_flip_diagnostics(
                     pair_weights=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
+                )
+                nominal_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost_legacy(
+                    cam_idx,
+                    raw_points_frame[cam_idx],
+                    raw_points_frame,
+                    raw_scores_frame,
+                    fundamental_matrices,
                 )
             else:
                 nominal_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1254,7 +1294,9 @@ def detect_left_right_flip_diagnostics(
     smoothed_nominal_costs = smooth_camera_time_series(effective_nominal_costs, window=smoothing_window)
 
     outlier_thresholds_by_camera = np.full(n_cams, float(outlier_floor_px), dtype=float)
+    legacy_outlier_thresholds_by_camera = np.full(n_cams, float(outlier_floor_px), dtype=float)
     candidate_mask = np.isfinite(effective_nominal_costs)
+    legacy_candidate_mask = np.zeros_like(candidate_mask, dtype=bool)
     if restrict_to_outliers:
         candidate_mask[:] = False
         for cam_idx in range(n_cams):
@@ -1267,8 +1309,21 @@ def detect_left_right_flip_diagnostics(
             if method == "epipolar":
                 smooth_outliers = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
                 candidate_mask[cam_idx] = raw_outliers | smooth_outliers
+                legacy_valid_costs = nominal_legacy_costs[cam_idx, np.isfinite(nominal_legacy_costs[cam_idx])]
+                if legacy_valid_costs.size > 0:
+                    legacy_threshold = max(
+                        float(outlier_floor_px),
+                        float(np.percentile(legacy_valid_costs, float(outlier_percentile))),
+                    )
+                    legacy_outlier_thresholds_by_camera[cam_idx] = legacy_threshold
+                    legacy_candidate_mask[cam_idx] = np.isfinite(nominal_legacy_costs[cam_idx]) & (
+                        nominal_legacy_costs[cam_idx] >= legacy_threshold
+                    )
+                    candidate_mask[cam_idx] |= legacy_candidate_mask[cam_idx]
             else:
                 candidate_mask[cam_idx] = raw_outliers
+    elif method == "epipolar":
+        legacy_candidate_mask = np.isfinite(nominal_legacy_costs)
 
     for frame_idx in range(n_frames):
         raw_points_frame = pose_data.keypoints[:, frame_idx]
@@ -1297,6 +1352,13 @@ def detect_left_right_flip_diagnostics(
                     pair_weights=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
+                )
+                swapped_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost_legacy(
+                    cam_idx,
+                    swapped_candidate,
+                    raw_points_frame,
+                    raw_scores_frame,
+                    fundamental_matrices,
                 )
             else:
                 swapped_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1332,6 +1394,17 @@ def detect_left_right_flip_diagnostics(
         temporal_tau_px=temporal_tau_px,
         temporal_weight=temporal_weight,
     )
+    if method == "epipolar":
+        legacy_decision = (
+            candidate_mask
+            & np.isfinite(nominal_legacy_costs)
+            & np.isfinite(swapped_legacy_costs)
+            & (nominal_legacy_costs > 0.0)
+            & (swapped_legacy_costs < float(improvement_ratio) * nominal_legacy_costs)
+            & ((nominal_legacy_costs - swapped_legacy_costs) >= float(min_gain_px))
+        )
+    else:
+        legacy_decision = np.zeros_like(candidate_mask, dtype=bool)
     gain_margin_px = effective_nominal_costs - effective_swapped_costs - float(min_gain_px)
     ratio_margin_px = float(improvement_ratio) * effective_nominal_costs - effective_swapped_costs
     decision_score = np.minimum(gain_margin_px, ratio_margin_px)
@@ -1345,6 +1418,7 @@ def detect_left_right_flip_diagnostics(
         ((decision_score > 0.0) & (smoothed_decision_score > 0.0))
         | (decision_score >= strong_positive_margin)
     )
+    suspect_mask |= legacy_decision
     frames_with_any_suspect = np.any(suspect_mask, axis=0)
     temporal_support_mask = np.isfinite(nominal_temporal_costs)
     candidate_temporal_support_mask = candidate_mask & temporal_support_mask
@@ -1385,7 +1459,14 @@ def detect_left_right_flip_diagnostics(
         "camera_frame_flip_candidates": {
             pose_data.camera_names[cam_idx]: int(candidate_mask[cam_idx].sum()) for cam_idx in range(n_cams)
         },
+        "camera_frame_flip_legacy_candidates": {
+            pose_data.camera_names[cam_idx]: int(legacy_candidate_mask[cam_idx].sum()) for cam_idx in range(n_cams)
+        },
         "cost_summaries_px": {
+            "legacy_nominal_median": float(np.nanmedian(nominal_legacy_costs)) if np.isfinite(nominal_legacy_costs).any() else None,
+            "legacy_swapped_candidate_median": float(np.nanmedian(swapped_legacy_costs[candidate_mask]))
+            if np.isfinite(swapped_legacy_costs[candidate_mask]).any()
+            else None,
             "geometric_nominal_median": float(np.nanmedian(nominal_costs)) if np.isfinite(nominal_costs).any() else None,
             "temporal_nominal_median": float(np.nanmedian(nominal_temporal_costs)) if np.isfinite(nominal_temporal_costs).any() else None,
             "combined_nominal_median": float(np.nanmedian(effective_nominal_costs)) if np.isfinite(effective_nominal_costs).any() else None,
@@ -1400,16 +1481,20 @@ def detect_left_right_flip_diagnostics(
     }
     detail_arrays = {
         "nominal_geometric_costs": nominal_costs,
+        "nominal_legacy_costs": nominal_legacy_costs,
         "nominal_temporal_costs": nominal_temporal_costs,
         "nominal_combined_costs": effective_nominal_costs,
         "nominal_combined_costs_smoothed": smoothed_nominal_costs,
         "swapped_geometric_costs": swapped_costs,
+        "swapped_legacy_costs": swapped_legacy_costs,
         "swapped_temporal_costs": swapped_temporal_costs,
         "swapped_combined_costs": effective_swapped_costs,
+        "legacy_decision_mask": legacy_decision.astype(bool),
         "decision_scores": decision_score,
         "decision_scores_smoothed": smoothed_decision_score,
         "strong_positive_margin": np.full_like(decision_score, strong_positive_margin, dtype=float),
         "candidate_mask": candidate_mask.astype(bool),
+        "legacy_candidate_mask": legacy_candidate_mask.astype(bool),
         "temporal_support_mask": temporal_support_mask.astype(bool),
     }
     return suspect_mask, diagnostics, detail_arrays
@@ -1802,6 +1887,7 @@ def triangulate_pose2sim_like(
         excluded_views=excluded_views,
         coherence_method=coherence_method,
         epipolar_coherence_compute_time_s=epipolar_time_s,
+        triangulation_compute_time_s=0.0,
     )
 
 
@@ -3265,23 +3351,31 @@ def model_stage_metadata(
     }
 
 
-def save_model_stage(cache_path: Path, lengths: SegmentLengths, biomod_path: Path, metadata: dict[str, object]) -> None:
+def save_model_stage(
+    cache_path: Path,
+    lengths: SegmentLengths,
+    biomod_path: Path,
+    metadata: dict[str, object],
+    compute_time_s: float = 0.0,
+) -> None:
     """Sauvegarde les longueurs et le chemin du biomod dans un cache dedie."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         cache_path,
         lengths=np.asarray(json.dumps(lengths.__dict__), dtype=object),
         biomod_path=np.asarray(str(biomod_path), dtype=object),
+        compute_time_s=np.asarray(float(compute_time_s), dtype=float),
         metadata=np.asarray(json.dumps(metadata), dtype=object),
     )
 
 
-def load_model_stage(cache_path: Path) -> tuple[SegmentLengths, Path]:
+def load_model_stage(cache_path: Path) -> tuple[SegmentLengths, Path, float]:
     """Recharge le stage modele sans recalculer les longueurs ni reexporter le biomod."""
     with np.load(cache_path, allow_pickle=True) as data:
         lengths_dict = json.loads(data["lengths"].item())
         biomod_path = Path(data["biomod_path"].item())
-    return SegmentLengths(**lengths_dict), biomod_path
+        compute_time_s = float(np.asarray(data["compute_time_s"]).item()) if "compute_time_s" in data else 0.0
+    return SegmentLengths(**lengths_dict), biomod_path, compute_time_s
 
 
 def metadata_cache_matches(cache_path: Path, expected_metadata: dict[str, object]) -> bool:
@@ -3328,6 +3422,7 @@ def save_reconstruction_cache(
         excluded_views=reconstruction.excluded_views,
         coherence_method=np.asarray(reconstruction.coherence_method, dtype=object),
         epipolar_coherence_compute_time_s=np.asarray(reconstruction.epipolar_coherence_compute_time_s, dtype=float),
+        triangulation_compute_time_s=np.asarray(reconstruction.triangulation_compute_time_s, dtype=float),
         keypoint_names=np.asarray(COCO17, dtype=object),
         metadata=np.asarray(json.dumps(metadata), dtype=object),
     )
@@ -3353,6 +3448,7 @@ def load_reconstruction_cache(cache_path: Path, coherence_method: str) -> Recons
         else:
             triangulation_coherence = np.asarray(data["multiview_coherence"])
         epipolar_time_s = float(np.asarray(data["epipolar_coherence_compute_time_s"]).item()) if "epipolar_coherence_compute_time_s" in data else 0.0
+        triangulation_time_s = float(np.asarray(data["triangulation_compute_time_s"]).item()) if "triangulation_compute_time_s" in data else 0.0
 
         multiview_coherence = select_active_coherence(
             epipolar_coherence=epipolar_coherence,
@@ -3372,6 +3468,7 @@ def load_reconstruction_cache(cache_path: Path, coherence_method: str) -> Recons
         excluded_views=excluded_views,
         coherence_method=coherence_method,
         epipolar_coherence_compute_time_s=epipolar_time_s,
+        triangulation_compute_time_s=triangulation_time_s,
     )
 
 
@@ -4098,7 +4195,7 @@ def main() -> None:
     )
     if metadata_cache_matches(model_cache_path, model_metadata) and args.biomod.exists():
         t0 = time.perf_counter()
-        lengths, biomod_path = load_model_stage(model_cache_path)
+        lengths, biomod_path, _compute_time_s = load_model_stage(model_cache_path)
         biomod_path = args.biomod
         stage_timings_s["model_stage_s"] = time.perf_counter() - t0
     else:
@@ -4111,7 +4208,7 @@ def main() -> None:
             reconstruction=reconstruction,
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
         )
-        save_model_stage(model_cache_path, lengths, biomod_path, model_metadata)
+        save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=t_model)
         stage_timings_s["model_stage_s"] = time.perf_counter() - t0
 
     if args.model_only:

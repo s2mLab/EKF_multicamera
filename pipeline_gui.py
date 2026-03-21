@@ -85,7 +85,7 @@ from reconstruction_registry import (
     scan_model_dirs,
     scan_reconstruction_dirs,
 )
-from reconstruction_timings import compute_time_seconds, format_reconstruction_timing_details
+from reconstruction_timings import format_reconstruction_timing_details, objective_total_seconds
 from root_kinematics import (
     TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
@@ -2074,6 +2074,7 @@ class DualAnimationTab(CommandTab):
         super().__init__(master, "3D animation")
         self.state = state
         self.bundle: dict[str, object] | None = None
+        self._view_state: tuple[float, float, float] | None = None
         form = ttk.LabelFrame(self.main, text="animation/animate_dual_stick_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
@@ -2313,9 +2314,19 @@ class DualAnimationTab(CommandTab):
         if not show_names:
             show_names = [next(iter(available.keys()))]
 
+        previous_axes = self.preview_figure.axes[0] if self.preview_figure.axes else None
+        if previous_axes is not None and hasattr(previous_axes, "elev") and hasattr(previous_axes, "azim"):
+            self._view_state = (
+                float(getattr(previous_axes, "elev", 30.0)),
+                float(getattr(previous_axes, "azim", -60.0)),
+                float(getattr(previous_axes, "roll", 0.0)),
+            )
+
         self.preview_figure.clear()
         ax = self.preview_figure.add_subplot(111, projection="3d")
         ax.mouse_init()
+        if self._view_state is not None:
+            ax.view_init(elev=self._view_state[0], azim=self._view_state[1], roll=self._view_state[2])
         points_dict = {name: available[name] for name in show_names}
         for name in show_names:
             frame_points = available[name][frame_idx]
@@ -2341,6 +2352,11 @@ class DualAnimationTab(CommandTab):
         ax.legend(loc="upper right", fontsize=8)
         self.preview_figure.tight_layout()
         self.preview_canvas.draw_idle()
+        self._view_state = (
+            float(getattr(ax, "elev", 30.0)),
+            float(getattr(ax, "azim", -60.0)),
+            float(getattr(ax, "roll", 0.0)),
+        )
 
 
 class MultiViewTab(CommandTab):
@@ -3217,7 +3233,7 @@ class DataExplorer2DTab(ttk.Frame):
         for method in ("epipolar", "triangulation"):
             if method in self.flip_masks:
                 continue
-            suspect_mask, diagnostics, _compute_time_s, _cache_path = load_or_compute_left_right_flip_cache(
+            suspect_mask, diagnostics, _compute_time_s, _cache_path, _flip_source = load_or_compute_left_right_flip_cache(
                 output_dir=output_dir,
                 pose_data=self.pose_data,
                 calibrations=self.calibrations,
@@ -3841,7 +3857,7 @@ class ModelTab(CommandTab):
                     return existing, frame_idx
         for frame_idx in range(pose_data.frames.shape[0]):
             single_frame_pose_data = slice_pose_data(pose_data, [frame_idx])
-            single_frame_reconstruction, _cache_path, _epipolar_cache_path = load_or_compute_triangulation_cache(
+            single_frame_reconstruction, _cache_path, _epipolar_cache_path, _triangulation_source = load_or_compute_triangulation_cache(
                 output_dir=model_dir,
                 pose_data=single_frame_pose_data,
                 calibrations=calibrations,
@@ -4725,7 +4741,7 @@ class ReconstructionsTab(CommandTab):
                 continue
             reproj = summary.get("reprojection_px", {})
             latest = summary.get("is_latest_family_version")
-            compute_s = compute_time_seconds(summary)
+            compute_s = objective_total_seconds(summary)
             iid = str(recon_dir)
             self.status_summaries[iid] = summary
             self.status_tree.insert(
@@ -5380,7 +5396,7 @@ class CameraToolsTab(ttk.Frame):
         dataset_dir = current_dataset_dir(self.state)
         pose_kwargs = shared_pose_data_kwargs(self.state)
         for method in ("epipolar", "triangulation"):
-            suspect_mask, diagnostics, _compute_time_s, cache_path = load_or_compute_left_right_flip_cache(
+            suspect_mask, diagnostics, _compute_time_s, cache_path, _flip_source = load_or_compute_left_right_flip_cache(
                 output_dir=dataset_dir,
                 pose_data=self.pose_data,
                 calibrations=self.calibrations,
