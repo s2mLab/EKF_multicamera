@@ -49,6 +49,7 @@ from preview_bundle import (
     project_points_all_cameras,
     root_center,
 )
+from preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
 from reconstruction_presenter import (
     bundle_available_reconstruction_names,
     catalog_rows_for_names,
@@ -1956,11 +1957,12 @@ class DualAnimationTab(CommandTab):
     def _on_frame_scale_click(self, event) -> str:
         widget = self.frame_scale
         widget.focus_set()
-        width = max(int(widget.winfo_width()), 1)
-        from_value = float(widget.cget("from"))
-        to_value = float(widget.cget("to"))
-        ratio = min(max(float(event.x) / float(width), 0.0), 1.0)
-        frame = int(round(from_value + ratio * (to_value - from_value)))
+        frame = frame_from_slider_click(
+            x=event.x,
+            width=widget.winfo_width(),
+            from_value=widget.cget("from"),
+            to_value=widget.cget("to"),
+        )
         self.frame_var.set(frame)
         self.refresh_preview()
         return "break"
@@ -1976,7 +1978,7 @@ class DualAnimationTab(CommandTab):
         if max_frame < 0:
             return "break"
         current = int(round(self.frame_var.get()))
-        next_frame = max(0, min(current + int(delta), max_frame))
+        next_frame = step_frame_index(current=current, delta=delta, max_frame=max_frame)
         if next_frame != current:
             self.frame_var.set(next_frame)
             self.refresh_preview()
@@ -2076,7 +2078,7 @@ class DualAnimationTab(CommandTab):
             return
         frame_idx = int(round(self.frame_var.get()))
         max_frame = min(points.shape[0] for points in available.values()) - 1
-        frame_idx = max(0, min(frame_idx, max_frame))
+        frame_idx = clamp_frame_index(frame_idx, max_frame)
         self.frame_var.set(frame_idx)
         self.frame_label.configure(text=f"frame {frame_idx}")
 
@@ -2197,11 +2199,12 @@ class MultiViewTab(CommandTab):
     def _on_frame_scale_click(self, event) -> str:
         widget = self.frame_scale
         widget.focus_set()
-        width = max(int(widget.winfo_width()), 1)
-        from_value = float(widget.cget("from"))
-        to_value = float(widget.cget("to"))
-        ratio = min(max(float(event.x) / float(width), 0.0), 1.0)
-        frame = int(round(from_value + ratio * (to_value - from_value)))
+        frame = frame_from_slider_click(
+            x=event.x,
+            width=widget.winfo_width(),
+            from_value=widget.cget("from"),
+            to_value=widget.cget("to"),
+        )
         self.frame_var.set(frame)
         self.refresh_preview()
         return "break"
@@ -2215,7 +2218,7 @@ class MultiViewTab(CommandTab):
         if n_frames <= 0:
             return "break"
         current = int(round(self.frame_var.get()))
-        next_frame = max(0, min(current + int(delta), n_frames - 1))
+        next_frame = step_frame_index(current=current, delta=delta, max_frame=n_frames - 1)
         if next_frame != current:
             self.frame_var.set(next_frame)
             self.refresh_preview()
@@ -2328,7 +2331,7 @@ class MultiViewTab(CommandTab):
             n_frames = min(n_frames, len(self.preview_bundle["frames"]))
         if n_frames == 0:
             return
-        frame_idx = max(0, min(int(round(self.frame_var.get())), n_frames - 1))
+        frame_idx = clamp_frame_index(int(round(self.frame_var.get())), n_frames - 1)
         self.frame_var.set(frame_idx)
         self.frame_label.configure(text=f"frame {frame_idx}")
 
