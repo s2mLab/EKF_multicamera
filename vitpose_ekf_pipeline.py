@@ -304,6 +304,18 @@ def frame_signature(frames: np.ndarray) -> str:
     return hashlib.sha1(frames.tobytes()).hexdigest()
 
 
+def pose_data_signature(pose_data: PoseData) -> str:
+    """Construit une signature stable a partir du contenu utile des observations 2D."""
+    hasher = hashlib.sha1()
+    hasher.update(np.asarray(pose_data.frames, dtype=np.int64).tobytes())
+    hasher.update(np.asarray(pose_data.keypoints, dtype=np.float64).tobytes())
+    hasher.update(np.asarray(pose_data.scores, dtype=np.float64).tobytes())
+    for camera_name in pose_data.camera_names:
+        hasher.update(str(camera_name).encode("utf-8"))
+        hasher.update(b"\0")
+    return hasher.hexdigest()[:16]
+
+
 def select_active_coherence(
     epipolar_coherence: np.ndarray,
     triangulation_coherence: np.ndarray,
@@ -1269,6 +1281,12 @@ def apply_left_right_flip_corrections(pose_data: PoseData, suspect_mask: np.ndar
         frames=np.array(pose_data.frames, copy=True),
         keypoints=corrected_keypoints,
         scores=corrected_scores,
+        raw_keypoints=None
+        if pose_data.raw_keypoints is None
+        else apply_left_right_flip_to_points(pose_data.raw_keypoints, suspect_mask),
+        filtered_keypoints=None
+        if pose_data.filtered_keypoints is None
+        else apply_left_right_flip_to_points(pose_data.filtered_keypoints, suspect_mask),
     )
 
 
@@ -3058,6 +3076,7 @@ def reconstruction_cache_metadata(
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
+        "pose_data_signature": pose_data_signature(pose_data),
         "reprojection_threshold_px": float(error_threshold_px),
         "min_cameras_for_triangulation": int(min_cameras_for_triangulation),
         "epipolar_threshold_px": float(epipolar_threshold_px),

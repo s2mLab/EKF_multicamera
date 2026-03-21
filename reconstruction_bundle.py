@@ -75,6 +75,7 @@ from vitpose_ekf_pipeline import (
     marker_name_list,
     metadata_cache_matches,
     model_stage_metadata,
+    pose_data_signature,
     reconstruction_cache_metadata,
     run_biorbd_marker_kalman_with_parameters,
     run_ekf,
@@ -136,6 +137,7 @@ def epipolar_cache_metadata(
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
+        "pose_data_signature": pose_data_signature(pose_data),
         "epipolar_threshold_px": float(epipolar_threshold_px),
         "pose_data_mode": pose_data_mode,
         "pose_filter_window": int(pose_filter_window),
@@ -227,6 +229,7 @@ def flip_cache_metadata(
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
+        "pose_data_signature": pose_data_signature(pose_data),
         "method": str(method),
         "pose_data_mode": pose_data_mode,
         "pose_filter_window": int(pose_filter_window),
@@ -358,6 +361,207 @@ def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) 
         raw_keypoints=None if pose_data.raw_keypoints is None else np.asarray(pose_data.raw_keypoints[:, idx, :, :], dtype=float),
         filtered_keypoints=None if pose_data.filtered_keypoints is None else np.asarray(pose_data.filtered_keypoints[:, idx, :, :], dtype=float),
     )
+
+
+def pose_variant_cache_metadata(
+    pose_data: PoseData,
+    *,
+    correction_mode: str,
+    pose_data_mode: str,
+    pose_filter_window: int,
+    pose_outlier_threshold_ratio: float,
+    pose_amplitude_lower_percentile: float,
+    pose_amplitude_upper_percentile: float,
+    flip_method: str | None = None,
+    improvement_ratio: float | None = None,
+    min_gain_px: float | None = None,
+    min_other_cameras: int | None = None,
+    restrict_to_outliers: bool | None = None,
+    outlier_percentile: float | None = None,
+    outlier_floor_px: float | None = None,
+    tau_px: float | None = None,
+    temporal_weight: float | None = None,
+    temporal_tau_px: float | None = None,
+    temporal_min_valid_keypoints: int | None = None,
+) -> dict[str, object]:
+    metadata = {
+        "camera_names": list(pose_data.camera_names),
+        "n_frames": int(pose_data.frames.shape[0]),
+        "frame_signature": frame_signature(pose_data.frames),
+        "source_pose_data_signature": pose_data_signature(pose_data),
+        "correction_mode": str(correction_mode),
+        "pose_data_mode": str(pose_data_mode),
+        "pose_filter_window": int(pose_filter_window),
+        "pose_outlier_threshold_ratio": float(pose_outlier_threshold_ratio),
+        "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
+        "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
+    }
+    if flip_method is not None:
+        metadata.update(
+            {
+                "flip_method": str(flip_method),
+                "improvement_ratio": float(improvement_ratio),
+                "min_gain_px": float(min_gain_px),
+                "min_other_cameras": int(min_other_cameras),
+                "restrict_to_outliers": bool(restrict_to_outliers),
+                "outlier_percentile": float(outlier_percentile),
+                "outlier_floor_px": float(outlier_floor_px),
+                "temporal_weight": float(temporal_weight),
+                "temporal_tau_px": float(temporal_tau_px),
+                "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
+            }
+        )
+        if tau_px is not None:
+            metadata["tau_px"] = float(tau_px)
+    return metadata
+
+
+def save_pose_variant_cache(
+    cache_path: Path,
+    pose_data: PoseData,
+    metadata: dict[str, object],
+    *,
+    diagnostics: dict[str, object] | None = None,
+    suspect_mask: np.ndarray | None = None,
+    compute_time_s: float = 0.0,
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, np.ndarray] = {
+        "camera_names": np.asarray(list(pose_data.camera_names), dtype=object),
+        "frames": np.asarray(pose_data.frames, dtype=int),
+        "keypoints": np.asarray(pose_data.keypoints, dtype=float),
+        "scores": np.asarray(pose_data.scores, dtype=float),
+        "metadata": np.asarray(json.dumps(_jsonable_metadata(metadata)), dtype=object),
+        "diagnostics": np.asarray(json.dumps(_jsonable_metadata(diagnostics or {})), dtype=object),
+        "compute_time_s": np.asarray(float(compute_time_s), dtype=float),
+    }
+    if pose_data.raw_keypoints is not None:
+        payload["raw_keypoints"] = np.asarray(pose_data.raw_keypoints, dtype=float)
+    if pose_data.filtered_keypoints is not None:
+        payload["filtered_keypoints"] = np.asarray(pose_data.filtered_keypoints, dtype=float)
+    if suspect_mask is not None:
+        payload["suspect_mask"] = np.asarray(suspect_mask, dtype=bool)
+    np.savez(cache_path, **payload)
+
+
+def load_pose_variant_cache(cache_path: Path) -> tuple[PoseData, dict[str, object], np.ndarray | None, float]:
+    with np.load(cache_path, allow_pickle=True) as data:
+        pose_data = PoseData(
+            camera_names=[str(name) for name in np.asarray(data["camera_names"], dtype=object).tolist()],
+            frames=np.asarray(data["frames"], dtype=int),
+            keypoints=np.asarray(data["keypoints"], dtype=float),
+            scores=np.asarray(data["scores"], dtype=float),
+            raw_keypoints=np.asarray(data["raw_keypoints"], dtype=float) if "raw_keypoints" in data else None,
+            filtered_keypoints=np.asarray(data["filtered_keypoints"], dtype=float) if "filtered_keypoints" in data else None,
+        )
+        diagnostics = json.loads(str(np.asarray(data["diagnostics"]).item())) if "diagnostics" in data else {}
+        suspect_mask = np.asarray(data["suspect_mask"], dtype=bool) if "suspect_mask" in data else None
+        compute_time_s = float(np.asarray(data["compute_time_s"]).item()) if "compute_time_s" in data else 0.0
+    return pose_data, diagnostics, suspect_mask, compute_time_s
+
+
+def load_or_compute_pose_data_variant_cache(
+    *,
+    output_dir: Path,
+    pose_data: PoseData,
+    calibrations: dict[str, CameraCalibration],
+    pose_data_mode: str,
+    pose_filter_window: int,
+    pose_outlier_threshold_ratio: float,
+    pose_amplitude_lower_percentile: float,
+    pose_amplitude_upper_percentile: float,
+    correction_mode: str = "none",
+    flip_method: str | None = None,
+    improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+    min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+    min_other_cameras: int = DEFAULT_FLIP_MIN_OTHER_CAMERAS,
+    restrict_to_outliers: bool = DEFAULT_FLIP_RESTRICT_TO_OUTLIERS,
+    outlier_percentile: float = DEFAULT_FLIP_OUTLIER_PERCENTILE,
+    outlier_floor_px: float = DEFAULT_FLIP_OUTLIER_FLOOR_PX,
+    tau_px: float | None = None,
+    temporal_weight: float = DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    temporal_tau_px: float = DEFAULT_FLIP_TEMPORAL_TAU_PX,
+    temporal_min_valid_keypoints: int = DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
+) -> tuple[PoseData, dict[str, object] | None, float, Path]:
+    metadata = pose_variant_cache_metadata(
+        pose_data,
+        correction_mode=correction_mode,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        flip_method=flip_method,
+        improvement_ratio=improvement_ratio if flip_method is not None else None,
+        min_gain_px=min_gain_px if flip_method is not None else None,
+        min_other_cameras=min_other_cameras if flip_method is not None else None,
+        restrict_to_outliers=restrict_to_outliers if flip_method is not None else None,
+        outlier_percentile=outlier_percentile if flip_method is not None else None,
+        outlier_floor_px=outlier_floor_px if flip_method is not None else None,
+        tau_px=tau_px if flip_method is not None else None,
+        temporal_weight=temporal_weight if flip_method is not None else None,
+        temporal_tau_px=temporal_tau_px if flip_method is not None else None,
+        temporal_min_valid_keypoints=temporal_min_valid_keypoints if flip_method is not None else None,
+    )
+    cache_dir = cache_entry_dir(output_dir, "pose2d", metadata, prefix=f"pose2d_{correction_mode}")
+    cache_path = cache_dir / "pose_data_variant.npz"
+    if metadata_cache_matches(cache_path, metadata):
+        corrected_pose_data, diagnostics, _suspect_mask, compute_time_s = load_pose_variant_cache(cache_path)
+        return corrected_pose_data, (diagnostics or None), compute_time_s, cache_path
+
+    if correction_mode == "none":
+        t0 = time.perf_counter()
+        corrected_pose_data = PoseData(
+            camera_names=list(pose_data.camera_names),
+            frames=np.asarray(pose_data.frames, dtype=int),
+            keypoints=np.asarray(pose_data.keypoints, dtype=float),
+            scores=np.asarray(pose_data.scores, dtype=float),
+            raw_keypoints=None if pose_data.raw_keypoints is None else np.asarray(pose_data.raw_keypoints, dtype=float),
+            filtered_keypoints=None if pose_data.filtered_keypoints is None else np.asarray(pose_data.filtered_keypoints, dtype=float),
+        )
+        compute_time_s = time.perf_counter() - t0
+        save_pose_variant_cache(cache_path, corrected_pose_data, metadata, compute_time_s=compute_time_s)
+        return corrected_pose_data, None, compute_time_s, cache_path
+
+    if correction_mode != "flip":
+        raise ValueError(f"Unsupported pose-data correction mode: {correction_mode}")
+    if flip_method is None:
+        raise ValueError("flip_method is required when correction_mode='flip'.")
+
+    suspect_mask, diagnostics, flip_compute_time_s, flip_cache_path = load_or_compute_left_right_flip_cache(
+        output_dir=output_dir,
+        pose_data=pose_data,
+        calibrations=calibrations,
+        method=flip_method,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        improvement_ratio=improvement_ratio,
+        min_gain_px=min_gain_px,
+        min_other_cameras=min_other_cameras,
+        restrict_to_outliers=restrict_to_outliers,
+        outlier_percentile=outlier_percentile,
+        outlier_floor_px=outlier_floor_px,
+        tau_px=tau_px,
+        temporal_weight=temporal_weight,
+        temporal_tau_px=temporal_tau_px,
+        temporal_min_valid_keypoints=temporal_min_valid_keypoints,
+    )
+    corrected_pose_data = apply_left_right_flip_corrections(pose_data, suspect_mask)
+    diagnostics = dict(diagnostics)
+    diagnostics["compute_time_s"] = float(flip_compute_time_s)
+    diagnostics["flip_cache_path"] = str(flip_cache_path)
+    save_pose_variant_cache(
+        cache_path,
+        corrected_pose_data,
+        metadata,
+        diagnostics=diagnostics,
+        suspect_mask=suspect_mask,
+        compute_time_s=float(flip_compute_time_s),
+    )
+    return corrected_pose_data, diagnostics, float(flip_compute_time_s), cache_path
 
 
 def reconstruction_with_full_frame_support(
@@ -532,6 +736,63 @@ def load_or_build_model_cache(
     )
     save_model_stage(cache_path, lengths, biomod_cache_path, metadata)
     return lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx)
+
+
+def prepare_pose_data_for_reconstruction(
+    *,
+    output_dir: Path,
+    pose_data: PoseData,
+    calibrations: dict[str, CameraCalibration],
+    coherence_method: str,
+    reprojection_threshold_px: float,
+    epipolar_threshold_px: float,
+    pose_data_mode: str,
+    pose_filter_window: int,
+    pose_outlier_threshold_ratio: float,
+    pose_amplitude_lower_percentile: float,
+    pose_amplitude_upper_percentile: float,
+    flip_left_right: bool,
+    flip_improvement_ratio: float,
+    flip_min_gain_px: float,
+    flip_min_other_cameras: int,
+    flip_restrict_to_outliers: bool,
+    flip_outlier_percentile: float,
+    flip_outlier_floor_px: float,
+    flip_temporal_weight: float,
+    flip_temporal_tau_px: float,
+    flip_temporal_min_valid_keypoints: int,
+) -> tuple[PoseData, dict[str, object] | None, Path | None]:
+    if not flip_left_right:
+        return pose_data, None, None
+
+    flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
+    pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path = load_or_compute_pose_data_variant_cache(
+        output_dir=output_dir,
+        pose_data=pose_data,
+        calibrations=calibrations,
+        correction_mode="flip",
+        flip_method=flip_method,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        improvement_ratio=flip_improvement_ratio,
+        min_gain_px=flip_min_gain_px,
+        min_other_cameras=flip_min_other_cameras,
+        restrict_to_outliers=flip_restrict_to_outliers,
+        outlier_percentile=flip_outlier_percentile,
+        outlier_floor_px=flip_outlier_floor_px,
+        tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
+        temporal_weight=flip_temporal_weight,
+        temporal_tau_px=flip_temporal_tau_px,
+        temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    )
+    if flip_diagnostics is not None:
+        flip_diagnostics = dict(flip_diagnostics)
+        flip_diagnostics["cache_path"] = str(pose_variant_cache_path)
+        flip_diagnostics["pose_data_signature"] = pose_data_signature(pose_data_used)
+    return pose_data_used, flip_diagnostics, pose_variant_cache_path
 
 def with_version_info(summary: dict[str, object], family: str) -> dict[str, object]:
     latest = latest_version_for_family(family)
@@ -1046,35 +1307,29 @@ def build_triangulation_bundle(
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
 ) -> tuple[BundleBuildResult, ReconstructionResult]:
-    flip_diagnostics = None
-    pose_data_used = pose_data
-    if flip_left_right:
-        flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
-        suspect_mask, flip_diagnostics, flip_compute_time_s, flip_cache_path = load_or_compute_left_right_flip_cache(
-            output_dir=output_dir,
-            pose_data=pose_data,
-            calibrations=calibrations,
-            method=flip_method,
-            pose_data_mode=pose_data_mode,
-            pose_filter_window=pose_filter_window,
-            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-            improvement_ratio=flip_improvement_ratio,
-            min_gain_px=flip_min_gain_px,
-            min_other_cameras=flip_min_other_cameras,
-            restrict_to_outliers=flip_restrict_to_outliers,
-            outlier_percentile=flip_outlier_percentile,
-            outlier_floor_px=flip_outlier_floor_px,
-            tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
-            temporal_weight=flip_temporal_weight,
-            temporal_tau_px=flip_temporal_tau_px,
-            temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
-        )
-        flip_diagnostics = dict(flip_diagnostics)
-        flip_diagnostics["compute_time_s"] = float(flip_compute_time_s)
-        flip_diagnostics["cache_path"] = str(flip_cache_path)
-        pose_data_used = apply_left_right_flip_corrections(pose_data, suspect_mask)
+    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+        output_dir=output_dir,
+        pose_data=pose_data,
+        calibrations=calibrations,
+        coherence_method=coherence_method,
+        reprojection_threshold_px=reprojection_threshold_px,
+        epipolar_threshold_px=epipolar_threshold_px,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        flip_left_right=flip_left_right,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
+        flip_min_other_cameras=flip_min_other_cameras,
+        flip_restrict_to_outliers=flip_restrict_to_outliers,
+        flip_outlier_percentile=flip_outlier_percentile,
+        flip_outlier_floor_px=flip_outlier_floor_px,
+        flip_temporal_weight=flip_temporal_weight,
+        flip_temporal_tau_px=flip_temporal_tau_px,
+        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    )
 
     print_step(2, 3, "Triangulation 3D")
     t0 = time.perf_counter()
@@ -1139,6 +1394,7 @@ def build_triangulation_bundle(
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
             "epipolar": str(epipolar_cache_path),
+            **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],
@@ -1208,35 +1464,29 @@ def build_ekf_3d_bundle(
     biorbd_kalman_error_factor: float,
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> BundleBuildResult:
-    flip_diagnostics = None
-    pose_data_used = pose_data
-    if flip_left_right:
-        flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
-        suspect_mask, flip_diagnostics, flip_compute_time_s, flip_cache_path = load_or_compute_left_right_flip_cache(
-            output_dir=output_dir,
-            pose_data=pose_data,
-            calibrations=calibrations,
-            method=flip_method,
-            pose_data_mode=pose_data_mode,
-            pose_filter_window=pose_filter_window,
-            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-            improvement_ratio=flip_improvement_ratio,
-            min_gain_px=flip_min_gain_px,
-            min_other_cameras=flip_min_other_cameras,
-            restrict_to_outliers=flip_restrict_to_outliers,
-            outlier_percentile=flip_outlier_percentile,
-            outlier_floor_px=flip_outlier_floor_px,
-            tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
-            temporal_weight=flip_temporal_weight,
-            temporal_tau_px=flip_temporal_tau_px,
-            temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
-        )
-        flip_diagnostics = dict(flip_diagnostics)
-        flip_diagnostics["compute_time_s"] = float(flip_compute_time_s)
-        flip_diagnostics["cache_path"] = str(flip_cache_path)
-        pose_data_used = apply_left_right_flip_corrections(pose_data, suspect_mask)
+    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+        output_dir=output_dir,
+        pose_data=pose_data,
+        calibrations=calibrations,
+        coherence_method=coherence_method,
+        reprojection_threshold_px=reprojection_threshold_px,
+        epipolar_threshold_px=epipolar_threshold_px,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        flip_left_right=flip_left_right,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
+        flip_min_other_cameras=flip_min_other_cameras,
+        flip_restrict_to_outliers=flip_restrict_to_outliers,
+        flip_outlier_percentile=flip_outlier_percentile,
+        flip_outlier_floor_px=flip_outlier_floor_px,
+        flip_temporal_weight=flip_temporal_weight,
+        flip_temporal_tau_px=flip_temporal_tau_px,
+        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    )
 
     print_step(2, 5, "Triangulation 3D")
     tri_start = time.perf_counter()
@@ -1336,6 +1586,7 @@ def build_ekf_3d_bundle(
             "triangulation": str(reconstruction_cache_path),
             "epipolar": str(epipolar_cache_path),
             "model": str(model_cache_path),
+            **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
@@ -1432,12 +1683,36 @@ def build_ekf_2d_bundle(
     if ekf2d_3d_source == "first_frame_only" and coherence_method != "epipolar":
         raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method=epipolar.")
 
+    pose_data_used, flip_diagnostics, pose_variant_cache_path = prepare_pose_data_for_reconstruction(
+        output_dir=output_dir,
+        pose_data=pose_data,
+        calibrations=calibrations,
+        coherence_method=coherence_method,
+        reprojection_threshold_px=reprojection_threshold_px,
+        epipolar_threshold_px=epipolar_threshold_px,
+        pose_data_mode=pose_data_mode,
+        pose_filter_window=pose_filter_window,
+        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        flip_left_right=flip_left_right,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
+        flip_min_other_cameras=flip_min_other_cameras,
+        flip_restrict_to_outliers=flip_restrict_to_outliers,
+        flip_outlier_percentile=flip_outlier_percentile,
+        flip_outlier_floor_px=flip_outlier_floor_px,
+        flip_temporal_weight=flip_temporal_weight,
+        flip_temporal_tau_px=flip_temporal_tau_px,
+        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    )
+
     print_step(2, 5, "Triangulation 3D")
     tri_start = time.perf_counter()
     if ekf2d_3d_source == "full_triangulation":
         reconstruction, reconstruction_cache_path, epipolar_cache_path = load_or_compute_triangulation_cache(
             output_dir=output_dir,
-            pose_data=pose_data,
+            pose_data=pose_data_used,
             calibrations=calibrations,
             coherence_method=coherence_method,
             triangulation_method=triangulation_method,
@@ -1454,7 +1729,7 @@ def build_ekf_2d_bundle(
         save_legacy_triangulation(
             output_dir,
             reconstruction,
-            pose_data,
+            pose_data_used,
             triangulation_method=triangulation_method,
             error_threshold_px=reprojection_threshold_px,
             min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -1469,7 +1744,7 @@ def build_ekf_2d_bundle(
     else:
         epipolar_coherence, epipolar_time_s, epipolar_cache_path = load_or_compute_epipolar_cache(
             output_dir=output_dir,
-            pose_data=pose_data,
+            pose_data=pose_data_used,
             calibrations=calibrations,
             epipolar_threshold_px=epipolar_threshold_px,
             pose_data_mode=pose_data_mode,
@@ -1478,7 +1753,7 @@ def build_ekf_2d_bundle(
             pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
         )
-        bootstrap_pose_data = slice_pose_data(pose_data, [0])
+        bootstrap_pose_data = slice_pose_data(pose_data_used, [0])
         bootstrap_reconstruction, reconstruction_cache_path, _ = load_or_compute_triangulation_cache(
             output_dir=output_dir,
             pose_data=bootstrap_pose_data,
@@ -1497,7 +1772,7 @@ def build_ekf_2d_bundle(
         )
         bootstrap_frame_idx = 0
         reconstruction = reconstruction_with_full_frame_support(
-            pose_data,
+            pose_data_used,
             bootstrap_reconstruction,
             epipolar_coherence,
             epipolar_time_s,
@@ -1505,36 +1780,6 @@ def build_ekf_2d_bundle(
             bootstrap_frame_global_idx=bootstrap_frame_idx,
         )
     triangulation_s = time.perf_counter() - tri_start
-
-    flip_diagnostics = None
-    pose_data_used = pose_data
-    if flip_left_right:
-        flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
-        suspect_mask, flip_diagnostics, flip_compute_time_s, flip_cache_path = load_or_compute_left_right_flip_cache(
-            output_dir=output_dir,
-            pose_data=pose_data,
-            calibrations=calibrations,
-            method=flip_method,
-            pose_data_mode=pose_data_mode,
-            pose_filter_window=pose_filter_window,
-            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-            improvement_ratio=flip_improvement_ratio,
-            min_gain_px=flip_min_gain_px,
-            min_other_cameras=flip_min_other_cameras,
-            restrict_to_outliers=flip_restrict_to_outliers,
-            outlier_percentile=flip_outlier_percentile,
-            outlier_floor_px=flip_outlier_floor_px,
-            tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
-            temporal_weight=flip_temporal_weight,
-            temporal_tau_px=flip_temporal_tau_px,
-            temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
-        )
-        flip_diagnostics = dict(flip_diagnostics)
-        flip_diagnostics["compute_time_s"] = float(flip_compute_time_s)
-        flip_diagnostics["cache_path"] = str(flip_cache_path)
-        pose_data_used = apply_left_right_flip_corrections(pose_data, suspect_mask)
 
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
@@ -1633,6 +1878,7 @@ def build_ekf_2d_bundle(
             "triangulation": str(reconstruction_cache_path),
             "epipolar": str(epipolar_cache_path),
             "model": str(model_cache_path),
+            **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
