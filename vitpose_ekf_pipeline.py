@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import functools
 import hashlib
 import json
 import itertools as it
@@ -551,19 +552,80 @@ def weighted_triangulation(projections: Iterable[np.ndarray], observations: np.n
     Chaque camera contribue proportionnellement a son score de confiance 2D.
     Cela reproduit l'idee de la triangulation ponderee utilisee dans Pose2Sim.
     """
-    A = []
-    for P, (u, v), w in zip(projections, observations, confidences):
-        if not np.isfinite(u) or not np.isfinite(v) or w <= 0:
-            continue
-        A.append((P[0] - u * P[2]) * w)
-        A.append((P[1] - v * P[2]) * w)
-    if len(A) < 4:
+    projections_array = np.asarray(list(projections), dtype=float)
+    observations = np.asarray(observations, dtype=float)
+    confidences = np.asarray(confidences, dtype=float)
+    if projections_array.ndim != 3 or projections_array.shape[1:] != (3, 4):
         return np.full(3, np.nan)
-    _, _, vh = np.linalg.svd(np.asarray(A))
+    valid = (
+        np.isfinite(observations[:, 0])
+        & np.isfinite(observations[:, 1])
+        & np.isfinite(confidences)
+        & (confidences > 0)
+    )
+    if np.count_nonzero(valid) < 2:
+        return np.full(3, np.nan)
+    projections_valid = projections_array[valid]
+    observations_valid = observations[valid]
+    weights_valid = confidences[valid][:, np.newaxis]
+    u = observations_valid[:, 0][:, np.newaxis]
+    v = observations_valid[:, 1][:, np.newaxis]
+    rows0 = (projections_valid[:, 0, :] - u * projections_valid[:, 2, :]) * weights_valid
+    rows1 = (projections_valid[:, 1, :] - v * projections_valid[:, 2, :]) * weights_valid
+    A = np.empty((2 * projections_valid.shape[0], 4), dtype=float)
+    A[0::2] = rows0
+    A[1::2] = rows1
+    _, _, vh = np.linalg.svd(A)
     q_h = vh[-1]
     if abs(q_h[3]) < 1e-12:
         return np.full(3, np.nan)
     return q_h[:3] / q_h[3]
+
+
+@functools.lru_cache(maxsize=64)
+def exclusion_combinations(n_valid: int, nb_cams_off: int) -> tuple[tuple[int, ...], ...]:
+    return tuple(it.combinations(range(int(n_valid)), int(nb_cams_off)))
+
+
+def triangulation_reference_from_other_views(
+    raw_2d_frame: np.ndarray,
+    raw_scores_frame: np.ndarray,
+    ordered_calibrations: list[CameraCalibration],
+    *,
+    min_other_cameras: int = 2,
+) -> np.ndarray:
+    """Precompute reprojection references for flip diagnostics in triangulation mode.
+
+    For each tested camera and keypoint, the 3D point is triangulated from the
+    *other* valid views only once, then reprojected back in the tested camera.
+    This avoids recomputing the same triangulation for nominal and swapped
+    hypotheses.
+    """
+    n_cams, n_keypoints = raw_2d_frame.shape[:2]
+    reprojected = np.full((n_cams, n_keypoints, 2), np.nan, dtype=float)
+    projections = [calibration.P for calibration in ordered_calibrations]
+    for cam_idx in range(n_cams):
+        other_mask = np.ones(n_cams, dtype=bool)
+        other_mask[cam_idx] = False
+        for kp_idx in range(n_keypoints):
+            valid_other = (
+                other_mask
+                & np.all(np.isfinite(raw_2d_frame[:, kp_idx]), axis=1)
+                & (raw_scores_frame[:, kp_idx] > 0)
+            )
+            if np.count_nonzero(valid_other) < max(2, int(min_other_cameras)):
+                continue
+            point_3d = weighted_triangulation(
+                [projections[idx] for idx in np.flatnonzero(valid_other)],
+                raw_2d_frame[valid_other, kp_idx],
+                raw_scores_frame[valid_other, kp_idx],
+            )
+            if not np.all(np.isfinite(point_3d)):
+                continue
+            reproj = ordered_calibrations[cam_idx].project_point(point_3d)
+            if np.all(np.isfinite(reproj)):
+                reprojected[cam_idx, kp_idx] = reproj
+    return reprojected
 
 
 def skew(vector: np.ndarray) -> np.ndarray:
@@ -757,6 +819,7 @@ def compute_camera_triangulation_cost(
     raw_scores_frame: np.ndarray,
     ordered_calibrations: list[CameraCalibration],
     min_other_cameras: int = 2,
+    precomputed_reprojected_points: np.ndarray | None = None,
 ) -> float:
     """Mesure la coherence d'une camera candidate via triangulation des autres vues.
 
@@ -764,6 +827,21 @@ def compute_camera_triangulation_cost(
     compare la reprojection dans cette camera pour l'hypothese nominale et la
     version swappee.
     """
+    if (
+        precomputed_reprojected_points is not None
+        and precomputed_reprojected_points.ndim == 3
+        and camera_idx < precomputed_reprojected_points.shape[0]
+    ):
+        references = np.asarray(precomputed_reprojected_points[camera_idx], dtype=float)
+        valid = (
+            np.all(np.isfinite(candidate_points), axis=1)
+            & np.all(np.isfinite(references), axis=1)
+            & (raw_scores_frame[camera_idx] > 0)
+        )
+        if not np.any(valid):
+            return np.nan
+        return float(np.median(np.linalg.norm(candidate_points[valid] - references[valid], axis=1)))
+
     errors = []
     calibration = ordered_calibrations[camera_idx]
     valid_candidate = np.all(np.isfinite(candidate_points), axis=1) & (raw_scores_frame[camera_idx] > 0)
@@ -845,6 +923,16 @@ def detect_left_right_flip_diagnostics(
     for frame_idx in range(n_frames):
         raw_points_frame = pose_data.keypoints[:, frame_idx]
         raw_scores_frame = pose_data.scores[:, frame_idx]
+        triangulation_references = (
+            triangulation_reference_from_other_views(
+                raw_points_frame,
+                raw_scores_frame,
+                ordered_calibrations,
+                min_other_cameras=min_other_cameras,
+            )
+            if method == "triangulation"
+            else None
+        )
         for cam_idx in range(n_cams):
             if method == "epipolar":
                 nominal_costs[cam_idx, frame_idx] = compute_camera_epipolar_cost(
@@ -858,6 +946,7 @@ def detect_left_right_flip_diagnostics(
                     raw_scores_frame,
                     ordered_calibrations,
                     min_other_cameras=min_other_cameras,
+                    precomputed_reprojected_points=triangulation_references,
                 )
             nominal_temporal_costs[cam_idx, frame_idx] = compute_camera_temporal_cost(
                 cam_idx,
@@ -913,6 +1002,7 @@ def detect_left_right_flip_diagnostics(
                     raw_scores_frame,
                     ordered_calibrations,
                     min_other_cameras=min_other_cameras,
+                    precomputed_reprojected_points=triangulation_references,
                 )
             swapped_temporal_costs[cam_idx, frame_idx] = compute_camera_temporal_cost(
                 cam_idx,
@@ -1067,11 +1157,12 @@ def robust_triangulation_from_best_cameras(
     best_point = np.full(3, np.nan)
     best_excluded = np.array([], dtype=int)
     best_included = np.where(valid)[0]
+    valid_indices = np.where(valid)[0]
 
     max_cams_off = max(0, np.count_nonzero(valid) - min_cameras_for_triangulation)
     for nb_cams_off in range(max_cams_off + 1):
-        valid_indices = np.where(valid)[0]
-        candidate_exclusions = list(it.combinations(valid_indices, nb_cams_off))
+        local_exclusions = exclusion_combinations(valid_indices.size, nb_cams_off)
+        candidate_exclusions = [tuple(valid_indices[list(local_exclusion)]) for local_exclusion in local_exclusions]
         if not candidate_exclusions:
             candidate_exclusions = [tuple()]
 
