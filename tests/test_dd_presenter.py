@@ -50,7 +50,7 @@ def test_format_dd_summary_handles_missing_body_shape_and_code():
     )
     assert "Reconstruction: Pose2Sim" in summary
     assert "body shape=- | code=82+33" in summary
-    assert "twists/salto=[0.5, 1.0]" in summary
+    assert "twists by salto=[S1: 0.5, S2: 1.0]" in summary
 
 
 def test_build_jump_plot_data_converts_indices_to_times_and_values():

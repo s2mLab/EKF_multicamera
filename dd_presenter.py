@@ -61,8 +61,8 @@ def format_dd_summary(
         body_shape = jump.body_shape if jump.body_shape is not None else "-"
         lines.append(f"  body shape={body_shape} | code={code_text}")
         if jump.twists_per_salto:
-            twists_str = ", ".join(f"{value:.1f}" for value in jump.twists_per_salto)
-            lines.append(f"  twists/salto=[{twists_str}]")
+            twists_str = ", ".join(f"S{idx}: {value:.1f}" for idx, value in enumerate(jump.twists_per_salto, start=1))
+            lines.append(f"  twists by salto=[{twists_str}]")
         lines.append("")
     return "\n".join(lines) + "\n"
 

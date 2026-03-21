@@ -278,6 +278,28 @@ def twists_per_completed_salto(
     return twists_per_salto, full_salto_event_indices
 
 
+def twists_per_rounded_salto(
+    cumulative_salto_turns: np.ndarray,
+    cumulative_twist_turns: np.ndarray,
+    rounded_total_saltos: float,
+) -> tuple[list[float], list[int]]:
+    twists_per_salto, full_salto_event_indices = twists_per_completed_salto(
+        cumulative_salto_turns,
+        cumulative_twist_turns,
+    )
+    total_segments = max(1, int(np.ceil(float(rounded_total_saltos) - 1e-9)))
+    valid_twist = np.flatnonzero(np.isfinite(cumulative_twist_turns))
+    if valid_twist.size == 0:
+        return twists_per_salto, full_salto_event_indices
+    end_idx = int(valid_twist[-1])
+    segment_start = 0 if not full_salto_event_indices else full_salto_event_indices[-1]
+    while len(twists_per_salto) < total_segments and end_idx > segment_start:
+        twist_delta = cumulative_twist_turns[end_idx] - cumulative_twist_turns[segment_start]
+        twists_per_salto.append(abs(round_to_nearest(twist_delta, 0.5)))
+        segment_start = end_idx
+    return twists_per_salto, full_salto_event_indices
+
+
 def detect_body_shape(
     q_segment: np.ndarray,
     hip_indices: list[int],
@@ -352,7 +374,11 @@ def analyze_single_jump(
     if np.isfinite(som_turns) and np.isfinite(twist_turns):
         quarter_salto_event_indices = signed_threshold_crossing_indices(somersault_curve_turns, 0.25)
         half_twist_event_indices = signed_threshold_crossing_indices(twist_curve_turns, 0.5)
-        twists_per_salto, full_salto_event_indices = twists_per_completed_salto(somersault_curve_turns, twist_curve_turns)
+        twists_per_salto, full_salto_event_indices = twists_per_rounded_salto(
+            somersault_curve_turns,
+            twist_curve_turns,
+            total_saltos,
+        )
 
     body_shape = None
     code = None
