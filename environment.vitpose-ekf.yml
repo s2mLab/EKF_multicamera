@@ -1,0 +1,19 @@
+name: vitpose-ekf
+channels:
+  - conda-forge
+  - opensim-org
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy=1.25
+  - scipy=1.15
+  - biorbd=1.11.2
+  - opencv
+  - lxml
+  - ezc3d
+  - matplotlib
+  - pandas
+  - pip:
+      - -e ../GIT/biobuddy
+      - pyorerun

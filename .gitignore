@@ -1,0 +1,12 @@
+.DS_Store
+.idea/
+.cache/
+_cache/
+__pycache__/
+*.pyc
+
+outputs/
+
+Archive.zip
+*.mat
+*.s2mMod
