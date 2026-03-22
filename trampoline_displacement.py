@@ -17,6 +17,8 @@ Y_INNER = 0.582
 
 @dataclass
 class TrampolineContact:
+    """Summary of one contact interval used for horizontal-displacement judging."""
+
     index: int
     start: int
     end: int
@@ -31,6 +33,8 @@ class TrampolineContact:
 
 
 def trampoline_penalty_refined(x: float, y: float) -> float:
+    """Return the FIG-style landing penalty associated with one bed position."""
+
     if abs(x) > X_MAX or abs(y) > Y_MAX:
         return float("nan")
     if abs(x) <= X_INNER and abs(y) <= Y_INNER:
@@ -43,6 +47,8 @@ def trampoline_penalty_refined(x: float, y: float) -> float:
 
 
 def contact_segments_between_jumps(session: DDSessionAnalysis) -> list[tuple[int, int]]:
+    """Return the contact intervals located between consecutive DD jumps."""
+
     segments: list[tuple[int, int]] = []
     for current, following in zip(session.jump_segments[:-1], session.jump_segments[1:]):
         start = int(current.end)
@@ -56,6 +62,8 @@ def analyze_trampoline_contacts(
     session: DDSessionAnalysis,
     contact_series: np.ndarray,
 ) -> list[TrampolineContact]:
+    """Score contact intervals from either XY contacts or full-body 3D marker trajectories."""
+
     points = np.asarray(contact_series, dtype=float)
     if points.ndim == 2 and points.shape[1] == 2:
         point_mode = "xy"
@@ -105,6 +113,7 @@ def analyze_trampoline_contacts(
             )
             continue
 
+        # Keep the strongest foot penalty for now, which matches the current judging approximation.
         left_foot = np.asarray(segment[:, 15, :2], dtype=float)
         right_foot = np.asarray(segment[:, 16, :2], dtype=float)
         left_valid = np.all(np.isfinite(left_foot), axis=1)
@@ -144,6 +153,8 @@ def analyze_trampoline_contacts(
 
 
 def total_trampoline_penalty(contacts: list[TrampolineContact]) -> float:
+    """Sum all finite trampoline-contact penalties."""
+
     penalties = [contact.penalty for contact in contacts if contact.penalty is not None]
     if not penalties:
         return 0.0

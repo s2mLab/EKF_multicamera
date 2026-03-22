@@ -1265,12 +1265,12 @@ def current_selected_camera_names(state: SharedAppState) -> list[str]:
 
 def current_calibration_correction_mode(state: SharedAppState) -> str:
     raw = state.calibration_correction_var.get().strip()
-    return raw if raw in {"none", "flip_epipolar", "flip_triangulation"} else "none"
+    return raw if raw in {"none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"} else "none"
 
 
 def normalize_pose_correction_mode(raw: str) -> str:
     value = str(raw).strip()
-    return value if value in {"none", "flip_epipolar", "flip_triangulation"} else "none"
+    return value if value in {"none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"} else "none"
 
 
 def shared_pose_data_kwargs(state: SharedAppState, *, data_mode: str | None = None) -> dict[str, object]:
@@ -1490,7 +1490,12 @@ def get_pose_data_with_correction(
     if correction_mode == "none":
         return calibrations, pose_data, None
 
-    flip_method = "epipolar" if correction_mode == "flip_epipolar" else "triangulation"
+    if correction_mode == "flip_epipolar":
+        flip_method = "epipolar"
+    elif correction_mode == "flip_epipolar_fast":
+        flip_method = "epipolar_fast"
+    else:
+        flip_method = "triangulation"
     corrected_pose_data, diagnostics, _compute_time_s, _cache_path, _source = load_or_compute_pose_data_variant_cache(
         output_dir=current_dataset_dir(state),
         pose_data=pose_data,
@@ -1508,7 +1513,7 @@ def get_pose_data_with_correction(
         restrict_to_outliers=bool(state.flip_restrict_to_outliers_var.get()),
         outlier_percentile=float(state.flip_outlier_percentile_var.get()),
         outlier_floor_px=float(state.flip_outlier_floor_px_var.get()),
-        tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if flip_method == "epipolar" else DEFAULT_REPROJECTION_THRESHOLD_PX,
+        tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if flip_method in {"epipolar", "epipolar_fast"} else DEFAULT_REPROJECTION_THRESHOLD_PX,
         temporal_weight=float(state.flip_temporal_weight_var.get()),
         temporal_tau_px=float(state.flip_temporal_tau_px_var.get()),
     )
@@ -3154,7 +3159,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.calibration_correction_box = ttk.Combobox(
             row_shared,
             textvariable=self.calibration_correction,
-            values=["none", "flip_epipolar", "flip_triangulation"],
+            values=["none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"],
             width=18,
             state="readonly",
         )
@@ -3188,7 +3193,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_mode_menu = ttk.Combobox(
             row_display,
             textvariable=self.flip_mode,
-            values=["none", "epipolar", "triangulation"],
+            values=["none", "epipolar", "epipolar_fast", "triangulation"],
             width=12,
             state="readonly",
         )
@@ -3274,14 +3279,14 @@ class DataExplorer2DTab(ttk.Frame):
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
         attach_tooltip(self.root_rotfix_check, "Si coché, la racine est réalignée en lacet autour de Z à partir de l'axe médio-latéral du tronc à t0. L'angle est arrondi au multiple de pi/2 le plus proche, puis partagé par le modèle, les reconstructions et les analyses.")
-        attach_tooltip(calib_correction_label, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire, ou flip détecté par triangulation.")
-        attach_tooltip(self.calibration_correction_box, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire, ou flip détecté par triangulation.")
+        attach_tooltip(calib_correction_label, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire Sampson, flip épipolaire rapide par distance symétrique, ou flip détecté par triangulation.")
+        attach_tooltip(self.calibration_correction_box, "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire Sampson, flip épipolaire rapide par distance symétrique, ou flip détecté par triangulation.")
         attach_tooltip(component_label, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(component_box, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(view_mode_label, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
         attach_tooltip(self.view_mode_menu, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
-        attach_tooltip(flip_mode_label, "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent toujours les suspicions epi (rouge) et triangulation (bleu).")
-        attach_tooltip(self.flip_mode_menu, "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent toujours les suspicions epi (rouge) et triangulation (bleu).")
+        attach_tooltip(flip_mode_label, "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent les suspicions épipolaires Sampson (rouge), épipolaires rapides distance symétrique (orange) et triangulation (bleu).")
+        attach_tooltip(self.flip_mode_menu, "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent les suspicions épipolaires Sampson (rouge), épipolaires rapides distance symétrique (orange) et triangulation (bleu).")
         self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour construire la référence filtrée 2D.")
         self.pose_outlier_ratio.set_tooltip("Seuil de rejet des points 2D trop éloignés de la référence filtrée.")
         self.pose_p_low.set_tooltip("Percentile bas utilisé pour définir l'amplitude robuste du mouvement 2D.")
@@ -3445,7 +3450,7 @@ class DataExplorer2DTab(ttk.Frame):
         outlier_floor_px = float(self.state.flip_outlier_floor_px_var.get())
         temporal_weight = float(self.state.flip_temporal_weight_var.get())
         temporal_tau_px = float(self.state.flip_temporal_tau_px_var.get())
-        for method in ("epipolar", "triangulation"):
+        for method in ("epipolar", "epipolar_fast", "triangulation"):
             if method in self.flip_masks:
                 continue
             suspect_mask, diagnostics, _compute_time_s, _cache_path, _flip_source = load_or_compute_left_right_flip_cache(
@@ -3464,7 +3469,7 @@ class DataExplorer2DTab(ttk.Frame):
                 restrict_to_outliers=restrict_to_outliers,
                 outlier_percentile=outlier_percentile,
                 outlier_floor_px=outlier_floor_px,
-                tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if method == "epipolar" else DEFAULT_REPROJECTION_THRESHOLD_PX,
+                tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if method in {"epipolar", "epipolar_fast"} else DEFAULT_REPROJECTION_THRESHOLD_PX,
                 temporal_weight=temporal_weight,
                 temporal_tau_px=temporal_tau_px,
             )
@@ -3519,6 +3524,9 @@ class DataExplorer2DTab(ttk.Frame):
             if "epipolar" in self.flip_masks:
                 for frame_idx in np.flatnonzero(self.flip_masks["epipolar"][ax_idx]):
                     ax.axvline(t[frame_idx], color="#c44e52", linestyle="--", linewidth=0.9, alpha=0.28)
+            if "epipolar_fast" in self.flip_masks:
+                for frame_idx in np.flatnonzero(self.flip_masks["epipolar_fast"][ax_idx]):
+                    ax.axvline(t[frame_idx], color="#dd8452", linestyle="-.", linewidth=0.9, alpha=0.26)
             if "triangulation" in self.flip_masks:
                 for frame_idx in np.flatnonzero(self.flip_masks["triangulation"][ax_idx]):
                     ax.axvline(t[frame_idx], color="#4c72b0", linestyle=":", linewidth=1.0, alpha=0.30)
@@ -3539,7 +3547,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.figure.suptitle(
             f"2D {self.view_mode.get()} | composante {self.component.get()} | correction L/R {self.flip_mode.get()} | "
             f"tau epi {DEFAULT_EPIPOLAR_THRESHOLD_PX:.1f}px | tau triang {DEFAULT_REPROJECTION_THRESHOLD_PX:.1f}px | "
-            "flips: epi rouge --, triang bleu :",
+            "flips: epi rouge --, epi fast orange -., triang bleu :",
             y=0.98,
         )
         self.figure.tight_layout()
@@ -3603,7 +3611,7 @@ class ModelTab(CommandTab):
         pose_correction_box = ttk.Combobox(
             row2b,
             textvariable=self.pose_correction_mode,
-            values=["none", "flip_epipolar", "flip_triangulation"],
+            values=["none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"],
             width=16,
             state="readonly",
         )
@@ -3638,7 +3646,7 @@ class ModelTab(CommandTab):
         attach_tooltip(pose_mode_label, "Choix de la version de base des 2D utilisées pour construire le modèle: raw, filtered ou cleaned.")
         attach_tooltip(pose_mode_box, "Choix de la version de base des 2D utilisées pour construire le modèle. `cleaned` applique le rejet des points aberrants.")
         attach_tooltip(pose_correction_label, "Correction optionnelle des labels gauche/droite avant la triangulation du modèle.")
-        attach_tooltip(pose_correction_box, "Utilise les 2D telles quelles (`none`), ou une version corrigée des flips L/R estimée par l'approche épipolaire ou par triangulation/reprojection.")
+        attach_tooltip(pose_correction_box, "Utilise les 2D telles quelles (`none`), ou une version corrigée des flips L/R estimée par l'approche épipolaire Sampson, par la distance épipolaire symétrique rapide, ou par triangulation/reprojection.")
         attach_tooltip(initial_rot_check, "Estime l'orientation horizontale de l'axe y du tronc à t0, l'arrondit au multiple de pi/2 le plus proche, puis applique cette correction autour de Z dans le bioMod.")
         self.max_frames.set_tooltip("Nombre de frames a prendre uniformement entre Start et End. Laisser vide pour garder toute la plage.")
         self.frame_start.set_tooltip("Première frame incluse pour construire le modèle.")
@@ -5852,7 +5860,13 @@ class CameraToolsTab(ttk.Frame):
         method_label = ttk.Label(inspector_controls, text="Method", width=9)
         method_label.pack(side=tk.LEFT)
         self.flip_method_var = tk.StringVar(value="epipolar")
-        self.flip_method_box = ttk.Combobox(inspector_controls, textvariable=self.flip_method_var, values=["epipolar", "triangulation"], width=16, state="readonly")
+        self.flip_method_box = ttk.Combobox(
+            inspector_controls,
+            textvariable=self.flip_method_var,
+            values=["epipolar", "epipolar_fast", "triangulation"],
+            width=16,
+            state="readonly",
+        )
         self.flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
         camera_label = ttk.Label(inspector_controls, text="Camera", width=8)
         camera_label.pack(side=tk.LEFT)
@@ -5892,8 +5906,8 @@ class CameraToolsTab(ttk.Frame):
         attach_tooltip(best_n_label, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(best_n_entry, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(self.metrics_tree, "Scores comparatifs pour choisir un sous-ensemble de caméras plus stable pour la reconstruction.")
-        attach_tooltip(method_label, "Méthode de diagnostic de flip L/R: cohérence épipolaire ou triangulation/reprojection.")
-        attach_tooltip(self.flip_method_box, "Méthode de diagnostic de flip L/R: cohérence épipolaire ou triangulation/reprojection.")
+        attach_tooltip(method_label, "Méthode de diagnostic de flip L/R: cohérence épipolaire Sampson, cohérence épipolaire rapide par distance symétrique, ou triangulation/reprojection.")
+        attach_tooltip(self.flip_method_box, "Méthode de diagnostic de flip L/R: cohérence épipolaire Sampson, cohérence épipolaire rapide par distance symétrique, ou triangulation/reprojection.")
         attach_tooltip(camera_label, "Caméra isolée à inspecter pour les frames suspectes.")
         attach_tooltip(self.flip_camera_box, "Caméra isolée à inspecter pour les frames suspectes.")
         attach_tooltip(self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F.")
@@ -5978,7 +5992,12 @@ class CameraToolsTab(ttk.Frame):
             if correction_mode == "none":
                 self.calibration_pose_status_var.set("Calibration 2D data: none")
             else:
-                method = "epipolar" if correction_mode == "flip_epipolar" else "triangulation"
+                if correction_mode == "flip_epipolar":
+                    method = "epipolar"
+                elif correction_mode == "flip_epipolar_fast":
+                    method = "epipolar_fast"
+                else:
+                    method = "triangulation"
                 suspect_count = int(correction_diagnostics.get("n_camera_frame_flip_suspects", 0)) if correction_diagnostics else 0
                 self.calibration_pose_status_var.set(
                     f"Calibration 2D data: flip {method} ({suspect_count} camera-frames suspectes)"
@@ -5994,7 +6013,7 @@ class CameraToolsTab(ttk.Frame):
             return
         dataset_dir = current_dataset_dir(self.state)
         pose_kwargs = shared_pose_data_kwargs(self.state)
-        for method in ("epipolar", "triangulation"):
+        for method in ("epipolar", "epipolar_fast", "triangulation"):
             suspect_mask, diagnostics, _compute_time_s, cache_path, _flip_source = load_or_compute_left_right_flip_cache(
                 output_dir=dataset_dir,
                 pose_data=self.base_pose_data,
@@ -6011,7 +6030,7 @@ class CameraToolsTab(ttk.Frame):
                 restrict_to_outliers=bool(self.state.flip_restrict_to_outliers_var.get()),
                 outlier_percentile=float(self.state.flip_outlier_percentile_var.get()),
                 outlier_floor_px=float(self.state.flip_outlier_floor_px_var.get()),
-                tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if method == "epipolar" else DEFAULT_REPROJECTION_THRESHOLD_PX,
+                tau_px=DEFAULT_EPIPOLAR_THRESHOLD_PX if method in {"epipolar", "epipolar_fast"} else DEFAULT_REPROJECTION_THRESHOLD_PX,
                 temporal_weight=float(self.state.flip_temporal_weight_var.get()),
                 temporal_tau_px=float(self.state.flip_temporal_tau_px_var.get()),
             )

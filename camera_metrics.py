@@ -14,6 +14,8 @@ if TYPE_CHECKING:
 
 @dataclass
 class CameraMetricRow:
+    """Per-camera quality indicators used for ranking and manual review."""
+
     camera_name: str
     valid_ratio: float
     mean_score: float | None
@@ -42,6 +44,8 @@ def camera_metric_sort_key(row: CameraMetricRow) -> tuple[float, ...]:
 
 
 def suggest_best_camera_names(rows: list[CameraMetricRow], count: int) -> list[str]:
+    """Return the top-ranked camera names according to the composite quality key."""
+
     ranked = sorted(rows, key=camera_metric_sort_key, reverse=True)
     return [row.camera_name for row in ranked[: max(0, int(count))]]
 
@@ -55,6 +59,8 @@ def compute_camera_metric_rows(
     flip_masks: dict[str, np.ndarray] | None = None,
     good_reprojection_threshold_px: float = 5.0,
 ) -> list[CameraMetricRow]:
+    """Compute camera quality metrics from 2D validity, coherence, reprojection, and flip rates."""
+
     n_cams, n_frames, n_keypoints = pose_data.scores.shape
     flip_masks = flip_masks or {}
     valid_measurements = (pose_data.scores > 0) & np.all(np.isfinite(pose_data.keypoints), axis=-1)
@@ -80,6 +86,7 @@ def compute_camera_metric_rows(
             reproj_cam = np.asarray(reprojection_error_per_view[:, :, cam_idx], dtype=float)
             reproj_mean = _finite_mean(np.where(valid_mask, reproj_cam, np.nan))
             masked_reproj = np.where(valid_mask, reproj_cam, np.nan)
+            # Summarize reprojection by frame before computing the "good frame" ratio.
             valid_per_frame = np.count_nonzero(np.isfinite(masked_reproj), axis=1)
             per_frame_sum = np.nansum(masked_reproj, axis=1)
             per_frame_mean = np.full(n_frames, np.nan, dtype=float)
@@ -114,6 +121,8 @@ def compute_camera_metric_rows(
 
 
 def _finite_mean(values: np.ndarray) -> float | None:
+    """Return the finite mean of an array or ``None`` when no finite sample exists."""
+
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
     if finite.size == 0:
@@ -122,6 +131,8 @@ def _finite_mean(values: np.ndarray) -> float | None:
 
 
 def _flip_rate(mask: np.ndarray | None, cam_idx: int, n_frames: int) -> float | None:
+    """Return the fraction of frames flagged as flipped for one camera."""
+
     if mask is None or mask.ndim != 2 or cam_idx >= mask.shape[0]:
         return None
     if n_frames <= 0:
@@ -130,4 +141,6 @@ def _flip_rate(mask: np.ndarray | None, cam_idx: int, n_frames: int) -> float | 
 
 
 def _sort_value(value: float | None) -> float:
+    """Convert optional metrics into sortable floats while pushing missing values last."""
+
     return float(value) if value is not None and np.isfinite(value) else float("-inf")

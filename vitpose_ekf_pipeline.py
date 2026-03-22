@@ -59,7 +59,7 @@ DEFAULT_BIORBD_KALMAN_ERROR_FACTOR = 1e-4
 DEFAULT_BIORBD_KALMAN_INIT_METHOD = "triangulation_ik_root_translation"
 DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
-DEFAULT_TRIANGULATION_WORKERS = 1
+DEFAULT_TRIANGULATION_WORKERS = 6
 DEFAULT_COHERENCE_CONFIDENCE_FLOOR = 0.35
 DEFAULT_SUBJECT_MASS_KG = 55.0
 DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
@@ -1077,6 +1077,37 @@ def sampson_error_pixels_vectorized(
     return errors
 
 
+def symmetric_epipolar_distance_vectorized(
+    candidate_points: np.ndarray,
+    other_points: np.ndarray,
+    fundamental_matrices: np.ndarray,
+) -> np.ndarray:
+    """Compute the symmetric epipolar distance for all `(camera, keypoint)` pairs."""
+
+    candidate_points = np.asarray(candidate_points, dtype=float)
+    other_points = np.asarray(other_points, dtype=float)
+    fundamental_matrices = np.asarray(fundamental_matrices, dtype=float)
+    if candidate_points.ndim != 2 or candidate_points.shape[1] != 2:
+        raise ValueError("candidate_points must have shape (n_keypoints, 2).")
+    if other_points.ndim != 3 or other_points.shape[2] != 2:
+        raise ValueError("other_points must have shape (n_other_cams, n_keypoints, 2).")
+    if fundamental_matrices.ndim != 3 or fundamental_matrices.shape[1:] != (3, 3):
+        raise ValueError("fundamental_matrices must have shape (n_other_cams, 3, 3).")
+
+    n_other_cams, n_keypoints = other_points.shape[:2]
+    candidate_h = np.concatenate((candidate_points, np.ones((n_keypoints, 1), dtype=float)), axis=1)
+    other_h = np.concatenate((other_points, np.ones((n_other_cams, n_keypoints, 1), dtype=float)), axis=2)
+    Fx1 = np.einsum("oab,kb->oka", fundamental_matrices, candidate_h, optimize=True)
+    Ftx2 = np.einsum("oba,okb->oka", fundamental_matrices, other_h, optimize=True)
+    numerator = np.abs(np.einsum("okb,okb->ok", other_h, Fx1, optimize=True))
+    denom1 = np.sqrt(Fx1[..., 0] ** 2 + Fx1[..., 1] ** 2)
+    denom2 = np.sqrt(Ftx2[..., 0] ** 2 + Ftx2[..., 1] ** 2)
+    errors = np.full((n_other_cams, n_keypoints), np.nan, dtype=float)
+    valid = np.isfinite(numerator) & np.isfinite(denom1) & np.isfinite(denom2) & (denom1 > 1e-12) & (denom2 > 1e-12)
+    errors[valid] = numerator[valid] / denom1[valid] + numerator[valid] / denom2[valid]
+    return errors
+
+
 def compute_camera_epipolar_costs_vectorized(
     camera_idx: int,
     candidate_points: np.ndarray,
@@ -1087,6 +1118,7 @@ def compute_camera_epipolar_costs_vectorized(
     pair_weights_array: np.ndarray | None = None,
     keypoint_weights: np.ndarray | None = None,
     min_other_cameras: int = DEFAULT_FLIP_MIN_OTHER_CAMERAS,
+    distance_mode: str = "sampson",
 ) -> tuple[float, float]:
     """Retourne les coûts épipolaires pondéré et legacy pour une caméra candidate."""
     n_cams = raw_2d_frame.shape[0]
@@ -1107,11 +1139,13 @@ def compute_camera_epipolar_costs_vectorized(
     if int(np.count_nonzero(informative_camera_mask)) < max(1, int(min_other_cameras)):
         return np.nan, np.nan
 
-    errors = sampson_error_pixels_vectorized(
-        candidate_points,
-        other_points,
-        fundamental_matrices_array[camera_idx, other_indices],
-    )
+    fundamental_blocks = fundamental_matrices_array[camera_idx, other_indices]
+    if distance_mode == "sampson":
+        errors = sampson_error_pixels_vectorized(candidate_points, other_points, fundamental_blocks)
+    elif distance_mode == "symmetric":
+        errors = symmetric_epipolar_distance_vectorized(candidate_points, other_points, fundamental_blocks)
+    else:
+        raise ValueError(f"Unknown epipolar distance mode: {distance_mode}")
     valid_mask &= np.isfinite(errors)
     if not np.any(valid_mask):
         return np.nan, np.nan
@@ -1354,8 +1388,10 @@ def detect_left_right_flip_diagnostics(
     fundamental_matrices = None
     pair_weights = None
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
-    smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if method == "epipolar" else 1
-    if method == "epipolar":
+    epipolar_family = method in {"epipolar", "epipolar_fast"}
+    epipolar_distance_mode = "sampson" if method == "epipolar" else ("symmetric" if method == "epipolar_fast" else "reprojection")
+    smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if epipolar_family else 1
+    if epipolar_family:
         fundamental_matrices = build_fundamental_matrix_array(ordered_calibrations)
         pair_weights = build_flip_epipolar_pair_weight_array(ordered_calibrations)
     elif method != "triangulation":
@@ -1382,7 +1418,7 @@ def detect_left_right_flip_diagnostics(
             else None
         )
         for cam_idx in range(n_cams):
-            if method == "epipolar":
+            if epipolar_family:
                 nominal_costs[cam_idx, frame_idx], nominal_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
                     cam_idx,
                     raw_points_frame[cam_idx],
@@ -1392,6 +1428,7 @@ def detect_left_right_flip_diagnostics(
                     pair_weights_array=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
+                    distance_mode=epipolar_distance_mode,
                 )
             else:
                 nominal_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1435,7 +1472,7 @@ def detect_left_right_flip_diagnostics(
             threshold = max(float(outlier_floor_px), float(np.percentile(valid_costs, float(outlier_percentile))))
             outlier_thresholds_by_camera[cam_idx] = threshold
             raw_outliers = np.isfinite(effective_nominal_costs[cam_idx]) & (effective_nominal_costs[cam_idx] >= threshold)
-            if method == "epipolar":
+            if epipolar_family:
                 smooth_outliers = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
                 candidate_mask[cam_idx] = raw_outliers | smooth_outliers
                 legacy_valid_costs = nominal_legacy_costs[cam_idx, np.isfinite(nominal_legacy_costs[cam_idx])]
@@ -1451,7 +1488,7 @@ def detect_left_right_flip_diagnostics(
                     candidate_mask[cam_idx] |= legacy_candidate_mask[cam_idx]
             else:
                 candidate_mask[cam_idx] = raw_outliers
-    elif method == "epipolar":
+    elif epipolar_family:
         legacy_candidate_mask = np.isfinite(nominal_legacy_costs)
 
     for frame_idx in range(n_frames):
@@ -1471,7 +1508,7 @@ def detect_left_right_flip_diagnostics(
             if not candidate_mask[cam_idx, frame_idx]:
                 continue
             swapped_candidate = swap_left_right_keypoints(raw_points_frame[cam_idx])
-            if method == "epipolar":
+            if epipolar_family:
                 swapped_costs[cam_idx, frame_idx], swapped_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
                     cam_idx,
                     swapped_candidate,
@@ -1481,6 +1518,7 @@ def detect_left_right_flip_diagnostics(
                     pair_weights_array=pair_weights,
                     keypoint_weights=keypoint_weights,
                     min_other_cameras=min_other_cameras,
+                    distance_mode=epipolar_distance_mode,
                 )
             else:
                 swapped_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1516,7 +1554,7 @@ def detect_left_right_flip_diagnostics(
         temporal_tau_px=temporal_tau_px,
         temporal_weight=temporal_weight,
     )
-    if method == "epipolar":
+    if epipolar_family:
         legacy_decision = (
             candidate_mask
             & np.isfinite(nominal_legacy_costs)
@@ -1535,7 +1573,7 @@ def detect_left_right_flip_diagnostics(
         np.where(np.isfinite(decision_score), decision_score, 0.0),
         window=smoothing_window,
     )
-    strong_positive_margin = 0.5 * float(min_gain_px) if method == "epipolar" else 0.0
+    strong_positive_margin = 0.5 * float(min_gain_px) if epipolar_family else 0.0
     suspect_mask = candidate_mask & np.isfinite(decision_score) & (
         ((decision_score > 0.0) & (smoothed_decision_score > 0.0))
         | (decision_score >= strong_positive_margin)
@@ -1546,6 +1584,7 @@ def detect_left_right_flip_diagnostics(
     candidate_temporal_support_mask = candidate_mask & temporal_support_mask
     diagnostics = {
         "method": method,
+        "distance_mode": epipolar_distance_mode,
         "n_frames_with_any_flip_suspect": int(frames_with_any_suspect.sum()),
         "n_camera_frame_flip_suspects": int(suspect_mask.sum()),
         "n_candidate_camera_frames_tested": int(np.count_nonzero(candidate_mask)),
@@ -1560,8 +1599,8 @@ def detect_left_right_flip_diagnostics(
         "temporal_weight": float(temporal_weight),
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
         "combination_method": "weighted_normalized_cost",
-        "epipolar_pair_weighting": "baseline_confidence_weighted" if method == "epipolar" else "n/a",
-        "epipolar_keypoint_weighting": "torso_proximal_priority" if method == "epipolar" else "n/a",
+        "epipolar_pair_weighting": "baseline_confidence_weighted" if epipolar_family else "n/a",
+        "epipolar_keypoint_weighting": "torso_proximal_priority" if epipolar_family else "n/a",
         "temporal_smoothing_window": int(smoothing_window),
         "n_camera_frame_temporal_support": int(np.count_nonzero(temporal_support_mask)),
         "n_candidate_camera_frames_with_temporal_support": int(np.count_nonzero(candidate_temporal_support_mask)),
@@ -4081,9 +4120,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose-correction-mode",
-        choices=("none", "flip_epipolar", "flip_triangulation"),
+        choices=("none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"),
         default="none",
-        help="Correction optionnelle des 2D apres chargement: aucune, flip L/R detecte par epipolaire, ou flip L/R detecte par triangulation/reprojection.",
+        help="Correction optionnelle des 2D apres chargement: aucune, flip L/R detecte par epipolaire, epipolaire rapide (distance symétrique), ou flip L/R detecte par triangulation/reprojection.",
     )
     parser.add_argument("--pose-filter-window", type=int, default=9, help="Fenetre de lissage temporel utilisee pour construire la reference filtree des 2D.")
     parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10, help="Seuil de rejet des outliers 2D, exprime comme fraction de l'amplitude robuste.")
@@ -4345,7 +4384,12 @@ def main() -> None:
         upper_percentile=args.pose_amplitude_upper_percentile,
     )
     if args.pose_correction_mode != "none":
-        flip_method = "epipolar" if args.pose_correction_mode == "flip_epipolar" else "triangulation"
+        if args.pose_correction_mode == "flip_epipolar":
+            flip_method = "epipolar"
+        elif args.pose_correction_mode == "flip_epipolar_fast":
+            flip_method = "epipolar_fast"
+        else:
+            flip_method = "triangulation"
         t0 = time.perf_counter()
         left_right_flip_suspect_mask, _left_right_flip_diagnostics, _left_right_flip_details = detect_left_right_flip_diagnostics(
             pose_data,
@@ -4356,7 +4400,7 @@ def main() -> None:
             restrict_to_outliers=not args.flip_test_all_camera_frames,
             outlier_percentile=args.flip_outlier_percentile,
             outlier_floor_px=args.flip_outlier_floor_px,
-            geometry_tau_px=args.epipolar_threshold_px if flip_method == "epipolar" else args.reprojection_threshold_px,
+            geometry_tau_px=args.epipolar_threshold_px if flip_method in {"epipolar", "epipolar_fast"} else args.reprojection_threshold_px,
             method=flip_method,
             temporal_weight=args.flip_temporal_weight,
             temporal_tau_px=args.flip_temporal_tau_px,

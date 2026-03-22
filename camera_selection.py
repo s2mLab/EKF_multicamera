@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 
 def parse_camera_names(raw: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    """Parse camera names from CLI/GUI input while preserving their first-seen order."""
+
     if raw is None:
         return []
     if isinstance(raw, str):
@@ -27,10 +29,14 @@ def parse_camera_names(raw: str | list[str] | tuple[str, ...] | None) -> list[st
 
 
 def format_camera_names(camera_names: list[str] | tuple[str, ...]) -> str:
+    """Format camera names for compact display in the GUI and summaries."""
+
     return ", ".join(str(name) for name in camera_names)
 
 
 def select_camera_names(available_camera_names: list[str], requested_camera_names: list[str] | tuple[str, ...] | None) -> list[str]:
+    """Validate and resolve a requested camera subset against the available names."""
+
     requested = parse_camera_names(list(requested_camera_names) if requested_camera_names is not None else None)
     if not requested:
         return [str(name) for name in available_camera_names]
@@ -45,6 +51,8 @@ def subset_calibrations(
     calibrations: dict[str, object],
     requested_camera_names: list[str] | tuple[str, ...] | None,
 ) -> dict[str, object]:
+    """Return a calibration mapping restricted to the selected camera subset."""
+
     selected = select_camera_names(list(calibrations.keys()), requested_camera_names)
     return {camera_name: calibrations[camera_name] for camera_name in selected}
 
@@ -53,6 +61,8 @@ def subset_pose_data(
     pose_data: "PoseData",
     requested_camera_names: list[str] | tuple[str, ...] | None,
 ) -> "PoseData":
+    """Return a shallow PoseData copy containing only the requested cameras."""
+
     from vitpose_ekf_pipeline import PoseData
 
     selected = select_camera_names(list(pose_data.camera_names), requested_camera_names)

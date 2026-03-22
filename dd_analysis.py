@@ -21,12 +21,16 @@ DEFAULT_KNEE_DOFS = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 
 
 def dd_debug(message: str) -> None:
+    """Emit a timestamped DD debug message to stdout."""
+
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[DD {timestamp}] {message}", flush=True)
 
 
 @dataclass
 class JumpSegment:
+    """Frame interval describing one detected jump."""
+
     start: int
     end: int
     peak_index: int
@@ -34,6 +38,8 @@ class JumpSegment:
 
 @dataclass
 class DDJumpAnalysis:
+    """Per-jump DD summary with curves, events, and optional body-shape metadata."""
+
     segment: JumpSegment
     somersault_turns: float
     twist_turns: float
@@ -54,6 +60,8 @@ class DDJumpAnalysis:
 
 @dataclass
 class DDSessionAnalysis:
+    """DD analysis output for a full trial."""
+
     root_q: np.ndarray
     height: np.ndarray
     smoothed_height: np.ndarray
@@ -64,6 +72,8 @@ class DDSessionAnalysis:
 
 
 def smooth_signal(signal: np.ndarray, window_frames: int) -> np.ndarray:
+    """Smooth a 1D signal with an odd moving-average window."""
+
     window_frames = max(1, int(window_frames))
     if window_frames <= 1:
         return np.asarray(signal, dtype=float).copy()
@@ -75,12 +85,16 @@ def smooth_signal(signal: np.ndarray, window_frames: int) -> np.ndarray:
 
 
 def relative_height_threshold(height: np.ndarray, ratio: float) -> float:
+    """Compute a relative flight threshold within the observed height range."""
+
     min_h = float(np.nanmin(height))
     max_h = float(np.nanmax(height))
     return min_h + float(ratio) * (max_h - min_h)
 
 
 def contiguous_true_regions(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return inclusive index ranges for each contiguous True segment."""
+
     regions: list[tuple[int, int]] = []
     start = None
     for idx, value in enumerate(np.asarray(mask, dtype=bool)):
@@ -95,6 +109,8 @@ def contiguous_true_regions(mask: np.ndarray) -> list[tuple[int, int]]:
 
 
 def merge_close_regions(regions: list[tuple[int, int]], max_gap_frames: int) -> list[tuple[int, int]]:
+    """Merge neighboring regions separated by at most ``max_gap_frames``."""
+
     if not regions:
         return []
     merged = [list(regions[0])]
@@ -107,6 +123,8 @@ def merge_close_regions(regions: list[tuple[int, int]], max_gap_frames: int) -> 
 
 
 def local_minimum_index(height: np.ndarray, center: int, left_limit: int, right_limit: int, window_frames: int) -> int:
+    """Find a nearby local minimum used to refine take-off and landing boundaries."""
+
     start = max(left_limit, center - window_frames)
     end = min(right_limit, center + window_frames)
     if end <= start:
@@ -115,6 +133,8 @@ def local_minimum_index(height: np.ndarray, center: int, left_limit: int, right_
 
 
 def refine_jump_boundaries(height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int) -> list[JumpSegment]:
+    """Refine jump limits around airborne regions using nearby local minima."""
+
     segments: list[JumpSegment] = []
     if not airborne_regions:
         return segments
@@ -136,6 +156,8 @@ def filter_jump_segments(
     min_airtime_frames: int,
     min_peak_prominence_m: float,
 ) -> list[JumpSegment]:
+    """Discard weak airborne segments that do not satisfy airtime/prominence criteria."""
+
     kept: list[JumpSegment] = []
     for segment in segments:
         segment_height = height[segment.start : segment.end + 1]
@@ -153,6 +175,8 @@ def filter_jump_segments(
 
 
 def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    """Normalize row vectors independently while preserving invalid rows as NaNs."""
+
     vectors = np.asarray(vectors, dtype=float)
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
     out = np.full_like(vectors, np.nan)
@@ -167,6 +191,8 @@ def compute_angles_over_jump_from_axes(
     end: int,
     rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate salto, twist, and tilt from reconstructed body axes."""
+
     window = np.asarray(root_q[start : end + 1], dtype=float)
     rotations = window[:, ROOT_ROTATION_SLICE]
     z_axes = np.full((window.shape[0], 3), np.nan, dtype=float)
@@ -178,6 +204,7 @@ def compute_angles_over_jump_from_axes(
         y_axes[idx] = matrix[:, 1]
         z_axes[idx] = matrix[:, 2]
 
+    # Somersault is measured from the longitudinal axis projected into the sagittal plane.
     sagittal_proj = np.array(z_axes, copy=True)
     sagittal_proj[:, 1] = 0.0
     sagittal_proj = _normalize_rows(sagittal_proj)
@@ -207,6 +234,8 @@ def compute_angles_over_jump_from_euler(
     end: int,
     rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Estimate salto, twist, and tilt directly from root Euler angles."""
+
     window = np.asarray(root_q[start : end + 1], dtype=float)
     raw_rotations = np.asarray(window[:, ROOT_ROTATION_SLICE], dtype=float)
     rotations = reextract_euler_with_gaps(raw_rotations, rotation_sequence)
@@ -224,21 +253,29 @@ def compute_angles_over_jump(
     rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
     angle_mode: str = "euler",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Dispatch DD angle extraction according to the selected angle mode."""
+
     if angle_mode == "body_axes":
         return compute_angles_over_jump_from_axes(root_q, start, end, rotation_sequence=rotation_sequence)
     return compute_angles_over_jump_from_euler(root_q, start, end, rotation_sequence=rotation_sequence)
 
 
 def round_to_nearest(value: float, step: float) -> float:
+    """Round a scalar value to the nearest multiple of ``step``."""
+
     return round(float(value) / float(step)) * float(step)
 
 
 def crossing_index(cumulative_turns: np.ndarray, target: float) -> int | None:
+    """Return the first index where a cumulative curve reaches ``target`` turns."""
+
     hits = np.where(np.asarray(cumulative_turns, dtype=float) >= float(target))[0]
     return int(hits[0]) if hits.size else None
 
 
 def signed_threshold_crossing_indices(cumulative_turns: np.ndarray, step: float) -> list[int]:
+    """Return the first frame index of each signed threshold crossing."""
+
     curve = np.asarray(cumulative_turns, dtype=float)
     valid = np.flatnonzero(np.isfinite(curve))
     if valid.size == 0:
@@ -267,6 +304,8 @@ def twists_per_completed_salto(
     cumulative_salto_turns: np.ndarray,
     cumulative_twist_turns: np.ndarray,
 ) -> tuple[list[float], list[int]]:
+    """Measure twist accumulated over each completed full salto."""
+
     twists_per_salto: list[float] = []
     full_salto_event_indices = signed_threshold_crossing_indices(cumulative_salto_turns, 1.0)
     segment_start = 0
@@ -284,6 +323,8 @@ def twists_per_rounded_salto(
     cumulative_twist_turns: np.ndarray,
     rounded_total_saltos: float,
 ) -> tuple[list[float], list[int]]:
+    """Extend twist-per-salto accounting to the rounded total number of saltos."""
+
     twists_per_salto, full_salto_event_indices = twists_per_completed_salto(
         cumulative_salto_turns,
         cumulative_twist_turns,
@@ -309,6 +350,8 @@ def detect_body_shape(
     knee_tuck_threshold_deg: float = 70.0,
     knee_pike_threshold_deg: float = 20.0,
 ) -> str:
+    """Infer a coarse FIG body shape from hip and knee flexion peaks."""
+
     hip_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, hip_indices]), axis=0))
     knee_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, knee_indices]), axis=0))
     hip_value = float(np.nanmax(hip_peak_deg))
@@ -321,15 +364,21 @@ def detect_body_shape(
 
 
 def body_shape_suffix(body_shape: str) -> str:
+    """Map a body-shape label to the suffix used in DD codes."""
+
     return {"grouped": "o", "piked": "<", "straight": "/"}.get(body_shape, "?")
 
 
 def quarter_salto_count_token(total_saltos: float) -> str:
+    """Return the DD token encoding the total number of quarter saltos."""
+
     quarter_count = int(round(float(total_saltos) * 4.0))
     return str(quarter_count)
 
 
 def classify_jump(som_turns: float, twist_turns: float) -> str:
+    """Build a coarse human-readable classification from salto and twist totals."""
+
     som_round = round(float(som_turns) * 2.0) / 2.0
     tw_round = round(float(twist_turns) * 2.0) / 2.0
     if abs(som_round - 2.0) < 0.25:
@@ -345,6 +394,8 @@ def classify_jump(som_turns: float, twist_turns: float) -> str:
 
 
 def default_body_shape_indices(q_names: list[str]) -> tuple[list[int], list[int]] | None:
+    """Return the default hip/knee DoF indices used for body-shape inference."""
+
     index_map = {name: idx for idx, name in enumerate(q_names)}
     if any(name not in index_map for name in DEFAULT_HIP_DOFS + DEFAULT_KNEE_DOFS):
         return None
@@ -360,6 +411,8 @@ def analyze_single_jump(
     q_names: list[str] | None = None,
     angle_mode: str = "euler",
 ) -> DDJumpAnalysis:
+    """Analyze one jump segment and derive its DD-oriented summary metrics."""
+
     som, tw, tilt = compute_angles_over_jump(root_q, segment.start, segment.end, angle_mode=angle_mode)
     som_turns = float((som[-1] - som[0]) / (2.0 * np.pi)) if np.count_nonzero(np.isfinite(som)) >= 2 else float("nan")
     twist_turns = float((tw[-1] - tw[0]) / (2.0 * np.pi)) if np.count_nonzero(np.isfinite(tw)) >= 2 else float("nan")
@@ -373,6 +426,7 @@ def analyze_single_jump(
     somersault_curve_turns = (som - som[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(som)) else np.full_like(som, np.nan)
     twist_curve_turns = (tw - tw[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(tw)) else np.full_like(tw, np.nan)
     if np.isfinite(som_turns) and np.isfinite(twist_turns):
+        # Event markers are used both for plotting and for DD code construction.
         quarter_salto_event_indices = signed_threshold_crossing_indices(somersault_curve_turns, 0.25)
         half_twist_event_indices = signed_threshold_crossing_indices(twist_curve_turns, 0.5)
         twists_per_salto, full_salto_event_indices = twists_per_rounded_salto(
@@ -431,6 +485,8 @@ def analyze_dd_session(
     q_names: list[str] | None = None,
     angle_mode: str = "euler",
 ) -> DDSessionAnalysis:
+    """Run the full DD workflow: segmentation, per-jump analysis, and summaries."""
+
     dd_debug(
         "analyze_dd_session start "
         f"frames={len(root_q)} fps={fps:.3f} smooth={smoothing_window_s} "

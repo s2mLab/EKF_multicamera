@@ -5,10 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
+LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 from reconstruction_registry import infer_dataset_name, latest_version_for_family
 from reconstruction_profiles import (
@@ -36,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=120.0)
-    parser.add_argument("--triangulation-workers", type=int, default=1)
+    parser.add_argument("--triangulation-workers", type=int, default=6)
     parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
     parser.add_argument("--dataset-name", type=str, default=None, help="Nom du dataset; sinon derive du fichier 2D.")
     parser.add_argument("--profile", action="append", default=None, help="Nom de profil a lancer. Peut etre repete.")

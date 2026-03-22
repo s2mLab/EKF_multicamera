@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+"""Helpers to inspect marker and observation Jacobian rank over time."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,12 +9,16 @@ import numpy as np
 
 
 def _to_array(value) -> np.ndarray:
+    """Convert biorbd-style containers and numpy-like values into float arrays."""
+
     if hasattr(value, "to_array"):
         return np.asarray(value.to_array(), dtype=float)
     return np.asarray(value, dtype=float)
 
 
 def stacked_marker_jacobian(model, q_values: np.ndarray) -> np.ndarray:
+    """Stack per-marker 3D Jacobians into one dense matrix."""
+
     marker_jacobians = model.markersJacobian(np.asarray(q_values, dtype=float))
     blocks = [_to_array(jacobian) for jacobian in marker_jacobians]
     if not blocks:
@@ -24,6 +31,8 @@ def stacked_observation_jacobian(
     q_values: np.ndarray,
     camera_calibrations: list[object],
 ) -> np.ndarray:
+    """Stack projected 2D observation Jacobians over all visible cameras and markers."""
+
     q_values = np.asarray(q_values, dtype=float)
     marker_positions = [_to_array(marker) for marker in model.markers(q_values)]
     marker_jacobians = [_to_array(jacobian) for jacobian in model.markersJacobian(q_values)]
@@ -37,6 +46,7 @@ def stacked_observation_jacobian(
     for calibration in camera_calibrations:
         projected_uv, projected_jac = calibration.project_points_and_jacobians(marker_points_array)
         H_q_blocks = np.einsum("mab,mbq->maq", projected_jac, marker_jacobians_array, optimize=True)
+        # Keep only rows where the marker and its projected Jacobian are finite.
         valid = (
             finite_markers
             & np.all(np.isfinite(projected_uv), axis=1)
@@ -50,6 +60,8 @@ def stacked_observation_jacobian(
 
 
 def matrix_rank_with_full_rank(matrix: np.ndarray) -> tuple[int, int]:
+    """Return the finite-row matrix rank and its maximum achievable rank."""
+
     matrix = np.asarray(matrix, dtype=float)
     if matrix.ndim != 2:
         raise ValueError("Expected a 2D matrix.")
@@ -64,6 +76,8 @@ def matrix_rank_with_full_rank(matrix: np.ndarray) -> tuple[int, int]:
 
 @dataclass
 class ObservabilityRankSeries:
+    """Frame-wise marker and observation rank trajectories."""
+
     marker_rank: np.ndarray
     marker_full_rank: int
     observation_rank: np.ndarray
@@ -75,6 +89,8 @@ def compute_observability_rank_series(
     q_series: np.ndarray,
     camera_calibrations: list[object],
 ) -> ObservabilityRankSeries:
+    """Compute marker and observation Jacobian rank at every frame."""
+
     q_series = np.asarray(q_series, dtype=float)
     if q_series.ndim != 2:
         raise ValueError("Expected q_series with shape (n_frames, n_q).")
@@ -102,6 +118,8 @@ def compute_observability_rank_series(
 
 
 def summarize_rank_series(ranks: np.ndarray, full_rank: int) -> dict[str, float]:
+    """Summarize a rank trajectory for display in the GUI."""
+
     ranks = np.asarray(ranks, dtype=float)
     if ranks.size == 0:
         return {"min": 0.0, "median": 0.0, "max": 0.0, "full_rank_ratio": 0.0}

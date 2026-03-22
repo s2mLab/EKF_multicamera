@@ -12,6 +12,8 @@ from dd_analysis import DDJumpAnalysis, DDSessionAnalysis
 
 @dataclass
 class DDJumpPlotData:
+    """Precomputed event annotations used by the DD plots."""
+
     local_t: np.ndarray
     full_salto_times: np.ndarray
     quarter_salto_times: np.ndarray
@@ -21,6 +23,8 @@ class DDJumpPlotData:
 
 
 def jump_list_label(index: int, jump: DDJumpAnalysis) -> str:
+    """Build the compact label shown in the DD jump list."""
+
     return f"S{index} | som {jump.somersault_turns:.2f} | tw {jump.twist_turns:.2f}"
 
 
@@ -32,6 +36,8 @@ def format_dd_summary(
     angle_mode: str,
     fps: float,
 ) -> str:
+    """Format the textual DD summary panel for the selected reconstruction."""
+
     if analysis is None or reconstruction_label_text is None:
         return "Aucune reconstruction sélectionnée.\n"
 
@@ -68,6 +74,8 @@ def format_dd_summary(
 
 
 def build_jump_plot_data(jump: DDJumpAnalysis, fps: float) -> DDJumpPlotData:
+    """Extract event times and values used to annotate salto and twist curves."""
+
     local_t = np.arange(jump.somersault_curve_turns.shape[0], dtype=float) / float(fps)
 
     def event_times(indices: list[int]) -> np.ndarray:

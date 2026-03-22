@@ -19,6 +19,7 @@ from vitpose_ekf_pipeline import (
     sampson_error_pixels_vectorized,
     sample_frames_uniformly,
     smooth_camera_time_series,
+    symmetric_epipolar_distance_vectorized,
     triangulation_reference_from_other_views,
     weighted_triangulation,
     weighted_median,
@@ -223,6 +224,15 @@ def test_sampson_error_pixels_vectorized_matches_scalar():
     np.testing.assert_allclose(vectorized, scalar, atol=1e-12)
 
 
+def test_symmetric_epipolar_distance_vectorized_is_zero_on_perfect_matches():
+    points = np.array([[0.1, 0.0], [0.2, 0.1]], dtype=float)
+    other_points = np.array([[[0.1, 0.0], [0.2, 0.1]]], dtype=float)
+    f_matrix = np.array([[[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]]], dtype=float)
+
+    distances = symmetric_epipolar_distance_vectorized(points, other_points, f_matrix)
+    np.testing.assert_allclose(distances, np.zeros_like(distances), atol=1e-12)
+
+
 def test_vectorized_epipolar_cost_matches_scalar_versions():
     cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
     point = np.array([0.2, -0.1, 2.5], dtype=float)
@@ -264,6 +274,28 @@ def test_vectorized_epipolar_cost_matches_scalar_versions():
     )
     np.testing.assert_allclose(weighted_vectorized, weighted_scalar, atol=1e-12)
     np.testing.assert_allclose(legacy_vectorized, legacy_scalar, atol=1e-12)
+
+
+def test_vectorized_epipolar_symmetric_cost_returns_finite_values():
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
+    point = np.array([0.15, -0.05, 2.5], dtype=float)
+    raw_2d_frame = np.stack([[camera.project_point(point) for _ in range(17)] for camera in cameras], axis=0)
+    raw_scores_frame = np.ones((3, 17), dtype=float)
+
+    weighted_cost, legacy_cost = compute_camera_epipolar_costs_vectorized(
+        0,
+        raw_2d_frame[0],
+        raw_2d_frame,
+        raw_scores_frame,
+        build_fundamental_matrix_array(cameras),
+        pair_weights_array=build_flip_epipolar_pair_weight_array(cameras),
+        keypoint_weights=np.ones(17, dtype=float),
+        min_other_cameras=2,
+        distance_mode="symmetric",
+    )
+
+    assert np.isfinite(weighted_cost)
+    assert np.isfinite(legacy_cost)
 
 
 def test_smooth_camera_time_series_reduces_isolated_spike():

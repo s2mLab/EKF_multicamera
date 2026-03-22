@@ -20,6 +20,8 @@ RIGHT_ANGLE_RAD = 0.5 * math.pi
 
 
 def normalize(vector: np.ndarray) -> np.ndarray:
+    """Return a unit vector, or NaNs when the input norm is degenerate."""
+
     norm = np.linalg.norm(vector)
     if not np.isfinite(norm) or norm < 1e-12:
         return np.full(3, np.nan)
@@ -27,6 +29,8 @@ def normalize(vector: np.ndarray) -> np.ndarray:
 
 
 def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
+    """Unwrap angle trajectories while treating NaN gaps as segment boundaries."""
+
     array = np.asarray(values, dtype=float)
     squeeze = array.ndim == 1
     if squeeze:
@@ -45,6 +49,8 @@ def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
 
 
 def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE) -> np.ndarray:
+    """Re-extract Euler angles frame by frame without bridging missing segments."""
+
     array = np.asarray(rotations, dtype=float)
     reextracted = np.full_like(array, np.nan, dtype=float)
     valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
@@ -65,6 +71,8 @@ def build_root_rotation_matrices(
     left_shoulder_idx: int = 5,
     right_shoulder_idx: int = 6,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Build trunk translations and body-to-world rotation matrices from markers."""
+
     translations = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
     rotation_matrices = np.full((points_3d.shape[0], 3, 3), np.nan, dtype=float)
 
@@ -83,6 +91,7 @@ def build_root_rotation_matrices(
             continue
         hip_center = 0.5 * (left_hip[frame_idx] + right_hip[frame_idx])
         shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
+        # The trunk frame uses z = longitudinal, y = medio-lateral, x = antero-posterior.
         z_axis = normalize(shoulder_center - hip_center)
         y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
         y_axis_seed = normalize(y_seed)
@@ -96,6 +105,8 @@ def build_root_rotation_matrices(
 
 
 def wrap_angle_pi(angle_rad: float) -> float:
+    """Wrap an angle to ]-pi, pi] with a stable representation for +pi."""
+
     wrapped = (float(angle_rad) + math.pi) % (2.0 * math.pi) - math.pi
     if abs(wrapped + math.pi) < 1e-12:
         return math.pi
@@ -103,6 +114,8 @@ def wrap_angle_pi(angle_rad: float) -> float:
 
 
 def root_z_correction_angle_from_rotation_matrices(rotation_matrices: np.ndarray) -> float:
+    """Estimate the snapped initial yaw correction from raw trunk matrices."""
+
     for matrix in np.asarray(rotation_matrices, dtype=float):
         if not np.all(np.isfinite(matrix)):
             continue
@@ -124,6 +137,8 @@ def root_z_correction_angle_from_points(
     left_shoulder_idx: int = 5,
     right_shoulder_idx: int = 6,
 ) -> float:
+    """Estimate the initial yaw correction directly from 3D trunk markers."""
+
     _, rotation_matrices = build_root_rotation_matrices(
         points_3d,
         left_hip_idx=left_hip_idx,
@@ -135,6 +150,8 @@ def root_z_correction_angle_from_points(
 
 
 def compute_trunk_dofs_from_points(points_3d: np.ndarray, unwrap_rotations: bool = True) -> np.ndarray:
+    """Convert 3D trunk markers into the ordered root DoFs [T, R]."""
+
     translations, rotation_matrices = build_root_rotation_matrices(points_3d)
     rotations_xyz = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
     for frame_idx in range(points_3d.shape[0]):
@@ -152,6 +169,8 @@ def extract_root_from_q(
     unwrap_rotations: bool = True,
     renormalize_rotations: bool = True,
 ) -> np.ndarray:
+    """Extract ordered root DoFs from a full generalized-coordinate trajectory."""
+
     name_to_index = {str(name): idx for idx, name in enumerate(np.asarray(q_names, dtype=object))}
     root_q = np.full((q_trajectory.shape[0], len(ROOT_Q_NAMES)), np.nan, dtype=float)
     for out_idx, dof_name in enumerate(ROOT_Q_NAMES):
@@ -165,6 +184,8 @@ def extract_root_from_q(
 
 
 def rotation_unit_scale(unit: str) -> float:
+    """Return the multiplicative factor that converts radians to the requested unit."""
+
     if unit == "deg":
         return 180.0 / math.pi
     if unit == "turns":
@@ -173,6 +194,8 @@ def rotation_unit_scale(unit: str) -> float:
 
 
 def rotation_unit_label(unit: str, quantity: str) -> str:
+    """Return the display label for root rotation units."""
+
     if unit == "deg":
         return "deg" if quantity == "q" else "deg/s"
     if unit == "turns":
@@ -181,6 +204,8 @@ def rotation_unit_label(unit: str, quantity: str) -> str:
 
 
 def centered_finite_difference(values: np.ndarray, dt: float) -> np.ndarray:
+    """Compute a centered finite-difference derivative while preserving NaN gaps."""
+
     derivative = np.full_like(values, np.nan, dtype=float)
     if values.shape[0] < 2:
         return derivative

@@ -11,6 +11,8 @@ def bundle_available_reconstruction_names(
     include_q: bool = True,
     include_q_root: bool = False,
 ) -> list[str]:
+    """Collect reconstruction names exposed by a preview bundle."""
+
     names: set[str] = set()
     if include_3d:
         names.update(bundle.get("recon_3d", {}).keys())
@@ -27,6 +29,8 @@ def catalog_rows_for_names(
     *,
     extra_rows: list[dict[str, object]] | None = None,
 ) -> list[dict[str, object]]:
+    """Filter catalog rows to the reconstructions that are both cached and available."""
+
     available = {str(name) for name in available_names}
     rows: list[dict[str, object]] = list(extra_rows or [])
     rows.extend(row for row in catalog if row.get("cached") and str(row.get("name")) in available)
@@ -39,6 +43,8 @@ def default_selection(
     *,
     fallback_count: int,
 ) -> list[str]:
+    """Choose preferred default selections with a fallback to the first available rows."""
+
     available = [str(name) for name in available_names]
     available_set = set(available)
     defaults = [name for name in preferred_names if name in available_set]

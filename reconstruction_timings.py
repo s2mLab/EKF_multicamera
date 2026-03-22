@@ -17,6 +17,8 @@ def make_timing_stage(
     cache_path: str | None = None,
     details: dict[str, object] | None = None,
 ) -> dict[str, object]:
+    """Build one normalized timing-stage record for bundle summaries."""
+
     stage: dict[str, object] = {
         "id": str(stage_id),
         "label": str(label),
@@ -32,10 +34,14 @@ def make_timing_stage(
 
 
 def stage_compute_time(stage: dict[str, object]) -> float | None:
+    """Extract the finite compute time stored in a timing stage."""
+
     return _coerce_float(stage.get("compute_time_s"))
 
 
 def objective_total_seconds(summary: dict[str, object]) -> float | None:
+    """Return the total objective compute time, including reused cached stages."""
+
     pipeline = summary.get("pipeline_timing")
     if isinstance(pipeline, dict):
         explicit_total = _coerce_float(pipeline.get("objective_total_s"))
@@ -59,6 +65,8 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
 
 
 def current_run_seconds(summary: dict[str, object]) -> float | None:
+    """Return the wall time spent by the current run, excluding prior cached work."""
+
     pipeline = summary.get("pipeline_timing")
     if not isinstance(pipeline, dict):
         return None
@@ -84,6 +92,8 @@ def parse_stage_timings(summary: dict[str, object]) -> list[tuple[str, float]]:
 
 
 def parse_timing_trace(summary: dict[str, object]) -> list[dict[str, object]]:
+    """Extract the normalized timing trace from a bundle summary."""
+
     pipeline = summary.get("pipeline_timing")
     if not isinstance(pipeline, dict):
         return []
@@ -94,6 +104,8 @@ def parse_timing_trace(summary: dict[str, object]) -> list[dict[str, object]]:
 
 
 def format_seconds_brief(value: float | None) -> str:
+    """Format short timing values for GUI summaries."""
+
     if value is None:
         return "-"
     if value < 60.0:
@@ -104,6 +116,8 @@ def format_seconds_brief(value: float | None) -> str:
 
 
 def humanize_stage_name(stage_name: str) -> str:
+    """Turn machine stage ids into user-facing labels."""
+
     raw = stage_name.strip()
     if raw.endswith("_s"):
         raw = raw[:-2]
@@ -134,6 +148,8 @@ def humanize_stage_name(stage_name: str) -> str:
 
 
 def compute_time_seconds(summary: dict[str, object]) -> float | None:
+    """Fallback accessor for legacy total timing fields."""
+
     for stage_name, value in parse_stage_timings(summary):
         if stage_name == "total_s":
             return value
@@ -141,6 +157,8 @@ def compute_time_seconds(summary: dict[str, object]) -> float | None:
 
 
 def build_pipeline_diagram(stages: Iterable[dict[str, object]]) -> str:
+    """Render the high-level stage flow used to produce a reconstruction."""
+
     labels = []
     for stage in stages:
         if not isinstance(stage, dict):
@@ -154,6 +172,8 @@ def build_pipeline_diagram(stages: Iterable[dict[str, object]]) -> str:
 
 
 def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
+    """Format the detailed timing panel shown in the Reconstructions tab."""
+
     pipeline_stages = parse_timing_trace(summary)
     objective_time = objective_total_seconds(summary)
     current_time = current_run_seconds(summary)
@@ -196,6 +216,8 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
 
 
 def _coerce_float(value: object) -> float | None:
+    """Convert a value to a finite float or return ``None``."""
+
     try:
         value_float = float(value)
     except (TypeError, ValueError):

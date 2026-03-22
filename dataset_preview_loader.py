@@ -12,6 +12,8 @@ from dataset_preview_state import DatasetPreviewState, build_dataset_preview_sta
 
 @dataclass
 class DatasetPreviewLoadResult:
+    """Aggregated resources needed by dataset-first preview tabs."""
+
     sources: dict[str, str]
     catalog: list[dict[str, object]]
     bundle: dict[str, object]
@@ -33,6 +35,8 @@ def load_dataset_preview_resources(
     biomod_path: Path | None = None,
     align_root: bool = False,
 ) -> DatasetPreviewLoadResult:
+    """Load dataset sources, catalog, preview bundle, and derived GUI state in one step."""
+
     sources = dataset_source_paths_fn(
         output_dir,
         calib=calib,

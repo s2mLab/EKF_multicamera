@@ -14,6 +14,8 @@ from reconstruction_presenter import (
 
 @dataclass
 class DatasetPreviewState:
+    """Compact state shared by preview tabs after loading a dataset bundle."""
+
     rows: list[dict[str, object]]
     defaults: list[str]
     available_names: list[str]
