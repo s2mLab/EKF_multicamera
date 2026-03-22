@@ -1,13 +1,16 @@
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from root_series import (
     quantity_unit_label,
     root_axis_labels,
+    root_rotation_matrices_from_points,
     root_rotation_matrices_from_series,
     root_series_from_precomputed,
     root_series_from_q,
     scale_root_series_rotations,
 )
+from root_kinematics import TRUNK_ROOT_ROTATION_SEQUENCE
 
 
 def test_root_series_from_q_uses_precomputed_qdot_when_requested():
@@ -64,3 +67,46 @@ def test_root_rotation_matrices_from_series_builds_expected_matrix():
     root_q = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=float)
     matrices = root_rotation_matrices_from_series(root_q)
     np.testing.assert_allclose(matrices[0], np.eye(3), atol=1e-12)
+
+
+def test_root_rotation_matrices_from_series_can_apply_initial_trunk_rotation():
+    q_equiv = np.array([[0.0, 0.0, 0.0, 0.2, -0.1, 0.3]], dtype=float)
+    alpha = np.pi
+    matrices = root_rotation_matrices_from_series(
+        q_equiv,
+        initial_rotation_correction_angle_rad=alpha,
+    )
+    expected = Rotation.from_euler("z", alpha, degrees=False).as_matrix() @ Rotation.from_euler(
+        TRUNK_ROOT_ROTATION_SEQUENCE,
+        q_equiv[0, 3:6],
+        degrees=False,
+    ).as_matrix()
+    np.testing.assert_allclose(matrices[0], expected, atol=1e-12)
+
+
+def test_root_rotation_matrices_from_points_can_keep_or_remove_alpha_correction():
+    base_points = np.full((1, 17, 3), np.nan, dtype=float)
+    base_points[0, 11] = [0.0, 1.0, 0.0]
+    base_points[0, 12] = [0.0, -1.0, 0.0]
+    base_points[0, 5] = [0.0, 1.0, 1.0]
+    base_points[0, 6] = [0.0, -1.0, 1.0]
+    q_equiv = np.array([0.2, -0.1, 0.3], dtype=float)
+    alpha = np.pi
+    total_rotation = Rotation.from_euler("z", alpha, degrees=False).as_matrix() @ Rotation.from_euler(
+        TRUNK_ROOT_ROTATION_SEQUENCE,
+        q_equiv,
+        degrees=False,
+    ).as_matrix()
+    rotated_points = np.array(base_points, copy=True)
+    for kp_idx in (11, 12, 5, 6):
+        rotated_points[0, kp_idx] = total_rotation @ base_points[0, kp_idx]
+
+    raw_matrices = root_rotation_matrices_from_points(rotated_points, initial_rotation_correction=False)
+    corrected_matrices = root_rotation_matrices_from_points(rotated_points, initial_rotation_correction=True)
+
+    np.testing.assert_allclose(raw_matrices[0], total_rotation, atol=1e-12)
+    np.testing.assert_allclose(
+        corrected_matrices[0],
+        Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, q_equiv, degrees=False).as_matrix(),
+        atol=1e-12,
+    )

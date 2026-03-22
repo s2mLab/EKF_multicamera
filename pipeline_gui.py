@@ -106,6 +106,7 @@ from root_series import (
     quantity_unit_label,
     root_axis_display_labels,
     root_ordered_names,
+    root_rotation_matrices_from_points,
     root_rotation_matrices_from_series,
     root_series_from_points,
     root_series_from_precomputed,
@@ -5169,12 +5170,15 @@ class RootKinematicsTab(ttk.Frame):
         self.unwrap_var = tk.BooleanVar(value=True)
         self.reextract_var = tk.BooleanVar(value=True)
         self.fd_qdot_var = tk.BooleanVar(value=True)
+        self.matrix_ignore_alpha_var = tk.BooleanVar(value=False)
         unwrap_check = ttk.Checkbutton(row2, text="unwrap rotations", variable=self.unwrap_var)
         unwrap_check.pack(side=tk.LEFT)
         reextract_check = ttk.Checkbutton(row2, text="recalcul matrice + re-extraction Euler", variable=self.reextract_var)
         reextract_check.pack(side=tk.LEFT, padx=(12, 0))
         fd_qdot_check = ttk.Checkbutton(row2, text="qdot par différence finie", variable=self.fd_qdot_var)
         fd_qdot_check.pack(side=tk.LEFT, padx=(12, 0))
+        matrix_ignore_alpha_check = ttk.Checkbutton(row2, text="matrix without alpha correction", variable=self.matrix_ignore_alpha_var)
+        matrix_ignore_alpha_check.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row2, text="Load / refresh", command=self.refresh_plot).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row2, text="Refresh available", command=self.refresh_available_reconstructions).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -5194,6 +5198,7 @@ class RootKinematicsTab(ttk.Frame):
         attach_tooltip(unwrap_check, "Applique un unwrap temporel aux angles de racine pour eviter les sauts a +/-pi.")
         attach_tooltip(reextract_check, "Recalcule les angles Euler via la matrice de rotation du tronc avant affichage.")
         attach_tooltip(fd_qdot_check, "Recalcule qdot par difference finie sur q au lieu d'utiliser qdot deja sauvegarde.")
+        attach_tooltip(matrix_ignore_alpha_check, "En mode matrix, affiche la matrice brute issue des marqueurs sans retirer la correction alpha. Cette option n'affecte que les reconstructions géométriques.")
 
         plot_box = ttk.LabelFrame(self, text="Comparaison racine")
         plot_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -5202,7 +5207,7 @@ class RootKinematicsTab(ttk.Frame):
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
-        self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
         self.family.trace_add("write", lambda *_args: self.refresh_plot())
         self.quantity.trace_add("write", lambda *_args: self.refresh_plot())
         self.rotation_plot_mode.trace_add("write", lambda *_args: self.refresh_plot())
@@ -5210,6 +5215,8 @@ class RootKinematicsTab(ttk.Frame):
         self.unwrap_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.reextract_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.matrix_ignore_alpha_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.after_idle(self.refresh_available_reconstructions)
 
     def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
         self._suspend_selection_refresh = True
@@ -5222,6 +5229,15 @@ class RootKinematicsTab(ttk.Frame):
         if self._suspend_selection_refresh:
             return
         self.refresh_plot()
+
+    def _show_empty_plot(self, message: str) -> None:
+        """Render a lightweight placeholder when no root plot can be produced."""
+
+        self.figure.clear()
+        ax = self.figure.subplots(1, 1)
+        ax.axis("off")
+        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
+        self.canvas.draw_idle()
 
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
@@ -5240,8 +5256,11 @@ class RootKinematicsTab(ttk.Frame):
                     fallback_count=4,
                 )
                 self._set_reconstruction_rows(rows, defaults)
-                if self.bundle is not None:
-                    self.refresh_plot()
+                self.refresh_plot()
+            else:
+                self._set_reconstruction_rows([], [])
+                self.bundle = bundle
+                self._show_empty_plot("No reconstruction available for root exploration.")
         except Exception:
             pass
 
@@ -5249,15 +5268,13 @@ class RootKinematicsTab(ttk.Frame):
         try:
             self.bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
             available_names = bundle_available_reconstruction_names(self.bundle, include_3d=True, include_q=True, include_q_root=False)
-            if available_names:
-                catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = catalog_rows_for_names(catalog, available_names)
-                defaults = default_selection(
-                    available_names,
-                    ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
-                    fallback_count=4,
-                )
-                self._set_reconstruction_rows(rows, defaults)
+            if not available_names:
+                self._show_empty_plot("No reconstruction available for root exploration.")
+                return
+            selected_names = self.recon_show.selected_names()
+            if not selected_names:
+                self._show_empty_plot("Select at least one reconstruction to compare root kinematics.")
+                return
             recon_3d = self.bundle["recon_3d"]
             recon_q = self.bundle["recon_q"]
             recon_qdot = self.bundle["recon_qdot"]
@@ -5284,7 +5301,7 @@ class RootKinematicsTab(ttk.Frame):
                     axes = np.array([axes])
             component_labels = [("R11", "R12", "R13"), ("R21", "R22", "R23"), ("R31", "R32", "R33")]
 
-            for name in self.recon_show.selected_names():
+            for name in selected_names:
                 series = None
                 summary = recon_summary.get(name, {}) if isinstance(recon_summary, dict) else {}
                 summary_family = str(summary.get("family", ""))
@@ -5333,7 +5350,26 @@ class RootKinematicsTab(ttk.Frame):
                     continue
                 t = np.arange(series.shape[0]) * dt
                 if matrix_mode:
-                    matrices = root_rotation_matrices_from_series(np.asarray(series, dtype=float))
+                    if geometric_family and name in recon_3d:
+                        matrices = root_rotation_matrices_from_points(
+                            np.asarray(recon_3d[name], dtype=float),
+                            initial_rotation_correction=(
+                                bool(self.state.initial_rotation_correction_var.get())
+                                and not bool(self.matrix_ignore_alpha_var.get())
+                            ),
+                        )
+                    else:
+                        initial_rotation_correction_angle_rad = 0.0
+                        if bool(self.matrix_ignore_alpha_var.get()) and bool(summary.get("initial_rotation_correction_applied")):
+                            raw_angle = summary.get("initial_rotation_correction_angle_rad")
+                            try:
+                                initial_rotation_correction_angle_rad = float(raw_angle)
+                            except (TypeError, ValueError):
+                                initial_rotation_correction_angle_rad = 0.0
+                        matrices = root_rotation_matrices_from_series(
+                            np.asarray(series, dtype=float),
+                            initial_rotation_correction_angle_rad=initial_rotation_correction_angle_rad,
+                        )
                     for row_idx in range(3):
                         for col_idx in range(3):
                             ax = axes[row_idx, col_idx]
@@ -5372,7 +5408,14 @@ class RootKinematicsTab(ttk.Frame):
                     axes[-1, col_idx].set_xlabel("Temps (s)")
             else:
                 axes[-1].set_xlabel("Temps (s)")
-            family_label = "translations" if family_is_translation else ("rotation matrix" if matrix_mode else f"rotations ({rotation_unit})")
+            if family_is_translation:
+                family_label = "translations"
+            elif matrix_mode:
+                family_label = "rotation matrix"
+                if bool(self.matrix_ignore_alpha_var.get()):
+                    family_label += " | raw marker frame"
+            else:
+                family_label = f"rotations ({rotation_unit})"
             displayed_quantity = effective_quantity if matrix_mode else quantity
             self.figure.suptitle(f"Cinématiques racine | {family_label} | {displayed_quantity}")
             self.figure.tight_layout()
