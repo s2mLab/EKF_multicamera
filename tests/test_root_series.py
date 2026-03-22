@@ -3,6 +3,7 @@ import numpy as np
 from root_series import (
     quantity_unit_label,
     root_axis_labels,
+    root_rotation_matrices_from_series,
     root_series_from_precomputed,
     root_series_from_q,
     scale_root_series_rotations,
@@ -57,3 +58,9 @@ def test_root_axis_labels_and_units_follow_family():
     assert root_axis_labels("rotations") == ["TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ"]
     assert quantity_unit_label("q", True, "deg") == "m"
     assert quantity_unit_label("qdot", False, "turns") == "turn/s"
+
+
+def test_root_rotation_matrices_from_series_builds_expected_matrix():
+    root_q = np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=float)
+    matrices = root_rotation_matrices_from_series(root_q)
+    np.testing.assert_allclose(matrices[0], np.eye(3), atol=1e-12)

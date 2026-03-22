@@ -4,6 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from root_kinematics import (
+    ROOT_ROTATION_SLICE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
     centered_finite_difference,
@@ -15,6 +16,7 @@ from root_kinematics import (
     rotation_unit_scale,
     unwrap_with_gaps,
 )
+from reconstruction_bundle import extract_root_from_points
 
 
 def test_unwrap_with_gaps_keeps_gaps_independent():
@@ -150,8 +152,31 @@ def test_root_z_correction_angle_from_points_snaps_to_nearest_right_angle():
         yawed[0, kp_idx] = yaw_matrix @ base_points[0, kp_idx]
     angle = root_z_correction_angle_from_points(yawed)
     _, rotation_matrices = build_root_rotation_matrices(yawed)
-    corrected = rotation_matrices[0] @ Rotation.from_euler("z", angle, degrees=False).as_matrix()
-    np.testing.assert_allclose(corrected[:, 1], np.array([0.0, 1.0, 0.0]), atol=5e-2)
+    corrected = Rotation.from_euler("z", -angle, degrees=False).as_matrix() @ rotation_matrices[0]
+    assert abs(corrected[0, 1]) < 5e-2
+    assert abs(abs(corrected[1, 1]) - 1.0) < 5e-2
+    assert abs(corrected[2, 1]) < 5e-2
+
+
+def test_extract_root_from_points_removes_model_rotfix_before_euler_extraction():
+    base_points = np.full((1, 17, 3), np.nan, dtype=float)
+    base_points[0, 11] = [0.0, 1.0, 0.0]
+    base_points[0, 12] = [0.0, -1.0, 0.0]
+    base_points[0, 5] = [0.0, 1.0, 1.0]
+    base_points[0, 6] = [0.0, -1.0, 1.0]
+    q_equiv = np.array([0.2, -0.1, 0.3], dtype=float)
+    alpha = math.pi
+    total_rotation = Rotation.from_euler("z", alpha, degrees=False).as_matrix() @ Rotation.from_euler(
+        TRUNK_ROOT_ROTATION_SEQUENCE,
+        q_equiv,
+        degrees=False,
+    ).as_matrix()
+    rotated_points = np.array(base_points, copy=True)
+    for kp_idx in (11, 12, 5, 6):
+        rotated_points[0, kp_idx] = total_rotation @ base_points[0, kp_idx]
+    root_q, correction_applied = extract_root_from_points(rotated_points, True, False)
+    assert correction_applied is True
+    np.testing.assert_allclose(root_q[0, ROOT_ROTATION_SLICE], q_equiv, atol=1e-12)
 
 
 def test_rotation_unit_helpers():

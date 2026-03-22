@@ -104,8 +104,9 @@ from root_kinematics import (
 )
 from root_series import (
     quantity_unit_label,
-    root_axis_labels,
+    root_axis_display_labels,
     root_ordered_names,
+    root_rotation_matrices_from_series,
     root_series_from_points,
     root_series_from_precomputed,
     root_series_from_q,
@@ -1930,7 +1931,7 @@ class PipelineTab(CommandTab):
         row1.pack(fill=tk.X, padx=8, pady=4)
         self.max_frames = LabeledEntry(row1, "Max frames", "")
         self.max_frames.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.triang_workers = LabeledEntry(row1, "Triang workers", "1")
+        self.triang_workers = LabeledEntry(row1, "Triang workers", "6")
         self.triang_workers.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.min_cams = LabeledEntry(row1, "Min cams", "3")
         self.min_cams.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -2191,6 +2192,8 @@ class DualAnimationTab(CommandTab):
         self.state = state
         self.bundle: dict[str, object] | None = None
         self._view_state: tuple[float, float, float] | None = None
+        self._suspend_selection_refresh = False
+        self._dragging_frame_scale = False
         form = ttk.LabelFrame(self.main, text="animation/animate_dual_stick_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
@@ -2220,8 +2223,8 @@ class DualAnimationTab(CommandTab):
         content_pane.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
         left_panel = ttk.Frame(content_pane)
         right_panel = ttk.Frame(content_pane)
-        content_pane.add(left_panel, weight=1)
-        content_pane.add(right_panel, weight=2)
+        content_pane.add(left_panel, weight=0)
+        content_pane.add(right_panel, weight=3)
 
         self.show = SelectionTable(
             left_panel,
@@ -2230,6 +2233,13 @@ class DualAnimationTab(CommandTab):
             action_command=self.refresh_available_reconstructions,
         )
         self.show.pack(fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.show.tree.configure(height=4)
+        self.show.tree.column("label", width=180, anchor="w")
+        self.show.tree.column("family", width=80, anchor="w")
+        self.show.tree.column("frames", width=60, anchor="w")
+        self.show.tree.column("reproj", width=80, anchor="w")
+        self.show.tree.column("path", width=220, anchor="w")
+        self.show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.show.tree, "Selectionnez les reconstructions a afficher ou exporter dans l'animation 3D.")
 
         preview_box = ttk.LabelFrame(right_panel, text="Preview 3D")
@@ -2271,24 +2281,61 @@ class DualAnimationTab(CommandTab):
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.refresh_available_reconstructions()
 
+    def _set_show_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        """Populate the table without triggering recursive refreshes."""
+        self._suspend_selection_refresh = True
+        try:
+            self.show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        if self.bundle is None:
+            self.load_preview()
+        else:
+            self.refresh_preview()
+
     def _bind_frame_navigation(self, widget: tk.Widget) -> None:
         if widget is self.frame_scale:
             widget.bind("<Button-1>", self._on_frame_scale_click)
+            widget.bind("<B1-Motion>", self._on_frame_scale_drag)
+            widget.bind("<ButtonRelease-1>", self._on_frame_scale_release)
         else:
             widget.bind("<Enter>", lambda _event: widget.focus_set())
         widget.bind("<Left>", lambda _event: self.step_frame(-1))
         widget.bind("<Right>", lambda _event: self.step_frame(1))
 
-    def _on_frame_scale_click(self, event) -> str:
-        widget = self.frame_scale
-        widget.focus_set()
-        frame = frame_from_slider_click(
+    def _frame_from_scale_event(self, event) -> int:
+        """Map a mouse event on the ttk.Scale trough to the target frame index."""
+        return frame_from_slider_click(
             x=event.x,
-            width=widget.winfo_width(),
-            from_value=widget.cget("from"),
-            to_value=widget.cget("to"),
+            width=self.frame_scale.winfo_width(),
+            from_value=self.frame_scale.cget("from"),
+            to_value=self.frame_scale.cget("to"),
         )
+
+    def _on_frame_scale_click(self, event) -> str:
+        self._dragging_frame_scale = True
+        self.frame_scale.focus_set()
+        frame = self._frame_from_scale_event(event)
         self.frame_var.set(frame)
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_drag(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self.frame_var.set(self._frame_from_scale_event(event))
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_release(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self._dragging_frame_scale = False
+        self.frame_var.set(self._frame_from_scale_event(event))
         self.refresh_preview()
         return "break"
 
@@ -2327,7 +2374,7 @@ class DualAnimationTab(CommandTab):
             preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
             fallback_count=4,
         )
-        self.show.set_rows(preview_state.rows, preview_state.defaults)
+        self._set_show_rows(preview_state.rows, preview_state.defaults)
         if self.bundle is not None:
             try:
                 sources = dataset_source_paths(
@@ -2347,7 +2394,7 @@ class DualAnimationTab(CommandTab):
                     preferred_names=["ekf_3d", "ekf_2d_flip_acc", "ekf_2d_acc", "pose2sim"],
                     fallback_count=4,
                 )
-                self.show.set_rows(preview_state.rows, preview_state.defaults)
+                self._set_show_rows(preview_state.rows, preview_state.defaults)
                 self.frame_scale.configure(to=preview_state.max_frame)
                 self.refresh_preview()
             except Exception:
@@ -2398,7 +2445,7 @@ class DualAnimationTab(CommandTab):
                 align_root=False,
             )
             self.bundle = preview_load.bundle
-            self.show.set_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
+            self._set_show_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
             self.frame_scale.configure(to=preview_load.preview_state.max_frame)
             self.frame_var.set(0)
             self.preview_canvas_widget.focus_set()
@@ -2485,6 +2532,8 @@ class MultiViewTab(CommandTab):
         self.projected_layers: dict[str, np.ndarray] = {}
         self.crop_limits_cache: dict[str, np.ndarray] = {}
         self.crop_limits_key: tuple[object, ...] | None = None
+        self._suspend_selection_refresh = False
+        self._dragging_frame_scale = False
         form = ttk.LabelFrame(self.main, text="animation/animate_multiview_2d_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
@@ -2512,6 +2561,7 @@ class MultiViewTab(CommandTab):
         self.crop_margin.pack(side=tk.LEFT, padx=(0, 6))
         self.show = SelectionTable(form, "Reconstructions disponibles", action_label="Refresh available", action_command=self.refresh_available_reconstructions)
         self.show.pack(fill=tk.BOTH, padx=8, pady=6)
+        self.show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.show.tree, "Selectionnez les couches a afficher ou exporter dans l'animation 2D multivues.")
 
         preview_box = ttk.LabelFrame(self.main, text="Preview 2D multivues")
@@ -2552,24 +2602,59 @@ class MultiViewTab(CommandTab):
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.refresh_available_reconstructions()
 
+    def _set_show_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        self._suspend_selection_refresh = True
+        try:
+            self.show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        if self.pose_data is None or self.preview_bundle is None:
+            self.load_preview()
+        else:
+            self.refresh_preview()
+
     def _bind_frame_navigation(self, widget: tk.Widget) -> None:
         if widget is self.frame_scale:
             widget.bind("<Button-1>", self._on_frame_scale_click)
+            widget.bind("<B1-Motion>", self._on_frame_scale_drag)
+            widget.bind("<ButtonRelease-1>", self._on_frame_scale_release)
         else:
             widget.bind("<Enter>", lambda _event: widget.focus_set())
         widget.bind("<Left>", lambda _event: self.step_frame(-1))
         widget.bind("<Right>", lambda _event: self.step_frame(1))
 
-    def _on_frame_scale_click(self, event) -> str:
-        widget = self.frame_scale
-        widget.focus_set()
-        frame = frame_from_slider_click(
+    def _frame_from_scale_event(self, event) -> int:
+        return frame_from_slider_click(
             x=event.x,
-            width=widget.winfo_width(),
-            from_value=widget.cget("from"),
-            to_value=widget.cget("to"),
+            width=self.frame_scale.winfo_width(),
+            from_value=self.frame_scale.cget("from"),
+            to_value=self.frame_scale.cget("to"),
         )
+
+    def _on_frame_scale_click(self, event) -> str:
+        self._dragging_frame_scale = True
+        self.frame_scale.focus_set()
+        frame = self._frame_from_scale_event(event)
         self.frame_var.set(frame)
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_drag(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self.frame_var.set(self._frame_from_scale_event(event))
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_release(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self._dragging_frame_scale = False
+        self.frame_var.set(self._frame_from_scale_event(event))
         self.refresh_preview()
         return "break"
 
@@ -2602,7 +2687,7 @@ class MultiViewTab(CommandTab):
             fallback_count=2,
             extra_rows=[{"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"}],
         )
-        self.show.set_rows(preview_state.rows, preview_state.defaults)
+        self._set_show_rows(preview_state.rows, preview_state.defaults)
         if self.pose_data is not None and self.calibrations is not None:
             try:
                 self.load_preview()
@@ -2675,7 +2760,7 @@ class MultiViewTab(CommandTab):
                 upper_percentile=float(self.state.pose_p_high_var.get()),
             )
             self.preview_bundle = preview_load.bundle
-            self.show.set_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
+            self._set_show_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
             camera_names = list(self.pose_data.camera_names)
             self.projected_layers = {}
             for name, points_3d in self.preview_bundle["recon_3d"].items():
@@ -5049,6 +5134,7 @@ class RootKinematicsTab(ttk.Frame):
         super().__init__(master)
         self.state = state
         self.bundle = None
+        self._suspend_selection_refresh = False
 
         controls = ttk.LabelFrame(self, text="Cinématiques de la racine")
         controls.pack(fill=tk.X, padx=10, pady=10)
@@ -5067,6 +5153,11 @@ class RootKinematicsTab(ttk.Frame):
         self.quantity = tk.StringVar(value="q")
         quantity_box = ttk.Combobox(row, textvariable=self.quantity, values=["q", "qdot"], width=10, state="readonly")
         quantity_box.pack(side=tk.LEFT, padx=(0, 6))
+        repr_label = ttk.Label(row, text="Rot plot", width=10)
+        repr_label.pack(side=tk.LEFT)
+        self.rotation_plot_mode = tk.StringVar(value="euler")
+        repr_box = ttk.Combobox(row, textvariable=self.rotation_plot_mode, values=["euler", "matrix"], width=10, state="readonly")
+        repr_box.pack(side=tk.LEFT, padx=(0, 6))
         rot_unit_label = ttk.Label(row, text="Rot unit", width=10)
         rot_unit_label.pack(side=tk.LEFT)
         self.rotation_unit = tk.StringVar(value="rad")
@@ -5089,12 +5180,15 @@ class RootKinematicsTab(ttk.Frame):
 
         self.recon_show = SelectionTable(controls, "Reconstructions")
         self.recon_show.pack(fill=tk.BOTH, padx=8, pady=6)
+        self.recon_show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.recon_show.tree, "Selectionnez les reconstructions a comparer pour la racine.")
 
         attach_tooltip(family_label, "Choisit si l'on compare les translations ou les rotations de la racine.")
         attach_tooltip(family_box, "Choisit si l'on compare les translations ou les rotations de la racine.")
         attach_tooltip(quantity_label, "Choisit entre positions q et vitesses qdot.")
         attach_tooltip(quantity_box, "Choisit entre positions q et vitesses qdot.")
+        attach_tooltip(repr_label, "Pour les rotations de racine, affiche soit les angles Euler, soit les 9 composantes de la matrice de rotation.")
+        attach_tooltip(repr_box, "Mode matrix: trace les composantes de R frame par frame. Ce mode s'applique aux rotations en q.")
         attach_tooltip(rot_unit_label, "Unite d'affichage des rotations de racine.")
         attach_tooltip(rotation_unit_box, "Unité d'affichage des trois rotations de racine. Les translations restent en m ou m/s.")
         attach_tooltip(unwrap_check, "Applique un unwrap temporel aux angles de racine pour eviter les sauts a +/-pi.")
@@ -5111,10 +5205,23 @@ class RootKinematicsTab(ttk.Frame):
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.family.trace_add("write", lambda *_args: self.refresh_plot())
         self.quantity.trace_add("write", lambda *_args: self.refresh_plot())
+        self.rotation_plot_mode.trace_add("write", lambda *_args: self.refresh_plot())
         self.rotation_unit.trace_add("write", lambda *_args: self.refresh_plot())
         self.unwrap_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.reextract_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
+
+    def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        self._suspend_selection_refresh = True
+        try:
+            self.recon_show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        self.refresh_plot()
 
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
@@ -5132,7 +5239,7 @@ class RootKinematicsTab(ttk.Frame):
                     ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
                     fallback_count=4,
                 )
-                self.recon_show.set_rows(rows, defaults)
+                self._set_reconstruction_rows(rows, defaults)
                 if self.bundle is not None:
                     self.refresh_plot()
         except Exception:
@@ -5150,7 +5257,7 @@ class RootKinematicsTab(ttk.Frame):
                     ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
                     fallback_count=4,
                 )
-                self.recon_show.set_rows(rows, defaults)
+                self._set_reconstruction_rows(rows, defaults)
             recon_3d = self.bundle["recon_3d"]
             recon_q = self.bundle["recon_q"]
             recon_qdot = self.bundle["recon_qdot"]
@@ -5160,16 +5267,22 @@ class RootKinematicsTab(ttk.Frame):
             q_names = self.bundle["q_names"]
             dt = 1.0 / float(self.state.fps_var.get())
             family_is_translation = self.family.get() == "translations"
+            matrix_mode = (not family_is_translation) and self.rotation_plot_mode.get() == "matrix"
             family_slice = slice(0, 3) if family_is_translation else slice(3, 6)
-            axis_labels = root_axis_labels(self.family.get())
+            axis_display_labels = root_axis_display_labels(self.family.get())
             quantity = self.quantity.get()
             rotation_unit = self.rotation_unit.get()
             unit_label = quantity_unit_label(quantity, family_is_translation, rotation_unit)
 
             self.figure.clear()
-            axes = self.figure.subplots(3, 1, sharex=True)
-            if not isinstance(axes, np.ndarray):
-                axes = np.array([axes])
+            effective_quantity = "q" if matrix_mode else quantity
+            if matrix_mode:
+                axes = np.asarray(self.figure.subplots(3, 3, sharex=True))
+            else:
+                axes = self.figure.subplots(3, 1, sharex=True)
+                if not isinstance(axes, np.ndarray):
+                    axes = np.array([axes])
+            component_labels = [("R11", "R12", "R13"), ("R21", "R22", "R23"), ("R31", "R32", "R33")]
 
             for name in self.recon_show.selected_names():
                 series = None
@@ -5184,7 +5297,7 @@ class RootKinematicsTab(ttk.Frame):
                 if geometric_family and name in recon_3d:
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
-                        quantity=quantity,
+                        quantity=effective_quantity,
                         dt=dt,
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
@@ -5193,7 +5306,7 @@ class RootKinematicsTab(ttk.Frame):
                     series = root_series_from_q(
                         q_names,
                         recon_q[name],
-                        quantity=quantity,
+                        quantity=effective_quantity,
                         dt=dt,
                         qdot=recon_qdot.get(name),
                         fd_qdot=bool(self.fd_qdot_var.get()),
@@ -5203,7 +5316,7 @@ class RootKinematicsTab(ttk.Frame):
                 elif name in recon_3d:
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
-                        quantity=quantity,
+                        quantity=effective_quantity,
                         dt=dt,
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
@@ -5211,34 +5324,57 @@ class RootKinematicsTab(ttk.Frame):
                 elif name in recon_q_root and not geometric_rotfix_mismatch:
                     series = root_series_from_precomputed(
                         np.asarray(recon_q_root[name], dtype=float),
-                        quantity=quantity,
+                        quantity=effective_quantity,
                         dt=dt,
                         qdot_root=recon_qdot_root.get(name),
                         fd_qdot=bool(self.fd_qdot_var.get()),
                     )
                 if series is None:
                     continue
-                series_to_plot = scale_root_series_rotations(np.asarray(series, dtype=float), family_is_translation, rotation_unit)
                 t = np.arange(series.shape[0]) * dt
-                for axis_idx, ax in enumerate(axes):
-                    ax.plot(
-                        t,
-                        series_to_plot[:, family_slice.start + axis_idx],
-                        color=reconstruction_color(name),
-                        linewidth=1.7,
-                        label=reconstruction_label(name),
-                    )
-                    ax.set_ylabel(f"{axis_labels[axis_idx].split(':')[1]} ({unit_label})")
-                    ax.grid(alpha=0.25)
-            handles, labels = axes[0].get_legend_handles_labels()
+                if matrix_mode:
+                    matrices = root_rotation_matrices_from_series(np.asarray(series, dtype=float))
+                    for row_idx in range(3):
+                        for col_idx in range(3):
+                            ax = axes[row_idx, col_idx]
+                            ax.plot(
+                                t,
+                                matrices[:, row_idx, col_idx],
+                                color=reconstruction_color(name),
+                                linewidth=1.5,
+                                label=reconstruction_label(name),
+                            )
+                            ax.set_title(component_labels[row_idx][col_idx], fontsize=9)
+                            ax.grid(alpha=0.25)
+                else:
+                    series_to_plot = scale_root_series_rotations(np.asarray(series, dtype=float), family_is_translation, rotation_unit)
+                    for axis_idx, ax in enumerate(axes):
+                        ax.plot(
+                            t,
+                            series_to_plot[:, family_slice.start + axis_idx],
+                            color=reconstruction_color(name),
+                            linewidth=1.7,
+                            label=reconstruction_label(name),
+                        )
+                        ax.set_ylabel(f"{axis_display_labels[axis_idx]} ({unit_label})")
+                        ax.grid(alpha=0.25)
+            legend_axis = axes[0, 0] if matrix_mode else axes[0]
+            handles, labels = legend_axis.get_legend_handles_labels()
             if handles:
                 uniq = {}
                 for handle, label in zip(handles, labels):
                     uniq[label] = handle
-                axes[0].legend(list(uniq.values()), list(uniq.keys()), loc="upper right", fontsize=8)
-            axes[-1].set_xlabel("Temps (s)")
-            family_label = "translations" if family_is_translation else f"rotations ({rotation_unit})"
-            self.figure.suptitle(f"Cinématiques racine | {family_label} | {quantity}")
+                legend_axis.legend(list(uniq.values()), list(uniq.keys()), loc="upper right", fontsize=8)
+            if matrix_mode:
+                for row_idx in range(3):
+                    axes[row_idx, 0].set_ylabel("value")
+                for col_idx in range(3):
+                    axes[-1, col_idx].set_xlabel("Temps (s)")
+            else:
+                axes[-1].set_xlabel("Temps (s)")
+            family_label = "translations" if family_is_translation else ("rotation matrix" if matrix_mode else f"rotations ({rotation_unit})")
+            displayed_quantity = effective_quantity if matrix_mode else quantity
+            self.figure.suptitle(f"Cinématiques racine | {family_label} | {displayed_quantity}")
             self.figure.tight_layout()
             self.canvas.draw_idle()
         except Exception as exc:
@@ -5251,6 +5387,7 @@ class JointKinematicsTab(ttk.Frame):
         self.state = state
         self.bundle = None
         self.q_names = np.array([], dtype=object)
+        self._suspend_selection_refresh = False
 
         controls = ttk.LabelFrame(self, text="Autres DoF")
         controls.pack(fill=tk.X, padx=10, pady=10)
@@ -5272,6 +5409,7 @@ class JointKinematicsTab(ttk.Frame):
 
         self.recon_show = SelectionTable(controls, "Reconstructions q")
         self.recon_show.pack(fill=tk.BOTH, padx=8, pady=6)
+        self.recon_show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.recon_show.tree, "Selectionnez les reconstructions a comparer pour les autres DoF.")
 
         self.pair_list = tk.Listbox(controls, selectmode=tk.MULTIPLE, exportselection=False, height=6)
@@ -5290,6 +5428,18 @@ class JointKinematicsTab(ttk.Frame):
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
 
+    def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        self._suspend_selection_refresh = True
+        try:
+            self.recon_show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        self.refresh_plot()
+
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
@@ -5306,7 +5456,7 @@ class JointKinematicsTab(ttk.Frame):
                     ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
                     fallback_count=3,
                 )
-                self.recon_show.set_rows(rows, defaults)
+                self._set_reconstruction_rows(rows, defaults)
                 if self.bundle is not None:
                     self.refresh_plot()
         except Exception:
@@ -5325,7 +5475,7 @@ class JointKinematicsTab(ttk.Frame):
                     ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
                     fallback_count=3,
                 )
-                self.recon_show.set_rows(rows, defaults)
+                self._set_reconstruction_rows(rows, defaults)
             pairs = pair_dof_names(self.q_names)
             current_labels = [self.pair_list.get(idx) for idx in range(self.pair_list.size())]
             new_labels = [pair_label for pair_label, _, _ in pairs]
@@ -5386,6 +5536,7 @@ class ObservabilityTab(ttk.Frame):
         super().__init__(master)
         self.state = state
         self.bundle = None
+        self._suspend_selection_refresh = False
 
         controls = ttk.LabelFrame(self, text="Observabilité du modèle")
         controls.pack(fill=tk.X, padx=10, pady=10)
@@ -5401,6 +5552,7 @@ class ObservabilityTab(ttk.Frame):
 
         self.recon_show = SelectionTable(controls, "Reconstructions q")
         self.recon_show.pack(fill=tk.BOTH, padx=8, pady=6)
+        self.recon_show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.recon_show.tree, "Choisissez une reconstruction avec q pour analyser le rang des jacobiennes des marqueurs 3D et des observations 2D.")
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
@@ -5430,6 +5582,18 @@ class ObservabilityTab(ttk.Frame):
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
 
+    def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        self._suspend_selection_refresh = True
+        try:
+            self.recon_show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        self.refresh_plot()
+
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
@@ -5446,7 +5610,7 @@ class ObservabilityTab(ttk.Frame):
                     ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
                     fallback_count=1,
                 )
-                self.recon_show.set_rows(rows, defaults[:1])
+                self._set_reconstruction_rows(rows, defaults[:1])
                 if self.bundle is not None:
                     self.refresh_plot()
         except Exception:
@@ -5465,7 +5629,7 @@ class ObservabilityTab(ttk.Frame):
                     ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
                     fallback_count=1,
                 )
-                self.recon_show.set_rows(rows, defaults[:1])
+                self._set_reconstruction_rows(rows, defaults[:1])
 
             selected_names = self.recon_show.selected_names()
             selected_name = selected_names[-1] if selected_names else None
@@ -6072,6 +6236,7 @@ class TrampolineTab(ttk.Frame):
         self.analysis: DDSessionAnalysis | None = None
         self.contacts = []
         self.current_reconstruction_name: str | None = None
+        self._suspend_selection_refresh = False
 
         controls = ttk.LabelFrame(self, text="Déplacement dans la toile")
         controls.pack(fill=tk.X, padx=10, pady=10)
@@ -6099,6 +6264,7 @@ class TrampolineTab(ttk.Frame):
         self.recon_show = SelectionTable(left, "Reconstructions disponibles", action_label="Refresh available", action_command=self.refresh_available_reconstructions)
         self.recon_show.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
         self.recon_show.tree.configure(selectmode="browse")
+        self.recon_show.tree.bind("<<TreeviewSelect>>", lambda _event: self._on_reconstruction_selection_changed())
         attach_tooltip(self.recon_show.tree, "Choisissez la reconstruction utilisée pour estimer les contacts et la pénalité de déplacement.")
         ttk.Button(left, text="Analyze / refresh", command=self.refresh_analysis).pack(anchor="w", pady=(0, 8))
 
@@ -6124,6 +6290,18 @@ class TrampolineTab(ttk.Frame):
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.sync_dataset_dir()
 
+    def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        self._suspend_selection_refresh = True
+        try:
+            self.recon_show.set_rows(rows, defaults)
+        finally:
+            self._suspend_selection_refresh = False
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        if self._suspend_selection_refresh:
+            return
+        self.refresh_analysis()
+
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
@@ -6139,7 +6317,7 @@ class TrampolineTab(ttk.Frame):
                 ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
                 fallback_count=4,
             )
-            self.recon_show.set_rows(rows, defaults)
+            self._set_reconstruction_rows(rows, defaults)
         except Exception:
             pass
 
@@ -6693,7 +6871,7 @@ class LauncherApp(tk.Tk):
             keypoints_var=tk.StringVar(value="inputs/1_partie_0429_keypoints.json"),
             pose2sim_trc_var=tk.StringVar(value="inputs/1_partie_0429.trc"),
             fps_var=tk.StringVar(value="120"),
-            workers_var=tk.StringVar(value="4"),
+            workers_var=tk.StringVar(value="6"),
             pose_data_mode_var=tk.StringVar(value="cleaned"),
             pose_filter_window_var=tk.StringVar(value="9"),
             pose_outlier_ratio_var=tk.StringVar(value="0.10"),

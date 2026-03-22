@@ -9,6 +9,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from datetime import datetime
 from root_kinematics import (
+    ROOT_ROTATION_SLICE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
@@ -167,7 +168,7 @@ def compute_angles_over_jump_from_axes(
     rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window = np.asarray(root_q[start : end + 1], dtype=float)
-    rotations = window[:, 3:6]
+    rotations = window[:, ROOT_ROTATION_SLICE]
     z_axes = np.full((window.shape[0], 3), np.nan, dtype=float)
     y_axes = np.full((window.shape[0], 3), np.nan, dtype=float)
     for idx, angles in enumerate(rotations):
@@ -207,7 +208,7 @@ def compute_angles_over_jump_from_euler(
     rotation_sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     window = np.asarray(root_q[start : end + 1], dtype=float)
-    raw_rotations = np.asarray(window[:, 3:6], dtype=float)
+    raw_rotations = np.asarray(window[:, ROOT_ROTATION_SLICE], dtype=float)
     rotations = reextract_euler_with_gaps(raw_rotations, rotation_sequence)
     rotations = unwrap_with_gaps(rotations)
     somersault_angle = rotations[:, 0]

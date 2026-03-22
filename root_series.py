@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from reconstruction_bundle import extract_root_from_points
 from root_kinematics import (
     ROOT_Q_NAMES,
+    ROOT_ROTATION_SLICE,
     TRUNK_ROTATION_NAMES,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_TRANSLATION_NAMES,
     centered_finite_difference,
     extract_root_from_q,
@@ -28,7 +31,7 @@ def scale_root_series_rotations(series: np.ndarray, family_is_translation: bool,
     if family_is_translation:
         return output
     scaled = np.array(output, copy=True)
-    scaled[:, 3:6] *= rotation_unit_scale(rotation_unit)
+    scaled[:, ROOT_ROTATION_SLICE] *= rotation_unit_scale(rotation_unit)
     return scaled
 
 
@@ -99,8 +102,26 @@ def root_series_from_precomputed(
     return np.asarray(qdot_root, dtype=float)
 
 
+def root_rotation_matrices_from_series(root_q: np.ndarray) -> np.ndarray:
+    root_q = np.asarray(root_q, dtype=float)
+    matrices = np.full((root_q.shape[0], 3, 3), np.nan, dtype=float)
+    if root_q.shape[1] < 6:
+        return matrices
+    for frame_idx, angles in enumerate(root_q[:, ROOT_ROTATION_SLICE]):
+        if not np.all(np.isfinite(angles)):
+            continue
+        matrices[frame_idx] = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, angles, degrees=False).as_matrix()
+    return matrices
+
+
 def root_axis_labels(family: str) -> list[str]:
     return TRUNK_TRANSLATION_NAMES if family == "translations" else TRUNK_ROTATION_NAMES
+
+
+def root_axis_display_labels(family: str) -> list[str]:
+    if family == "translations":
+        return ["TransX", "TransY", "TransZ"]
+    return ["Somersault", "Tilt", "Twist"]
 
 
 def root_ordered_names() -> np.ndarray:

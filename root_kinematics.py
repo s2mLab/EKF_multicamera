@@ -13,6 +13,9 @@ TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
 TRUNK_ROTATION_NAMES = ["TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ"]
 TRUNK_ROOT_ROTATION_SEQUENCE = "yxz"
 ROOT_Q_NAMES = np.asarray(TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES, dtype=object)
+# Shared slices avoid hard-coded root DoF indexing across the codebase.
+ROOT_TRANSLATION_SLICE = slice(0, len(TRUNK_TRANSLATION_NAMES))
+ROOT_ROTATION_SLICE = slice(len(TRUNK_TRANSLATION_NAMES), len(TRUNK_TRANSLATION_NAMES) + len(TRUNK_ROTATION_NAMES))
 RIGHT_ANGLE_RAD = 0.5 * math.pi
 
 
@@ -155,9 +158,9 @@ def extract_root_from_q(
         if str(dof_name) in name_to_index:
             root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
     if renormalize_rotations:
-        root_q[:, 3:6] = reextract_euler_with_gaps(root_q[:, 3:6], TRUNK_ROOT_ROTATION_SEQUENCE)
+        root_q[:, ROOT_ROTATION_SLICE] = reextract_euler_with_gaps(root_q[:, ROOT_ROTATION_SLICE], TRUNK_ROOT_ROTATION_SEQUENCE)
     if unwrap_rotations:
-        root_q[:, 3:6] = unwrap_with_gaps(root_q[:, 3:6])
+        root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
     return root_q
 
 

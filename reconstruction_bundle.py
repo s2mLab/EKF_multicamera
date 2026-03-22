@@ -18,6 +18,7 @@ from scipy.spatial.transform import Rotation
 from reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
 from reconstruction_timings import make_timing_stage
 from root_kinematics import (
+    ROOT_ROTATION_SLICE,
     ROOT_Q_NAMES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
@@ -914,11 +915,11 @@ def extract_root_from_points(
         if not np.all(np.isfinite(matrix)):
             continue
         if correction_applied:
-            matrix = matrix @ Rotation.from_euler("z", correction_angle, degrees=False).as_matrix()
-        root_q[frame_idx, 3:6] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
+            matrix = Rotation.from_euler("z", -correction_angle, degrees=False).as_matrix() @ matrix
+        root_q[frame_idx, ROOT_ROTATION_SLICE] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
 
     if unwrap_rotations:
-        root_q[:, 3:6] = unwrap_with_gaps(root_q[:, 3:6])
+        root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
     return root_q, correction_applied
 
 
