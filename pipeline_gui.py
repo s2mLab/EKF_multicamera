@@ -41,33 +41,33 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 from scipy.spatial.transform import Rotation
 
-from camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
-from camera_selection import format_camera_names, parse_camera_names
-from dd_analysis import DDSessionAnalysis, analyze_dd_session
-from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
-from dataset_preview_loader import load_dataset_preview_resources
-from dataset_preview_state import build_dataset_preview_state
-from observability_analysis import compute_observability_rank_series, summarize_rank_series
-from preview_bundle import (
+from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
+from camera_tools.camera_selection import format_camera_names, parse_camera_names
+from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session
+from judging.dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from preview.dataset_preview_loader import load_dataset_preview_resources
+from preview.dataset_preview_state import build_dataset_preview_state
+from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
+from preview.preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
     project_points_all_cameras,
     root_center,
 )
-from preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
-from reconstruction_presenter import (
+from preview.preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
+from reconstruction.reconstruction_presenter import (
     bundle_available_reconstruction_names,
     catalog_rows_for_names,
     default_selection,
 )
-from reconstruction_bundle import (
+from reconstruction.reconstruction_bundle import (
     extract_root_from_points,
     load_or_compute_left_right_flip_cache,
     load_or_compute_pose_data_variant_cache,
     load_or_compute_triangulation_cache,
     slice_pose_data,
 )
-from reconstruction_profiles import (
+from reconstruction.reconstruction_profiles import (
     ReconstructionProfile,
     build_pipeline_command,
     canonical_profile_name,
@@ -79,8 +79,13 @@ from reconstruction_profiles import (
     scan_variant_output_dirs,
     validate_profile,
 )
-from reconstruction_dataset import dataset_source_paths, reconstruction_color, reconstruction_label
-from reconstruction_registry import (
+from reconstruction.reconstruction_dataset import (
+    dataset_source_paths,
+    reconstruction_color,
+    reconstruction_label,
+    write_trc_file,
+)
+from reconstruction.reconstruction_registry import (
     dataset_figures_dir,
     dataset_models_dir,
     dataset_reconstructions_dir,
@@ -92,8 +97,8 @@ from reconstruction_registry import (
     scan_model_dirs,
     scan_reconstruction_dirs,
 )
-from reconstruction_timings import format_reconstruction_timing_details, objective_total_seconds
-from root_kinematics import (
+from reconstruction.reconstruction_timings import format_reconstruction_timing_details, objective_total_seconds
+from kinematics.root_kinematics import (
     TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
@@ -102,7 +107,7 @@ from root_kinematics import (
     extract_root_from_q,
     normalize,
 )
-from root_series import (
+from kinematics.root_series import (
     quantity_unit_label,
     root_axis_display_labels,
     root_ordered_names,
@@ -113,7 +118,7 @@ from root_series import (
     root_series_from_q,
     scale_root_series_rotations,
 )
-from trampoline_displacement import (
+from judging.trampoline_displacement import (
     X_INNER,
     X_MAX,
     Y_INNER,
@@ -3246,6 +3251,17 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_min_cameras.var = state.flip_min_other_cameras_var
         self.flip_min_cameras.entry_widget.configure(textvariable=self.flip_min_cameras.var)
         self.flip_min_cameras.pack(side=tk.LEFT, padx=(0, 10))
+        triang_flip_label = ttk.Label(row_flip, text="Triang flip", width=9)
+        triang_flip_label.pack(side=tk.LEFT)
+        self.triang_flip_method = tk.StringVar(value="raw")
+        self.triang_flip_method_box = ttk.Combobox(
+            row_flip,
+            textvariable=self.triang_flip_method,
+            values=["raw", "greedy", "exhaustive"],
+            width=10,
+            state="readonly",
+        )
+        self.triang_flip_method_box.pack(side=tk.LEFT, padx=(0, 10))
         self.flip_temporal_weight = LabeledEntry(row_flip, "Temp w", str(DEFAULT_FLIP_TEMPORAL_WEIGHT), label_width=7, entry_width=4)
         self.flip_temporal_weight.var = state.flip_temporal_weight_var
         self.flip_temporal_weight.entry_widget.configure(textvariable=self.flip_temporal_weight.var)
@@ -3297,6 +3313,8 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_improvement_ratio.set_tooltip("Le flip est accepté si le coût swappé devient inférieur à ce ratio du coût nominal.")
         self.flip_min_gain.set_tooltip("Gain minimal en pixels requis entre coût nominal et coût swappé pour valider un flip L/R.")
         self.flip_min_cameras.set_tooltip("Nombre minimal d'autres caméras valides pour évaluer un flip L/R en mode triangulation.")
+        attach_tooltip(triang_flip_label, "Choisit la variante de triangulation utilisée pour le diagnostic flip L/R: raw (une triangulation pondérée), greedy, ou exhaustive.")
+        attach_tooltip(self.triang_flip_method_box, "raw: une triangulation pondérée par keypoint. greedy: suppression gloutonne des pires vues. exhaustive: test des combinaisons de vues les plus robuste mais plus coûteux.")
         self.flip_temporal_weight.set_tooltip("Poids du coût temporel par caméra dans le coût combiné de décision du flip. Mettre 0 pour rester purement géométrique.")
         self.flip_temporal_tau.set_tooltip("Echelle en pixels du coût temporel 2D utilisée pour normaliser sa contribution avant combinaison avec le coût épipolaire ou triangulation.")
         self.component.trace_add("write", lambda *_args: self.refresh_plot())
@@ -3313,9 +3331,14 @@ class DataExplorer2DTab(ttk.Frame):
         self.state.flip_min_other_cameras_var.trace_add("write", lambda *_args: self.on_flip_settings_changed())
         self.state.flip_temporal_weight_var.trace_add("write", lambda *_args: self.on_flip_settings_changed())
         self.state.flip_temporal_tau_px_var.trace_add("write", lambda *_args: self.on_flip_settings_changed())
+        self.triang_flip_method.trace_add("write", lambda *_args: self.on_flip_settings_changed())
         self.state.initial_rotation_correction_var.trace_add("write", lambda *_args: synchronize_profiles_initial_rotation_correction(self.state))
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_dataset_summary())
         self.on_keypoints_changed()
+
+    def selected_triangulation_flip_method(self) -> str:
+        value = str(self.triang_flip_method.get()).strip().lower()
+        return value if value in {"raw", "greedy", "exhaustive"} else "raw"
 
     def on_keypoints_changed(self) -> None:
         keypoints_path = ROOT / self.keypoints.get()
@@ -3336,8 +3359,8 @@ class DataExplorer2DTab(ttk.Frame):
         self.update_flip_status_text()
 
     def on_flip_settings_changed(self) -> None:
-        self.flip_masks = {}
-        self.flip_diagnostics = {}
+        self.flip_masks = {key: value for key, value in self.flip_masks.items() if key in {"epipolar", "epipolar_fast"}}
+        self.flip_diagnostics = {key: value for key, value in self.flip_diagnostics.items() if key in {"epipolar", "epipolar_fast"}}
         self.update_flip_status_text()
         if self.pose_data is not None and self.calibrations is not None:
             self.refresh_plot()
@@ -3363,7 +3386,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_status_var.set(
             f"{gating} | accept if swapped < {improvement_ratio:.2f}*nominal and gain >= {min_gain_px:.1f}px"
             f" | tau_epi={DEFAULT_EPIPOLAR_THRESHOLD_PX:.1f}px | tau_triang={DEFAULT_REPROJECTION_THRESHOLD_PX:.1f}px"
-            f" | temp w={temporal_weight:.2f} | temp tau={temporal_tau_px:.1f}px | min cams={min_other_cameras}"
+            f" | triang={self.selected_triangulation_flip_method()} | temp w={temporal_weight:.2f} | temp tau={temporal_tau_px:.1f}px | min cams={min_other_cameras}"
         )
 
     def clean_trial_outputs(self) -> None:
@@ -3450,7 +3473,8 @@ class DataExplorer2DTab(ttk.Frame):
         outlier_floor_px = float(self.state.flip_outlier_floor_px_var.get())
         temporal_weight = float(self.state.flip_temporal_weight_var.get())
         temporal_tau_px = float(self.state.flip_temporal_tau_px_var.get())
-        for method in ("epipolar", "epipolar_fast", "triangulation"):
+        selected_triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
+        for method in ("epipolar", "epipolar_fast", selected_triangulation_method):
             if method in self.flip_masks:
                 continue
             suspect_mask, diagnostics, _compute_time_s, _cache_path, _flip_source = load_or_compute_left_right_flip_cache(
@@ -3489,8 +3513,12 @@ class DataExplorer2DTab(ttk.Frame):
         else:
             points = np.asarray(self.pose_data.keypoints, dtype=float)
         correction_mode = self.flip_mode.get()
-        if correction_mode in self.flip_masks:
+        if correction_mode in {"epipolar", "epipolar_fast"} and correction_mode in self.flip_masks:
             points = apply_left_right_flip_to_points(points, self.flip_masks[correction_mode])
+        elif correction_mode == "triangulation":
+            triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
+            if triangulation_method in self.flip_masks:
+                points = apply_left_right_flip_to_points(points, self.flip_masks[triangulation_method])
         t = np.asarray(self.pose_data.frames, dtype=float) / float(self.fps.get())
 
         self.figure.clear()
@@ -3527,8 +3555,9 @@ class DataExplorer2DTab(ttk.Frame):
             if "epipolar_fast" in self.flip_masks:
                 for frame_idx in np.flatnonzero(self.flip_masks["epipolar_fast"][ax_idx]):
                     ax.axvline(t[frame_idx], color="#dd8452", linestyle="-.", linewidth=0.9, alpha=0.26)
-            if "triangulation" in self.flip_masks:
-                for frame_idx in np.flatnonzero(self.flip_masks["triangulation"][ax_idx]):
+            triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
+            if triangulation_method in self.flip_masks:
+                for frame_idx in np.flatnonzero(self.flip_masks[triangulation_method][ax_idx]):
                     ax.axvline(t[frame_idx], color="#4c72b0", linestyle=":", linewidth=1.0, alpha=0.30)
             ax.set_title(cam_name.replace("Camera", ""))
             ax.grid(alpha=0.2)
@@ -3547,7 +3576,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.figure.suptitle(
             f"2D {self.view_mode.get()} | composante {self.component.get()} | correction L/R {self.flip_mode.get()} | "
             f"tau epi {DEFAULT_EPIPOLAR_THRESHOLD_PX:.1f}px | tau triang {DEFAULT_REPROJECTION_THRESHOLD_PX:.1f}px | "
-            "flips: epi rouge --, epi fast orange -., triang bleu :",
+            f"triang mode {self.selected_triangulation_flip_method()} | flips: epi rouge --, epi fast orange -., triang bleu :",
             y=0.98,
         )
         self.figure.tight_layout()
@@ -4958,6 +4987,8 @@ class ReconstructionsTab(CommandTab):
         ttk.Button(controls, text="Refresh profiles", command=self.refresh_profile_tree).pack(side=tk.LEFT)
         ttk.Button(controls, text="Refresh caches", command=self.refresh_status_tree).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(controls, text="Clear reconstructions", command=self.clear_reconstructions).pack(side=tk.LEFT, padx=(8, 0))
+        self.export_trc_button = ttk.Button(controls, text="Export TRC from q", command=self.export_selected_trc_from_q)
+        self.export_trc_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.profile_tree = ttk.Treeview(form, columns=("name", "family", "mode", "flags"), show="headings", height=6, selectmode="extended")
         for col, label, width in [("name", "Name", 260), ("family", "Family", 90), ("mode", "2D mode", 90), ("flags", "Flags", 420)]:
@@ -4986,6 +5017,7 @@ class ReconstructionsTab(CommandTab):
             self.status_tree.column(col, width=widths[col], anchor="w")
         self.status_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         attach_tooltip(self.status_tree, "Tableau des reconstructions du dataset courant, avec temps de calcul total et erreurs de reprojection.")
+        attach_tooltip(self.export_trc_button, "Reconstruit les marqueurs du modèle depuis q pour la reconstruction sélectionnée et écrit un fichier TRC dans son dossier.")
 
         timing_box = ttk.LabelFrame(self.main, text="Durées détaillées de la reconstruction sélectionnée")
         timing_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8), before=self.output)
@@ -5063,6 +5095,53 @@ class ReconstructionsTab(CommandTab):
             self.status_tree.selection_set(first)
             self.status_tree.focus(first)
         self.refresh_timing_details()
+
+    def export_selected_trc_from_q(self) -> None:
+        """Export the selected q-based reconstruction as a TRC marker trajectory."""
+
+        selected = self.status_tree.selection()
+        if not selected:
+            messagebox.showinfo("Export TRC from q", "Select one reconstruction first.")
+            return
+
+        recon_dir = Path(selected[0])
+        bundle_path = recon_dir / "reconstruction_bundle.npz"
+        if not bundle_path.exists():
+            messagebox.showerror("Export TRC from q", f"Bundle not found:\n{bundle_path}")
+            return
+
+        data = np.load(bundle_path, allow_pickle=True)
+        if "q" not in data:
+            messagebox.showinfo("Export TRC from q", "The selected reconstruction does not contain generalized coordinates q.")
+            return
+
+        q = np.asarray(data["q"], dtype=float)
+        frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(q.shape[0], dtype=int)
+        time_s = np.asarray(data["time_s"], dtype=float) if "time_s" in data else np.arange(q.shape[0], dtype=float) / max(float(self.state.fps_var.get()), 1.0)
+        biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), self.status_summaries.get(str(recon_dir), {}).get("name", recon_dir.name))
+        if biomod_path is None or not biomod_path.exists():
+            messagebox.showerror("Export TRC from q", f"No bioMod found for:\n{recon_dir.name}")
+            return
+
+        import biorbd
+
+        model = biorbd.Model(str(biomod_path))
+        marker_names = [name.to_string() for name in model.markerNames()]
+        marker_points = np.full((q.shape[0], len(marker_names), 3), np.nan, dtype=float)
+        for frame_idx, q_values in enumerate(q):
+            for marker_idx, marker in enumerate(model.markers(q_values)):
+                marker_points[frame_idx, marker_idx] = marker.to_array()
+
+        if time_s.shape[0] > 1 and np.all(np.isfinite(time_s)):
+            dt = np.diff(time_s)
+            positive_dt = dt[np.isfinite(dt) & (dt > 0)]
+            data_rate = float(1.0 / np.median(positive_dt)) if positive_dt.size else float(self.state.fps_var.get())
+        else:
+            data_rate = float(self.state.fps_var.get())
+
+        output_path = recon_dir / f"{recon_dir.name}_markers_from_q.trc"
+        write_trc_file(output_path, marker_names, marker_points, frames, time_s, data_rate=data_rate, units="m")
+        messagebox.showinfo("Export TRC from q", f"TRC written to:\n{output_path}")
 
     def refresh_timing_details(self) -> None:
         selected = self.status_tree.selection()
@@ -5631,7 +5710,8 @@ class ObservabilityTab(ttk.Frame):
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.refresh_plot())
-        self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.after_idle(self.refresh_available_reconstructions)
 
     def _set_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
         self._suspend_selection_refresh = True
@@ -5644,6 +5724,17 @@ class ObservabilityTab(ttk.Frame):
         if self._suspend_selection_refresh:
             return
         self.refresh_plot()
+
+    def _show_empty_plot(self, message: str) -> None:
+        """Render a lightweight placeholder when no observability plot can be produced."""
+
+        self.figure.clear()
+        ax = self.figure.subplots(1, 1)
+        ax.axis("off")
+        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
+        self.canvas.draw_idle()
+        self.summary_text.delete("1.0", tk.END)
+        self.summary_text.insert("1.0", message)
 
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
@@ -5662,8 +5753,12 @@ class ObservabilityTab(ttk.Frame):
                     fallback_count=1,
                 )
                 self._set_reconstruction_rows(rows, defaults[:1])
-                if self.bundle is not None:
-                    self.refresh_plot()
+                self.bundle = bundle
+                self.refresh_plot()
+            else:
+                self.bundle = bundle
+                self._set_reconstruction_rows([], [])
+                self._show_empty_plot("No reconstruction with q is available for observability analysis.")
         except Exception:
             pass
 
@@ -5672,26 +5767,18 @@ class ObservabilityTab(ttk.Frame):
             dataset_dir = ROOT / self.output_dir.get()
             self.bundle = get_cached_preview_bundle(self.state, dataset_dir, None, None, align_root=False)
             available_q = bundle_available_reconstruction_names(self.bundle, include_3d=False, include_q=True, include_q_root=False)
-            if available_q:
-                catalog = discover_reconstruction_catalog(dataset_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get()))
-                rows = catalog_rows_for_names(catalog, available_q)
-                defaults = default_selection(
-                    available_q,
-                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
-                    fallback_count=1,
-                )
-                self._set_reconstruction_rows(rows, defaults[:1])
+            if not available_q:
+                self._show_empty_plot("No reconstruction with q is available for observability analysis.")
+                return
 
             selected_names = self.recon_show.selected_names()
             selected_name = selected_names[-1] if selected_names else None
+            if selected_name is None:
+                self._show_empty_plot("Select one reconstruction with q to inspect observability.")
+                return
+
             self.figure.clear()
             self.summary_text.delete("1.0", tk.END)
-            if selected_name is None:
-                ax = self.figure.subplots(1, 1)
-                ax.text(0.5, 0.5, "No reconstruction with q selected", ha="center", va="center", transform=ax.transAxes)
-                ax.set_axis_off()
-                self.canvas.draw_idle()
-                return
 
             q = self.bundle.get("recon_q", {}).get(selected_name)
             if q is None:
@@ -5830,7 +5917,7 @@ class CameraToolsTab(ttk.Frame):
         metrics_box.pack(fill=tk.BOTH, expand=True)
         self.metrics_tree = ttk.Treeview(
             metrics_box,
-            columns=("camera", "valid", "score", "epi", "weighted", "reproj", "good", "usage", "flip_epi", "flip_tri"),
+            columns=("camera", "valid", "score", "epi", "weighted", "reproj", "good", "usage", "flip_epi", "flip_epif", "flip_tri"),
             show="headings",
             selectmode="extended",
             height=10,
@@ -5845,9 +5932,10 @@ class CameraToolsTab(ttk.Frame):
             "good": "Good reproj %",
             "usage": "Triang use %",
             "flip_epi": "Flip epi %",
+            "flip_epif": "Flip epiF %",
             "flip_tri": "Flip tri %",
         }
-        widths = {"camera": 120, "valid": 80, "score": 70, "epi": 70, "weighted": 95, "reproj": 85, "good": 95, "usage": 95, "flip_epi": 85, "flip_tri": 85}
+        widths = {"camera": 120, "valid": 80, "score": 70, "epi": 70, "weighted": 95, "reproj": 85, "good": 95, "usage": 95, "flip_epi": 85, "flip_epif": 90, "flip_tri": 85}
         for column in self.metrics_tree["columns"]:
             self.metrics_tree.heading(column, text=headings[column])
             self.metrics_tree.column(column, width=widths[column], anchor="center")
@@ -6075,6 +6163,7 @@ class CameraToolsTab(ttk.Frame):
                     self._fmt_pct(row.reprojection_good_frame_ratio),
                     self._fmt_pct(row.triangulation_usage_ratio),
                     self._fmt_pct(row.flip_rate_epipolar),
+                    self._fmt_pct(row.flip_rate_epipolar_fast),
                     self._fmt_pct(row.flip_rate_triangulation),
                 ),
             )

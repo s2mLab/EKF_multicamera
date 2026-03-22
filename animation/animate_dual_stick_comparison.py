@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 
-from reconstruction_dataset import (
+from reconstruction.reconstruction_dataset import (
     align_array_to_frames,
     load_bundle_entries,
     preferred_master_name,

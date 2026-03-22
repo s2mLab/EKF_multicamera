@@ -1,4 +1,4 @@
-from dataset_preview_state import build_dataset_preview_state
+from preview.dataset_preview_state import build_dataset_preview_state
 
 
 def test_build_dataset_preview_state_uses_bundle_names_and_bundle_frame_count():

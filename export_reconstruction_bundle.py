@@ -13,8 +13,8 @@ LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
-from camera_selection import parse_camera_names, subset_calibrations
-from reconstruction_bundle import (
+from camera_tools.camera_selection import parse_camera_names, subset_calibrations
+from reconstruction.reconstruction_bundle import (
     SUPPORTED_EKF2D_3D_SOURCE_MODES,
     build_ekf_2d_bundle,
     build_ekf_3d_bundle,

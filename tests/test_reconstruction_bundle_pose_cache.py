@@ -1,6 +1,6 @@
 import numpy as np
 
-from reconstruction_bundle import epipolar_cache_metadata, load_or_compute_pose_data_variant_cache
+from reconstruction.reconstruction_bundle import epipolar_cache_metadata, load_or_compute_pose_data_variant_cache
 from vitpose_ekf_pipeline import KP_INDEX, PoseData, apply_left_right_flip_corrections, reconstruction_cache_metadata
 
 
@@ -106,7 +106,7 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
         diagnostics = {"method": "epipolar", "n_suspects": 1}
         return suspect_mask, diagnostics, 0.123, tmp_path / "flip_cache.npz", "computed_now"
 
-    monkeypatch.setattr("reconstruction_bundle.load_or_compute_left_right_flip_cache", fake_flip_cache)
+    monkeypatch.setattr("reconstruction.reconstruction_bundle.load_or_compute_left_right_flip_cache", fake_flip_cache)
 
     corrected_a, diagnostics_a, compute_time_a, cache_path, source_a = load_or_compute_pose_data_variant_cache(
         output_dir=tmp_path,

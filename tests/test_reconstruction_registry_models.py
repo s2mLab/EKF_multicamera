@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from reconstruction_registry import default_model_stem, model_output_dir
+from reconstruction.reconstruction_registry import default_model_stem, model_output_dir
 
 
 def test_default_model_stem_includes_pose_correction_mode() -> None:

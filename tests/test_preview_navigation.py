@@ -1,4 +1,4 @@
-from preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
+from preview.preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
 
 
 def test_frame_from_slider_click_maps_position_and_clamps_ratio():

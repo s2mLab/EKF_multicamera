@@ -6,8 +6,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from reconstruction_bundle import extract_root_from_points
-from root_kinematics import (
+from reconstruction.reconstruction_bundle import extract_root_from_points
+from kinematics.root_kinematics import (
     ROOT_Q_NAMES,
     ROOT_ROTATION_SLICE,
     TRUNK_ROTATION_NAMES,

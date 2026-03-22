@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
-from reconstruction_registry import infer_dataset_name, reconstruction_output_dir, scan_dataset_dirs, scan_reconstruction_dirs, slugify
+from reconstruction.reconstruction_registry import infer_dataset_name, reconstruction_output_dir, scan_dataset_dirs, scan_reconstruction_dirs, slugify
 
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn")

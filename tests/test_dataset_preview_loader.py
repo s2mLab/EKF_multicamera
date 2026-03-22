@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from dataset_preview_loader import load_dataset_preview_resources
+from preview.dataset_preview_loader import load_dataset_preview_resources
 
 
 def test_load_dataset_preview_resources_combines_sources_catalog_bundle_and_state():

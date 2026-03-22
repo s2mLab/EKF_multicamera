@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from root_series import (
+from kinematics.root_series import (
     quantity_unit_label,
     root_axis_labels,
     root_rotation_matrices_from_points,
@@ -10,7 +10,7 @@ from root_series import (
     root_series_from_q,
     scale_root_series_rotations,
 )
-from root_kinematics import TRUNK_ROOT_ROTATION_SEQUENCE
+from kinematics.root_kinematics import TRUNK_ROOT_ROTATION_SEQUENCE
 
 
 def test_root_series_from_q_uses_precomputed_qdot_when_requested():

@@ -1,6 +1,6 @@
 import numpy as np
 
-from observability_analysis import (
+from observability.observability_analysis import (
     compute_observability_rank_series,
     matrix_rank_with_full_rank,
     stacked_marker_jacobian,

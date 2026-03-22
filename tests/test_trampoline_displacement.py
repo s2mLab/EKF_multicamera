@@ -1,7 +1,7 @@
 import numpy as np
 
-from dd_analysis import DDSessionAnalysis, JumpSegment
-from trampoline_displacement import (
+from judging.dd_analysis import DDSessionAnalysis, JumpSegment
+from judging.trampoline_displacement import (
     analyze_trampoline_contacts,
     contact_segments_between_jumps,
     total_trampoline_penalty,

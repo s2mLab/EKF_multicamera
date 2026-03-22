@@ -26,7 +26,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 
-from root_kinematics import (
+from kinematics.root_kinematics import (
     TRUNK_ROTATION_NAMES,
     centered_finite_difference,
     compute_trunk_dofs_from_points,

@@ -48,7 +48,7 @@ from animation.animate_dual_stick_comparison import (
     parse_trc,
     resample_points,
 )
-from reconstruction_dataset import dataset_source_paths, reconstruction_color, reconstruction_label, resolve_requested_names
+from reconstruction.reconstruction_dataset import dataset_source_paths, reconstruction_color, reconstruction_label, resolve_requested_names
 from vitpose_ekf_pipeline import COCO17, fundamental_matrix, load_calibrations, load_pose_data, sampson_error_pixels
 
 

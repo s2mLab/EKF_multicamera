@@ -28,8 +28,8 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from camera_selection import parse_camera_names, subset_calibrations
-from root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
+from camera_tools.camera_selection import parse_camera_names, subset_calibrations
+from kinematics.root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
 
 try:
     import tomllib
@@ -1302,6 +1302,8 @@ def compute_camera_triangulation_cost(
     ordered_calibrations: list[CameraCalibration],
     min_other_cameras: int = 2,
     precomputed_reprojected_points: np.ndarray | None = None,
+    triangulation_variant: str = "raw",
+    error_threshold_px: float = DEFAULT_REPROJECTION_THRESHOLD_PX,
 ) -> float:
     """Mesure la coherence d'une camera candidate via triangulation des autres vues.
 
@@ -1309,7 +1311,13 @@ def compute_camera_triangulation_cost(
     compare la reprojection dans cette camera pour l'hypothese nominale et la
     version swappee.
     """
+    triangulation_variant = str(triangulation_variant).strip().lower()
+    if triangulation_variant not in {"raw", "greedy", "exhaustive"}:
+        raise ValueError(f"Unknown triangulation variant: {triangulation_variant}")
+
     if (
+        triangulation_variant == "raw"
+        and
         precomputed_reprojected_points is not None
         and precomputed_reprojected_points.ndim == 3
         and camera_idx < precomputed_reprojected_points.shape[0]
@@ -1333,6 +1341,7 @@ def compute_camera_triangulation_cost(
         projections = []
         observations = []
         confidences = []
+        supporting_calibrations = []
         for other_idx in range(raw_2d_frame.shape[0]):
             if other_idx == camera_idx:
                 continue
@@ -1344,13 +1353,27 @@ def compute_camera_triangulation_cost(
             projections.append(ordered_calibrations[other_idx].P)
             observations.append(point_other)
             confidences.append(raw_scores_frame[other_idx, kp_idx])
+            supporting_calibrations.append(ordered_calibrations[other_idx])
         if len(observations) < max(2, int(min_other_cameras)):
             continue
-        point_3d = weighted_triangulation(
-            projections,
-            np.asarray(observations, dtype=float),
-            np.asarray(confidences, dtype=float),
-        )
+        observations_array = np.asarray(observations, dtype=float)
+        confidences_array = np.asarray(confidences, dtype=float)
+        if triangulation_variant == "raw":
+            point_3d = weighted_triangulation(
+                projections,
+                observations_array,
+                confidences_array,
+            )
+        else:
+            triangulate_fn = robust_triangulation_from_best_cameras if triangulation_variant == "exhaustive" else greedy_triangulation_from_best_cameras
+            point_3d, _mean_error, _per_view, _coherence, _excluded = triangulate_fn(
+                projections,
+                observations_array,
+                confidences_array,
+                supporting_calibrations,
+                error_threshold_px=float(error_threshold_px),
+                min_cameras_for_triangulation=max(2, int(min_other_cameras)),
+            )
         if not np.all(np.isfinite(point_3d)):
             continue
         reprojected = calibration.project_point(point_3d)
@@ -1389,12 +1412,18 @@ def detect_left_right_flip_diagnostics(
     pair_weights = None
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
     epipolar_family = method in {"epipolar", "epipolar_fast"}
+    triangulation_family = method in {"triangulation", "triangulation_raw", "triangulation_greedy", "triangulation_exhaustive"}
+    triangulation_variant = (
+        "raw"
+        if method in {"triangulation", "triangulation_raw"}
+        else ("greedy" if method == "triangulation_greedy" else "exhaustive")
+    )
     epipolar_distance_mode = "sampson" if method == "epipolar" else ("symmetric" if method == "epipolar_fast" else "reprojection")
     smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if epipolar_family else 1
     if epipolar_family:
         fundamental_matrices = build_fundamental_matrix_array(ordered_calibrations)
         pair_weights = build_flip_epipolar_pair_weight_array(ordered_calibrations)
-    elif method != "triangulation":
+    elif not triangulation_family:
         raise ValueError(f"Unknown flip diagnostic method: {method}")
     nominal_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
     nominal_legacy_costs = np.full((n_cams, n_frames), np.nan, dtype=float)
@@ -1414,7 +1443,7 @@ def detect_left_right_flip_diagnostics(
                 ordered_calibrations,
                 min_other_cameras=min_other_cameras,
             )
-            if method == "triangulation"
+            if triangulation_family and triangulation_variant == "raw"
             else None
         )
         for cam_idx in range(n_cams):
@@ -1439,6 +1468,8 @@ def detect_left_right_flip_diagnostics(
                     ordered_calibrations,
                     min_other_cameras=min_other_cameras,
                     precomputed_reprojected_points=triangulation_references,
+                    triangulation_variant=triangulation_variant,
+                    error_threshold_px=geometry_tau_px,
                 )
             nominal_temporal_costs[cam_idx, frame_idx] = compute_camera_temporal_cost(
                 cam_idx,
@@ -1501,7 +1532,7 @@ def detect_left_right_flip_diagnostics(
                 ordered_calibrations,
                 min_other_cameras=min_other_cameras,
             )
-            if method == "triangulation"
+            if triangulation_family and triangulation_variant == "raw"
             else None
         )
         for cam_idx in range(n_cams):
@@ -1529,6 +1560,8 @@ def detect_left_right_flip_diagnostics(
                     ordered_calibrations,
                     min_other_cameras=min_other_cameras,
                     precomputed_reprojected_points=triangulation_references,
+                    triangulation_variant=triangulation_variant,
+                    error_threshold_px=geometry_tau_px,
                 )
             swapped_temporal_costs[cam_idx, frame_idx] = compute_camera_temporal_cost(
                 cam_idx,

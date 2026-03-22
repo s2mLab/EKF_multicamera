@@ -1,6 +1,6 @@
 import numpy as np
 
-from camera_selection import parse_camera_names, select_camera_names, subset_calibrations, subset_pose_data
+from camera_tools.camera_selection import parse_camera_names, select_camera_names, subset_calibrations, subset_pose_data
 from vitpose_ekf_pipeline import PoseData
 
 

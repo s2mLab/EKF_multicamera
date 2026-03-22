@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from dataset_preview_state import DatasetPreviewState, build_dataset_preview_state
+from preview.dataset_preview_state import DatasetPreviewState, build_dataset_preview_state
 
 
 @dataclass

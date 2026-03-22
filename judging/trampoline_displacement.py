@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dd_analysis import DDSessionAnalysis
+from judging.dd_analysis import DDSessionAnalysis
 
 X_MAX = 2.525
 Y_MAX = 1.455

@@ -1,7 +1,7 @@
 import numpy as np
 
-from dd_analysis import DDJumpAnalysis, DDSessionAnalysis, JumpSegment
-from dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis, JumpSegment
+from judging.dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
 
 
 def make_jump() -> DDJumpAnalysis:

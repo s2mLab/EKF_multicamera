@@ -1,4 +1,4 @@
-from reconstruction_timings import (
+from reconstruction.reconstruction_timings import (
     build_pipeline_diagram,
     compute_time_seconds,
     format_reconstruction_timing_details,

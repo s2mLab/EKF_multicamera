@@ -1,6 +1,6 @@
 import numpy as np
 
-from camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
+from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from vitpose_ekf_pipeline import PoseData
 
 
@@ -24,6 +24,7 @@ def test_compute_camera_metric_rows_summarizes_expected_ratios():
     excluded[:2, 0, 1] = [False, True]
     flip_masks = {
         "epipolar": np.array([[False, True, False], [True, False, False]], dtype=bool),
+        "epipolar_fast": np.array([[False, False, True], [False, False, False]], dtype=bool),
         "triangulation": np.array([[False, False, False], [True, True, False]], dtype=bool),
     }
 
@@ -43,6 +44,7 @@ def test_compute_camera_metric_rows_summarizes_expected_ratios():
     assert abs(row1.reprojection_good_frame_ratio - 1.0) < 1e-12
     assert abs(row1.triangulation_usage_ratio - (2 / 3)) < 1e-12
     assert abs(row1.flip_rate_epipolar - (1 / 3)) < 1e-12
+    assert abs(row1.flip_rate_epipolar_fast - (1 / 3)) < 1e-12
     assert row2.reprojection_good_frame_ratio == 0.0
 
 
@@ -60,6 +62,7 @@ def test_suggest_best_camera_names_prefers_high_confidence_low_flip_rows():
     epipolar[:, 0, 2] = [0.95, 0.95]
     flip_masks = {
         "epipolar": np.array([[False, False], [True, False], [False, False]], dtype=bool),
+        "epipolar_fast": np.array([[False, False], [False, False], [False, True]], dtype=bool),
         "triangulation": np.array([[False, False], [False, True], [False, False]], dtype=bool),
     }
     rows = compute_camera_metric_rows(pose_data, epipolar_coherence=epipolar, flip_masks=flip_masks)

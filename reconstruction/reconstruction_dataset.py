@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from reconstruction_registry import scan_reconstruction_dirs
+from reconstruction.reconstruction_registry import scan_reconstruction_dirs
 
 DEFAULT_CALIB = Path("inputs/Calib.toml")
 
@@ -235,3 +235,76 @@ def load_bundle_entries(path: Path) -> list[dict[str, object]]:
         )
     entries.sort(key=lambda entry: list(PREFERRED_MASTER_NAMES).index(entry["name"]) if entry["name"] in PREFERRED_MASTER_NAMES else 999)
     return entries
+
+
+def write_trc_file(
+    output_path: Path,
+    marker_names: list[str],
+    points_3d: np.ndarray,
+    frames: np.ndarray,
+    time_s: np.ndarray,
+    *,
+    data_rate: float,
+    units: str = "m",
+) -> Path:
+    """Write a simple TRC file from 3D marker trajectories.
+
+    The output follows the subset of the TRC format already parsed by the
+    project utilities: two header rows, a marker-name row, a coordinate-label
+    row, then one row per frame with `X/Y/Z` triplets.
+    """
+
+    output_path = Path(output_path)
+    marker_names = [str(name) for name in marker_names]
+    points_3d = np.asarray(points_3d, dtype=float)
+    frames = np.asarray(frames, dtype=int)
+    time_s = np.asarray(time_s, dtype=float)
+    if points_3d.ndim != 3 or points_3d.shape[2] != 3:
+        raise ValueError("points_3d must have shape (n_frames, n_markers, 3).")
+    if points_3d.shape[0] != len(frames) or points_3d.shape[0] != len(time_s):
+        raise ValueError("frames/time_s length must match the first points_3d dimension.")
+    if points_3d.shape[1] != len(marker_names):
+        raise ValueError("marker_names length must match the second points_3d dimension.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_keys = [
+        "DataRate",
+        "CameraRate",
+        "NumFrames",
+        "NumMarkers",
+        "Units",
+        "OrigDataRate",
+        "OrigDataStartFrame",
+        "OrigNumFrames",
+    ]
+    metadata_values = [
+        f"{float(data_rate):g}",
+        f"{float(data_rate):g}",
+        str(int(points_3d.shape[0])),
+        str(int(points_3d.shape[1])),
+        str(units),
+        f"{float(data_rate):g}",
+        str(int(frames[0]) if len(frames) else 1),
+        str(int(points_3d.shape[0])),
+    ]
+    marker_row = ["Frame#", "Time"]
+    coord_row = ["", ""]
+    for marker_idx, marker_name in enumerate(marker_names, start=1):
+        marker_row.extend([marker_name, "", ""])
+        coord_row.extend([f"X{marker_idx}", f"Y{marker_idx}", f"Z{marker_idx}"])
+
+    lines = [
+        f"PathFileType\t4\t(X/Y/Z)\t{output_path.name}",
+        "\t".join(metadata_keys),
+        "\t".join(metadata_values),
+        "\t".join(marker_row),
+        "\t".join(coord_row),
+    ]
+    for frame_idx in range(points_3d.shape[0]):
+        row = [str(int(frames[frame_idx])), f"{float(time_s[frame_idx]):.8f}"]
+        for point in points_3d[frame_idx]:
+            for value in point:
+                row.append("" if not np.isfinite(value) else f"{float(value):.8f}")
+        lines.append("\t".join(row))
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output_path

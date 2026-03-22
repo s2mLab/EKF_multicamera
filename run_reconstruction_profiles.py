@@ -16,8 +16,8 @@ LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
-from reconstruction_registry import infer_dataset_name, latest_version_for_family
-from reconstruction_profiles import (
+from reconstruction.reconstruction_registry import infer_dataset_name, latest_version_for_family
+from reconstruction.reconstruction_profiles import (
     build_pipeline_command,
     example_profiles,
     load_profiles_json,

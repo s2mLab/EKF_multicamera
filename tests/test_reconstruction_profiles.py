@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from reconstruction_profiles import ReconstructionProfile, build_pipeline_command, canonical_profile_name, validate_profile
+from reconstruction.reconstruction_profiles import ReconstructionProfile, build_pipeline_command, canonical_profile_name, validate_profile
 
 
 def test_canonical_profile_name_includes_camera_names():

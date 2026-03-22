@@ -3,7 +3,7 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from root_kinematics import (
+from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
@@ -16,7 +16,7 @@ from root_kinematics import (
     rotation_unit_scale,
     unwrap_with_gaps,
 )
-from reconstruction_bundle import extract_root_from_points
+from reconstruction.reconstruction_bundle import extract_root_from_points
 
 
 def test_unwrap_with_gaps_keeps_gaps_independent():

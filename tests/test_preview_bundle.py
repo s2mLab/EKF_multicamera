@@ -2,7 +2,7 @@ from pathlib import Path
 
 import numpy as np
 
-from preview_bundle import align_to_reference, assemble_dataset_preview_bundle, root_center
+from preview.preview_bundle import align_to_reference, assemble_dataset_preview_bundle, root_center
 
 
 def test_root_center_uses_midpoint_of_hips():

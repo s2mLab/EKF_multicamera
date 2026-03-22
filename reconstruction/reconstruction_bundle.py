@@ -15,9 +15,9 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
-from reconstruction_timings import make_timing_stage
-from root_kinematics import (
+from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
+from reconstruction.reconstruction_timings import make_timing_stage
+from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
     ROOT_Q_NAMES,
     TRUNK_ROOT_ROTATION_SEQUENCE,

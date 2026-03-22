@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from datetime import datetime
-from root_kinematics import (
+from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,

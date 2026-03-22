@@ -1,6 +1,6 @@
 import numpy as np
 
-from dd_analysis import (
+from judging.dd_analysis import (
     JumpSegment,
     analyze_single_jump,
     default_body_shape_indices,
@@ -37,7 +37,7 @@ def test_analyze_single_jump_code_uses_half_twists_per_completed_salto(monkeypat
     def fake_compute_angles_over_jump(_root_q, _start, _end, rotation_sequence="yxz", angle_mode="euler"):
         return som_curve, tw_curve, tilt_curve
 
-    monkeypatch.setattr("dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
+    monkeypatch.setattr("judging.dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
     jump = analyze_single_jump(np.zeros((6, 6)), JumpSegment(start=0, end=5, peak_index=3))
     assert jump.twists_per_salto == [1.5, 0.5]
     assert jump.code == "831"
@@ -54,7 +54,7 @@ def test_analyze_single_jump_infers_last_salto_twist_from_end_of_jump(monkeypatc
     def fake_compute_angles_over_jump(_root_q, _start, _end, rotation_sequence="yxz", angle_mode="euler"):
         return som_curve, tw_curve, tilt_curve
 
-    monkeypatch.setattr("dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
+    monkeypatch.setattr("judging.dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
     jump = analyze_single_jump(np.zeros((5, 6)), JumpSegment(start=0, end=4, peak_index=2))
     assert jump.twists_per_salto == [1.0, 0.5]
     assert jump.code == "821"

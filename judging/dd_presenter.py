@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from dd_analysis import DDJumpAnalysis, DDSessionAnalysis
+from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis
 
 
 @dataclass

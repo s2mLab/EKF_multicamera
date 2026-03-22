@@ -25,6 +25,7 @@ class CameraMetricRow:
     reprojection_good_frame_ratio: float | None
     triangulation_usage_ratio: float | None
     flip_rate_epipolar: float | None
+    flip_rate_epipolar_fast: float | None
     flip_rate_triangulation: float | None
 
 
@@ -37,6 +38,7 @@ def camera_metric_sort_key(row: CameraMetricRow) -> tuple[float, ...]:
         _sort_value(row.reprojection_good_frame_ratio),
         -_sort_value(row.reprojection_mean_px),
         -_sort_value(row.flip_rate_epipolar),
+        -_sort_value(row.flip_rate_epipolar_fast),
         -_sort_value(row.flip_rate_triangulation),
         _sort_value(row.valid_ratio),
         _sort_value(row.mean_score),
@@ -102,6 +104,7 @@ def compute_camera_metric_rows(
             usage_ratio = float(np.count_nonzero(used) / valid_count) if valid_count else None
 
         flip_rate_epipolar = _flip_rate(flip_masks.get("epipolar"), cam_idx, n_frames)
+        flip_rate_epipolar_fast = _flip_rate(flip_masks.get("epipolar_fast"), cam_idx, n_frames)
         flip_rate_triangulation = _flip_rate(flip_masks.get("triangulation"), cam_idx, n_frames)
         rows.append(
             CameraMetricRow(
@@ -114,6 +117,7 @@ def compute_camera_metric_rows(
                 reprojection_good_frame_ratio=reproj_good_ratio,
                 triangulation_usage_ratio=usage_ratio,
                 flip_rate_epipolar=flip_rate_epipolar,
+                flip_rate_epipolar_fast=flip_rate_epipolar_fast,
                 flip_rate_triangulation=flip_rate_triangulation,
             )
         )
