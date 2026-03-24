@@ -1,10 +1,13 @@
 import numpy as np
 import vitpose_ekf_pipeline
+import json
+from pathlib import Path
 
 from vitpose_ekf_pipeline import (
     CameraCalibration,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
+    align_root_translation_guess_to_frame_zero,
     compute_biorbd_kalman_initial_state,
     apply_root_pose_guess_to_state,
     build_fundamental_matrix_array,
@@ -14,13 +17,17 @@ from vitpose_ekf_pipeline import (
     compute_camera_triangulation_cost,
     compute_camera_epipolar_cost,
     compute_camera_epipolar_cost_legacy,
+    canonical_coherence_method,
+    canonical_triangulation_method,
     project_point_with_projection_matrices,
     q_names_from_model,
+    load_pose_data,
     sampson_error_pixels_vectorized,
     sample_frames_uniformly,
     smooth_camera_time_series,
     symmetric_epipolar_distance_vectorized,
     triangulation_reference_from_other_views,
+    triangulation_method_from_coherence_method,
     weighted_triangulation,
     weighted_median,
     KP_INDEX,
@@ -117,6 +124,13 @@ def test_precomputed_triangulation_cost_matches_direct_computation():
     assert abs(direct - cached) < 1e-12
 
 
+def test_canonical_triangulation_and_coherence_methods_support_once():
+    assert canonical_triangulation_method("raw") == "once"
+    assert canonical_triangulation_method("once") == "once"
+    assert canonical_coherence_method("triangulation", "greedy") == "triangulation_greedy"
+    assert triangulation_method_from_coherence_method("triangulation_once", "exhaustive") == "once"
+
+
 def test_sequential_measurement_update_matches_batch_update():
     rng = np.random.default_rng(42)
     nq = 5
@@ -200,7 +214,10 @@ def test_compute_camera_epipolar_cost_uses_pair_and_keypoint_weights(monkeypatch
         raw_scores_frame,
         {(0, 1): np.eye(3), (0, 2): np.eye(3)},
         pair_weights={(0, 1): 10.0, (0, 2): 1.0},
-        keypoint_weights=np.array([0.0] * shoulder_idx + [2.0] + [0.0] * (wrist_idx - shoulder_idx - 1) + [0.5] + [0.0] * (16 - wrist_idx), dtype=float),
+        keypoint_weights=np.array(
+            [0.0] * shoulder_idx + [2.0] + [0.0] * (wrist_idx - shoulder_idx - 1) + [0.5] + [0.0] * (16 - wrist_idx),
+            dtype=float,
+        ),
         min_other_cameras=2,
     )
     assert abs(cost - 1.0) < 1e-12
@@ -231,6 +248,24 @@ def test_symmetric_epipolar_distance_vectorized_is_zero_on_perfect_matches():
 
     distances = symmetric_epipolar_distance_vectorized(points, other_points, f_matrix)
     np.testing.assert_allclose(distances, np.zeros_like(distances), atol=1e-12)
+
+
+def test_load_pose_data_applies_frame_stride(tmp_path: Path):
+    keypoints_path = tmp_path / "keypoints.json"
+    payload = {
+        "cam_M11139": {
+            "frames": [0, 1, 2, 3, 4, 5],
+            "keypoints": np.zeros((6, 17, 2), dtype=float).tolist(),
+            "scores": np.ones((6, 17), dtype=float).tolist(),
+        }
+    }
+    keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+    calibrations = {"M11139": _make_camera("M11139", 0.0)}
+
+    pose_data = load_pose_data(keypoints_path, calibrations, frame_stride=3, data_mode="raw")
+
+    np.testing.assert_array_equal(pose_data.frames, np.array([0, 3], dtype=int))
+    assert pose_data.frame_stride == 3
 
 
 def test_vectorized_epipolar_cost_matches_scalar_versions():
@@ -345,6 +380,11 @@ class _FakeModel:
         return sum(segment.nbDof() for segment in self._segments)
 
 
+class _FakeReconstruction:
+    def __init__(self, points_3d: np.ndarray):
+        self.points_3d = np.asarray(points_3d, dtype=float)
+
+
 def test_apply_root_pose_guess_to_state_sets_root_dofs_only():
     model = _FakeModel()
     state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -368,8 +408,12 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
     triangulation_state = np.full(3 * model.nbQ(), 7.0, dtype=float)
     root_pose = np.array([1.0, 2.0, 3.0, 0.4, -0.2, 1.1], dtype=float)
 
-    monkeypatch.setattr(vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda _model, _reconstruction: triangulation_state)
-    monkeypatch.setattr(vitpose_ekf_pipeline, "first_valid_root_pose_from_triangulation", lambda _reconstruction: (12, root_pose))
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda _model, _reconstruction: triangulation_state
+    )
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline, "first_valid_root_pose_from_triangulation", lambda _reconstruction: (12, root_pose)
+    )
 
     state, diagnostics = compute_biorbd_kalman_initial_state(
         model,
@@ -389,6 +433,33 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
     assert state[q_names.index("TRUNK:RotX")] == -0.2
     assert state[q_names.index("TRUNK:RotZ")] == 1.1
     assert state[q_names.index("LEFT_THIGH:RotY")] == 0.0
+
+
+def test_align_root_translation_guess_to_frame_zero_reanchors_horizontal_root_position():
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    state = np.zeros(3 * model.nbQ(), dtype=float)
+    state[q_names.index("TRUNK:TransX")] = 1.2
+    state[q_names.index("TRUNK:TransY")] = -0.4
+    state[q_names.index("TRUNK:TransZ")] = 0.9
+
+    points_3d = np.full((3, 17, 3), np.nan, dtype=float)
+    points_3d[0, KP_INDEX["left_hip"]] = np.array([0.1, 0.2, 1.0], dtype=float)
+    points_3d[0, KP_INDEX["right_hip"]] = np.array([0.3, -0.2, 1.0], dtype=float)
+    points_3d[2, KP_INDEX["left_hip"]] = np.array([1.0, 0.2, 1.1], dtype=float)
+    points_3d[2, KP_INDEX["right_hip"]] = np.array([1.2, -0.2, 1.1], dtype=float)
+    reconstruction = _FakeReconstruction(points_3d)
+
+    aligned = align_root_translation_guess_to_frame_zero(
+        model,
+        state,
+        reconstruction,
+        source_frame_idx=2,
+    )
+
+    assert aligned[q_names.index("TRUNK:TransX")] == 0.2
+    assert aligned[q_names.index("TRUNK:TransY")] == 0.0
+    assert aligned[q_names.index("TRUNK:TransZ")] == 1.0
 
 
 def test_sample_frames_uniformly_spreads_indices_over_range():

@@ -14,6 +14,7 @@ dependencies:
   - ezc3d
   - matplotlib
   - pandas
+  - black
   - pip:
       - -e ../GIT/biobuddy
       - pyorerun

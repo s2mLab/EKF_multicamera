@@ -1,7 +1,15 @@
 import numpy as np
 
 from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis, JumpSegment
-from judging.dd_presenter import build_jump_plot_data, format_dd_summary, jump_list_label
+from judging.dd_presenter import (
+    build_jump_plot_data,
+    compare_dd_to_reference,
+    dd_reference_status_color,
+    dd_reference_status_text,
+    format_dd_summary,
+    jump_list_label,
+    jump_list_label_with_reference,
+)
 
 
 def make_jump() -> DDJumpAnalysis:
@@ -30,6 +38,11 @@ def test_jump_list_label_formats_expected_text():
     assert label == "S3 | som 2.25 | tw 1.50"
 
 
+def test_jump_list_label_with_reference_appends_reference_code():
+    label = jump_list_label_with_reference(3, make_jump(), "821o")
+    assert label == "S3 | som 2.25 | tw 1.50 | ref 821o"
+
+
 def test_format_dd_summary_handles_missing_body_shape_and_code():
     jump = make_jump()
     analysis = DDSessionAnalysis(
@@ -47,9 +60,11 @@ def test_format_dd_summary_handles_missing_body_shape_and_code():
         height_dof="TRUNK:TransZ",
         angle_mode="euler",
         fps=120.0,
+        expected_codes_by_jump={1: "821o"},
     )
     assert "Reconstruction: Pose2Sim" in summary
     assert "body shape=- | code=82+33" in summary
+    assert "reference code=821o | diff" in summary
     assert "twists by salto=[S1: 0.5, S2: 1.0]" in summary
 
 
@@ -69,3 +84,42 @@ def test_build_jump_plot_data_converts_indices_to_times_and_values():
         jump.twist_curve_turns[[4, 10]],
         atol=1e-12,
     )
+
+
+def test_compare_dd_to_reference_reports_exact_match():
+    jump = make_jump()
+    jump.code = "821o"
+    analysis = DDSessionAnalysis(
+        root_q=np.zeros((40, 6)),
+        height=np.linspace(1.0, 2.0, 40),
+        smoothed_height=np.linspace(1.0, 2.0, 40),
+        height_threshold=1.4,
+        airborne_regions=[(12, 25)],
+        jump_segments=[jump.segment],
+        jumps=[jump],
+    )
+    comparison = compare_dd_to_reference(analysis, {1: "821o"})
+    assert comparison.status == "exact"
+    assert dd_reference_status_text(comparison) == "1/1"
+    assert dd_reference_status_color(comparison) == "ok"
+
+
+def test_compare_dd_to_reference_reports_partial_match():
+    jump_a = make_jump()
+    jump_a.code = "821o"
+    jump_b = make_jump()
+    jump_b.code = "42/"
+    jump_b.segment = JumpSegment(start=40, end=60, peak_index=50)
+    analysis = DDSessionAnalysis(
+        root_q=np.zeros((80, 6)),
+        height=np.linspace(1.0, 2.0, 80),
+        smoothed_height=np.linspace(1.0, 2.0, 80),
+        height_threshold=1.4,
+        airborne_regions=[(12, 25), (42, 55)],
+        jump_segments=[jump_a.segment, jump_b.segment],
+        jumps=[jump_a, jump_b],
+    )
+    comparison = compare_dd_to_reference(analysis, {1: "821o", 2: "43/"})
+    assert comparison.status == "partial"
+    assert dd_reference_status_text(comparison) == "1/2"
+    assert dd_reference_status_color(comparison) == "partial"

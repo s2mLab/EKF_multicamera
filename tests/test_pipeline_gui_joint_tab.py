@@ -1,0 +1,114 @@
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+pytest.importorskip("tkinter")
+
+import pipeline_gui
+
+
+class _FakeAxis:
+    def plot(self, *_args, **_kwargs):
+        return None
+
+    def set_title(self, *_args, **_kwargs):
+        return None
+
+    def grid(self, *_args, **_kwargs):
+        return None
+
+    def set_ylabel(self, *_args, **_kwargs):
+        return None
+
+    def set_xlabel(self, *_args, **_kwargs):
+        return None
+
+    def get_legend_handles_labels(self):
+        return [], []
+
+    def legend(self, *_args, **_kwargs):
+        return None
+
+
+class _FakeFigure:
+    def clear(self):
+        return None
+
+    def subplots(self, nrows, _ncols=None, **_kwargs):
+        if int(nrows) == 1:
+            return _FakeAxis()
+        return np.asarray([_FakeAxis() for _ in range(int(nrows))], dtype=object)
+
+    def tight_layout(self):
+        return None
+
+
+class _FakeCanvas:
+    def draw_idle(self):
+        return None
+
+
+class _FakeListbox:
+    def __init__(self, items: list[str], selected: list[int]):
+        self.items = list(items)
+        self.selected = list(selected)
+
+    def size(self):
+        return len(self.items)
+
+    def get(self, idx: int):
+        return self.items[idx]
+
+    def curselection(self):
+        return tuple(self.selected)
+
+    def delete(self, _start, _end=None):
+        self.items.clear()
+        self.selected.clear()
+
+    def insert(self, _where, value: str):
+        self.items.append(value)
+
+    def selection_set(self, idx: int):
+        if idx not in self.selected:
+            self.selected.append(idx)
+
+
+def test_joint_kinematics_refresh_plot_does_not_repopulate_rows(monkeypatch):
+    bundle = {
+        "q_names": np.asarray(["LEFT_KNEE:RotY", "RIGHT_KNEE:RotY"], dtype=object),
+        "recon_q": {"demo": np.zeros((20, 2), dtype=float)},
+        "recon_qdot": {"demo": np.zeros((20, 2), dtype=float)},
+    }
+
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        shared_reconstruction_selection=["demo"],
+    )
+    tab.output_dir = SimpleNamespace(get=lambda: "outputs/1_partie_0429")
+    tab.pair_list = _FakeListbox(["Knee"], [0])
+    tab.figure = _FakeFigure()
+    tab.canvas = _FakeCanvas()
+    tab.quantity = SimpleNamespace(get=lambda: "q")
+    tab.fd_qdot_var = SimpleNamespace(get=lambda: False)
+    tab.bundle = None
+    tab.q_names = np.array([], dtype=object)
+    tab._show_empty_plot = lambda _message: (_ for _ in ()).throw(AssertionError("unexpected empty plot"))
+    tab._set_reconstruction_rows = lambda _rows, _defaults: (_ for _ in ()).throw(
+        AssertionError("refresh_plot should not repopulate rows")
+    )
+
+    monkeypatch.setattr(pipeline_gui, "get_cached_preview_bundle", lambda *_args, **_kwargs: bundle)
+    monkeypatch.setattr(pipeline_gui, "bundle_available_reconstruction_names", lambda *_args, **_kwargs: ["demo"])
+    monkeypatch.setattr(
+        pipeline_gui, "pair_dof_names", lambda _q_names: [("Knee", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY")]
+    )
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showerror",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected GUI error")),
+    )
+
+    pipeline_gui.JointKinematicsTab.refresh_plot(tab)

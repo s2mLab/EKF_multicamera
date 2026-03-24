@@ -42,6 +42,8 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     DEFAULT_SUBJECT_MASS_KG,
+    SUPPORTED_COHERENCE_METHODS,
+    SUPPORTED_TRIANGULATION_METHODS,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
     load_calibrations,
@@ -57,26 +59,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
-    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
+    parser.add_argument(
+        "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
+    )
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--frame-stride", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--pose-data-mode", choices=("raw", "filtered", "cleaned"), default="cleaned")
     parser.add_argument("--pose-filter-window", type=int, default=9)
     parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10)
     parser.add_argument("--pose-amplitude-lower-percentile", type=float, default=5.0)
     parser.add_argument("--pose-amplitude-upper-percentile", type=float, default=95.0)
     parser.add_argument("--initial-rotation-correction", action="store_true")
-    parser.add_argument("--triangulation-method", choices=("exhaustive", "greedy"), default=DEFAULT_TRIANGULATION_METHOD)
+    parser.add_argument(
+        "--triangulation-method", choices=SUPPORTED_TRIANGULATION_METHODS, default=DEFAULT_TRIANGULATION_METHOD
+    )
     parser.add_argument("--triangulation-workers", type=int, default=DEFAULT_TRIANGULATION_WORKERS)
     parser.add_argument("--reprojection-threshold-px", type=float, default=DEFAULT_REPROJECTION_THRESHOLD_PX)
     parser.add_argument("--epipolar-threshold-px", type=float, default=DEFAULT_EPIPOLAR_THRESHOLD_PX)
     parser.add_argument("--min-cameras-for-triangulation", type=int, default=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION)
-    parser.add_argument("--coherence-method", choices=("epipolar", "triangulation"), default=DEFAULT_COHERENCE_METHOD)
+    parser.add_argument("--coherence-method", choices=SUPPORTED_COHERENCE_METHODS, default=DEFAULT_COHERENCE_METHOD)
     parser.add_argument("--subject-mass-kg", type=float, default=DEFAULT_SUBJECT_MASS_KG)
     parser.add_argument("--biorbd-kalman-noise-factor", type=float, default=DEFAULT_BIORBD_KALMAN_NOISE_FACTOR)
     parser.add_argument("--biorbd-kalman-error-factor", type=float, default=DEFAULT_BIORBD_KALMAN_ERROR_FACTOR)
     parser.add_argument(
         "--biorbd-kalman-init-method",
-        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest"),
+        choices=(
+            "none",
+            "triangulation_ik",
+            "triangulation_ik_root_translation",
+            "root_translation_zero_rest",
+            "root_pose_zero_rest",
+        ),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     )
     parser.add_argument("--predictor", choices=("acc", "dyn"), default="acc")
@@ -93,10 +106,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flip-min-other-cameras", type=int, default=2)
     parser.add_argument("--flip-outlier-percentile", type=float, default=85.0)
     parser.add_argument("--flip-outlier-floor-px", type=float, default=5.0)
-    parser.add_argument("--flip-test-all-camera-frames", action="store_true", help="Desactive la restriction du test flip L/R aux outliers du cout nominal.")
+    parser.add_argument(
+        "--flip-test-all-camera-frames",
+        action="store_true",
+        help="Desactive la restriction du test flip L/R aux outliers du cout nominal.",
+    )
     parser.add_argument("--flip-temporal-weight", type=float, default=DEFAULT_FLIP_TEMPORAL_WEIGHT)
     parser.add_argument("--flip-temporal-tau-px", type=float, default=DEFAULT_FLIP_TEMPORAL_TAU_PX)
-    parser.add_argument("--flip-temporal-min-valid-keypoints", type=int, default=DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS)
+    parser.add_argument(
+        "--flip-temporal-min-valid-keypoints", type=int, default=DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS
+    )
     parser.add_argument("--enable-dof-locking", action="store_true")
     parser.add_argument("--measurement-noise-scale", type=float, default=DEFAULT_MEASUREMENT_NOISE_SCALE)
     parser.add_argument("--process-noise-scale", type=float, default=1.0)
@@ -129,6 +148,7 @@ def main() -> None:
         keypoints_path=args.keypoints,
         calibrations=calibrations,
         max_frames=args.max_frames,
+        frame_stride=(1 if args.family == "pose2sim" else args.frame_stride),
         pose_data_mode=args.pose_data_mode,
         pose_filter_window=args.pose_filter_window,
         pose_outlier_threshold_ratio=args.pose_outlier_threshold_ratio,

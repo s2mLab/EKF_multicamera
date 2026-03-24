@@ -11,6 +11,7 @@ Le script enchaine quatre etapes:
 Le but n'est pas de reproduire toute la chaine Pose2Sim/biobuddy, mais de
 fournir un pipeline compact et modifiable autour des donnees du projet.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -60,6 +61,14 @@ DEFAULT_BIORBD_KALMAN_INIT_METHOD = "triangulation_ik_root_translation"
 DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
 DEFAULT_TRIANGULATION_WORKERS = 6
+SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
+SUPPORTED_COHERENCE_METHODS = (
+    "epipolar",
+    "triangulation",
+    "triangulation_once",
+    "triangulation_greedy",
+    "triangulation_exhaustive",
+)
 DEFAULT_COHERENCE_CONFIDENCE_FLOOR = 0.35
 DEFAULT_SUBJECT_MASS_KG = 55.0
 DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
@@ -137,6 +146,7 @@ class CameraCalibration:
     Les attributs sont stockes une fois pour eviter de recalculer la meme
     geometrie a chaque projection dans l'EKF.
     """
+
     name: str
     image_size: tuple[int, int]
     K: np.ndarray
@@ -190,7 +200,9 @@ class CameraCalibration:
             return np.empty((0, 2), dtype=float), np.empty((0, 2, 3), dtype=float)
         point_cam = points_world @ self.R.T + self.tvec.reshape(1, 3)
         z = np.maximum(point_cam[:, 2], 1e-9)
-        normalized = np.column_stack((point_cam[:, 0] / z, point_cam[:, 1] / z, np.ones(point_cam.shape[0], dtype=float)))
+        normalized = np.column_stack(
+            (point_cam[:, 0] / z, point_cam[:, 1] / z, np.ones(point_cam.shape[0], dtype=float))
+        )
         uv_h = normalized @ self.K.T
         fx = float(self.K[0, 0])
         fy = float(self.K[1, 1])
@@ -206,10 +218,12 @@ class CameraCalibration:
 @dataclass
 class PoseData:
     """Keypoints 2D et scores de confiance synchronises sur un nombre de frames commun."""
+
     camera_names: list[str]
     frames: np.ndarray
     keypoints: np.ndarray  # (n_cam, n_frames, 17, 2)
     scores: np.ndarray  # (n_cam, n_frames, 17)
+    frame_stride: int = 1
     raw_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
     filtered_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
 
@@ -217,6 +231,7 @@ class PoseData:
 @dataclass
 class SegmentLengths:
     """Longueurs segmentaires estimees a partir de la reconstruction 3D initiale."""
+
     trunk_height: float
     head_length: float
     shoulder_half_width: float
@@ -233,6 +248,7 @@ class SegmentLengths:
 @dataclass
 class ReconstructionResult:
     """Resultat de la triangulation initiale avant filtrage cinematique."""
+
     frames: np.ndarray
     points_3d: np.ndarray  # (n_frames, 17, 3)
     mean_confidence: np.ndarray  # (n_frames, 17)
@@ -250,6 +266,7 @@ class ReconstructionResult:
 @dataclass
 class ComparisonResult:
     """Conteneur des sorties pour la comparaison EKF multi-vues vs Kalman `biorbd`."""
+
     q_ekf: np.ndarray
     q_ekf_3d: np.ndarray
     qdot_ekf_3d: np.ndarray
@@ -346,11 +363,46 @@ def select_active_coherence(
     coherence_method: str,
 ) -> np.ndarray:
     """Selectionne le score de coherence actif selon la methode demandee."""
+    coherence_method = canonical_coherence_method(coherence_method)
     if coherence_method == "epipolar":
         return np.array(epipolar_coherence, copy=True)
-    if coherence_method == "triangulation":
+    if coherence_method in {"triangulation_once", "triangulation_greedy", "triangulation_exhaustive"}:
         return np.array(triangulation_coherence, copy=True)
     raise ValueError(f"Unknown coherence method: {coherence_method}")
+
+
+def canonical_triangulation_method(triangulation_method: str) -> str:
+    """Normalize triangulation method names while keeping legacy aliases working."""
+
+    method = str(triangulation_method).strip().lower()
+    if method == "raw":
+        return "once"
+    if method not in SUPPORTED_TRIANGULATION_METHODS:
+        raise ValueError(f"Unknown triangulation method: {triangulation_method}")
+    return method
+
+
+def canonical_coherence_method(coherence_method: str, triangulation_method: str = DEFAULT_TRIANGULATION_METHOD) -> str:
+    """Normalize coherence-method aliases to the explicit internal representation."""
+
+    method = str(coherence_method).strip().lower()
+    if method == "triangulation":
+        return f"triangulation_{canonical_triangulation_method(triangulation_method)}"
+    if method not in SUPPORTED_COHERENCE_METHODS:
+        raise ValueError(f"Unknown coherence method: {coherence_method}")
+    return method
+
+
+def triangulation_method_from_coherence_method(
+    coherence_method: str,
+    triangulation_method: str = DEFAULT_TRIANGULATION_METHOD,
+) -> str:
+    """Return the triangulation variant required by the active coherence method."""
+
+    normalized = canonical_coherence_method(coherence_method, triangulation_method)
+    if normalized == "epipolar":
+        return canonical_triangulation_method(triangulation_method)
+    return normalized.replace("triangulation_", "", 1)
 
 
 def smooth_valid_1d(values: np.ndarray, valid_mask: np.ndarray, window: int = 9) -> np.ndarray:
@@ -494,6 +546,7 @@ def load_pose_data(
     keypoints_path: Path,
     calibrations: dict[str, CameraCalibration],
     max_frames: int | None = None,
+    frame_stride: int = 1,
     frame_start: int | None = None,
     frame_end: int | None = None,
     data_mode: str = "cleaned",
@@ -545,6 +598,9 @@ def load_pose_data(
         frames = frames[frames >= int(frame_start)]
     if frame_end is not None:
         frames = frames[frames <= int(frame_end)]
+    frame_stride = max(1, int(frame_stride))
+    if frame_stride > 1:
+        frames = frames[::frame_stride]
     if max_frames is not None:
         frames = sample_frames_uniformly(frames, int(max_frames))
     n_frames = len(frames)
@@ -596,6 +652,7 @@ def load_pose_data(
         frames=frames,
         keypoints=selected_keypoints,
         scores=selected_scores,
+        frame_stride=frame_stride,
         raw_keypoints=raw_keypoints,
         filtered_keypoints=filtered_keypoints,
     )
@@ -623,7 +680,9 @@ def sample_frames_uniformly(frames: np.ndarray, max_frames: int | None) -> np.nd
     return frames[sample_idx[:max_frames]]
 
 
-def weighted_triangulation(projections: Iterable[np.ndarray], observations: np.ndarray, confidences: np.ndarray) -> np.ndarray:
+def weighted_triangulation(
+    projections: Iterable[np.ndarray], observations: np.ndarray, confidences: np.ndarray
+) -> np.ndarray:
     """Triangule un keypoint 3D par DLT ponderee.
 
     Chaque camera contribue proportionnellement a son score de confiance 2D.
@@ -635,10 +694,7 @@ def weighted_triangulation(projections: Iterable[np.ndarray], observations: np.n
     if projections_array.ndim != 3 or projections_array.shape[1:] != (3, 4):
         return np.full(3, np.nan)
     valid = (
-        np.isfinite(observations[:, 0])
-        & np.isfinite(observations[:, 1])
-        & np.isfinite(confidences)
-        & (confidences > 0)
+        np.isfinite(observations[:, 0]) & np.isfinite(observations[:, 1]) & np.isfinite(confidences) & (confidences > 0)
     )
     if np.count_nonzero(valid) < 2:
         return np.full(3, np.nan)
@@ -686,9 +742,7 @@ def triangulation_reference_from_other_views(
         other_mask[cam_idx] = False
         for kp_idx in range(n_keypoints):
             valid_other = (
-                other_mask
-                & np.all(np.isfinite(raw_2d_frame[:, kp_idx]), axis=1)
-                & (raw_scores_frame[:, kp_idx] > 0)
+                other_mask & np.all(np.isfinite(raw_2d_frame[:, kp_idx]), axis=1) & (raw_scores_frame[:, kp_idx] > 0)
             )
             if np.count_nonzero(valid_other) < max(2, int(min_other_cameras)):
                 continue
@@ -878,7 +932,9 @@ def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
     for left_name, right_name in LEFT_RIGHT_SWAP_PAIRS:
         left_idx = KP_INDEX[left_name]
         right_idx = KP_INDEX[right_name]
-        swapped[left_idx], swapped[right_idx] = np.array(points_2d[right_idx], copy=True), np.array(points_2d[left_idx], copy=True)
+        swapped[left_idx], swapped[right_idx] = np.array(points_2d[right_idx], copy=True), np.array(
+            points_2d[left_idx], copy=True
+        )
     return swapped
 
 
@@ -913,10 +969,9 @@ def build_temporal_reference_points(pose_data: PoseData) -> tuple[np.ndarray, np
                     dt = frame_numbers[next_idx] - frame_numbers[prev_idx]
                     if dt > 0:
                         alpha = (frame_numbers[frame_idx] - frame_numbers[prev_idx]) / dt
-                        prediction = (
-                            (1.0 - alpha) * camera_points[prev_idx, kp_idx]
-                            + alpha * camera_points[next_idx, kp_idx]
-                        )
+                        prediction = (1.0 - alpha) * camera_points[prev_idx, kp_idx] + alpha * camera_points[
+                            next_idx, kp_idx
+                        ]
                 elif previous.size >= 2:
                     prev_idx = int(previous[-1])
                     prev2_idx = int(previous[-2])
@@ -969,7 +1024,7 @@ def build_flip_epipolar_pair_weights(
     exponent = float(max(exponent, 0.0))
     for key, baseline in list(weights.items()):
         normalized = max(baseline / baseline_scale, 1e-6)
-        weights[key] = float(normalized ** exponent)
+        weights[key] = float(normalized**exponent)
     return weights
 
 
@@ -1065,12 +1120,7 @@ def sampson_error_pixels_vectorized(
     Fx1 = np.einsum("oab,kb->oka", fundamental_matrices, candidate_h, optimize=True)
     Ftx2 = np.einsum("oba,okb->oka", fundamental_matrices, other_h, optimize=True)
     numerator = np.abs(np.einsum("okb,okb->ok", other_h, Fx1, optimize=True))
-    denominator = np.sqrt(
-        Fx1[..., 0] ** 2
-        + Fx1[..., 1] ** 2
-        + Ftx2[..., 0] ** 2
-        + Ftx2[..., 1] ** 2
-    )
+    denominator = np.sqrt(Fx1[..., 0] ** 2 + Fx1[..., 1] ** 2 + Ftx2[..., 0] ** 2 + Ftx2[..., 1] ** 2)
     errors = np.full((n_other_cams, n_keypoints), np.nan, dtype=float)
     valid = np.isfinite(numerator) & np.isfinite(denominator) & (denominator > 1e-12)
     errors[valid] = numerator[valid] / denominator[valid]
@@ -1213,7 +1263,8 @@ def combine_flip_costs(
     valid = np.isfinite(geometric) & np.isfinite(temporal)
     combined = np.where(
         valid,
-        geometry_tau_px * ((1.0 - temporal_weight) * (geometric / geometry_tau_px) + temporal_weight * (temporal / temporal_tau_px)),
+        geometry_tau_px
+        * ((1.0 - temporal_weight) * (geometric / geometry_tau_px) + temporal_weight * (temporal / temporal_tau_px)),
         geometric,
     )
     return float(combined) if combined.ndim == 0 else combined
@@ -1255,7 +1306,9 @@ def compute_camera_epipolar_cost(
                 errors.append(err)
                 informative_other_cameras.add(other_idx)
                 pair_weight = 1.0 if pair_weights is None else float(pair_weights.get((camera_idx, other_idx), 1.0))
-                confidence_weight = float(min(raw_scores_frame[camera_idx, kp_idx], raw_scores_frame[other_idx, kp_idx]))
+                confidence_weight = float(
+                    min(raw_scores_frame[camera_idx, kp_idx], raw_scores_frame[other_idx, kp_idx])
+                )
                 weights.append(max(pair_weight * kp_weight * max(confidence_weight, 1e-6), 1e-9))
     if len(informative_other_cameras) < max(1, int(min_other_cameras)):
         return np.nan
@@ -1311,14 +1364,13 @@ def compute_camera_triangulation_cost(
     compare la reprojection dans cette camera pour l'hypothese nominale et la
     version swappee.
     """
-    triangulation_variant = str(triangulation_variant).strip().lower()
-    if triangulation_variant not in {"raw", "greedy", "exhaustive"}:
+    triangulation_variant = canonical_triangulation_method(triangulation_variant)
+    if triangulation_variant not in {"once", "greedy", "exhaustive"}:
         raise ValueError(f"Unknown triangulation variant: {triangulation_variant}")
 
     if (
-        triangulation_variant == "raw"
-        and
-        precomputed_reprojected_points is not None
+        triangulation_variant == "once"
+        and precomputed_reprojected_points is not None
         and precomputed_reprojected_points.ndim == 3
         and camera_idx < precomputed_reprojected_points.shape[0]
     ):
@@ -1358,14 +1410,18 @@ def compute_camera_triangulation_cost(
             continue
         observations_array = np.asarray(observations, dtype=float)
         confidences_array = np.asarray(confidences, dtype=float)
-        if triangulation_variant == "raw":
+        if triangulation_variant == "once":
             point_3d = weighted_triangulation(
                 projections,
                 observations_array,
                 confidences_array,
             )
         else:
-            triangulate_fn = robust_triangulation_from_best_cameras if triangulation_variant == "exhaustive" else greedy_triangulation_from_best_cameras
+            triangulate_fn = (
+                robust_triangulation_from_best_cameras
+                if triangulation_variant == "exhaustive"
+                else greedy_triangulation_from_best_cameras
+            )
             point_3d, _mean_error, _per_view, _coherence, _excluded = triangulate_fn(
                 projections,
                 observations_array,
@@ -1412,13 +1468,21 @@ def detect_left_right_flip_diagnostics(
     pair_weights = None
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
     epipolar_family = method in {"epipolar", "epipolar_fast"}
-    triangulation_family = method in {"triangulation", "triangulation_raw", "triangulation_greedy", "triangulation_exhaustive"}
+    triangulation_family = method in {
+        "triangulation",
+        "triangulation_once",
+        "triangulation_raw",
+        "triangulation_greedy",
+        "triangulation_exhaustive",
+    }
     triangulation_variant = (
-        "raw"
-        if method in {"triangulation", "triangulation_raw"}
+        "once"
+        if method in {"triangulation", "triangulation_once", "triangulation_raw"}
         else ("greedy" if method == "triangulation_greedy" else "exhaustive")
     )
-    epipolar_distance_mode = "sampson" if method == "epipolar" else ("symmetric" if method == "epipolar_fast" else "reprojection")
+    epipolar_distance_mode = (
+        "sampson" if method == "epipolar" else ("symmetric" if method == "epipolar_fast" else "reprojection")
+    )
     smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if epipolar_family else 1
     if epipolar_family:
         fundamental_matrices = build_fundamental_matrix_array(ordered_calibrations)
@@ -1448,16 +1512,18 @@ def detect_left_right_flip_diagnostics(
         )
         for cam_idx in range(n_cams):
             if epipolar_family:
-                nominal_costs[cam_idx, frame_idx], nominal_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
-                    cam_idx,
-                    raw_points_frame[cam_idx],
-                    raw_points_frame,
-                    raw_scores_frame,
-                    fundamental_matrices,
-                    pair_weights_array=pair_weights,
-                    keypoint_weights=keypoint_weights,
-                    min_other_cameras=min_other_cameras,
-                    distance_mode=epipolar_distance_mode,
+                nominal_costs[cam_idx, frame_idx], nominal_legacy_costs[cam_idx, frame_idx] = (
+                    compute_camera_epipolar_costs_vectorized(
+                        cam_idx,
+                        raw_points_frame[cam_idx],
+                        raw_points_frame,
+                        raw_scores_frame,
+                        fundamental_matrices,
+                        pair_weights_array=pair_weights,
+                        keypoint_weights=keypoint_weights,
+                        min_other_cameras=min_other_cameras,
+                        distance_mode=epipolar_distance_mode,
+                    )
                 )
             else:
                 nominal_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1502,9 +1568,13 @@ def detect_left_right_flip_diagnostics(
                 continue
             threshold = max(float(outlier_floor_px), float(np.percentile(valid_costs, float(outlier_percentile))))
             outlier_thresholds_by_camera[cam_idx] = threshold
-            raw_outliers = np.isfinite(effective_nominal_costs[cam_idx]) & (effective_nominal_costs[cam_idx] >= threshold)
+            raw_outliers = np.isfinite(effective_nominal_costs[cam_idx]) & (
+                effective_nominal_costs[cam_idx] >= threshold
+            )
             if epipolar_family:
-                smooth_outliers = np.isfinite(smoothed_nominal_costs[cam_idx]) & (smoothed_nominal_costs[cam_idx] >= threshold)
+                smooth_outliers = np.isfinite(smoothed_nominal_costs[cam_idx]) & (
+                    smoothed_nominal_costs[cam_idx] >= threshold
+                )
                 candidate_mask[cam_idx] = raw_outliers | smooth_outliers
                 legacy_valid_costs = nominal_legacy_costs[cam_idx, np.isfinite(nominal_legacy_costs[cam_idx])]
                 if legacy_valid_costs.size > 0:
@@ -1540,16 +1610,18 @@ def detect_left_right_flip_diagnostics(
                 continue
             swapped_candidate = swap_left_right_keypoints(raw_points_frame[cam_idx])
             if epipolar_family:
-                swapped_costs[cam_idx, frame_idx], swapped_legacy_costs[cam_idx, frame_idx] = compute_camera_epipolar_costs_vectorized(
-                    cam_idx,
-                    swapped_candidate,
-                    raw_points_frame,
-                    raw_scores_frame,
-                    fundamental_matrices,
-                    pair_weights_array=pair_weights,
-                    keypoint_weights=keypoint_weights,
-                    min_other_cameras=min_other_cameras,
-                    distance_mode=epipolar_distance_mode,
+                swapped_costs[cam_idx, frame_idx], swapped_legacy_costs[cam_idx, frame_idx] = (
+                    compute_camera_epipolar_costs_vectorized(
+                        cam_idx,
+                        swapped_candidate,
+                        raw_points_frame,
+                        raw_scores_frame,
+                        fundamental_matrices,
+                        pair_weights_array=pair_weights,
+                        keypoint_weights=keypoint_weights,
+                        min_other_cameras=min_other_cameras,
+                        distance_mode=epipolar_distance_mode,
+                    )
                 )
             else:
                 swapped_costs[cam_idx, frame_idx] = compute_camera_triangulation_cost(
@@ -1607,9 +1679,10 @@ def detect_left_right_flip_diagnostics(
         window=smoothing_window,
     )
     strong_positive_margin = 0.5 * float(min_gain_px) if epipolar_family else 0.0
-    suspect_mask = candidate_mask & np.isfinite(decision_score) & (
-        ((decision_score > 0.0) & (smoothed_decision_score > 0.0))
-        | (decision_score >= strong_positive_margin)
+    suspect_mask = (
+        candidate_mask
+        & np.isfinite(decision_score)
+        & (((decision_score > 0.0) & (smoothed_decision_score > 0.0)) | (decision_score >= strong_positive_margin))
     )
     suspect_mask |= legacy_decision
     frames_with_any_suspect = np.any(suspect_mask, axis=0)
@@ -1641,14 +1714,16 @@ def detect_left_right_flip_diagnostics(
             pose_data.camera_names[cam_idx]: float(outlier_thresholds_by_camera[cam_idx]) for cam_idx in range(n_cams)
         },
         "camera_frame_temporal_support": {
-            pose_data.camera_names[cam_idx]: int(np.count_nonzero(temporal_support_mask[cam_idx])) for cam_idx in range(n_cams)
+            pose_data.camera_names[cam_idx]: int(np.count_nonzero(temporal_support_mask[cam_idx]))
+            for cam_idx in range(n_cams)
         },
         "frames_with_any_flip_suspect": pose_data.frames[frames_with_any_suspect].astype(int).tolist(),
         "camera_frame_flip_suspects": {
             pose_data.camera_names[cam_idx]: int(suspect_mask[cam_idx].sum()) for cam_idx in range(n_cams)
         },
         "camera_frame_flip_suspect_frames": {
-            pose_data.camera_names[cam_idx]: pose_data.frames[suspect_mask[cam_idx]].astype(int).tolist() for cam_idx in range(n_cams)
+            pose_data.camera_names[cam_idx]: pose_data.frames[suspect_mask[cam_idx]].astype(int).tolist()
+            for cam_idx in range(n_cams)
         },
         "camera_frame_flip_candidates": {
             pose_data.camera_names[cam_idx]: int(candidate_mask[cam_idx].sum()) for cam_idx in range(n_cams)
@@ -1657,20 +1732,36 @@ def detect_left_right_flip_diagnostics(
             pose_data.camera_names[cam_idx]: int(legacy_candidate_mask[cam_idx].sum()) for cam_idx in range(n_cams)
         },
         "cost_summaries_px": {
-            "legacy_nominal_median": float(np.nanmedian(nominal_legacy_costs)) if np.isfinite(nominal_legacy_costs).any() else None,
-            "legacy_swapped_candidate_median": float(np.nanmedian(swapped_legacy_costs[candidate_mask]))
-            if np.isfinite(swapped_legacy_costs[candidate_mask]).any()
-            else None,
-            "geometric_nominal_median": float(np.nanmedian(nominal_costs)) if np.isfinite(nominal_costs).any() else None,
-            "temporal_nominal_median": float(np.nanmedian(nominal_temporal_costs)) if np.isfinite(nominal_temporal_costs).any() else None,
-            "combined_nominal_median": float(np.nanmedian(effective_nominal_costs)) if np.isfinite(effective_nominal_costs).any() else None,
-            "combined_nominal_smoothed_median": float(np.nanmedian(smoothed_nominal_costs)) if np.isfinite(smoothed_nominal_costs).any() else None,
-            "combined_swapped_candidate_median": float(np.nanmedian(effective_swapped_costs[candidate_mask]))
-            if np.isfinite(effective_swapped_costs[candidate_mask]).any()
-            else None,
-            "decision_score_median": float(np.nanmedian(decision_score[candidate_mask]))
-            if np.isfinite(decision_score[candidate_mask]).any()
-            else None,
+            "legacy_nominal_median": (
+                float(np.nanmedian(nominal_legacy_costs)) if np.isfinite(nominal_legacy_costs).any() else None
+            ),
+            "legacy_swapped_candidate_median": (
+                float(np.nanmedian(swapped_legacy_costs[candidate_mask]))
+                if np.isfinite(swapped_legacy_costs[candidate_mask]).any()
+                else None
+            ),
+            "geometric_nominal_median": (
+                float(np.nanmedian(nominal_costs)) if np.isfinite(nominal_costs).any() else None
+            ),
+            "temporal_nominal_median": (
+                float(np.nanmedian(nominal_temporal_costs)) if np.isfinite(nominal_temporal_costs).any() else None
+            ),
+            "combined_nominal_median": (
+                float(np.nanmedian(effective_nominal_costs)) if np.isfinite(effective_nominal_costs).any() else None
+            ),
+            "combined_nominal_smoothed_median": (
+                float(np.nanmedian(smoothed_nominal_costs)) if np.isfinite(smoothed_nominal_costs).any() else None
+            ),
+            "combined_swapped_candidate_median": (
+                float(np.nanmedian(effective_swapped_costs[candidate_mask]))
+                if np.isfinite(effective_swapped_costs[candidate_mask]).any()
+                else None
+            ),
+            "decision_score_median": (
+                float(np.nanmedian(decision_score[candidate_mask]))
+                if np.isfinite(decision_score[candidate_mask]).any()
+                else None
+            ),
         },
     }
     detail_arrays = {
@@ -1717,12 +1808,17 @@ def apply_left_right_flip_corrections(pose_data: PoseData, suspect_mask: np.ndar
         frames=np.array(pose_data.frames, copy=True),
         keypoints=corrected_keypoints,
         scores=corrected_scores,
-        raw_keypoints=None
-        if pose_data.raw_keypoints is None
-        else apply_left_right_flip_to_points(pose_data.raw_keypoints, suspect_mask),
-        filtered_keypoints=None
-        if pose_data.filtered_keypoints is None
-        else apply_left_right_flip_to_points(pose_data.filtered_keypoints, suspect_mask),
+        frame_stride=int(getattr(pose_data, "frame_stride", 1)),
+        raw_keypoints=(
+            None
+            if pose_data.raw_keypoints is None
+            else apply_left_right_flip_to_points(pose_data.raw_keypoints, suspect_mask)
+        ),
+        filtered_keypoints=(
+            None
+            if pose_data.filtered_keypoints is None
+            else apply_left_right_flip_to_points(pose_data.filtered_keypoints, suspect_mask)
+        ),
     )
 
 
@@ -1790,7 +1886,9 @@ def robust_triangulation_from_best_cameras(
             if not np.all(np.isfinite(point)):
                 continue
 
-            projected = project_point_with_projection_matrices(np.asarray([projections[i] for i in included_indices], dtype=float), point)
+            projected = project_point_with_projection_matrices(
+                np.asarray([projections[i] for i in included_indices], dtype=float), point
+            )
             errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
             candidate_error = float(np.mean(errors)) if errors.size else np.inf
 
@@ -1811,7 +1909,9 @@ def robust_triangulation_from_best_cameras(
         return best_point, np.nan, reprojection_error_per_view, coherence_per_view, excluded_views
 
     valid_indices = np.where(valid)[0]
-    projected_valid = project_point_with_projection_matrices(np.asarray([projections[i] for i in valid_indices], dtype=float), best_point)
+    projected_valid = project_point_with_projection_matrices(
+        np.asarray([projections[i] for i in valid_indices], dtype=float), best_point
+    )
     reprojection_error_per_view[valid_indices] = np.linalg.norm(observations[valid_indices] - projected_valid, axis=1)
 
     excluded_views[:] = True
@@ -1860,7 +1960,9 @@ def greedy_triangulation_from_best_cameras(
         if not np.all(np.isfinite(point)):
             break
 
-        projected = project_point_with_projection_matrices(np.asarray([projections[i] for i in included_indices], dtype=float), point)
+        projected = project_point_with_projection_matrices(
+            np.asarray([projections[i] for i in included_indices], dtype=float), point
+        )
         errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
         mean_error = float(np.mean(errors))
         if mean_error < best_error:
@@ -1881,7 +1983,9 @@ def greedy_triangulation_from_best_cameras(
         return best_point, np.nan, reprojection_error_per_view, coherence_per_view, excluded_views
 
     valid_indices = np.where(valid)[0]
-    projected_valid = project_point_with_projection_matrices(np.asarray([projections[i] for i in valid_indices], dtype=float), best_point)
+    projected_valid = project_point_with_projection_matrices(
+        np.asarray([projections[i] for i in valid_indices], dtype=float), best_point
+    )
     reprojection_error_per_view[valid_indices] = np.linalg.norm(observations[valid_indices] - projected_valid, axis=1)
 
     excluded_views[best_included] = False
@@ -1892,6 +1996,48 @@ def greedy_triangulation_from_best_cameras(
         best_point = np.full(3, np.nan)
 
     return best_point, best_error, reprojection_error_per_view, coherence_per_view, excluded_views
+
+
+def once_triangulation_from_best_cameras(
+    projections: list[np.ndarray],
+    observations: np.ndarray,
+    confidences: np.ndarray,
+    calibrations: list[CameraCalibration],
+    error_threshold_px: float,
+    min_cameras_for_triangulation: int,
+) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
+    """Triangulate once from all valid cameras without view rejection."""
+
+    _ = calibrations
+    n_cams = len(projections)
+    valid = np.isfinite(observations[:, 0]) & np.isfinite(observations[:, 1]) & (confidences > 0)
+    if np.count_nonzero(valid) < min_cameras_for_triangulation:
+        nan_views = np.full(n_cams, np.nan)
+        return np.full(3, np.nan), np.nan, nan_views, np.zeros(n_cams), ~valid
+
+    included_indices = np.where(valid)[0]
+    point = weighted_triangulation(
+        [projections[i] for i in included_indices],
+        observations[included_indices],
+        confidences[included_indices],
+    )
+    reprojection_error_per_view = np.full(n_cams, np.nan)
+    coherence_per_view = np.zeros(n_cams)
+    excluded_views = ~valid
+    if not np.all(np.isfinite(point)):
+        return point, np.nan, reprojection_error_per_view, coherence_per_view, excluded_views
+
+    projected = project_point_with_projection_matrices(
+        np.asarray([projections[i] for i in included_indices], dtype=float), point
+    )
+    errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
+    mean_error = float(np.mean(errors)) if errors.size else np.nan
+    reprojection_error_per_view[included_indices] = errors
+    for i_cam in included_indices:
+        coherence_per_view[i_cam] = multiview_coherence_score(reprojection_error_per_view[i_cam], error_threshold_px)
+    if mean_error > error_threshold_px:
+        point = np.full(3, np.nan)
+    return point, mean_error, reprojection_error_per_view, coherence_per_view, excluded_views
 
 
 def compute_epipolar_coherence(
@@ -1933,12 +2079,7 @@ def compute_epipolar_coherence(
             Fxi = xi @ Fij.T
             Ftxj = xj @ Fij
             numer = np.sum(xj * Fxi, axis=-1)
-            denom = (
-                Fxi[..., 0] ** 2
-                + Fxi[..., 1] ** 2
-                + Ftxj[..., 0] ** 2
-                + Ftxj[..., 1] ** 2
-            )
+            denom = Fxi[..., 0] ** 2 + Fxi[..., 1] ** 2 + Ftxj[..., 0] ** 2 + Ftxj[..., 1] ** 2
             pair_error = np.full((n_frames, n_keypoints), np.nan, dtype=float)
             valid_denom = valid_ij & (denom > 1e-12) & np.isfinite(numer) & np.isfinite(denom)
             pair_error[valid_denom] = np.abs(numer[valid_denom]) / np.sqrt(denom[valid_denom])
@@ -1973,6 +2114,8 @@ def triangulate_pose2sim_like(
     precomputed_epipolar_time_s: float | None = None,
 ) -> ReconstructionResult:
     """Effectue une reconstruction 3D frame-par-frame de tous les keypoints."""
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     projections = [calibrations[name].P for name in pose_data.camera_names]
     ordered_calibrations = [calibrations[name] for name in pose_data.camera_names]
     n_frames = pose_data.keypoints.shape[1]
@@ -1983,9 +2126,15 @@ def triangulate_pose2sim_like(
     reprojection_error_per_view = np.full((n_frames, n_keypoints, len(pose_data.camera_names)), np.nan)
     triangulation_coherence = np.zeros((n_frames, n_keypoints, len(pose_data.camera_names)))
     excluded_views = np.ones((n_frames, n_keypoints, len(pose_data.camera_names)), dtype=bool)
-    triangulate_one = robust_triangulation_from_best_cameras if triangulation_method == "exhaustive" else greedy_triangulation_from_best_cameras
-    if triangulation_method not in ("exhaustive", "greedy"):
-        raise ValueError(f"Unknown triangulation method: {triangulation_method}")
+    triangulate_one = (
+        once_triangulation_from_best_cameras
+        if triangulation_method == "once"
+        else (
+            robust_triangulation_from_best_cameras
+            if triangulation_method == "exhaustive"
+            else greedy_triangulation_from_best_cameras
+        )
+    )
 
     fundamental_matrices = {
         (i_cam, j_cam): fundamental_matrix(ordered_calibrations[i_cam], ordered_calibrations[j_cam])
@@ -2229,7 +2378,9 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
         inertia_diag = np.asarray(generic.inertia(None, None), dtype=float).reshape(-1)[:3]
         return InertiaParametersReal(mass=mass, center_of_mass=com, inertia=np.diag(inertia_diag))
 
-    def aggregate_distal(primary: InertiaParametersReal, distal: InertiaParametersReal, distal_offset: np.ndarray) -> InertiaParametersReal:
+    def aggregate_distal(
+        primary: InertiaParametersReal, distal: InertiaParametersReal, distal_offset: np.ndarray
+    ) -> InertiaParametersReal:
         primary_mass = float(primary.mass)
         distal_mass = float(distal.mass)
         total_mass = primary_mass + distal_mass
@@ -2242,9 +2393,13 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
         I_distal = np.asarray(distal.inertia, dtype=float)[:3, :3]
         d_primary = primary_com - total_com
         d_distal = distal_com - total_com
-        I_primary_shifted = I_primary + primary_mass * ((d_primary @ d_primary) * np.eye(3) - np.outer(d_primary, d_primary))
+        I_primary_shifted = I_primary + primary_mass * (
+            (d_primary @ d_primary) * np.eye(3) - np.outer(d_primary, d_primary)
+        )
         I_distal_shifted = I_distal + distal_mass * ((d_distal @ d_distal) * np.eye(3) - np.outer(d_distal, d_distal))
-        return InertiaParametersReal(mass=total_mass, center_of_mass=total_com, inertia=I_primary_shifted + I_distal_shifted)
+        return InertiaParametersReal(
+            mass=total_mass, center_of_mass=total_com, inertia=I_primary_shifted + I_distal_shifted
+        )
 
     trunk = to_real(SegmentName.TRUNK)
     head = to_real(SegmentName.HEAD)
@@ -2297,6 +2452,7 @@ def build_biomod(
 
     inertia = female_deleva_inertia_parameters(lengths, total_mass_kg=subject_mass_kg)
     model = BiomechanicalModelReal()
+
     def mesh_with_axes(base_points: list[tuple[float, float, float]], axis_scale: float) -> MeshReal:
         """Construit un mesh polyline affichant aussi le repere local du segment.
 
@@ -2337,8 +2493,16 @@ def build_biomod(
     trunk = model.segments["TRUNK"]
     trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
     trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
-    trunk.add_marker(MarkerReal(name="left_shoulder", parent_name="TRUNK", position=[0, lengths.shoulder_half_width, lengths.trunk_height]))
-    trunk.add_marker(MarkerReal(name="right_shoulder", parent_name="TRUNK", position=[0, -lengths.shoulder_half_width, lengths.trunk_height]))
+    trunk.add_marker(
+        MarkerReal(
+            name="left_shoulder", parent_name="TRUNK", position=[0, lengths.shoulder_half_width, lengths.trunk_height]
+        )
+    )
+    trunk.add_marker(
+        MarkerReal(
+            name="right_shoulder", parent_name="TRUNK", position=[0, -lengths.shoulder_half_width, lengths.trunk_height]
+        )
+    )
 
     model.add_segment(
         SegmentReal(
@@ -2357,10 +2521,26 @@ def build_biomod(
     )
     head = model.segments["HEAD"]
     head.add_marker(MarkerReal(name="nose", parent_name="HEAD", position=[lengths.head_length, 0, lengths.head_length]))
-    head.add_marker(MarkerReal(name="left_eye", parent_name="HEAD", position=[lengths.head_length - lengths.eye_offset_x, lengths.eye_offset_y, lengths.head_length]))
-    head.add_marker(MarkerReal(name="right_eye", parent_name="HEAD", position=[lengths.head_length - lengths.eye_offset_x, -lengths.eye_offset_y, lengths.head_length]))
-    head.add_marker(MarkerReal(name="left_ear", parent_name="HEAD", position=[0, lengths.ear_offset_y, 0.7 * lengths.head_length]))
-    head.add_marker(MarkerReal(name="right_ear", parent_name="HEAD", position=[0, -lengths.ear_offset_y, 0.7 * lengths.head_length]))
+    head.add_marker(
+        MarkerReal(
+            name="left_eye",
+            parent_name="HEAD",
+            position=[lengths.head_length - lengths.eye_offset_x, lengths.eye_offset_y, lengths.head_length],
+        )
+    )
+    head.add_marker(
+        MarkerReal(
+            name="right_eye",
+            parent_name="HEAD",
+            position=[lengths.head_length - lengths.eye_offset_x, -lengths.eye_offset_y, lengths.head_length],
+        )
+    )
+    head.add_marker(
+        MarkerReal(name="left_ear", parent_name="HEAD", position=[0, lengths.ear_offset_y, 0.7 * lengths.head_length])
+    )
+    head.add_marker(
+        MarkerReal(name="right_ear", parent_name="HEAD", position=[0, -lengths.ear_offset_y, 0.7 * lengths.head_length])
+    )
 
     for side, sign in (("left", 1.0), ("right", -1.0)):
         shoulder_offset = (0, sign * lengths.shoulder_half_width, lengths.trunk_height)
@@ -2387,7 +2567,9 @@ def build_biomod(
             )
         )
         upper_arm = model.segments[upper_name]
-        upper_arm.add_marker(MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -lengths.upper_arm_length]))
+        upper_arm.add_marker(
+            MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -lengths.upper_arm_length])
+        )
 
         model.add_segment(
             SegmentReal(
@@ -2405,7 +2587,9 @@ def build_biomod(
             )
         )
         forearm = model.segments[forearm_name]
-        forearm.add_marker(MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -lengths.forearm_length]))
+        forearm.add_marker(
+            MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -lengths.forearm_length])
+        )
 
         model.add_segment(
             SegmentReal(
@@ -2423,7 +2607,9 @@ def build_biomod(
             )
         )
         thigh = model.segments[thigh_name]
-        thigh.add_marker(MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -lengths.thigh_length]))
+        thigh.add_marker(
+            MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -lengths.thigh_length])
+        )
 
         model.add_segment(
             SegmentReal(
@@ -2441,7 +2627,9 @@ def build_biomod(
             )
         )
         shank = model.segments[shank_name]
-        shank.add_marker(MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -lengths.shank_length]))
+        shank.add_marker(
+            MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -lengths.shank_length])
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.to_biomod(str(output_path), with_mesh=True)
@@ -2634,7 +2822,9 @@ def points_to_marker_tensor(model, point_frame: np.ndarray) -> np.ndarray:
     return markers
 
 
-def first_valid_marker_tensor_from_reconstruction(model, reconstruction: ReconstructionResult) -> tuple[int, np.ndarray] | tuple[None, None]:
+def first_valid_marker_tensor_from_reconstruction(
+    model, reconstruction: ReconstructionResult
+) -> tuple[int, np.ndarray] | tuple[None, None]:
     """Retourne la premiere frame triangulee exploitable et son tenseur marqueurs."""
     for frame_idx in range(reconstruction.points_3d.shape[0]):
         marker_positions = points_to_marker_tensor(model, reconstruction.points_3d[frame_idx])
@@ -2690,7 +2880,11 @@ class MultiViewKinematicEKF:
         self.joint_indices = np.arange(self.n_root, self.nq, dtype=int)
         self.identity_x = np.eye(self.nx)
         self.marker_names = marker_name_list(model)
-        self.marker_pairs = [(marker_idx, KP_INDEX[marker_name]) for marker_idx, marker_name in enumerate(self.marker_names) if marker_name in KP_INDEX]
+        self.marker_pairs = [
+            (marker_idx, KP_INDEX[marker_name])
+            for marker_idx, marker_name in enumerate(self.marker_names)
+            if marker_name in KP_INDEX
+        ]
         self.marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in self.marker_pairs], dtype=int)
         self.camera_order = pose_data.camera_names
         self.camera_calibrations = [self.calibrations[cam_name] for cam_name in self.camera_order]
@@ -2734,7 +2928,9 @@ class MultiViewKinematicEKF:
             effective_confidences = scores
         else:
             coherence_cam_frame_kp = np.transpose(np.asarray(self.multiview_coherence, dtype=float), (2, 0, 1))
-            blended_coherence = self.coherence_confidence_floor + (1.0 - self.coherence_confidence_floor) * coherence_cam_frame_kp
+            blended_coherence = (
+                self.coherence_confidence_floor + (1.0 - self.coherence_confidence_floor) * coherence_cam_frame_kp
+            )
             effective_confidences = scores * blended_coherence
         effective_confidences = np.asarray(effective_confidences, dtype=float)
         measurement_variances = self.measurement_noise_scale * (4.0 / np.maximum(effective_confidences, 1e-3)) ** 2
@@ -2794,7 +2990,9 @@ class MultiViewKinematicEKF:
             return np.asarray(vector.to_array(), dtype=float).reshape(-1)
         return np.asarray(vector, dtype=float).reshape(-1)
 
-    def _compute_root_acceleration_from_flight_dynamics(self, q: np.ndarray, qdot: np.ndarray, qddot_joint: np.ndarray) -> np.ndarray:
+    def _compute_root_acceleration_from_flight_dynamics(
+        self, q: np.ndarray, qdot: np.ndarray, qddot_joint: np.ndarray
+    ) -> np.ndarray:
         """Calcule `qddot_root` en phase aerienne.
 
         Par defaut, on utilise `biorbd.ForwardDynamicsFreeFloatingBase`, comme
@@ -2818,7 +3016,9 @@ class MultiViewKinematicEKF:
 
         if hasattr(self.model, "ForwardDynamicsFreeFloatingBase"):
             try:
-                qddot_root = self.model.ForwardDynamicsFreeFloatingBase(q_biorbd, qdot_biorbd, np.asarray(qddot_joint, dtype=float))
+                qddot_root = self.model.ForwardDynamicsFreeFloatingBase(
+                    q_biorbd, qdot_biorbd, np.asarray(qddot_joint, dtype=float)
+                )
                 qddot_root = self._biorbd_to_numpy(qddot_root)
                 if qddot_root.size == self.nq:
                     qddot_root = qddot_root[self.root_indices]
@@ -2887,7 +3087,9 @@ class MultiViewKinematicEKF:
                 covariance[:, full_idx] = 0.0
                 covariance[full_idx, full_idx] = 1e-9
 
-    def update(self, predicted_state: np.ndarray, predicted_covariance: np.ndarray, frame_idx: int) -> tuple[np.ndarray, np.ndarray, str]:
+    def update(
+        self, predicted_state: np.ndarray, predicted_covariance: np.ndarray, frame_idx: int
+    ) -> tuple[np.ndarray, np.ndarray, str]:
         """Etape de correction EKF dans l'espace image 2D.
 
         Le score de confiance 2D est converti en bruit de mesure: une detection
@@ -2940,7 +3142,9 @@ class MultiViewKinematicEKF:
         for cam_idx, calibration in enumerate(self.camera_calibrations):
             frame_keypoints = self.pose_data.keypoints[cam_idx, frame_idx]
             frame_variances = self.measurement_variances[cam_idx, frame_idx]
-            valid_keypoints = np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
+            valid_keypoints = (
+                np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
+            )
             if not np.any(valid_keypoints):
                 continue
             valid_pairs = finite_marker_points & valid_keypoints[self.marker_pair_keypoint_indices]
@@ -2953,9 +3157,8 @@ class MultiViewKinematicEKF:
             if locked_q_columns.size:
                 H_q_blocks = np.array(H_q_blocks, copy=True)
                 H_q_blocks[:, :, locked_q_columns] = 0.0
-            finite_pairs = (
-                np.all(np.isfinite(projected_uv), axis=1)
-                & np.all(np.isfinite(H_q_blocks.reshape(H_q_blocks.shape[0], -1)), axis=1)
+            finite_pairs = np.all(np.isfinite(projected_uv), axis=1) & np.all(
+                np.isfinite(H_q_blocks.reshape(H_q_blocks.shape[0], -1)), axis=1
             )
             if not np.any(finite_pairs):
                 continue
@@ -3019,7 +3222,9 @@ def q_names_from_model(model) -> list[str]:
     ]
 
 
-def first_valid_root_translation_from_triangulation(reconstruction: ReconstructionResult) -> tuple[int | None, np.ndarray | None]:
+def first_valid_root_translation_from_triangulation(
+    reconstruction: ReconstructionResult,
+) -> tuple[int | None, np.ndarray | None]:
     """Estime `TransX/Y/Z` de la racine au milieu des hanches triangulees."""
     left_idx = KP_INDEX["left_hip"]
     right_idx = KP_INDEX["right_hip"]
@@ -3031,7 +3236,29 @@ def first_valid_root_translation_from_triangulation(reconstruction: Reconstructi
     return None, None
 
 
-def first_valid_root_pose_from_triangulation(reconstruction: ReconstructionResult) -> tuple[int | None, np.ndarray | None]:
+def root_translation_from_triangulation_frame(
+    reconstruction: ReconstructionResult,
+    frame_idx: int,
+) -> np.ndarray | None:
+    """Estimate the root translation from one specific triangulated frame."""
+
+    if not hasattr(reconstruction, "points_3d"):
+        return None
+    frame_idx = int(frame_idx)
+    if frame_idx < 0 or frame_idx >= reconstruction.points_3d.shape[0]:
+        return None
+    left_idx = KP_INDEX["left_hip"]
+    right_idx = KP_INDEX["right_hip"]
+    left_hip = reconstruction.points_3d[frame_idx, left_idx]
+    right_hip = reconstruction.points_3d[frame_idx, right_idx]
+    if np.all(np.isfinite(left_hip)) and np.all(np.isfinite(right_hip)):
+        return 0.5 * (left_hip + right_hip)
+    return None
+
+
+def first_valid_root_pose_from_triangulation(
+    reconstruction: ReconstructionResult,
+) -> tuple[int | None, np.ndarray | None]:
     """Estime les 6 DoF de la racine a partir du tronc triangule."""
     root_q = compute_trunk_dofs_from_points(reconstruction.points_3d, unwrap_rotations=False)
     for frame_idx in range(root_q.shape[0]):
@@ -3062,10 +3289,37 @@ def apply_root_pose_guess_to_state(model, state: np.ndarray, root_pose: np.ndarr
         return np.array(state, copy=True)
     q_names = q_names_from_model(model)
     updated_state = np.array(state, copy=True)
-    for value, target_name in zip(root_pose[:6], ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ", "TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ")):
+    for value, target_name in zip(
+        root_pose[:6], ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ", "TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ")
+    ):
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(value)
     return updated_state
+
+
+def align_root_translation_guess_to_frame_zero(
+    model,
+    state: np.ndarray,
+    reconstruction: ReconstructionResult,
+    *,
+    source_frame_idx: int | None,
+) -> np.ndarray:
+    """Re-anchor root translation to frame 0 when the hips are available there.
+
+    The biorbd warm-start may be solved from the first triangulated frame with
+    enough markers, which is not always the first frame of the sequence. When
+    the athlete already drifts horizontally, this produces a transient bias on
+    `TRUNK:TransX/TransY` during the first reconstructed frames. If frame 0 has
+    valid hips, we shift the guessed root translation back to that frame.
+    """
+
+    if source_frame_idx is None:
+        return np.array(state, copy=True)
+    source_translation = root_translation_from_triangulation_frame(reconstruction, int(source_frame_idx))
+    target_translation = root_translation_from_triangulation_frame(reconstruction, 0)
+    if source_translation is None or target_translation is None:
+        return np.array(state, copy=True)
+    return apply_root_translation_guess_to_state(model, state, target_translation)
 
 
 def compute_biorbd_kalman_initial_state(
@@ -3087,12 +3341,29 @@ def compute_biorbd_kalman_initial_state(
     }
 
     if method == "triangulation_ik":
-        return state, diagnostics
+        aligned_state = align_root_translation_guess_to_frame_zero(
+            model,
+            state,
+            reconstruction,
+            source_frame_idx=diagnostics["bootstrap_frame_idx"],
+        )
+        diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(aligned_state, state, equal_nan=True)
+        return aligned_state, diagnostics
     if method == "triangulation_ik_root_translation":
         frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
-        return apply_root_translation_guess_to_state(model, state, root_translation), diagnostics
+        updated_state = apply_root_translation_guess_to_state(model, state, root_translation)
+        aligned_state = align_root_translation_guess_to_frame_zero(
+            model,
+            updated_state,
+            reconstruction,
+            source_frame_idx=diagnostics["bootstrap_frame_idx"],
+        )
+        diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
+            aligned_state, updated_state, equal_nan=True
+        )
+        return aligned_state, diagnostics
     if method == "root_pose_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
         frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
@@ -3100,14 +3371,34 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_pose is not None)
         diagnostics["used_root_pose_guess"] = bool(root_pose is not None)
-        return apply_root_pose_guess_to_state(model, zero_state, root_pose), diagnostics
+        updated_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
+        aligned_state = align_root_translation_guess_to_frame_zero(
+            model,
+            updated_state,
+            reconstruction,
+            source_frame_idx=diagnostics["bootstrap_frame_idx"],
+        )
+        diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
+            aligned_state, updated_state, equal_nan=True
+        )
+        return aligned_state, diagnostics
     if method == "root_translation_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
         frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
-        return apply_root_translation_guess_to_state(model, zero_state, root_translation), diagnostics
+        updated_state = apply_root_translation_guess_to_state(model, zero_state, root_translation)
+        aligned_state = align_root_translation_guess_to_frame_zero(
+            model,
+            updated_state,
+            reconstruction,
+            source_frame_idx=diagnostics["bootstrap_frame_idx"],
+        )
+        diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
+            aligned_state, updated_state, equal_nan=True
+        )
+        return aligned_state, diagnostics
     raise ValueError(f"Unsupported biorbd kalman init method: {method}")
 
 
@@ -3133,7 +3424,11 @@ def initial_state_from_ekf_bootstrap(
     `qdot`/`qddot` a zero. Cela donne un bootstrap 2D plus proche de la
     formulation du filtre que l'IK 3D pure, tout en restant tres local.
     """
-    ik_state = np.array(initial_state, copy=True) if initial_state is not None else initial_state_from_triangulation(model, reconstruction)
+    ik_state = (
+        np.array(initial_state, copy=True)
+        if initial_state is not None
+        else initial_state_from_triangulation(model, reconstruction)
+    )
     frame_idx, _marker_positions = first_valid_marker_tensor_from_reconstruction(model, reconstruction)
     diagnostics: dict[str, object] = {
         "method": "ekf_bootstrap",
@@ -3175,7 +3470,9 @@ def initial_state_from_ekf_bootstrap(
         covariance = np.array(base_covariance, copy=True)
         ekf.skip_correction_countdown = 0
         predicted_state, predicted_covariance = ekf.predict(seed_state, covariance, frame_idx)
-        corrected_state, _corrected_covariance, update_status = ekf.update(predicted_state, predicted_covariance, frame_idx)
+        corrected_state, _corrected_covariance, update_status = ekf.update(
+            predicted_state, predicted_covariance, frame_idx
+        )
         diagnostics["update_statuses"].append(str(update_status))
         diagnostics["completed_passes"] = int(diagnostics["completed_passes"]) + 1
         if update_status != "corrected" or not np.all(np.isfinite(corrected_state)):
@@ -3375,7 +3672,11 @@ def run_ekf(
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
     )
-    state = np.array(initial_state, copy=True) if initial_state is not None else initial_state_from_triangulation(model, reconstruction)
+    state = (
+        np.array(initial_state, copy=True)
+        if initial_state is not None
+        else initial_state_from_triangulation(model, reconstruction)
+    )
     covariance = np.eye(ekf.nx) * 1e-2
     timings["init_s"] = time.perf_counter() - t_init
 
@@ -3385,17 +3686,34 @@ def run_ekf(
     for frame_idx in range(pose_data.frames.shape[0]):
         predicted_state, predicted_covariance = ekf.predict(state, covariance, frame_idx)
         if debug_console:
-            print(debug_state_summary(predicted_state, ekf.q_names, ekf.nq, f"[{debug_label or 'EKF'}] frame {frame_idx} predicted"))
-            validate_ekf_state_or_raise(predicted_state, predicted_covariance, ekf.q_names, ekf.nq, frame_idx, "predict")
+            print(
+                debug_state_summary(
+                    predicted_state, ekf.q_names, ekf.nq, f"[{debug_label or 'EKF'}] frame {frame_idx} predicted"
+                )
+            )
+            validate_ekf_state_or_raise(
+                predicted_state, predicted_covariance, ekf.q_names, ekf.nq, frame_idx, "predict"
+            )
         state, covariance, update_status = ekf.update(predicted_state, predicted_covariance, frame_idx)
         if debug_console:
-            print(debug_state_summary(state, ekf.q_names, ekf.nq, f"[{debug_label or 'EKF'}] frame {frame_idx} corrected ({update_status})"))
+            print(
+                debug_state_summary(
+                    state,
+                    ekf.q_names,
+                    ekf.nq,
+                    f"[{debug_label or 'EKF'}] frame {frame_idx} corrected ({update_status})",
+                )
+            )
             validate_ekf_state_or_raise(state, covariance, ekf.q_names, ekf.nq, frame_idx, "update")
         states[frame_idx] = state
         update_status_per_frame.append(update_status)
     timings["loop_s"] = time.perf_counter() - t_loop
     timings.update({key: float(value) for key, value in ekf.profiling.items()})
-    q = unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names) if unwrap_root else np.array(states[:, : ekf.nq], copy=True)
+    q = (
+        unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names)
+        if unwrap_root
+        else np.array(states[:, : ekf.nq], copy=True)
+    )
     return (
         {
             "q": q,
@@ -3755,8 +4073,16 @@ def load_reconstruction_cache(cache_path: Path, coherence_method: str) -> Recons
             triangulation_coherence = np.asarray(data["triangulation_coherence"])
         else:
             triangulation_coherence = np.asarray(data["multiview_coherence"])
-        epipolar_time_s = float(np.asarray(data["epipolar_coherence_compute_time_s"]).item()) if "epipolar_coherence_compute_time_s" in data else 0.0
-        triangulation_time_s = float(np.asarray(data["triangulation_compute_time_s"]).item()) if "triangulation_compute_time_s" in data else 0.0
+        epipolar_time_s = (
+            float(np.asarray(data["epipolar_coherence_compute_time_s"]).item())
+            if "epipolar_coherence_compute_time_s" in data
+            else 0.0
+        )
+        triangulation_time_s = (
+            float(np.asarray(data["triangulation_compute_time_s"]).item())
+            if "triangulation_compute_time_s" in data
+            else 0.0
+        )
 
         multiview_coherence = select_active_coherence(
             epipolar_coherence=epipolar_coherence,
@@ -3780,7 +4106,9 @@ def load_reconstruction_cache(cache_path: Path, coherence_method: str) -> Recons
     )
 
 
-def reconstruction_distance_stats(reference: ReconstructionResult, alternative: ReconstructionResult) -> dict[str, float]:
+def reconstruction_distance_stats(
+    reference: ReconstructionResult, alternative: ReconstructionResult
+) -> dict[str, float]:
     """Compare deux triangulations en distance 3D point a point."""
     n_frames = min(reference.points_3d.shape[0], alternative.points_3d.shape[0])
     ref = reference.points_3d[:n_frames]
@@ -3886,7 +4214,9 @@ def save_biorbd_kalman_cache(cache_path: Path, result: dict[str, np.ndarray], me
         q=result["q"],
         qdot=result["qdot"],
         qddot=result["qddot"],
-        initial_state_method=np.asarray(str(result.get("initial_state_method", DEFAULT_BIORBD_KALMAN_INIT_METHOD)), dtype=object),
+        initial_state_method=np.asarray(
+            str(result.get("initial_state_method", DEFAULT_BIORBD_KALMAN_INIT_METHOD)), dtype=object
+        ),
         initial_state_diagnostics=np.asarray(json.dumps(result.get("initial_state_diagnostics", {})), dtype=object),
         metadata=np.asarray(json.dumps(metadata), dtype=object),
     )
@@ -3899,10 +4229,16 @@ def load_biorbd_kalman_cache(cache_path: Path) -> dict[str, np.ndarray]:
             "q": np.asarray(data["q"]),
             "qdot": np.asarray(data["qdot"]),
             "qddot": np.asarray(data["qddot"]),
-            "initial_state_method": np.asarray(data["initial_state_method"]).item() if "initial_state_method" in data else DEFAULT_BIORBD_KALMAN_INIT_METHOD,
-            "initial_state_diagnostics": json.loads(str(np.asarray(data["initial_state_diagnostics"]).item()))
-            if "initial_state_diagnostics" in data
-            else {},
+            "initial_state_method": (
+                np.asarray(data["initial_state_method"]).item()
+                if "initial_state_method" in data
+                else DEFAULT_BIORBD_KALMAN_INIT_METHOD
+            ),
+            "initial_state_diagnostics": (
+                json.loads(str(np.asarray(data["initial_state_diagnostics"]).item()))
+                if "initial_state_diagnostics" in data
+                else {}
+            ),
         }
 
 
@@ -3978,7 +4314,9 @@ def save_outputs(
     if reconstruction_fast is not None and reconstruction_fast_cache_path is not None:
         reconstruction_fast_metadata_dict = dict(reconstruction_cache_metadata_dict)
         reconstruction_fast_metadata_dict["triangulation_method"] = "greedy"
-        save_reconstruction_cache(reconstruction_fast_cache_path, reconstruction_fast, reconstruction_fast_metadata_dict)
+        save_reconstruction_cache(
+            reconstruction_fast_cache_path, reconstruction_fast, reconstruction_fast_metadata_dict
+        )
     save_single_ekf_state(output_dir / "ekf_states_acc.npz", ekf_result_acc)
     ekf_combined_payload = {
         "q": ekf_result_acc["q"],
@@ -4051,7 +4389,9 @@ def save_outputs(
         "mean_epipolar_coherence": float(np.nanmean(reconstruction.epipolar_coherence)),
         "mean_triangulation_coherence": float(np.nanmean(reconstruction.triangulation_coherence)),
         "epipolar_coherence_compute_time_s": float(reconstruction.epipolar_coherence_compute_time_s),
-        "mean_reprojection_error_fast_px": float(np.nanmean(reconstruction_fast.reprojection_error)) if reconstruction_fast is not None else None,
+        "mean_reprojection_error_fast_px": (
+            float(np.nanmean(reconstruction_fast.reprojection_error)) if reconstruction_fast is not None else None
+        ),
         "triangulation_defaults": {
             "reprojection_threshold_px": DEFAULT_REPROJECTION_THRESHOLD_PX,
             "epipolar_threshold_px": DEFAULT_EPIPOLAR_THRESHOLD_PX,
@@ -4062,7 +4402,9 @@ def save_outputs(
         },
         "coherence_method_used": reconstruction.coherence_method,
         "reconstruction_cache_path": str(reconstruction_cache_path),
-        "reconstruction_fast_cache_path": str(reconstruction_fast_cache_path) if reconstruction_fast_cache_path is not None else None,
+        "reconstruction_fast_cache_path": (
+            str(reconstruction_fast_cache_path) if reconstruction_fast_cache_path is not None else None
+        ),
         "subject_mass_kg": float(subject_mass_kg),
         "measurement_noise_scale": float(measurement_noise_scale),
         "coherence_confidence_floor": float(coherence_confidence_floor),
@@ -4081,7 +4423,9 @@ def save_outputs(
         },
         "ekf_2d_acc_frame_diagnostics": {
             "total_frames": int(ekf_result_acc["q"].shape[0]),
-            "update_status_counts": {key: int(value) for key, value in ekf_result_acc.get("update_status_counts", {}).items()},
+            "update_status_counts": {
+                key: int(value) for key, value in ekf_result_acc.get("update_status_counts", {}).items()
+            },
         },
     }
     if stage_timings_s is not None:
@@ -4120,18 +4464,24 @@ def save_outputs(
     if ekf_result_dyn is not None:
         summary["ekf_2d_dyn_frame_diagnostics"] = {
             "total_frames": int(ekf_result_dyn["q"].shape[0]),
-            "update_status_counts": {key: int(value) for key, value in ekf_result_dyn.get("update_status_counts", {}).items()},
+            "update_status_counts": {
+                key: int(value) for key, value in ekf_result_dyn.get("update_status_counts", {}).items()
+            },
         }
     if ekf_result_flip_acc is not None:
         summary["ekf_2d_flip_acc_frame_diagnostics"] = {
             "total_frames": int(ekf_result_flip_acc["q"].shape[0]),
-            "update_status_counts": {key: int(value) for key, value in ekf_result_flip_acc.get("update_status_counts", {}).items()},
+            "update_status_counts": {
+                key: int(value) for key, value in ekf_result_flip_acc.get("update_status_counts", {}).items()
+            },
         }
         summary["ekf2d_flip_acc_initial_state_diagnostics"] = shared_initial_state_flip_acc_diagnostics
     if ekf_result_flip_dyn is not None:
         summary["ekf_2d_flip_dyn_frame_diagnostics"] = {
             "total_frames": int(ekf_result_flip_dyn["q"].shape[0]),
-            "update_status_counts": {key: int(value) for key, value in ekf_result_flip_dyn.get("update_status_counts", {}).items()},
+            "update_status_counts": {
+                key: int(value) for key, value in ekf_result_flip_dyn.get("update_status_counts", {}).items()
+            },
         }
     if animation_target is not None:
         summary["pyorerun_animation"] = animation_target
@@ -4141,10 +4491,14 @@ def save_outputs(
 
 def parse_args() -> argparse.Namespace:
     """Construit l'interface CLI du pipeline."""
-    parser = argparse.ArgumentParser(description="Triangulation 3D initiale + bioMod + EKF multi-vues pour keypoints 2D.")
+    parser = argparse.ArgumentParser(
+        description="Triangulation 3D initiale + bioMod + EKF multi-vues pour keypoints 2D."
+    )
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
-    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
+    parser.add_argument(
+        "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
+    )
     parser.add_argument(
         "--pose-data-mode",
         choices=("raw", "filtered", "cleaned"),
@@ -4157,10 +4511,30 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Correction optionnelle des 2D apres chargement: aucune, flip L/R detecte par epipolaire, epipolaire rapide (distance symétrique), ou flip L/R detecte par triangulation/reprojection.",
     )
-    parser.add_argument("--pose-filter-window", type=int, default=9, help="Fenetre de lissage temporel utilisee pour construire la reference filtree des 2D.")
-    parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10, help="Seuil de rejet des outliers 2D, exprime comme fraction de l'amplitude robuste.")
-    parser.add_argument("--pose-amplitude-lower-percentile", type=float, default=5.0, help="Percentile inferieur utilise pour definir l'amplitude robuste des 2D.")
-    parser.add_argument("--pose-amplitude-upper-percentile", type=float, default=95.0, help="Percentile superieur utilise pour definir l'amplitude robuste des 2D.")
+    parser.add_argument(
+        "--pose-filter-window",
+        type=int,
+        default=9,
+        help="Fenetre de lissage temporel utilisee pour construire la reference filtree des 2D.",
+    )
+    parser.add_argument(
+        "--pose-outlier-threshold-ratio",
+        type=float,
+        default=0.10,
+        help="Seuil de rejet des outliers 2D, exprime comme fraction de l'amplitude robuste.",
+    )
+    parser.add_argument(
+        "--pose-amplitude-lower-percentile",
+        type=float,
+        default=5.0,
+        help="Percentile inferieur utilise pour definir l'amplitude robuste des 2D.",
+    )
+    parser.add_argument(
+        "--pose-amplitude-upper-percentile",
+        type=float,
+        default=95.0,
+        help="Percentile superieur utilise pour definir l'amplitude robuste des 2D.",
+    )
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence d'acquisition camera en Hz.")
     parser.add_argument("--frame-start", type=int, default=None, help="Premiere frame incluse apres chargement des 2D.")
     parser.add_argument("--frame-end", type=int, default=None, help="Derniere frame incluse apres chargement des 2D.")
@@ -4200,7 +4574,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Si le repere racine reconstruit a t0 est oppose au repere global, applique une rotation de pi autour de Z lors de la construction du bioMod.",
     )
-    parser.add_argument("--max-frames", type=int, default=None, help="Limite optionnelle pour valider rapidement le pipeline.")
+    parser.add_argument(
+        "--max-frames", type=int, default=None, help="Limite optionnelle pour valider rapidement le pipeline."
+    )
     parser.add_argument(
         "--reprojection-threshold-px",
         type=float,
@@ -4221,15 +4597,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--coherence-method",
-        choices=("epipolar", "triangulation"),
+        choices=SUPPORTED_COHERENCE_METHODS,
         default=DEFAULT_COHERENCE_METHOD,
         help="Source du score de coherence multivue utilise dans l'EKF.",
     )
     parser.add_argument(
         "--triangulation-method",
-        choices=("exhaustive", "greedy"),
+        choices=SUPPORTED_TRIANGULATION_METHODS,
         default=DEFAULT_TRIANGULATION_METHOD,
-        help="Strategie de triangulation adaptative: exhaustive ou suppression gloutonne.",
+        help="Strategie de triangulation: une seule DLT ponderee, suppression gloutonne, ou recherche exhaustive.",
     )
     parser.add_argument(
         "--triangulation-workers",
@@ -4377,7 +4753,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--biorbd-kalman-init-method",
-        choices=("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest"),
+        choices=(
+            "none",
+            "triangulation_ik",
+            "triangulation_ik_root_translation",
+            "root_translation_zero_rest",
+            "root_pose_zero_rest",
+        ),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
         help="Strategie de warm-start du Kalman marqueurs `biorbd` via setInitState.",
     )
@@ -4391,7 +4773,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Affiche les etats predits/corriges de EKF 2D DYN et arrete en cas de NaN ou de divergence evidente.",
     )
-    parser.add_argument("--compare-biorbd-kalman", action="store_true", help="Lance aussi le Kalman marqueurs classique de biorbd.")
+    parser.add_argument(
+        "--compare-biorbd-kalman", action="store_true", help="Lance aussi le Kalman marqueurs classique de biorbd."
+    )
     parser.add_argument("--animate", action="store_true", help="Exporte/lance une animation pyorerun si disponible.")
     return parser.parse_args()
 
@@ -4424,29 +4808,51 @@ def main() -> None:
         else:
             flip_method = "triangulation"
         t0 = time.perf_counter()
-        left_right_flip_suspect_mask, _left_right_flip_diagnostics, _left_right_flip_details = detect_left_right_flip_diagnostics(
-            pose_data,
-            calibrations,
-            improvement_ratio=args.flip_improvement_ratio,
-            min_gain_px=args.flip_min_gain_px,
-            min_other_cameras=args.flip_min_other_cameras,
-            restrict_to_outliers=not args.flip_test_all_camera_frames,
-            outlier_percentile=args.flip_outlier_percentile,
-            outlier_floor_px=args.flip_outlier_floor_px,
-            geometry_tau_px=args.epipolar_threshold_px if flip_method in {"epipolar", "epipolar_fast"} else args.reprojection_threshold_px,
-            method=flip_method,
-            temporal_weight=args.flip_temporal_weight,
-            temporal_tau_px=args.flip_temporal_tau_px,
-            temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+        left_right_flip_suspect_mask, _left_right_flip_diagnostics, _left_right_flip_details = (
+            detect_left_right_flip_diagnostics(
+                pose_data,
+                calibrations,
+                improvement_ratio=args.flip_improvement_ratio,
+                min_gain_px=args.flip_min_gain_px,
+                min_other_cameras=args.flip_min_other_cameras,
+                restrict_to_outliers=not args.flip_test_all_camera_frames,
+                outlier_percentile=args.flip_outlier_percentile,
+                outlier_floor_px=args.flip_outlier_floor_px,
+                geometry_tau_px=(
+                    args.epipolar_threshold_px
+                    if flip_method in {"epipolar", "epipolar_fast"}
+                    else args.reprojection_threshold_px
+                ),
+                method=flip_method,
+                temporal_weight=args.flip_temporal_weight,
+                temporal_tau_px=args.flip_temporal_tau_px,
+                temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+            )
         )
         pose_data = apply_left_right_flip_corrections(pose_data, left_right_flip_suspect_mask)
         stage_timings_s["pose_correction_s"] = time.perf_counter() - t0
 
     output_dir = args.output_dir
+    selected_triangulation_method = canonical_triangulation_method(args.triangulation_method)
+    selected_coherence_method = canonical_coherence_method(args.coherence_method, selected_triangulation_method)
     reconstruction_cache_path = args.reconstruction_cache or (args.output_dir / "triangulation_pose2sim_like.npz")
     reconstruction_fast_cache_path = output_dir / "triangulation_pose2sim_like_fast.npz"
+    reconstruction_once_cache_path = output_dir / "triangulation_pose2sim_like_once.npz"
     model_cache_path = args.model_cache or (output_dir / "model_stage.npz")
     biorbd_kalman_cache_path = args.biorbd_kalman_cache or (output_dir / "biorbd_kalman_states.npz")
+    reconstruction_once_metadata_dict = reconstruction_cache_metadata(
+        pose_data=pose_data,
+        error_threshold_px=args.reprojection_threshold_px,
+        min_cameras_for_triangulation=args.min_cameras_for_triangulation,
+        epipolar_threshold_px=args.epipolar_threshold_px,
+        triangulation_method="once",
+        pose_data_mode=args.pose_data_mode,
+        pose_correction_mode=args.pose_correction_mode,
+        pose_filter_window=args.pose_filter_window,
+        pose_outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
+        pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,
+        pose_amplitude_upper_percentile=args.pose_amplitude_upper_percentile,
+    )
     reconstruction_metadata_dict = reconstruction_cache_metadata(
         pose_data=pose_data,
         error_threshold_px=args.reprojection_threshold_px,
@@ -4474,9 +4880,38 @@ def main() -> None:
         pose_amplitude_upper_percentile=args.pose_amplitude_upper_percentile,
     )
 
-    if args.reuse_triangulation and reconstruction_cache_matches(reconstruction_cache_path, reconstruction_metadata_dict):
+    if args.reuse_triangulation and reconstruction_cache_matches(
+        reconstruction_once_cache_path, reconstruction_once_metadata_dict
+    ):
         t0 = time.perf_counter()
-        reconstruction_adaptive = load_reconstruction_cache(reconstruction_cache_path, coherence_method=args.coherence_method)
+        reconstruction_once = load_reconstruction_cache(
+            reconstruction_once_cache_path, coherence_method=selected_coherence_method
+        )
+        stage_timings_s["triangulation_once_s"] = time.perf_counter() - t0
+    else:
+        t0 = time.perf_counter()
+        reconstruction_once = triangulate_pose2sim_like(
+            pose_data,
+            calibrations,
+            error_threshold_px=args.reprojection_threshold_px,
+            min_cameras_for_triangulation=args.min_cameras_for_triangulation,
+            coherence_method=selected_coherence_method,
+            epipolar_threshold_px=args.epipolar_threshold_px,
+            triangulation_method="once",
+            n_workers=args.triangulation_workers,
+        )
+        stage_timings_s["triangulation_once_s"] = time.perf_counter() - t0
+        save_reconstruction_cache(
+            reconstruction_once_cache_path, reconstruction_once, reconstruction_once_metadata_dict
+        )
+
+    if args.reuse_triangulation and reconstruction_cache_matches(
+        reconstruction_cache_path, reconstruction_metadata_dict
+    ):
+        t0 = time.perf_counter()
+        reconstruction_adaptive = load_reconstruction_cache(
+            reconstruction_cache_path, coherence_method=selected_coherence_method
+        )
         stage_timings_s["triangulation_adaptive_s"] = time.perf_counter() - t0
     else:
         t0 = time.perf_counter()
@@ -4485,7 +4920,7 @@ def main() -> None:
             calibrations,
             error_threshold_px=args.reprojection_threshold_px,
             min_cameras_for_triangulation=args.min_cameras_for_triangulation,
-            coherence_method=args.coherence_method,
+            coherence_method=selected_coherence_method,
             epipolar_threshold_px=args.epipolar_threshold_px,
             triangulation_method="exhaustive",
             n_workers=args.triangulation_workers,
@@ -4493,9 +4928,13 @@ def main() -> None:
         stage_timings_s["triangulation_adaptive_s"] = time.perf_counter() - t0
         save_reconstruction_cache(reconstruction_cache_path, reconstruction_adaptive, reconstruction_metadata_dict)
 
-    if args.reuse_triangulation and reconstruction_cache_matches(reconstruction_fast_cache_path, reconstruction_fast_metadata_dict):
+    if args.reuse_triangulation and reconstruction_cache_matches(
+        reconstruction_fast_cache_path, reconstruction_fast_metadata_dict
+    ):
         t0 = time.perf_counter()
-        reconstruction_fast = load_reconstruction_cache(reconstruction_fast_cache_path, coherence_method=args.coherence_method)
+        reconstruction_fast = load_reconstruction_cache(
+            reconstruction_fast_cache_path, coherence_method=selected_coherence_method
+        )
         stage_timings_s["triangulation_fast_s"] = time.perf_counter() - t0
     else:
         t0 = time.perf_counter()
@@ -4504,25 +4943,40 @@ def main() -> None:
             calibrations,
             error_threshold_px=args.reprojection_threshold_px,
             min_cameras_for_triangulation=args.min_cameras_for_triangulation,
-            coherence_method=args.coherence_method,
+            coherence_method=selected_coherence_method,
             epipolar_threshold_px=args.epipolar_threshold_px,
             triangulation_method="greedy",
             n_workers=args.triangulation_workers,
         )
         stage_timings_s["triangulation_fast_s"] = time.perf_counter() - t0
-        save_reconstruction_cache(reconstruction_fast_cache_path, reconstruction_fast, reconstruction_fast_metadata_dict)
+        save_reconstruction_cache(
+            reconstruction_fast_cache_path, reconstruction_fast, reconstruction_fast_metadata_dict
+        )
 
-    reconstruction = reconstruction_adaptive if args.triangulation_method == "exhaustive" else reconstruction_fast
-    selected_reconstruction_cache_path = reconstruction_cache_path if args.triangulation_method == "exhaustive" else reconstruction_fast_cache_path
-    selected_reconstruction_metadata_dict = reconstruction_metadata_dict if args.triangulation_method == "exhaustive" else reconstruction_fast_metadata_dict
+    reconstruction_by_method = {
+        "once": (reconstruction_once, reconstruction_once_cache_path, reconstruction_once_metadata_dict),
+        "greedy": (reconstruction_fast, reconstruction_fast_cache_path, reconstruction_fast_metadata_dict),
+        "exhaustive": (reconstruction_adaptive, reconstruction_cache_path, reconstruction_metadata_dict),
+    }
+    reconstruction, selected_reconstruction_cache_path, selected_reconstruction_metadata_dict = (
+        reconstruction_by_method[selected_triangulation_method]
+    )
     triangulation_comparison = reconstruction_distance_stats(reconstruction_adaptive, reconstruction_fast)
     stage_timings_s["epipolar_coherence_s"] = float(reconstruction.epipolar_coherence_compute_time_s)
 
     if args.triangulate_only:
         print(f"Frames traitées: {pose_data.frames.shape[0]}")
-        print(f"Triangulation adaptive: {stage_timings_s['triangulation_adaptive_s']:.2f} s | erreur moyenne {np.nanmean(reconstruction_adaptive.reprojection_error):.2f} px")
-        print(f"Triangulation fast: {stage_timings_s['triangulation_fast_s']:.2f} s | erreur moyenne {np.nanmean(reconstruction_fast.reprojection_error):.2f} px")
+        print(
+            f"Triangulation once: {stage_timings_s['triangulation_once_s']:.2f} s | erreur moyenne {np.nanmean(reconstruction_once.reprojection_error):.2f} px"
+        )
+        print(
+            f"Triangulation adaptive: {stage_timings_s['triangulation_adaptive_s']:.2f} s | erreur moyenne {np.nanmean(reconstruction_adaptive.reprojection_error):.2f} px"
+        )
+        print(
+            f"Triangulation fast: {stage_timings_s['triangulation_fast_s']:.2f} s | erreur moyenne {np.nanmean(reconstruction_fast.reprojection_error):.2f} px"
+        )
         print(f"Ecart 3D adaptive vs fast: {triangulation_comparison['mean_distance_m']:.4f} m (moyenne)")
+        print(f"Cache once: {reconstruction_once_cache_path}")
         print(f"Cache adaptive: {reconstruction_cache_path}")
         print(f"Cache fast: {reconstruction_fast_cache_path}")
         return
@@ -4566,19 +5020,21 @@ def main() -> None:
     _ = shared_biorbd_model.markers(np.zeros(shared_biorbd_model.nbQ()))
     _ = shared_biorbd_model.markersJacobian(np.zeros(shared_biorbd_model.nbQ()))
 
-    left_right_flip_suspect_mask, left_right_flip_diagnostics, _left_right_flip_details = detect_left_right_flip_diagnostics(
-        pose_data,
-        calibrations,
-        improvement_ratio=args.flip_improvement_ratio,
-        min_gain_px=args.flip_min_gain_px,
-        min_other_cameras=args.flip_min_other_cameras,
-        restrict_to_outliers=not args.flip_test_all_camera_frames,
-        outlier_percentile=args.flip_outlier_percentile,
-        outlier_floor_px=args.flip_outlier_floor_px,
-        geometry_tau_px=args.epipolar_threshold_px,
-        temporal_weight=args.flip_temporal_weight,
-        temporal_tau_px=args.flip_temporal_tau_px,
-        temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+    left_right_flip_suspect_mask, left_right_flip_diagnostics, _left_right_flip_details = (
+        detect_left_right_flip_diagnostics(
+            pose_data,
+            calibrations,
+            improvement_ratio=args.flip_improvement_ratio,
+            min_gain_px=args.flip_min_gain_px,
+            min_other_cameras=args.flip_min_other_cameras,
+            restrict_to_outliers=not args.flip_test_all_camera_frames,
+            outlier_percentile=args.flip_outlier_percentile,
+            outlier_floor_px=args.flip_outlier_floor_px,
+            geometry_tau_px=args.epipolar_threshold_px,
+            temporal_weight=args.flip_temporal_weight,
+            temporal_tau_px=args.flip_temporal_tau_px,
+            temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+        )
     )
     left_right_flip_diagnostics = dict(left_right_flip_diagnostics)
     left_right_flip_diagnostics["tau_px"] = float(args.epipolar_threshold_px)
@@ -4806,7 +5262,11 @@ def main() -> None:
                 classic_result=classic_result,
                 unwrap_root=not args.no_root_unwrap,
             )
-    animation_target = try_export_pyorerun_animation(biomod_path, ekf_result_acc["q"], args.fps, args.output_dir) if args.animate else None
+    animation_target = (
+        try_export_pyorerun_animation(biomod_path, ekf_result_acc["q"], args.fps, args.output_dir)
+        if args.animate
+        else None
+    )
     dyn_vs_acc_diagnostics = compute_dyn_activation_and_root_qddot_diff(
         reconstruction=reconstruction,
         ekf_result_acc=ekf_result_acc,
@@ -4977,7 +5437,9 @@ def main() -> None:
             f"non-zero = {int(dyn_vs_acc_diagnostics['qddot_root_dyn_minus_acc_norm_nonzero_frames'])}"
         )
         if int(dyn_vs_acc_diagnostics["n_root"]) == 0:
-            print("Avertissement: `biorbd` rapporte nbRoot = 0 pour ce bioMod, donc la branche DYN n'agit actuellement sur aucun DoF racine.")
+            print(
+                "Avertissement: `biorbd` rapporte nbRoot = 0 pour ce bioMod, donc la branche DYN n'agit actuellement sur aucun DoF racine."
+            )
     if ekf_result_flip_acc is not None:
         flip_acc_counts = ekf_result_flip_acc.get("update_status_counts", {})
         print(

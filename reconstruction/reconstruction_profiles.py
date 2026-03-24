@@ -16,15 +16,34 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
-from reconstruction.reconstruction_registry import infer_dataset_name, reconstruction_output_dir, scan_dataset_dirs, scan_reconstruction_dirs, slugify
+from reconstruction.reconstruction_registry import (
+    infer_dataset_name,
+    reconstruction_output_dir,
+    scan_dataset_dirs,
+    scan_reconstruction_dirs,
+    slugify,
+)
 
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
-SUPPORTED_TRIANGULATION_METHODS = ("exhaustive", "greedy")
-SUPPORTED_COHERENCE_METHODS = ("epipolar", "triangulation")
-SUPPORTED_BIORBD_KALMAN_INIT_METHODS = ("none", "triangulation_ik", "triangulation_ik_root_translation", "root_translation_zero_rest", "root_pose_zero_rest")
+SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
+SUPPORTED_COHERENCE_METHODS = (
+    "epipolar",
+    "triangulation",
+    "triangulation_once",
+    "triangulation_greedy",
+    "triangulation_exhaustive",
+)
+SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
+    "none",
+    "triangulation_ik",
+    "triangulation_ik_root_translation",
+    "root_translation_zero_rest",
+    "root_pose_zero_rest",
+)
+SUPPORTED_FRAME_STRIDES = (1, 2, 3, 4)
 DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
 
 
@@ -33,6 +52,7 @@ class ReconstructionProfile:
     name: str
     family: str
     camera_names: list[str] | None = None
+    frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
     ekf2d_initial_state_method: str = "ekf_bootstrap"
@@ -68,6 +88,7 @@ class ReconstructionProfile:
     enabled: bool = True
     extra_args: list[str] | None = None
 
+
 def canonical_profile_name(profile: ReconstructionProfile) -> str:
     parts = [profile.family]
     if profile.family == "pose2sim":
@@ -83,6 +104,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("rootq0")
         if int(profile.ekf2d_bootstrap_passes) != 5:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
+        if profile.coherence_method != "epipolar":
+            parts.append(f"coh_{profile.coherence_method}")
         if profile.flip:
             parts.append("flip")
         if profile.dof_locking:
@@ -125,6 +148,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if int(profile.frame_stride) != 1:
+        parts.append(f"stride{int(profile.frame_stride)}")
     if profile.camera_names:
         parts.append("cams")
         parts.extend(str(name) for name in profile.camera_names)
@@ -142,6 +167,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
+    profile.frame_stride = int(profile.frame_stride)
+    if profile.frame_stride not in SUPPORTED_FRAME_STRIDES:
+        raise ValueError(f"Unsupported frame_stride: {profile.frame_stride}")
     if profile.camera_names is not None:
         normalized_camera_names: list[str] = []
         seen_camera_names: set[str] = set()
@@ -157,12 +185,15 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.pose_filter_window += 1
     if not (0.0 < float(profile.pose_outlier_threshold_ratio) <= 1.0):
         raise ValueError("pose_outlier_threshold_ratio must be in (0, 1].")
-    if not (0.0 <= float(profile.pose_amplitude_lower_percentile) < float(profile.pose_amplitude_upper_percentile) <= 100.0):
+    if not (
+        0.0 <= float(profile.pose_amplitude_lower_percentile) < float(profile.pose_amplitude_upper_percentile) <= 100.0
+    ):
         raise ValueError("Amplitude percentiles must satisfy 0 <= lower < upper <= 100.")
 
     if profile.family == "pose2sim":
         profile.pose_data_mode = "cleaned"
         profile.triangulation_method = "exhaustive"
+        profile.frame_stride = 1
     if profile.family == "ekf_2d":
         profile.predictor = profile.predictor or "acc"
         if profile.predictor not in SUPPORTED_PREDICTORS:
@@ -235,15 +266,40 @@ def example_profiles() -> list[ReconstructionProfile]:
     examples = [
         ReconstructionProfile(name="pose2sim", family="pose2sim", initial_rotation_correction=False),
         ReconstructionProfile(name="pose2sim_rotfix", family="pose2sim", initial_rotation_correction=True),
-        ReconstructionProfile(name="ekf_2d_acc_flip_lock_filtered", family="ekf_2d", predictor="acc", flip=True, dof_locking=True, pose_data_mode="filtered"),
-        ReconstructionProfile(name="ekf_2d_acc_flip_lock", family="ekf_2d", predictor="acc", flip=True, dof_locking=True, pose_data_mode="cleaned"),
+        ReconstructionProfile(
+            name="ekf_2d_acc_flip_lock_filtered",
+            family="ekf_2d",
+            predictor="acc",
+            flip=True,
+            dof_locking=True,
+            pose_data_mode="filtered",
+        ),
+        ReconstructionProfile(
+            name="ekf_2d_acc_flip_lock",
+            family="ekf_2d",
+            predictor="acc",
+            flip=True,
+            dof_locking=True,
+            pose_data_mode="cleaned",
+        ),
         ReconstructionProfile(name="ekf_2d_acc", family="ekf_2d", predictor="acc", pose_data_mode="cleaned"),
-        ReconstructionProfile(name="ekf_2d_acc_bootstrap1", family="ekf_2d", predictor="acc", pose_data_mode="cleaned", ekf2d_3d_source="first_frame_only"),
+        ReconstructionProfile(
+            name="ekf_2d_acc_bootstrap1",
+            family="ekf_2d",
+            predictor="acc",
+            pose_data_mode="cleaned",
+            ekf2d_3d_source="first_frame_only",
+        ),
         ReconstructionProfile(name="ekf_3d_filtered", family="ekf_3d", pose_data_mode="filtered"),
         ReconstructionProfile(name="ekf_3d_flip", family="ekf_3d", flip=True, pose_data_mode="cleaned"),
         ReconstructionProfile(name="ekf_3d", family="ekf_3d", pose_data_mode="cleaned"),
-        ReconstructionProfile(name="triangulation_exhaustive", family="triangulation", triangulation_method="exhaustive"),
-        ReconstructionProfile(name="triangulation_exhaustive_flip", family="triangulation", triangulation_method="exhaustive", flip=True),
+        ReconstructionProfile(
+            name="triangulation_exhaustive", family="triangulation", triangulation_method="exhaustive"
+        ),
+        ReconstructionProfile(
+            name="triangulation_exhaustive_flip", family="triangulation", triangulation_method="exhaustive", flip=True
+        ),
+        ReconstructionProfile(name="triangulation_once", family="triangulation", triangulation_method="once"),
         ReconstructionProfile(name="triangulation_greedy", family="triangulation", triangulation_method="greedy"),
     ]
     return [validate_profile(profile) for profile in examples]
@@ -349,7 +405,9 @@ def variant_output_dir(
     pose2sim_trc: Path | None = None,
 ) -> Path:
     profile = validate_profile(profile)
-    dataset_name = infer_dataset_name(keypoints_path=keypoints_path, pose2sim_trc=pose2sim_trc, dataset_name=dataset_name)
+    dataset_name = infer_dataset_name(
+        keypoints_path=keypoints_path, pose2sim_trc=pose2sim_trc, dataset_name=dataset_name
+    )
     return reconstruction_output_dir(output_root, dataset_name, profile.name)
 
 
@@ -387,6 +445,8 @@ def build_pipeline_command(
         str(out_dir),
         "--pose-data-mode",
         profile.pose_data_mode,
+        "--frame-stride",
+        str(profile.frame_stride),
         "--triangulation-method",
         profile.triangulation_method,
         "--coherence-method",

@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""Execution-deduction helpers used by the GUI execution-analysis tab.
+
+The current implementation keeps a pragmatic scope:
+- it reuses the DD jump segmentation to isolate complete elements;
+- it computes a small set of discrete FIG-like deductions;
+- it localizes each deduction to one representative frame and body region so
+  the GUI can highlight the error in 3D and 2D.
+
+This module is intentionally conservative. The resulting deductions are meant
+to support inspection and iterative development of the judging workflow, not
+to claim full FIG compliance yet.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.signal import butter, filtfilt
+
+from judging.dd_analysis import DDSessionAnalysis, JumpSegment
+from vitpose_ekf_pipeline import KP_INDEX
+
+DEG10 = np.deg2rad(10.0)
+DEG20 = np.deg2rad(20.0)
+DEG45 = np.deg2rad(45.0)
+DEG90 = np.deg2rad(90.0)
+DEG135 = np.deg2rad(135.0)
+DEG170 = np.deg2rad(170.0)
+
+EXECUTION_HIP_DOF_NAMES = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
+EXECUTION_KNEE_DOF_NAMES = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
+ROOT_TILT_DOF_NAME = "TRUNK:RotX"
+ROOT_TRANSLATION_VELOCITY_NAMES = ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ")
+
+
+@dataclass
+class ExecutionDeductionEvent:
+    """One localized deduction ready for display in the GUI."""
+
+    code: str
+    label: str
+    deduction: float
+    frame_idx: int
+    local_frame_idx: int
+    metric_value: float
+    metric_unit: str
+    detail: str
+    keypoint_names: tuple[str, ...]
+
+
+@dataclass
+class ExecutionJumpAnalysis:
+    """Per-jump execution deductions and the local metrics used to derive them."""
+
+    jump_index: int
+    segment: JumpSegment
+    classification: str
+    total_deduction: float
+    capped_deduction: float
+    event_frame_idx: int
+    deduction_events: list[ExecutionDeductionEvent]
+    metric_time_s: np.ndarray
+    metric_series: dict[str, np.ndarray]
+
+
+@dataclass
+class ExecutionSessionAnalysis:
+    """Execution deductions over a full trial."""
+
+    jumps: list[ExecutionJumpAnalysis]
+    total_deduction: float
+    execution_score: float
+    time_of_flight_s: float
+
+
+def lowpass_filter(signal: np.ndarray, fs: float, fc: float = 10.0) -> np.ndarray:
+    """Apply a simple low-pass filter to mimic judge perception."""
+
+    signal = np.asarray(signal, dtype=float)
+    if signal.shape[-1] < 4 or fs <= 0.0:
+        return np.array(signal, copy=True)
+    normalized_cutoff = float(fc) / (0.5 * float(fs))
+    if not np.isfinite(normalized_cutoff) or normalized_cutoff <= 0.0:
+        return np.array(signal, copy=True)
+    normalized_cutoff = min(normalized_cutoff, 0.99)
+    b, a = butter(2, normalized_cutoff, btype="low")
+    min_length = 3 * max(len(a), len(b))
+    if signal.shape[-1] <= min_length:
+        return np.array(signal, copy=True)
+    return filtfilt(b, a, signal, axis=-1)
+
+
+def quantize_fig(value: float, thresholds: list[tuple[float, float]]) -> float:
+    """Convert one continuous metric into a discrete FIG deduction."""
+
+    for threshold, deduction in thresholds:
+        if value < threshold:
+            return deduction
+    return thresholds[-1][1]
+
+
+def deduction_form_discrete(knee_angle: np.ndarray, hip_angle: np.ndarray) -> float:
+    """Compute the discrete body-form deduction from knee and hip angles."""
+
+    deduction = 0.0
+    knee_error = np.mean(np.abs(np.pi - np.asarray(knee_angle, dtype=float)))
+    if knee_error > DEG10:
+        deduction += 0.1
+    if knee_error > DEG20:
+        deduction += 0.1
+
+    hip_error = np.mean(np.abs(np.pi - np.asarray(hip_angle, dtype=float)))
+    if hip_error > DEG10:
+        deduction += 0.1
+
+    return min(0.5, deduction)
+
+
+def deduction_opening_discrete(hip_angle: np.ndarray, time: np.ndarray) -> float:
+    """Compute the opening deduction from the timing of the return to straight."""
+
+    error = np.abs(np.asarray(hip_angle, dtype=float) - np.pi)
+    idx_open = int(np.nanargmin(error)) if error.size else 0
+    ratio = 0.0 if len(time) == 0 else float(idx_open) / float(len(time))
+    if ratio < 0.6:
+        return 0.0
+    if ratio < 0.75:
+        return 0.1
+    if ratio < 0.9:
+        return 0.2
+    return 0.3
+
+
+def deduction_pike_down_discrete(hip_angle: np.ndarray) -> float:
+    """Compute the pike-down deduction from the minimum hip angle."""
+
+    min_angle = float(np.nanmin(np.asarray(hip_angle, dtype=float)))
+    if min_angle > DEG170:
+        return 0.0
+    if min_angle > DEG135:
+        return 0.1
+    return 0.2
+
+
+def deduction_arms_discrete(arm_angle: np.ndarray) -> float:
+    """Compute the arm-position deduction."""
+
+    if np.nanmax(np.asarray(arm_angle, dtype=float)) > DEG90:
+        return 0.1
+    return 0.0
+
+
+def deduction_axis_discrete(root_tilt: np.ndarray) -> float:
+    """Compute the axis-control deduction from tilt variability."""
+
+    root_tilt = np.asarray(root_tilt, dtype=float)
+    if not np.any(np.isfinite(root_tilt)):
+        return 0.0
+    variance = float(np.nanvar(root_tilt))
+    return quantize_fig(
+        variance,
+        [
+            (0.01, 0.0),
+            (0.03, 0.1),
+            (0.06, 0.2),
+            (0.1, 0.3),
+            (np.inf, 0.5),
+        ],
+    )
+
+
+def deduction_landing_discrete(root_velocity_norm: float) -> float:
+    """Compute the landing deduction from root translational speed."""
+
+    velocity = float(root_velocity_norm)
+    if velocity < 0.5:
+        return 0.0
+    if velocity < 1.0:
+        return 0.1
+    if velocity < 2.0:
+        return 0.2
+    return 0.3
+
+
+def deduction_fall(contact_type: str) -> float:
+    """Return the extra deduction associated with a fall or invalid landing."""
+
+    if contact_type == "hands":
+        return 0.5
+    if contact_type in {"knees", "out"}:
+        return 1.0
+    return 0.0
+
+
+def _safe_name_to_index(q_names: list[str] | np.ndarray) -> dict[str, int]:
+    """Build a robust DoF lookup dictionary from q-name labels."""
+
+    return {str(name): idx for idx, name in enumerate(np.asarray(q_names, dtype=object))}
+
+
+def _optional_dof_indices(q_names: list[str] | np.ndarray, names: tuple[str, ...]) -> list[int]:
+    """Return the subset of DoF indices present in the trajectory."""
+
+    name_to_index = _safe_name_to_index(q_names)
+    return [name_to_index[name] for name in names if name in name_to_index]
+
+
+def _vector_angle(vectors_a: np.ndarray, vectors_b: np.ndarray) -> np.ndarray:
+    """Return the frame-wise angle between two vector series."""
+
+    vectors_a = np.asarray(vectors_a, dtype=float)
+    vectors_b = np.asarray(vectors_b, dtype=float)
+    if vectors_a.shape != vectors_b.shape:
+        raise ValueError("Both vector series must share the same shape.")
+    norms_a = np.linalg.norm(vectors_a, axis=-1)
+    norms_b = np.linalg.norm(vectors_b, axis=-1)
+    denom = norms_a * norms_b
+    cosine = np.full(vectors_a.shape[:-1], np.nan, dtype=float)
+    valid = (
+        np.all(np.isfinite(vectors_a), axis=-1)
+        & np.all(np.isfinite(vectors_b), axis=-1)
+        & np.isfinite(denom)
+        & (denom > 1e-12)
+    )
+    if np.any(valid):
+        cosine[valid] = np.sum(vectors_a[valid] * vectors_b[valid], axis=-1) / denom[valid]
+    return np.arccos(np.clip(cosine, -1.0, 1.0))
+
+
+def _midpoint(points_a: np.ndarray, points_b: np.ndarray) -> np.ndarray:
+    """Return the midpoint between two point trajectories."""
+
+    return 0.5 * (np.asarray(points_a, dtype=float) + np.asarray(points_b, dtype=float))
+
+
+def _joint_angle_series(
+    points_proximal: np.ndarray,
+    points_joint: np.ndarray,
+    points_distal: np.ndarray,
+) -> np.ndarray:
+    """Return the internal joint angle defined by three point series."""
+
+    return _vector_angle(
+        np.asarray(points_proximal, dtype=float) - np.asarray(points_joint, dtype=float),
+        np.asarray(points_distal, dtype=float) - np.asarray(points_joint, dtype=float),
+    )
+
+
+def knee_angle_series(points_3d: np.ndarray) -> np.ndarray:
+    """Estimate the average internal knee angle from left and right leg markers."""
+
+    points_3d = np.asarray(points_3d, dtype=float)
+    left = _joint_angle_series(
+        points_3d[:, KP_INDEX["left_hip"], :],
+        points_3d[:, KP_INDEX["left_knee"], :],
+        points_3d[:, KP_INDEX["left_ankle"], :],
+    )
+    right = _joint_angle_series(
+        points_3d[:, KP_INDEX["right_hip"], :],
+        points_3d[:, KP_INDEX["right_knee"], :],
+        points_3d[:, KP_INDEX["right_ankle"], :],
+    )
+    return np.nanmean(np.column_stack((left, right)), axis=1)
+
+
+def hip_angle_series(points_3d: np.ndarray) -> np.ndarray:
+    """Estimate the average internal hip angle from trunk and thigh directions."""
+
+    points_3d = np.asarray(points_3d, dtype=float)
+    shoulder_center = _midpoint(points_3d[:, KP_INDEX["left_shoulder"], :], points_3d[:, KP_INDEX["right_shoulder"], :])
+    left = _joint_angle_series(
+        shoulder_center,
+        points_3d[:, KP_INDEX["left_hip"], :],
+        points_3d[:, KP_INDEX["left_knee"], :],
+    )
+    right = _joint_angle_series(
+        shoulder_center,
+        points_3d[:, KP_INDEX["right_hip"], :],
+        points_3d[:, KP_INDEX["right_knee"], :],
+    )
+    return np.nanmean(np.column_stack((left, right)), axis=1)
+
+
+def arm_raise_series(points_3d: np.ndarray) -> np.ndarray:
+    """Estimate how far the upper arms move away from the trunk."""
+
+    points_3d = np.asarray(points_3d, dtype=float)
+    hip_center = _midpoint(points_3d[:, KP_INDEX["left_hip"], :], points_3d[:, KP_INDEX["right_hip"], :])
+    left = _vector_angle(
+        points_3d[:, KP_INDEX["left_elbow"], :] - points_3d[:, KP_INDEX["left_shoulder"], :],
+        hip_center - points_3d[:, KP_INDEX["left_shoulder"], :],
+    )
+    right = _vector_angle(
+        points_3d[:, KP_INDEX["right_elbow"], :] - points_3d[:, KP_INDEX["right_shoulder"], :],
+        hip_center - points_3d[:, KP_INDEX["right_shoulder"], :],
+    )
+    return np.nanmean(np.column_stack((left, right)), axis=1)
+
+
+def root_tilt_series(q_series: np.ndarray, q_names: list[str] | np.ndarray) -> np.ndarray:
+    """Extract the root tilt DoF from the generalized coordinates."""
+
+    q_series = np.asarray(q_series, dtype=float)
+    name_to_index = _safe_name_to_index(q_names)
+    tilt_idx = name_to_index.get(ROOT_TILT_DOF_NAME)
+    if tilt_idx is None:
+        return np.full(q_series.shape[0], np.nan, dtype=float)
+    return q_series[:, tilt_idx]
+
+
+def root_translation_velocity_series(qdot_series: np.ndarray, q_names: list[str] | np.ndarray) -> np.ndarray:
+    """Extract the root translational velocity norm from qdot."""
+
+    qdot_series = np.asarray(qdot_series, dtype=float)
+    translation_indices = _optional_dof_indices(q_names, ROOT_TRANSLATION_VELOCITY_NAMES)
+    if len(translation_indices) != len(ROOT_TRANSLATION_VELOCITY_NAMES):
+        return np.full(qdot_series.shape[0], np.nan, dtype=float)
+    velocity_xyz = qdot_series[:, translation_indices]
+    return np.linalg.norm(velocity_xyz, axis=1)
+
+
+def root_vertical_translation_series(q_series: np.ndarray, q_names: list[str] | np.ndarray) -> np.ndarray:
+    """Extract the root vertical translation used for time-of-flight scoring."""
+
+    q_series = np.asarray(q_series, dtype=float)
+    name_to_index = _safe_name_to_index(q_names)
+    translation_z_idx = name_to_index.get("TRUNK:TransZ")
+    if translation_z_idx is None:
+        return np.full(q_series.shape[0], np.nan, dtype=float)
+    return q_series[:, translation_z_idx]
+
+
+def detect_contacts_velocity(Tz: np.ndarray, time: np.ndarray) -> list[int]:
+    """Detect likely trampoline-contact instants from the vertical root trajectory.
+
+    The heuristic looks for local minima where vertical velocity changes from
+    descending to ascending. This keeps the implementation lightweight while
+    staying robust enough for session-level time-of-flight summaries.
+    """
+
+    Tz = np.asarray(Tz, dtype=float)
+    time = np.asarray(time, dtype=float)
+    if Tz.ndim != 1 or time.ndim != 1 or Tz.shape[0] != time.shape[0] or Tz.shape[0] < 3:
+        return []
+
+    valid = np.isfinite(Tz) & np.isfinite(time)
+    if np.count_nonzero(valid) < 3:
+        return []
+
+    valid_indices = np.flatnonzero(valid)
+    tz_valid = Tz[valid]
+    time_valid = time[valid]
+    contact_indices: list[int] = []
+    if tz_valid[0] <= tz_valid[1]:
+        contact_indices.append(int(valid_indices[0]))
+
+    delta_tz = np.diff(tz_valid)
+    minima_mask = (delta_tz[:-1] < 0.0) & (delta_tz[1:] >= 0.0)
+    for local_min_idx in np.flatnonzero(minima_mask) + 1:
+        contact_indices.append(int(valid_indices[local_min_idx]))
+
+    if tz_valid[-1] <= tz_valid[-2]:
+        contact_indices.append(int(valid_indices[-1]))
+
+    if not contact_indices:
+        return []
+
+    deduplicated: list[int] = [contact_indices[0]]
+    for frame_idx in contact_indices[1:]:
+        if frame_idx != deduplicated[-1]:
+            deduplicated.append(frame_idx)
+    return deduplicated
+
+
+def compute_time_of_flight_robust(Tz: np.ndarray, time: np.ndarray) -> float:
+    """Return the summed time between robustly detected contact instants.
+
+    Small gaps are ignored to avoid counting micro-bounces as full elements.
+    """
+
+    contacts = detect_contacts_velocity(Tz, time)
+    if len(contacts) < 2:
+        return 0.0
+
+    total = 0.0
+    for contact_idx, next_contact_idx in zip(contacts[:-1], contacts[1:]):
+        dt = float(time[next_contact_idx] - time[contact_idx])
+        if dt > 0.2:
+            total += dt
+    return total
+
+
+def execution_focus_frame(jump: ExecutionJumpAnalysis) -> int:
+    """Return the frame that should drive the 3D/2D execution preview."""
+
+    if jump.deduction_events:
+        return int(max(jump.deduction_events, key=lambda event: event.deduction).frame_idx)
+    return int(jump.event_frame_idx)
+
+
+def _event(
+    *,
+    code: str,
+    label: str,
+    deduction: float,
+    segment: JumpSegment,
+    local_frame_idx: int,
+    metric_value: float,
+    metric_unit: str,
+    detail: str,
+    keypoint_names: tuple[str, ...],
+) -> ExecutionDeductionEvent:
+    """Build one localized deduction event."""
+
+    local_frame_idx = int(np.clip(local_frame_idx, 0, max(segment.end - segment.start, 0)))
+    return ExecutionDeductionEvent(
+        code=code,
+        label=label,
+        deduction=float(deduction),
+        frame_idx=int(segment.start + local_frame_idx),
+        local_frame_idx=local_frame_idx,
+        metric_value=float(metric_value),
+        metric_unit=str(metric_unit),
+        detail=str(detail),
+        keypoint_names=tuple(str(name) for name in keypoint_names),
+    )
+
+
+def compute_execution_jump_analysis(
+    *,
+    jump_index: int,
+    segment: JumpSegment,
+    classification: str,
+    q_series: np.ndarray,
+    qdot_series: np.ndarray | None,
+    q_names: list[str] | np.ndarray,
+    points_3d: np.ndarray,
+    fs: float,
+) -> ExecutionJumpAnalysis:
+    """Compute localized execution deductions for one jump segment."""
+
+    q_slice = np.asarray(q_series[segment.start : segment.end + 1], dtype=float)
+    points_slice = np.asarray(points_3d[segment.start : segment.end + 1], dtype=float)
+    time_local = np.arange(q_slice.shape[0], dtype=float) / max(float(fs), 1.0)
+    q_filtered = lowpass_filter(q_slice.T, fs).T if q_slice.size else q_slice
+    points_filtered = lowpass_filter(np.moveaxis(points_slice, 0, -1), fs)
+    points_filtered = np.moveaxis(points_filtered, -1, 0)
+
+    knee_series_rad = knee_angle_series(points_filtered)
+    hip_series_rad = hip_angle_series(points_filtered)
+    arm_series_rad = arm_raise_series(points_filtered)
+    tilt_series_rad = root_tilt_series(q_filtered, q_names)
+    landing_speed_series = (
+        root_translation_velocity_series(np.asarray(qdot_series, dtype=float), q_names)
+        if qdot_series is not None and np.asarray(qdot_series).size
+        else np.full(q_series.shape[0], np.nan, dtype=float)
+    )
+    landing_speed_local = landing_speed_series[segment.start : segment.end + 1]
+
+    metric_series = {
+        "knee_error_deg": np.rad2deg(np.abs(np.pi - knee_series_rad)),
+        "hip_error_deg": np.rad2deg(np.abs(np.pi - hip_series_rad)),
+        "hip_angle_deg": np.rad2deg(hip_series_rad),
+        "arm_raise_deg": np.rad2deg(arm_series_rad),
+        "tilt_deg": np.rad2deg(tilt_series_rad),
+        "landing_speed_mps": landing_speed_local,
+    }
+
+    events: list[ExecutionDeductionEvent] = []
+
+    knee_error_series = np.abs(np.pi - knee_series_rad)
+    hip_error_series = np.abs(np.pi - hip_series_rad)
+    mean_knee_error = float(np.nanmean(knee_error_series))
+    mean_hip_error = float(np.nanmean(hip_error_series))
+    if np.isfinite(mean_knee_error) and mean_knee_error > DEG10:
+        local_idx = int(np.nanargmax(knee_error_series))
+        deduction = 0.2 if mean_knee_error > DEG20 else 0.1
+        events.append(
+            _event(
+                code="form_knees",
+                label="Leg form",
+                deduction=deduction,
+                segment=segment,
+                local_frame_idx=local_idx,
+                metric_value=np.rad2deg(knee_error_series[local_idx]),
+                metric_unit="deg",
+                detail="Knee extension error exceeds the FIG form threshold.",
+                keypoint_names=("left_hip", "left_knee", "left_ankle", "right_hip", "right_knee", "right_ankle"),
+            )
+        )
+    if np.isfinite(mean_hip_error) and mean_hip_error > DEG10:
+        local_idx = int(np.nanargmax(hip_error_series))
+        events.append(
+            _event(
+                code="form_hips",
+                label="Body straightness",
+                deduction=0.1,
+                segment=segment,
+                local_frame_idx=local_idx,
+                metric_value=np.rad2deg(hip_error_series[local_idx]),
+                metric_unit="deg",
+                detail="Hip angle departs from a straight body line.",
+                keypoint_names=("left_shoulder", "right_shoulder", "left_hip", "right_hip", "left_knee", "right_knee"),
+            )
+        )
+
+    if hip_series_rad.size:
+        opening_idx = int(np.nanargmin(hip_error_series))
+        opening_ratio = float(opening_idx) / float(max(len(time_local), 1))
+        opening_deduction = deduction_opening_discrete(hip_series_rad, time_local)
+        if opening_deduction > 0.0:
+            events.append(
+                _event(
+                    code="opening",
+                    label="Late opening",
+                    deduction=opening_deduction,
+                    segment=segment,
+                    local_frame_idx=opening_idx,
+                    metric_value=opening_ratio,
+                    metric_unit="ratio",
+                    detail="The return to a straight body happens late in the element.",
+                    keypoint_names=(
+                        "left_shoulder",
+                        "right_shoulder",
+                        "left_hip",
+                        "right_hip",
+                        "left_knee",
+                        "right_knee",
+                    ),
+                )
+            )
+
+        pike_deduction = deduction_pike_down_discrete(hip_series_rad)
+        if pike_deduction > 0.0:
+            pike_idx = int(np.nanargmin(hip_series_rad))
+            events.append(
+                _event(
+                    code="pike_down",
+                    label="Pike down",
+                    deduction=pike_deduction,
+                    segment=segment,
+                    local_frame_idx=pike_idx,
+                    metric_value=np.rad2deg(hip_series_rad[pike_idx]),
+                    metric_unit="deg",
+                    detail="The hip angle reaches a visible pike-down configuration.",
+                    keypoint_names=(
+                        "left_shoulder",
+                        "right_shoulder",
+                        "left_hip",
+                        "right_hip",
+                        "left_knee",
+                        "right_knee",
+                    ),
+                )
+            )
+
+    if arm_series_rad.size and np.nanmax(arm_series_rad) > DEG90:
+        arm_idx = int(np.nanargmax(arm_series_rad))
+        events.append(
+            _event(
+                code="arms",
+                label="Arm position",
+                deduction=0.1,
+                segment=segment,
+                local_frame_idx=arm_idx,
+                metric_value=np.rad2deg(arm_series_rad[arm_idx]),
+                metric_unit="deg",
+                detail="Arms move visibly away from the trunk line.",
+                keypoint_names=(
+                    "left_shoulder",
+                    "left_elbow",
+                    "left_wrist",
+                    "right_shoulder",
+                    "right_elbow",
+                    "right_wrist",
+                ),
+            )
+        )
+
+    axis_deduction = deduction_axis_discrete(tilt_series_rad)
+    if axis_deduction > 0.0 and tilt_series_rad.size and np.any(np.isfinite(tilt_series_rad)):
+        tilt_idx = int(np.nanargmax(np.abs(tilt_series_rad)))
+        events.append(
+            _event(
+                code="axis",
+                label="Axis control",
+                deduction=axis_deduction,
+                segment=segment,
+                local_frame_idx=tilt_idx,
+                metric_value=np.rad2deg(np.abs(tilt_series_rad[tilt_idx])),
+                metric_unit="deg",
+                detail="Root tilt varies enough to trigger an axis-control deduction.",
+                keypoint_names=("left_shoulder", "right_shoulder", "left_hip", "right_hip"),
+            )
+        )
+
+    if landing_speed_local.size:
+        landing_local_idx = landing_speed_local.shape[0] - 1
+        landing_speed = landing_speed_local[landing_local_idx]
+        landing_deduction = deduction_landing_discrete(landing_speed)
+        if landing_deduction > 0.0:
+            events.append(
+                _event(
+                    code="landing",
+                    label="Landing control",
+                    deduction=landing_deduction,
+                    segment=segment,
+                    local_frame_idx=landing_local_idx,
+                    metric_value=landing_speed,
+                    metric_unit="m/s",
+                    detail="Root translational speed remains high at landing.",
+                    keypoint_names=("left_ankle", "right_ankle", "left_hip", "right_hip"),
+                )
+            )
+
+    total_deduction = float(sum(event.deduction for event in events))
+    capped_deduction = float(min(0.5, total_deduction))
+    focus_local_idx = int(segment.peak_index - segment.start)
+    if events:
+        focus_local_idx = int(max(events, key=lambda event: event.deduction).local_frame_idx)
+    return ExecutionJumpAnalysis(
+        jump_index=int(jump_index),
+        segment=segment,
+        classification=str(classification),
+        total_deduction=total_deduction,
+        capped_deduction=capped_deduction,
+        event_frame_idx=int(segment.start + focus_local_idx),
+        deduction_events=events,
+        metric_time_s=time_local,
+        metric_series=metric_series,
+    )
+
+
+def analyze_execution_session(
+    dd_session: DDSessionAnalysis,
+    q_series: np.ndarray,
+    qdot_series: np.ndarray | None,
+    q_names: list[str] | np.ndarray,
+    points_3d: np.ndarray,
+    fs: float,
+) -> ExecutionSessionAnalysis:
+    """Compute execution deductions over all complete jumps in one trial."""
+
+    q_series = np.asarray(q_series, dtype=float)
+    points_3d = np.asarray(points_3d, dtype=float)
+    qdot_series = None if qdot_series is None else np.asarray(qdot_series, dtype=float)
+    jumps: list[ExecutionJumpAnalysis] = []
+    for jump_index, segment in enumerate(dd_session.jump_segments, start=1):
+        classification = (
+            dd_session.jumps[jump_index - 1].classification if jump_index - 1 < len(dd_session.jumps) else "-"
+        )
+        jumps.append(
+            compute_execution_jump_analysis(
+                jump_index=jump_index,
+                segment=segment,
+                classification=classification,
+                q_series=q_series,
+                qdot_series=qdot_series,
+                q_names=q_names,
+                points_3d=points_3d,
+                fs=fs,
+            )
+        )
+    total_deduction = float(sum(jump.capped_deduction for jump in jumps))
+    time = np.arange(q_series.shape[0], dtype=float) / max(float(fs), 1.0)
+    root_tz = root_vertical_translation_series(q_series, q_names)
+    return ExecutionSessionAnalysis(
+        jumps=jumps,
+        total_deduction=total_deduction,
+        execution_score=max(0.0, 20.0 - total_deduction),
+        time_of_flight_s=compute_time_of_flight_robust(root_tz, time),
+    )

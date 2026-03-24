@@ -16,6 +16,7 @@ from kinematics.root_kinematics import (
     reextract_euler_with_gaps,
     unwrap_with_gaps,
 )
+
 DEFAULT_HIP_DOFS = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
 DEFAULT_KNEE_DOFS = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 
@@ -69,6 +70,7 @@ class DDSessionAnalysis:
     airborne_regions: list[tuple[int, int]]
     jump_segments: list[JumpSegment]
     jumps: list[DDJumpAnalysis]
+    analysis_start_frame: int = 0
 
 
 def smooth_signal(signal: np.ndarray, window_frames: int) -> np.ndarray:
@@ -132,7 +134,9 @@ def local_minimum_index(height: np.ndarray, center: int, left_limit: int, right_
     return int(start + np.argmin(height[start : end + 1]))
 
 
-def refine_jump_boundaries(height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int) -> list[JumpSegment]:
+def refine_jump_boundaries(
+    height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int
+) -> list[JumpSegment]:
     """Refine jump limits around airborne regions using nearby local minima."""
 
     segments: list[JumpSegment] = []
@@ -140,9 +144,15 @@ def refine_jump_boundaries(height: np.ndarray, airborne_regions: list[tuple[int,
         return segments
     previous_end = 0
     for region_idx, (start, end) in enumerate(airborne_regions):
-        next_region_start = airborne_regions[region_idx + 1][0] if region_idx + 1 < len(airborne_regions) else len(height) - 1
-        jump_start = local_minimum_index(height, center=start, left_limit=previous_end, right_limit=start, window_frames=contact_window_frames)
-        jump_end = local_minimum_index(height, center=end, left_limit=end, right_limit=next_region_start, window_frames=contact_window_frames)
+        next_region_start = (
+            airborne_regions[region_idx + 1][0] if region_idx + 1 < len(airborne_regions) else len(height) - 1
+        )
+        jump_start = local_minimum_index(
+            height, center=start, left_limit=previous_end, right_limit=start, window_frames=contact_window_frames
+        )
+        jump_end = local_minimum_index(
+            height, center=end, left_limit=end, right_limit=next_region_start, window_frames=contact_window_frames
+        )
         peak_index = int(jump_start + np.argmax(height[jump_start : jump_end + 1]))
         segments.append(JumpSegment(start=jump_start, end=jump_end, peak_index=peak_index))
         previous_end = jump_end
@@ -169,6 +179,31 @@ def filter_jump_segments(
         peak_h = float(height[segment.peak_index])
         prominence = peak_h - max(start_h, end_h)
         if prominence < min_peak_prominence_m:
+            continue
+        kept.append(segment)
+    return kept
+
+
+def filter_complete_jump_segments(
+    segments: list[JumpSegment],
+    *,
+    analysis_start_frame: int,
+    frame_count: int,
+) -> list[JumpSegment]:
+    """Keep only complete jumps with visible take-off and landing bounds.
+
+    A jump is considered complete when its start boundary is strictly after the
+    analysis start frame and its landing boundary occurs before the final frame.
+    This removes edge-truncated jumps that start before the inspected window or
+    end after the available sequence.
+    """
+
+    kept: list[JumpSegment] = []
+    last_frame_index = max(int(frame_count) - 1, 0)
+    for segment in segments:
+        if segment.start <= int(analysis_start_frame):
+            continue
+        if segment.end >= last_frame_index:
             continue
         kept.append(segment)
     return kept
@@ -416,14 +451,18 @@ def analyze_single_jump(
     som, tw, tilt = compute_angles_over_jump(root_q, segment.start, segment.end, angle_mode=angle_mode)
     som_turns = float((som[-1] - som[0]) / (2.0 * np.pi)) if np.count_nonzero(np.isfinite(som)) >= 2 else float("nan")
     twist_turns = float((tw[-1] - tw[0]) / (2.0 * np.pi)) if np.count_nonzero(np.isfinite(tw)) >= 2 else float("nan")
-    classification = classify_jump(som_turns, twist_turns) if np.isfinite(som_turns) and np.isfinite(twist_turns) else "unknown"
+    classification = (
+        classify_jump(som_turns, twist_turns) if np.isfinite(som_turns) and np.isfinite(twist_turns) else "unknown"
+    )
 
     total_saltos = abs(round_to_nearest(som_turns, 0.25)) if np.isfinite(som_turns) else float("nan")
     twists_per_salto: list[float] = []
     full_salto_event_indices: list[int] = []
     quarter_salto_event_indices: list[int] = []
     half_twist_event_indices: list[int] = []
-    somersault_curve_turns = (som - som[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(som)) else np.full_like(som, np.nan)
+    somersault_curve_turns = (
+        (som - som[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(som)) else np.full_like(som, np.nan)
+    )
     twist_curve_turns = (tw - tw[0]) / (2.0 * np.pi) if np.count_nonzero(np.isfinite(tw)) else np.full_like(tw, np.nan)
     if np.isfinite(som_turns) and np.isfinite(twist_turns):
         # Event markers are used both for plotting and for DD code construction.
@@ -484,6 +523,8 @@ def analyze_dd_session(
     full_q: np.ndarray | None = None,
     q_names: list[str] | None = None,
     angle_mode: str = "euler",
+    analysis_start_frame: int = 0,
+    require_complete_jumps: bool = True,
 ) -> DDSessionAnalysis:
     """Run the full DD workflow: segmentation, per-jump analysis, and summaries."""
 
@@ -495,12 +536,20 @@ def analyze_dd_session(
     if height_values is None:
         height_values = root_q[:, 2]
     height = np.asarray(height_values, dtype=float)
+    analysis_start_frame = max(0, int(analysis_start_frame))
     window_frames = max(1, int(round(float(smoothing_window_s) * float(fps))))
     smoothed_height = smooth_signal(height, window_frames=window_frames)
-    effective_threshold = float(height_threshold) if height_threshold is not None else relative_height_threshold(smoothed_height, ratio=height_threshold_range_ratio)
+    effective_threshold = (
+        float(height_threshold)
+        if height_threshold is not None
+        else relative_height_threshold(smoothed_height, ratio=height_threshold_range_ratio)
+    )
     airborne_mask = smoothed_height > effective_threshold
+    airborne_mask[:analysis_start_frame] = False
     airborne_regions = contiguous_true_regions(airborne_mask)
-    airborne_regions = merge_close_regions(airborne_regions, max_gap_frames=max(0, int(round(float(min_gap_s) * float(fps)))))
+    airborne_regions = merge_close_regions(
+        airborne_regions, max_gap_frames=max(0, int(round(float(min_gap_s) * float(fps))))
+    )
     segments = refine_jump_boundaries(
         smoothed_height,
         airborne_regions,
@@ -513,6 +562,12 @@ def analyze_dd_session(
         min_airtime_frames=max(1, int(round(float(min_airtime_s) * float(fps)))),
         min_peak_prominence_m=float(min_peak_prominence_m),
     )
+    if require_complete_jumps:
+        segments = filter_complete_jump_segments(
+            segments,
+            analysis_start_frame=analysis_start_frame,
+            frame_count=len(height),
+        )
     dd_debug(
         "analyze_dd_session segmentation "
         f"airborne_regions={len(airborne_regions)} jumps={len(segments)} "
@@ -532,4 +587,5 @@ def analyze_dd_session(
         airborne_regions=airborne_regions,
         jump_segments=segments,
         jumps=jumps,
+        analysis_start_frame=analysis_start_frame,
     )

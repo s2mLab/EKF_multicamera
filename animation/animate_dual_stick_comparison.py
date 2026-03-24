@@ -182,12 +182,26 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs") / "vitpose_full" / "vitpose_chain.bioMod",
         help="Modele biorbd utilise pour convertir les `q` en positions de keypoints",
     )
-    parser.add_argument("--triangulation-fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence supposee pour le NPZ triangule")
+    parser.add_argument(
+        "--triangulation-fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence supposee pour le NPZ triangule"
+    )
     parser.add_argument("--fps", type=float, default=15.0, help="Frequence d'affichage du GIF")
     parser.add_argument("--stride", type=int, default=3, help="Sous-echantillonnage temporel")
     parser.add_argument("--marker-size", type=float, default=12.0, help="Taille des marqueurs affiches dans le GIF")
-    parser.add_argument("--show", nargs="+", default=None, help="Liste des reconstructions a afficher dans l'animation.")
-    parser.add_argument("--show-trunk-frames", action="store_true", help="Affiche les reperes locaux du tronc pour chaque reconstruction.")
+    parser.add_argument(
+        "--framing",
+        choices=("tight", "full"),
+        default="full",
+        help="Cadrage de la vue 3D: adapte a chaque frame ou fixe sur toute la sequence.",
+    )
+    parser.add_argument(
+        "--show", nargs="+", default=None, help="Liste des reconstructions a afficher dans l'animation."
+    )
+    parser.add_argument(
+        "--show-trunk-frames",
+        action="store_true",
+        help="Affiche les reperes locaux du tronc pour chaque reconstruction.",
+    )
     parser.add_argument(
         "--align-root",
         action="store_true",
@@ -291,7 +305,9 @@ def resample_points(points: np.ndarray, source_time: np.ndarray, target_time: np
             valid = np.isfinite(values)
             if np.sum(valid) < 2:
                 continue
-            out[:, marker_idx, axis] = np.interp(target_time, source_time[valid], values[valid], left=np.nan, right=np.nan)
+            out[:, marker_idx, axis] = np.interp(
+                target_time, source_time[valid], values[valid], left=np.nan, right=np.nan
+            )
     return out
 
 
@@ -322,10 +338,16 @@ def resolve_dataset_biomod(dataset_dir: Path, biomod_path: Path | None) -> Path 
     return candidates[0] if candidates else None
 
 
-def load_dataset_reconstructions(dataset_dir: Path, biomod_path: Path | None = None) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
+def load_dataset_reconstructions(
+    dataset_dir: Path, biomod_path: Path | None = None
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, np.ndarray]:
     """Charge toutes les reconstructions 3D disponibles depuis un dossier dataset."""
     entries = load_bundle_entries(dataset_dir)
-    point_entries = [entry for entry in entries if np.asarray(entry["points_3d"]).ndim == 3 and np.asarray(entry["points_3d"]).shape[1] == len(COCO17)]
+    point_entries = [
+        entry
+        for entry in entries
+        if np.asarray(entry["points_3d"]).ndim == 3 and np.asarray(entry["points_3d"]).shape[1] == len(COCO17)
+    ]
     if not point_entries:
         raise ValueError(f"Aucune reconstruction bundle 3D disponible dans {dataset_dir}")
 
@@ -383,7 +405,9 @@ def align_pose2sim_to_triangulation(reference: np.ndarray, moving: np.ndarray) -
     return moving + delta[np.newaxis, np.newaxis, :]
 
 
-def compute_axis_limits(*point_sets: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+def compute_axis_limits(
+    *point_sets: np.ndarray,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """Bornes 3D fixes calculees sur l'ensemble des reconstructions comparees."""
     point_sets = [pts for pts in point_sets if pts is not None]
     flat = np.concatenate([pts.reshape(-1, 3) for pts in point_sets], axis=0)
@@ -397,6 +421,24 @@ def compute_axis_limits(*point_sets: np.ndarray) -> tuple[tuple[float, float], t
         (center[1] - radius, center[1] + radius),
         (center[2] - radius, center[2] + radius),
     )
+
+
+def compute_frame_axis_limits(
+    recon_points: dict[str, np.ndarray], show_names: list[str], frame_idx: int
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Compute 3D limits from the currently displayed frame only."""
+    frame_sets = [
+        recon_points[name][frame_idx : frame_idx + 1] for name in show_names if frame_idx < recon_points[name].shape[0]
+    ]
+    return compute_axis_limits(*frame_sets)
+
+
+def apply_axis_limits(ax, limits: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]) -> None:
+    """Apply precomputed axis limits to a 3D axes."""
+    xlim, ylim, zlim = limits
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    ax.set_zlim(*zlim)
 
 
 def grouped_marker_points(frame_points: np.ndarray) -> dict[str, np.ndarray]:
@@ -439,7 +481,9 @@ def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray
     return origin, np.column_stack((x_axis, y_axis, z_axis))
 
 
-def draw_coordinate_system(ax, origin: np.ndarray, rotation: np.ndarray, scale: float = 0.18, alpha: float = 1.0, line_width: float = 2.0):
+def draw_coordinate_system(
+    ax, origin: np.ndarray, rotation: np.ndarray, scale: float = 0.18, alpha: float = 1.0, line_width: float = 2.0
+):
     colors = ["#d62728", "#2ca02c", "#1f77b4"]
     artists = []
     for axis_idx in range(3):
@@ -470,7 +514,9 @@ def init_artists(ax, color: str, label: str, marker_size: float, line_style: str
     }
     lines = []
     for name_a, name_b in SKELETON_EDGES:
-        (line,) = ax.plot([], [], [], linewidth=edge_linewidth(name_a, name_b), color=color, alpha=0.9, linestyle=line_style)
+        (line,) = ax.plot(
+            [], [], [], linewidth=edge_linewidth(name_a, name_b), color=color, alpha=0.9, linestyle=line_style
+        )
         lines.append(line)
     return scatter, lines
 
@@ -512,6 +558,7 @@ def create_animation(
     show: tuple[str, ...],
     airborne_mask: np.ndarray,
     show_trunk_frames: bool,
+    framing: str,
 ) -> None:
     """Exporte un GIF comparatif pour l'ensemble des reconstructions demandees."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -520,18 +567,18 @@ def create_animation(
     show_names = [name for name in show if name in recon_points]
     if not show_names:
         raise ValueError("Aucune reconstruction selectionnee n'est disponible pour l'animation 3D.")
-    xlim, ylim, zlim = compute_axis_limits(*[recon_points[name] for name in show_names])
+    full_limits = compute_axis_limits(*[recon_points[name] for name in show_names])
 
     artists: dict[str, tuple[object | None, list]] = {}
     for name in show_names:
-        artists[name] = build_artist_group(ax, True, reconstruction_color(name), reconstruction_label(name), marker_size, "-")
+        artists[name] = build_artist_group(
+            ax, True, reconstruction_color(name), reconstruction_label(name), marker_size, "-"
+        )
     trunk_frame_artists: dict[str, list] = {name: [] for name in show_names}
     label = ax.text2D(0.02, 0.95, "", transform=ax.transAxes)
 
     def init():
-        ax.set_xlim(*xlim)
-        ax.set_ylim(*ylim)
-        ax.set_zlim(*zlim)
+        apply_axis_limits(ax, full_limits)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -547,6 +594,10 @@ def create_animation(
 
     def update(frame_idx: int):
         updated = [label]
+        if framing == "tight":
+            apply_axis_limits(ax, compute_frame_axis_limits(recon_points, show_names, frame_idx))
+        else:
+            apply_axis_limits(ax, full_limits)
         for name in show_names:
             for artist in trunk_frame_artists[name]:
                 try:
@@ -564,14 +615,18 @@ def create_animation(
             if show_trunk_frames:
                 origin, rotation = compute_root_frame_from_points(frame_points)
                 if origin is not None and rotation is not None:
-                    trunk_frame_artists[name] = draw_coordinate_system(ax, origin, rotation, scale=0.18, alpha=0.95, line_width=2.2)
+                    trunk_frame_artists[name] = draw_coordinate_system(
+                        ax, origin, rotation, scale=0.18, alpha=0.95, line_width=2.2
+                    )
                     updated.extend(trunk_frame_artists[name])
         phase = "AIR" if airborne_mask[frame_idx] else "TOILE"
         label.set_text(f"t = {time_s[frame_idx]:.2f} s | {phase}")
         return updated
 
     first_name = show_names[0]
-    anim = FuncAnimation(fig, update, init_func=init, frames=recon_points[first_name].shape[0], interval=1000 / fps, blit=False)
+    anim = FuncAnimation(
+        fig, update, init_func=init, frames=recon_points[first_name].shape[0], interval=1000 / fps, blit=False
+    )
     anim.save(output_path, writer=PillowWriter(fps=fps))
     plt.close(fig)
 
@@ -587,12 +642,18 @@ def main() -> None:
         local_time = local_frames / args.triangulation_fps
         flight_threshold, flight_min_consecutive = load_flight_parameters(args.triangulation)
         airborne_mask = compute_airborne_mask(local_points, flight_threshold, flight_min_consecutive)
-        ekf_2d_acc_q, ekf_3d_q, ekf_2d_dyn_q, ekf_2d_flip_acc_q, ekf_2d_flip_dyn_q = load_q_reconstructions(args.ekf_states, args.kalman_comparison)
+        ekf_2d_acc_q, ekf_3d_q, ekf_2d_dyn_q, ekf_2d_flip_acc_q, ekf_2d_flip_dyn_q = load_q_reconstructions(
+            args.ekf_states, args.kalman_comparison
+        )
         ekf_2d_acc_points = biorbd_markers_from_q(args.biomod, ekf_2d_acc_q)
         ekf_3d_points = biorbd_markers_from_q(args.biomod, ekf_3d_q)
         ekf_2d_dyn_points = None if ekf_2d_dyn_q is None else biorbd_markers_from_q(args.biomod, ekf_2d_dyn_q)
-        ekf_2d_flip_acc_points = None if ekf_2d_flip_acc_q is None else biorbd_markers_from_q(args.biomod, ekf_2d_flip_acc_q)
-        ekf_2d_flip_dyn_points = None if ekf_2d_flip_dyn_q is None else biorbd_markers_from_q(args.biomod, ekf_2d_flip_dyn_q)
+        ekf_2d_flip_acc_points = (
+            None if ekf_2d_flip_acc_q is None else biorbd_markers_from_q(args.biomod, ekf_2d_flip_acc_q)
+        )
+        ekf_2d_flip_dyn_points = (
+            None if ekf_2d_flip_dyn_q is None else biorbd_markers_from_q(args.biomod, ekf_2d_flip_dyn_q)
+        )
 
         pose2sim_points, pose2sim_time, _ = parse_trc(args.pose2sim_trc)
 
@@ -654,6 +715,7 @@ def main() -> None:
         show=tuple(show_names),
         airborne_mask=airborne_mask,
         show_trunk_frames=bool(args.show_trunk_frames),
+        framing=str(args.framing),
     )
     print(f"Animation comparative exportee dans: {args.output}")
 

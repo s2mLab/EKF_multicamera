@@ -22,10 +22,91 @@ class DDJumpPlotData:
     half_twist_values: np.ndarray
 
 
+@dataclass
+class DDReferenceComparison:
+    """Summary of how one reconstruction matches the expected DD reference codes."""
+
+    matched_count: int
+    expected_count: int
+    detected_count: int
+    status: str
+    detected_codes: list[str]
+    expected_codes: list[str]
+
+
+def compare_dd_to_reference(
+    analysis: DDSessionAnalysis | None,
+    expected_codes_by_jump: dict[int, str] | None,
+) -> DDReferenceComparison:
+    """Compare one DD analysis against the optional reference-code file."""
+
+    detected_codes = [str(jump.code or "-") for jump in (analysis.jumps if analysis is not None else [])]
+    expected_codes = [code for _, code in sorted((expected_codes_by_jump or {}).items())]
+    if not expected_codes:
+        return DDReferenceComparison(
+            matched_count=0,
+            expected_count=0,
+            detected_count=len(detected_codes),
+            status="no_reference",
+            detected_codes=detected_codes,
+            expected_codes=[],
+        )
+    expected_count = len(expected_codes)
+    matched_count = sum(
+        1
+        for jump_idx, expected_code in sorted(expected_codes_by_jump.items())
+        if analysis is not None
+        and 1 <= jump_idx <= len(analysis.jumps)
+        and str(analysis.jumps[jump_idx - 1].code or "") == str(expected_code)
+    )
+    if matched_count == expected_count and len(detected_codes) == expected_count:
+        status = "exact"
+    elif matched_count > 0:
+        status = "partial"
+    else:
+        status = "mismatch"
+    return DDReferenceComparison(
+        matched_count=matched_count,
+        expected_count=expected_count,
+        detected_count=len(detected_codes),
+        status=status,
+        detected_codes=detected_codes,
+        expected_codes=expected_codes,
+    )
+
+
+def dd_reference_status_text(comparison: DDReferenceComparison) -> str:
+    """Format one short status label for the DD comparison table."""
+
+    if comparison.status == "no_reference":
+        return "No ref"
+    return f"{comparison.matched_count}/{comparison.expected_count}"
+
+
+def dd_reference_status_color(comparison: DDReferenceComparison) -> str:
+    """Map a DD comparison status to a GUI-friendly color token."""
+
+    return {
+        "exact": "ok",
+        "partial": "partial",
+        "mismatch": "bad",
+        "no_reference": "neutral",
+    }.get(comparison.status, "neutral")
+
+
 def jump_list_label(index: int, jump: DDJumpAnalysis) -> str:
     """Build the compact label shown in the DD jump list."""
 
     return f"S{index} | som {jump.somersault_turns:.2f} | tw {jump.twist_turns:.2f}"
+
+
+def jump_list_label_with_reference(index: int, jump: DDJumpAnalysis, expected_code: str | None = None) -> str:
+    """Build one jump-list label and append the expected DD code when available."""
+
+    label = jump_list_label(index, jump)
+    if expected_code:
+        return f"{label} | ref {expected_code}"
+    return label
 
 
 def format_dd_summary(
@@ -35,6 +116,7 @@ def format_dd_summary(
     height_dof: str,
     angle_mode: str,
     fps: float,
+    expected_codes_by_jump: dict[int, str] | None = None,
 ) -> str:
     """Format the textual DD summary panel for the selected reconstruction."""
 
@@ -66,6 +148,10 @@ def format_dd_summary(
         code_text = jump.code if jump.code is not None else "-"
         body_shape = jump.body_shape if jump.body_shape is not None else "-"
         lines.append(f"  body shape={body_shape} | code={code_text}")
+        expected_code = (expected_codes_by_jump or {}).get(idx)
+        if expected_code:
+            match_text = "match" if jump.code == expected_code else "diff"
+            lines.append(f"  reference code={expected_code} | {match_text}")
         if jump.twists_per_salto:
             twists_str = ", ".join(f"S{idx}: {value:.1f}" for idx, value in enumerate(jump.twists_per_salto, start=1))
             lines.append(f"  twists by salto=[{twists_str}]")

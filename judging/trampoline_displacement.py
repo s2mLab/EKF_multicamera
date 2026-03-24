@@ -9,10 +9,79 @@ import numpy as np
 
 from judging.dd_analysis import DDSessionAnalysis
 
-X_MAX = 2.525
-Y_MAX = 1.455
-X_INNER = 1.01
-Y_INNER = 0.582
+BED_X_MAX = 2.525
+BED_Y_MAX = 1.455
+
+
+@dataclass(frozen=True)
+class TrampolineGeometry:
+    """Reference 2D geometry of the judged trampoline zones."""
+
+    center: np.ndarray
+    cross: dict[str, np.ndarray]
+    small_square: dict[str, np.ndarray]
+    big_rectangle: dict[str, np.ndarray]
+
+
+def _reference_marker_xy() -> dict[str, np.ndarray]:
+    """Return the reference trampoline markers extracted from the TRC example."""
+
+    return {
+        "Center": np.array([0.043268113558143854, -0.05300411860982727], dtype=float),
+        "Cross_1": np.array([-0.27952443398574717, -0.04696764728727904], dtype=float),
+        "Cross_2": np.array([0.37652836700158177, -0.04795804673711549], dtype=float),
+        "Cross_3": np.array([0.05005495872135084, -0.3823917151684797], dtype=float),
+        "Cross_4": np.array([0.04356532271660445, 0.27947414593708636], dtype=float),
+        "SmallSquare_1": np.array([-0.45678352093271957, -0.558066501261472], dtype=float),
+        "SmallSquare_2": np.array([-0.46609020457361006, 0.46948830182957657], dtype=float),
+        "SmallSquare_3": np.array([0.564131366062569, -0.5636934229359234], dtype=float),
+        "SmallSquare_4": np.array([0.55429137445568, 0.4711246832757012], dtype=float),
+        "BigRect_1": np.array([-0.9598132124496965, -0.5786406873658397], dtype=float),
+        "BigRect_2": np.array([-0.9982785248343781, 0.47024547295091973], dtype=float),
+        "BigRect_3": np.array([1.0873758536665161, -0.5780009194576564], dtype=float),
+        "BigRect_4": np.array([1.08636698254981, 0.46828409287201767], dtype=float),
+    }
+
+
+def trampoline_geometry_from_reference() -> TrampolineGeometry:
+    """Build a centered geometry model from the reference TRC marker set."""
+
+    markers = _reference_marker_xy()
+    center = markers["Center"]
+    normalized = {name: value - center for name, value in markers.items()}
+    return TrampolineGeometry(
+        center=np.zeros(2, dtype=float),
+        cross={
+            "left": normalized["Cross_1"],
+            "right": normalized["Cross_2"],
+            "bottom": normalized["Cross_3"],
+            "top": normalized["Cross_4"],
+        },
+        small_square={
+            "bottom_left": normalized["SmallSquare_1"],
+            "top_left": normalized["SmallSquare_2"],
+            "bottom_right": normalized["SmallSquare_3"],
+            "top_right": normalized["SmallSquare_4"],
+        },
+        big_rectangle={
+            "bottom_left": normalized["BigRect_1"],
+            "top_left": normalized["BigRect_2"],
+            "bottom_right": normalized["BigRect_3"],
+            "top_right": normalized["BigRect_4"],
+        },
+    )
+
+
+def rectangle_half_extents(corners: dict[str, np.ndarray]) -> tuple[float, float]:
+    """Return symmetric half-extents from a set of rectangle corner markers."""
+
+    xy = np.asarray(list(corners.values()), dtype=float)
+    return float(np.max(np.abs(xy[:, 0]))), float(np.max(np.abs(xy[:, 1])))
+
+
+TRAMPOLINE_GEOMETRY = trampoline_geometry_from_reference()
+X_INNER, Y_INNER = rectangle_half_extents(TRAMPOLINE_GEOMETRY.small_square)
+X_MAX, Y_MAX = rectangle_half_extents(TRAMPOLINE_GEOMETRY.big_rectangle)
 
 
 @dataclass
@@ -118,10 +187,26 @@ def analyze_trampoline_contacts(
         right_foot = np.asarray(segment[:, 16, :2], dtype=float)
         left_valid = np.all(np.isfinite(left_foot), axis=1)
         right_valid = np.all(np.isfinite(right_foot), axis=1)
-        left_center = np.nanmedian(left_foot[left_valid], axis=0) if np.any(left_valid) else np.array([np.nan, np.nan], dtype=float)
-        right_center = np.nanmedian(right_foot[right_valid], axis=0) if np.any(right_valid) else np.array([np.nan, np.nan], dtype=float)
-        left_penalty = trampoline_penalty_refined(float(left_center[0]), float(left_center[1])) if np.all(np.isfinite(left_center)) else float("nan")
-        right_penalty = trampoline_penalty_refined(float(right_center[0]), float(right_center[1])) if np.all(np.isfinite(right_center)) else float("nan")
+        left_center = (
+            np.nanmedian(left_foot[left_valid], axis=0)
+            if np.any(left_valid)
+            else np.array([np.nan, np.nan], dtype=float)
+        )
+        right_center = (
+            np.nanmedian(right_foot[right_valid], axis=0)
+            if np.any(right_valid)
+            else np.array([np.nan, np.nan], dtype=float)
+        )
+        left_penalty = (
+            trampoline_penalty_refined(float(left_center[0]), float(left_center[1]))
+            if np.all(np.isfinite(left_center))
+            else float("nan")
+        )
+        right_penalty = (
+            trampoline_penalty_refined(float(right_center[0]), float(right_center[1]))
+            if np.all(np.isfinite(right_center))
+            else float("nan")
+        )
         penalties = [value for value in (left_penalty, right_penalty) if np.isfinite(value)]
         if penalties:
             penalty = float(max(penalties))

@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from reconstruction.reconstruction_profiles import ReconstructionProfile, build_pipeline_command, canonical_profile_name, validate_profile
+import pytest
+
+from reconstruction.reconstruction_profiles import (
+    ReconstructionProfile,
+    build_pipeline_command,
+    canonical_profile_name,
+    validate_profile,
+)
 
 
 def test_canonical_profile_name_includes_camera_names():
@@ -49,6 +56,18 @@ def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
     assert canonical_profile_name(profile) == "ekf_2d_acc_rootq0"
 
 
+def test_canonical_profile_name_includes_frame_stride():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            frame_stride=3,
+        )
+    )
+    assert canonical_profile_name(profile) == "ekf_2d_acc_stride3"
+
+
 def test_canonical_profile_name_includes_ekf3d_root_pose_flag():
     profile = validate_profile(
         ReconstructionProfile(
@@ -78,3 +97,106 @@ def test_build_pipeline_command_includes_ekf3d_init_method():
     )
     assert "--biorbd-kalman-init-method" in cmd
     assert cmd[cmd.index("--biorbd-kalman-init-method") + 1] == "root_pose_zero_rest"
+
+
+def test_build_pipeline_command_includes_frame_stride():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="tri_stride2",
+            family="triangulation",
+            frame_stride=2,
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/Calib.toml"),
+        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        python_executable="python",
+    )
+    assert "--frame-stride" in cmd
+    assert cmd[cmd.index("--frame-stride") + 1] == "2"
+
+
+def test_build_pipeline_command_includes_frame_stride_for_ekf2d():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_stride4",
+            family="ekf_2d",
+            predictor="acc",
+            frame_stride=4,
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/Calib.toml"),
+        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        python_executable="python",
+    )
+    assert "--frame-stride" in cmd
+    assert cmd[cmd.index("--frame-stride") + 1] == "4"
+
+
+def test_validate_profile_pose2sim_forces_frame_stride_to_one():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="pose2sim_stride4",
+            family="pose2sim",
+            frame_stride=4,
+        )
+    )
+    assert profile.frame_stride == 1
+
+
+def test_validate_profile_rejects_unsupported_frame_stride():
+    with pytest.raises(ValueError, match="Unsupported frame_stride"):
+        validate_profile(
+            ReconstructionProfile(
+                name="bad_stride",
+                family="triangulation",
+                frame_stride=5,
+            )
+        )
+
+
+def test_validate_profile_accepts_once_and_triangulation_once_coherence():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            triangulation_method="once",
+            coherence_method="triangulation_once",
+        )
+    )
+
+    assert profile.triangulation_method == "once"
+    assert profile.coherence_method == "triangulation_once"
+    assert "coh_triangulation_once" in canonical_profile_name(profile)
+
+
+def test_build_pipeline_command_includes_explicit_coherence_and_once_triangulation():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_once",
+            family="ekf_2d",
+            predictor="acc",
+            triangulation_method="once",
+            coherence_method="triangulation_greedy",
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/Calib.toml"),
+        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert cmd[cmd.index("--triangulation-method") + 1] == "once"
+    assert cmd[cmd.index("--coherence-method") + 1] == "triangulation_greedy"

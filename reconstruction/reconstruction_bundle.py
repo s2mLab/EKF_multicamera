@@ -64,6 +64,8 @@ from vitpose_ekf_pipeline import (
     apply_left_right_flip_corrections,
     apply_left_right_flip_to_points,
     build_biomod,
+    canonical_coherence_method,
+    canonical_triangulation_method,
     compute_epipolar_coherence,
     detect_left_right_flip_diagnostics,
     estimate_segment_lengths,
@@ -86,8 +88,8 @@ from vitpose_ekf_pipeline import (
     save_single_ekf_state,
     select_active_coherence,
     triangulate_pose2sim_like,
+    triangulation_method_from_coherence_method,
 )
-
 
 DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
@@ -149,7 +151,9 @@ def epipolar_cache_metadata(
     }
 
 
-def save_epipolar_cache(cache_path: Path, epipolar_coherence: np.ndarray, metadata: dict[str, object], compute_time_s: float) -> None:
+def save_epipolar_cache(
+    cache_path: Path, epipolar_coherence: np.ndarray, metadata: dict[str, object], compute_time_s: float
+) -> None:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         cache_path,
@@ -365,8 +369,15 @@ def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) 
         frames=np.asarray(pose_data.frames[idx], dtype=int),
         keypoints=np.asarray(pose_data.keypoints[:, idx, :, :], dtype=float),
         scores=np.asarray(pose_data.scores[:, idx, :], dtype=float),
-        raw_keypoints=None if pose_data.raw_keypoints is None else np.asarray(pose_data.raw_keypoints[:, idx, :, :], dtype=float),
-        filtered_keypoints=None if pose_data.filtered_keypoints is None else np.asarray(pose_data.filtered_keypoints[:, idx, :, :], dtype=float),
+        frame_stride=int(getattr(pose_data, "frame_stride", 1)),
+        raw_keypoints=(
+            None if pose_data.raw_keypoints is None else np.asarray(pose_data.raw_keypoints[:, idx, :, :], dtype=float)
+        ),
+        filtered_keypoints=(
+            None
+            if pose_data.filtered_keypoints is None
+            else np.asarray(pose_data.filtered_keypoints[:, idx, :, :], dtype=float)
+        ),
     )
 
 
@@ -438,6 +449,7 @@ def save_pose_variant_cache(
         "frames": np.asarray(pose_data.frames, dtype=int),
         "keypoints": np.asarray(pose_data.keypoints, dtype=float),
         "scores": np.asarray(pose_data.scores, dtype=float),
+        "frame_stride": np.asarray(int(getattr(pose_data, "frame_stride", 1)), dtype=int),
         "metadata": np.asarray(json.dumps(_jsonable_metadata(metadata)), dtype=object),
         "diagnostics": np.asarray(json.dumps(_jsonable_metadata(diagnostics or {})), dtype=object),
         "compute_time_s": np.asarray(float(compute_time_s), dtype=float),
@@ -458,8 +470,11 @@ def load_pose_variant_cache(cache_path: Path) -> tuple[PoseData, dict[str, objec
             frames=np.asarray(data["frames"], dtype=int),
             keypoints=np.asarray(data["keypoints"], dtype=float),
             scores=np.asarray(data["scores"], dtype=float),
+            frame_stride=int(np.asarray(data["frame_stride"]).item()) if "frame_stride" in data else 1,
             raw_keypoints=np.asarray(data["raw_keypoints"], dtype=float) if "raw_keypoints" in data else None,
-            filtered_keypoints=np.asarray(data["filtered_keypoints"], dtype=float) if "filtered_keypoints" in data else None,
+            filtered_keypoints=(
+                np.asarray(data["filtered_keypoints"], dtype=float) if "filtered_keypoints" in data else None
+            ),
         )
         diagnostics = json.loads(str(np.asarray(data["diagnostics"]).item())) if "diagnostics" in data else {}
         suspect_mask = np.asarray(data["suspect_mask"], dtype=bool) if "suspect_mask" in data else None
@@ -526,8 +541,11 @@ def load_or_compute_pose_data_variant_cache(
             frames=np.asarray(pose_data.frames, dtype=int),
             keypoints=np.asarray(pose_data.keypoints, dtype=float),
             scores=np.asarray(pose_data.scores, dtype=float),
+            frame_stride=int(getattr(pose_data, "frame_stride", 1)),
             raw_keypoints=None if pose_data.raw_keypoints is None else np.asarray(pose_data.raw_keypoints, dtype=float),
-            filtered_keypoints=None if pose_data.filtered_keypoints is None else np.asarray(pose_data.filtered_keypoints, dtype=float),
+            filtered_keypoints=(
+                None if pose_data.filtered_keypoints is None else np.asarray(pose_data.filtered_keypoints, dtype=float)
+            ),
         )
         compute_time_s = time.perf_counter() - t0
         save_pose_variant_cache(cache_path, corrected_pose_data, metadata, compute_time_s=compute_time_s)
@@ -538,26 +556,28 @@ def load_or_compute_pose_data_variant_cache(
     if flip_method is None:
         raise ValueError("flip_method is required when correction_mode='flip'.")
 
-    suspect_mask, diagnostics, flip_compute_time_s, flip_cache_path, flip_source = load_or_compute_left_right_flip_cache(
-        output_dir=output_dir,
-        pose_data=pose_data,
-        calibrations=calibrations,
-        method=flip_method,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-        improvement_ratio=improvement_ratio,
-        min_gain_px=min_gain_px,
-        min_other_cameras=min_other_cameras,
-        restrict_to_outliers=restrict_to_outliers,
-        outlier_percentile=outlier_percentile,
-        outlier_floor_px=outlier_floor_px,
-        tau_px=tau_px,
-        temporal_weight=temporal_weight,
-        temporal_tau_px=temporal_tau_px,
-        temporal_min_valid_keypoints=temporal_min_valid_keypoints,
+    suspect_mask, diagnostics, flip_compute_time_s, flip_cache_path, flip_source = (
+        load_or_compute_left_right_flip_cache(
+            output_dir=output_dir,
+            pose_data=pose_data,
+            calibrations=calibrations,
+            method=flip_method,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            improvement_ratio=improvement_ratio,
+            min_gain_px=min_gain_px,
+            min_other_cameras=min_other_cameras,
+            restrict_to_outliers=restrict_to_outliers,
+            outlier_percentile=outlier_percentile,
+            outlier_floor_px=outlier_floor_px,
+            tau_px=tau_px,
+            temporal_weight=temporal_weight,
+            temporal_tau_px=temporal_tau_px,
+            temporal_min_valid_keypoints=temporal_min_valid_keypoints,
+        )
     )
     corrected_pose_data = apply_left_right_flip_corrections(pose_data, suspect_mask)
     diagnostics = dict(diagnostics)
@@ -596,7 +616,9 @@ def reconstruction_with_full_frame_support(
     points_3d[bootstrap_frame_global_idx] = bootstrap_reconstruction.points_3d[local_idx]
     mean_confidence[bootstrap_frame_global_idx] = bootstrap_reconstruction.mean_confidence[local_idx]
     reprojection_error[bootstrap_frame_global_idx] = bootstrap_reconstruction.reprojection_error[local_idx]
-    reprojection_error_per_view[bootstrap_frame_global_idx] = bootstrap_reconstruction.reprojection_error_per_view[local_idx]
+    reprojection_error_per_view[bootstrap_frame_global_idx] = bootstrap_reconstruction.reprojection_error_per_view[
+        local_idx
+    ]
     triangulation_coherence[bootstrap_frame_global_idx] = bootstrap_reconstruction.triangulation_coherence[local_idx]
     excluded_views[bootstrap_frame_global_idx] = bootstrap_reconstruction.excluded_views[local_idx]
 
@@ -664,19 +686,24 @@ def load_or_compute_triangulation_cache(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> tuple[ReconstructionResult, Path, Path, str]:
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
+    effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
     metadata = reconstruction_cache_metadata(
         pose_data,
         reprojection_threshold_px,
         min_cameras_for_triangulation,
         epipolar_threshold_px,
-        triangulation_method,
+        effective_triangulation_method,
         pose_data_mode,
         pose_filter_window,
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
     )
-    cache_dir = cache_entry_dir(output_dir, "triangulation", metadata, prefix=f"triang_{triangulation_method}")
+    cache_dir = cache_entry_dir(
+        output_dir, "triangulation", metadata, prefix=f"triang_{effective_triangulation_method}"
+    )
     cache_path = cache_dir / "reconstruction.npz"
     epipolar_coherence, epipolar_compute_time_s, epipolar_cache_path, epipolar_source = load_or_compute_epipolar_cache(
         output_dir=output_dir,
@@ -702,7 +729,7 @@ def load_or_compute_triangulation_cache(
         min_cameras_for_triangulation=min_cameras_for_triangulation,
         coherence_method=coherence_method,
         epipolar_threshold_px=epipolar_threshold_px,
-        triangulation_method=triangulation_method,
+        triangulation_method=effective_triangulation_method,
         n_workers=triangulation_workers,
         precomputed_epipolar_coherence=epipolar_coherence,
         precomputed_epipolar_time_s=epipolar_compute_time_s,
@@ -781,37 +808,41 @@ def prepare_pose_data_for_reconstruction(
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
 ) -> tuple[PoseData, dict[str, object] | None, Path | None, str]:
+    coherence_method = canonical_coherence_method(coherence_method)
     if not flip_left_right:
         return pose_data, None, None, "computed_now"
 
     flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
-    pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path, pose_variant_source = load_or_compute_pose_data_variant_cache(
-        output_dir=output_dir,
-        pose_data=pose_data,
-        calibrations=calibrations,
-        correction_mode="flip",
-        flip_method=flip_method,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-        improvement_ratio=flip_improvement_ratio,
-        min_gain_px=flip_min_gain_px,
-        min_other_cameras=flip_min_other_cameras,
-        restrict_to_outliers=flip_restrict_to_outliers,
-        outlier_percentile=flip_outlier_percentile,
-        outlier_floor_px=flip_outlier_floor_px,
-        tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
-        temporal_weight=flip_temporal_weight,
-        temporal_tau_px=flip_temporal_tau_px,
-        temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path, pose_variant_source = (
+        load_or_compute_pose_data_variant_cache(
+            output_dir=output_dir,
+            pose_data=pose_data,
+            calibrations=calibrations,
+            correction_mode="flip",
+            flip_method=flip_method,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            improvement_ratio=flip_improvement_ratio,
+            min_gain_px=flip_min_gain_px,
+            min_other_cameras=flip_min_other_cameras,
+            restrict_to_outliers=flip_restrict_to_outliers,
+            outlier_percentile=flip_outlier_percentile,
+            outlier_floor_px=flip_outlier_floor_px,
+            tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
+            temporal_weight=flip_temporal_weight,
+            temporal_tau_px=flip_temporal_tau_px,
+            temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+        )
     )
     if flip_diagnostics is not None:
         flip_diagnostics = dict(flip_diagnostics)
         flip_diagnostics["cache_path"] = str(pose_variant_cache_path)
         flip_diagnostics["pose_data_signature"] = pose_data_signature(pose_data_used)
     return pose_data_used, flip_diagnostics, pose_variant_cache_path, str(pose_variant_source)
+
 
 def with_version_info(summary: dict[str, object], family: str) -> dict[str, object]:
     latest = latest_version_for_family(family)
@@ -822,7 +853,68 @@ def with_version_info(summary: dict[str, object], family: str) -> dict[str, obje
     enriched["is_latest_family_version"] = True
     return enriched
 
+
+def _canonical_trc_marker_name(marker_name: str) -> str:
+    """Normalize TRC marker labels so multiple header styles map consistently."""
+
+    text = str(marker_name).strip().lower()
+    text = text.replace("_", " ")
+    text = " ".join(text.split())
+    return text
+
+
+TRC_MARKER_TO_COCO = {
+    "nose": "nose",
+    "l eye": "left_eye",
+    "left eye": "left_eye",
+    "r eye": "right_eye",
+    "right eye": "right_eye",
+    "l ear": "left_ear",
+    "left ear": "left_ear",
+    "r ear": "right_ear",
+    "right ear": "right_ear",
+    "l shoulder": "left_shoulder",
+    "left shoulder": "left_shoulder",
+    "r shoulder": "right_shoulder",
+    "right shoulder": "right_shoulder",
+    "l elbow": "left_elbow",
+    "left elbow": "left_elbow",
+    "r elbow": "right_elbow",
+    "right elbow": "right_elbow",
+    "l wrist": "left_wrist",
+    "left wrist": "left_wrist",
+    "r wrist": "right_wrist",
+    "right wrist": "right_wrist",
+    "l hip": "left_hip",
+    "left hip": "left_hip",
+    "left_hip": "left_hip",
+    "r hip": "right_hip",
+    "right hip": "right_hip",
+    "right_hip": "right_hip",
+    "l knee": "left_knee",
+    "left knee": "left_knee",
+    "left_knee": "left_knee",
+    "r knee": "right_knee",
+    "right knee": "right_knee",
+    "right_knee": "right_knee",
+    "l ankle": "left_ankle",
+    "left ankle": "left_ankle",
+    "left_ankle": "left_ankle",
+    "r ankle": "right_ankle",
+    "right ankle": "right_ankle",
+    "right_ankle": "right_ankle",
+    "left shoulder": "left_shoulder",
+    "right shoulder": "right_shoulder",
+    "left elbow": "left_elbow",
+    "right elbow": "right_elbow",
+    "left wrist": "left_wrist",
+    "right wrist": "right_wrist",
+}
+
+
 def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Parse a TRC file generated either by Pose2Sim or by the local exporter."""
+
     with trc_path.open("r", encoding="utf-8") as file:
         lines = [line.rstrip("\n") for line in file]
 
@@ -832,25 +924,6 @@ def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
     data_rate = float(metadata["DataRate"])
 
     marker_labels = [label for label in lines[3].split("\t")[2:] if label]
-    trc_to_coco = {
-        "Nose": "nose",
-        "L Eye": "left_eye",
-        "R Eye": "right_eye",
-        "L Ear": "left_ear",
-        "R Ear": "right_ear",
-        "L Shoulder": "left_shoulder",
-        "R Shoulder": "right_shoulder",
-        "L Elbow": "left_elbow",
-        "R Elbow": "right_elbow",
-        "L Wrist": "left_wrist",
-        "R Wrist": "right_wrist",
-        "L Hip": "left_hip",
-        "R Hip": "right_hip",
-        "L Knee": "left_knee",
-        "R Knee": "right_knee",
-        "L Ankle": "left_ankle",
-        "R Ankle": "right_ankle",
-    }
 
     rows = []
     for line in lines[5:]:
@@ -860,14 +933,17 @@ def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
     frames = np.asarray([int(row[0]) for row in rows], dtype=int)
     time_s = np.asarray([float(row[1]) for row in rows], dtype=float)
-    xyz_values = np.asarray([[float(value) if value != "" else np.nan for value in row[2:]] for row in rows], dtype=float)
+    xyz_values = np.asarray(
+        [[float(value) if value != "" else np.nan for value in row[2:]] for row in rows], dtype=float
+    )
     points_3d = np.full((len(frames), len(COCO17), 3), np.nan, dtype=float)
     for marker_idx, marker_name in enumerate(marker_labels):
-        coco_name = trc_to_coco.get(marker_name)
+        coco_name = TRC_MARKER_TO_COCO.get(_canonical_trc_marker_name(marker_name))
         if coco_name is None:
             continue
         points_3d[:, KP_INDEX[coco_name], :] = xyz_values[:, 3 * marker_idx : 3 * marker_idx + 3]
     return frames, time_s, points_3d, data_rate
+
 
 def q_names_from_model(model) -> np.ndarray:
     names = [
@@ -876,6 +952,7 @@ def q_names_from_model(model) -> np.ndarray:
         for i_dof in range(model.segment(i_seg).nbDof())
     ]
     return np.asarray(names, dtype=object)
+
 
 def should_apply_initial_rotation_correction(points_3d: np.ndarray) -> bool:
     angle = root_z_correction_angle_from_points(
@@ -886,6 +963,7 @@ def should_apply_initial_rotation_correction(points_3d: np.ndarray) -> bool:
         right_shoulder_idx=KP_INDEX["right_shoulder"],
     )
     return abs(angle) > 1e-8
+
 
 def extract_root_from_points(
     points_3d: np.ndarray,
@@ -917,7 +995,9 @@ def extract_root_from_points(
             continue
         if correction_applied:
             matrix = Rotation.from_euler("z", -correction_angle, degrees=False).as_matrix() @ matrix
-        root_q[frame_idx, ROOT_ROTATION_SLICE] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
+        root_q[frame_idx, ROOT_ROTATION_SLICE] = Rotation.from_matrix(matrix).as_euler(
+            TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False
+        )
 
     if unwrap_rotations:
         root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
@@ -1147,7 +1227,14 @@ def save_legacy_triangulation(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> Path:
-    cache_path = output_dir / ("triangulation_pose2sim_like_fast.npz" if triangulation_method == "greedy" else "triangulation_pose2sim_like.npz")
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    if triangulation_method == "once":
+        cache_name = "triangulation_pose2sim_like_once.npz"
+    elif triangulation_method == "greedy":
+        cache_name = "triangulation_pose2sim_like_fast.npz"
+    else:
+        cache_name = "triangulation_pose2sim_like.npz"
+    cache_path = output_dir / cache_name
     metadata = reconstruction_cache_metadata(
         pose_data,
         error_threshold_px,
@@ -1164,7 +1251,13 @@ def save_legacy_triangulation(
     return cache_path
 
 
-def save_legacy_ekf_2d(output_dir: Path, result: dict[str, np.ndarray], predictor: str, flip: bool, marker_points_3d: np.ndarray | None = None) -> None:
+def save_legacy_ekf_2d(
+    output_dir: Path,
+    result: dict[str, np.ndarray],
+    predictor: str,
+    flip: bool,
+    marker_points_3d: np.ndarray | None = None,
+) -> None:
     save_single_ekf_state(output_dir / f"ekf_states_{'flip_' if flip else ''}{predictor}.npz", result)
     key_prefix = f"q_ekf_2d_{'flip_' if flip else ''}{predictor}"
     qdot_prefix = f"qdot_ekf_2d_{'flip_' if flip else ''}{predictor}"
@@ -1185,7 +1278,12 @@ def save_legacy_ekf_2d(output_dir: Path, result: dict[str, np.ndarray], predicto
     np.savez(output_dir / "ekf_states.npz", **payload)
 
 
-def save_legacy_ekf_3d(output_dir: Path, result: dict[str, np.ndarray], reprojection_stats: dict[str, object], marker_points_3d: np.ndarray | None = None) -> None:
+def save_legacy_ekf_3d(
+    output_dir: Path,
+    result: dict[str, np.ndarray],
+    reprojection_stats: dict[str, object],
+    marker_points_3d: np.ndarray | None = None,
+) -> None:
     np.savez(
         output_dir / "kalman_comparison.npz",
         q_ekf_3d=result["q"],
@@ -1196,8 +1294,12 @@ def save_legacy_ekf_3d(output_dir: Path, result: dict[str, np.ndarray], reprojec
         qddot_biorbd_kalman=result["qddot"],
         q_names=result["q_names"],
         **({"points_3d_ekf_3d": np.asarray(marker_points_3d, dtype=float)} if marker_points_3d is not None else {}),
-        ekf_3d_reprojection_mean_px=np.asarray(reprojection_stats["mean_px"] if reprojection_stats["mean_px"] is not None else np.nan, dtype=float),
-        ekf_3d_reprojection_std_px=np.asarray(reprojection_stats["std_px"] if reprojection_stats["std_px"] is not None else np.nan, dtype=float),
+        ekf_3d_reprojection_mean_px=np.asarray(
+            reprojection_stats["mean_px"] if reprojection_stats["mean_px"] is not None else np.nan, dtype=float
+        ),
+        ekf_3d_reprojection_std_px=np.asarray(
+            reprojection_stats["std_px"] if reprojection_stats["std_px"] is not None else np.nan, dtype=float
+        ),
     )
 
 
@@ -1206,6 +1308,7 @@ def build_pose_data(
     keypoints_path: Path,
     calibrations: dict[str, CameraCalibration],
     max_frames: int | None,
+    frame_stride: int,
     pose_data_mode: str,
     pose_filter_window: int,
     pose_outlier_threshold_ratio: float,
@@ -1216,12 +1319,20 @@ def build_pose_data(
         keypoints_path,
         calibrations,
         max_frames=max_frames,
+        frame_stride=frame_stride,
         data_mode=pose_data_mode,
         smoothing_window=pose_filter_window,
         outlier_threshold_ratio=pose_outlier_threshold_ratio,
         lower_percentile=pose_amplitude_lower_percentile,
         upper_percentile=pose_amplitude_upper_percentile,
     )
+
+
+def pose_effective_fps(pose_data: PoseData, source_fps: float) -> float:
+    """Return the effective sampling rate after frame decimation."""
+
+    frame_stride = max(1, int(getattr(pose_data, "frame_stride", 1)))
+    return float(source_fps) / float(frame_stride)
 
 
 def print_step(step_idx: int, step_total: int, label: str) -> None:
@@ -1257,9 +1368,15 @@ def build_pose2sim_bundle(
     pipeline_stages = []
     if pose_data_compute_time_s is not None:
         pipeline_stages.append(
-            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+            make_timing_stage(
+                "pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now"
+            )
         )
-    pipeline_stages.append(make_timing_stage("pose2sim", "Load Pose2Sim 3D", compute_time_s=time.perf_counter() - t0, source="computed_now"))
+    pipeline_stages.append(
+        make_timing_stage(
+            "pose2sim", "Load Pose2Sim 3D", compute_time_s=time.perf_counter() - t0, source="computed_now"
+        )
+    )
 
     summary = {
         "name": name,
@@ -1285,7 +1402,13 @@ def build_pose2sim_bundle(
         "pipeline_timing": {
             "diagram": [str(stage["id"]) for stage in pipeline_stages],
             "stages": pipeline_stages,
-            "objective_total_s": float(sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))),
+            "objective_total_s": float(
+                sum(
+                    float(stage.get("compute_time_s") or 0.0)
+                    for stage in pipeline_stages
+                    if bool(stage.get("include_in_total", True))
+                )
+            ),
             "current_run_wall_s": float((pose_data_compute_time_s or 0.0) + (time.perf_counter() - t0)),
         },
     }
@@ -1342,53 +1465,61 @@ def build_triangulation_bundle(
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
 ) -> tuple[BundleBuildResult, ReconstructionResult]:
-    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
-        output_dir=output_dir,
-        pose_data=pose_data,
-        calibrations=calibrations,
-        coherence_method=coherence_method,
-        reprojection_threshold_px=reprojection_threshold_px,
-        epipolar_threshold_px=epipolar_threshold_px,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-        flip_left_right=flip_left_right,
-        flip_improvement_ratio=flip_improvement_ratio,
-        flip_min_gain_px=flip_min_gain_px,
-        flip_min_other_cameras=flip_min_other_cameras,
-        flip_restrict_to_outliers=flip_restrict_to_outliers,
-        flip_outlier_percentile=flip_outlier_percentile,
-        flip_outlier_floor_px=flip_outlier_floor_px,
-        flip_temporal_weight=flip_temporal_weight,
-        flip_temporal_tau_px=flip_temporal_tau_px,
-        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
+    effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
+    effective_fps = pose_effective_fps(pose_data, fps)
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
+        prepare_pose_data_for_reconstruction(
+            output_dir=output_dir,
+            pose_data=pose_data,
+            calibrations=calibrations,
+            coherence_method=coherence_method,
+            reprojection_threshold_px=reprojection_threshold_px,
+            epipolar_threshold_px=epipolar_threshold_px,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            flip_left_right=flip_left_right,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
+            flip_min_other_cameras=flip_min_other_cameras,
+            flip_restrict_to_outliers=flip_restrict_to_outliers,
+            flip_outlier_percentile=flip_outlier_percentile,
+            flip_outlier_floor_px=flip_outlier_floor_px,
+            flip_temporal_weight=flip_temporal_weight,
+            flip_temporal_tau_px=flip_temporal_tau_px,
+            flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+        )
     )
 
     print_step(2, 3, "Triangulation 3D")
     t0 = time.perf_counter()
-    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
-        output_dir=output_dir,
-        pose_data=pose_data_used,
-        calibrations=calibrations,
-        coherence_method=coherence_method,
-        triangulation_method=triangulation_method,
-        reprojection_threshold_px=reprojection_threshold_px,
-        min_cameras_for_triangulation=min_cameras_for_triangulation,
-        epipolar_threshold_px=epipolar_threshold_px,
-        triangulation_workers=triangulation_workers,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = (
+        load_or_compute_triangulation_cache(
+            output_dir=output_dir,
+            pose_data=pose_data_used,
+            calibrations=calibrations,
+            coherence_method=coherence_method,
+            triangulation_method=triangulation_method,
+            reprojection_threshold_px=reprojection_threshold_px,
+            min_cameras_for_triangulation=min_cameras_for_triangulation,
+            epipolar_threshold_px=epipolar_threshold_px,
+            triangulation_workers=triangulation_workers,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        )
     )
     save_legacy_triangulation(
         output_dir,
         reconstruction,
         pose_data_used,
-        triangulation_method=triangulation_method,
+        triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
         epipolar_threshold_px=epipolar_threshold_px,
@@ -1399,8 +1530,10 @@ def build_triangulation_bundle(
         pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
     )
     time_s = reconstruction.frames / float(fps)
-    q_root, correction_applied = extract_root_from_points(reconstruction.points_3d, initial_rotation_correction, unwrap_root)
-    qdot_root = centered_finite_difference(q_root, 1.0 / fps)
+    q_root, correction_applied = extract_root_from_points(
+        reconstruction.points_3d, initial_rotation_correction, unwrap_root
+    )
+    qdot_root = centered_finite_difference(q_root, 1.0 / effective_fps)
     reprojection_errors = reconstruction.reprojection_error_per_view
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
     correction_angle = root_z_correction_angle_from_points(
@@ -1414,7 +1547,9 @@ def build_triangulation_bundle(
     pipeline_stages = []
     if pose_data_compute_time_s is not None:
         pipeline_stages.append(
-            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+            make_timing_stage(
+                "pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now"
+            )
         )
     if flip_diagnostics is not None:
         flip_method_label = str(flip_diagnostics.get("method", "unknown"))
@@ -1458,7 +1593,9 @@ def build_triangulation_bundle(
     summary = {
         "name": name,
         "family": "triangulation",
-        "fps": float(fps),
+        "fps": float(effective_fps),
+        "source_fps": float(fps),
+        "frame_stride": int(getattr(pose_data_used, "frame_stride", 1)),
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
@@ -1490,7 +1627,11 @@ def build_triangulation_bundle(
             "diagram": [str(stage["id"]) for stage in pipeline_stages],
             "stages": pipeline_stages,
             "objective_total_s": float(
-                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+                sum(
+                    float(stage.get("compute_time_s") or 0.0)
+                    for stage in pipeline_stages
+                    if bool(stage.get("include_in_total", True))
+                )
             ),
             "current_run_wall_s": float(time.perf_counter() - t0),
         },
@@ -1552,54 +1693,62 @@ def build_ekf_3d_bundle(
     biorbd_kalman_error_factor: float,
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> BundleBuildResult:
-    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
-        output_dir=output_dir,
-        pose_data=pose_data,
-        calibrations=calibrations,
-        coherence_method=coherence_method,
-        reprojection_threshold_px=reprojection_threshold_px,
-        epipolar_threshold_px=epipolar_threshold_px,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-        flip_left_right=flip_left_right,
-        flip_improvement_ratio=flip_improvement_ratio,
-        flip_min_gain_px=flip_min_gain_px,
-        flip_min_other_cameras=flip_min_other_cameras,
-        flip_restrict_to_outliers=flip_restrict_to_outliers,
-        flip_outlier_percentile=flip_outlier_percentile,
-        flip_outlier_floor_px=flip_outlier_floor_px,
-        flip_temporal_weight=flip_temporal_weight,
-        flip_temporal_tau_px=flip_temporal_tau_px,
-        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
+    effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
+    effective_fps = pose_effective_fps(pose_data, fps)
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
+        prepare_pose_data_for_reconstruction(
+            output_dir=output_dir,
+            pose_data=pose_data,
+            calibrations=calibrations,
+            coherence_method=coherence_method,
+            reprojection_threshold_px=reprojection_threshold_px,
+            epipolar_threshold_px=epipolar_threshold_px,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            flip_left_right=flip_left_right,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
+            flip_min_other_cameras=flip_min_other_cameras,
+            flip_restrict_to_outliers=flip_restrict_to_outliers,
+            flip_outlier_percentile=flip_outlier_percentile,
+            flip_outlier_floor_px=flip_outlier_floor_px,
+            flip_temporal_weight=flip_temporal_weight,
+            flip_temporal_tau_px=flip_temporal_tau_px,
+            flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+        )
     )
 
     print_step(2, 5, "Triangulation 3D")
     tri_start = time.perf_counter()
-    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
-        output_dir=output_dir,
-        pose_data=pose_data_used,
-        calibrations=calibrations,
-        coherence_method=coherence_method,
-        triangulation_method=triangulation_method,
-        reprojection_threshold_px=reprojection_threshold_px,
-        min_cameras_for_triangulation=min_cameras_for_triangulation,
-        epipolar_threshold_px=epipolar_threshold_px,
-        triangulation_workers=triangulation_workers,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+    reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = (
+        load_or_compute_triangulation_cache(
+            output_dir=output_dir,
+            pose_data=pose_data_used,
+            calibrations=calibrations,
+            coherence_method=coherence_method,
+            triangulation_method=triangulation_method,
+            reprojection_threshold_px=reprojection_threshold_px,
+            min_cameras_for_triangulation=min_cameras_for_triangulation,
+            epipolar_threshold_px=epipolar_threshold_px,
+            triangulation_workers=triangulation_workers,
+            pose_data_mode=pose_data_mode,
+            pose_filter_window=pose_filter_window,
+            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        )
     )
     triangulation_s = time.perf_counter() - tri_start
     save_legacy_triangulation(
         output_dir,
         reconstruction,
         pose_data_used,
-        triangulation_method=triangulation_method,
+        triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
         epipolar_threshold_px=epipolar_threshold_px,
@@ -1615,7 +1764,7 @@ def build_ekf_3d_bundle(
         output_dir=output_dir,
         reconstruction=reconstruction,
         reconstruction_cache_path=reconstruction_cache_path,
-        fps=fps,
+        fps=effective_fps,
         subject_mass_kg=subject_mass_kg,
         initial_rotation_correction=initial_rotation_correction,
         lengths_mode="full_triangulation",
@@ -1632,7 +1781,7 @@ def build_ekf_3d_bundle(
     result = run_biorbd_marker_kalman_with_parameters(
         model,
         reconstruction,
-        fps,
+        effective_fps,
         noise_factor=biorbd_kalman_noise_factor,
         error_factor=biorbd_kalman_error_factor,
         unwrap_root=unwrap_root,
@@ -1642,7 +1791,9 @@ def build_ekf_3d_bundle(
     result["q_names"] = q_names_from_model(model)
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
     q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
-    qdot_root = extract_root_from_q(result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False)
+    qdot_root = extract_root_from_q(
+        result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
+    )
     correction_angle = root_z_correction_angle_from_points(
         reconstruction.points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1650,7 +1801,9 @@ def build_ekf_3d_bundle(
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
     )
-    reprojection_errors = compute_points_reprojection_error_per_view(model_points_3d, reconstruction.frames, calibrations, pose_data_used)
+    reprojection_errors = compute_points_reprojection_error_per_view(
+        model_points_3d, reconstruction.frames, calibrations, pose_data_used
+    )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
     save_legacy_ekf_3d(output_dir, result, reprojection_stats, model_points_3d)
     print_step(5, 5, "Export bundle EKF 3D")
@@ -1659,7 +1812,9 @@ def build_ekf_3d_bundle(
     pipeline_stages = []
     if pose_data_compute_time_s is not None:
         pipeline_stages.append(
-            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+            make_timing_stage(
+                "pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now"
+            )
         )
     if flip_diagnostics is not None:
         flip_method_label = str(flip_diagnostics.get("method", "unknown"))
@@ -1672,7 +1827,13 @@ def build_ekf_3d_bundle(
                     source=pose_variant_source,
                     cache_path=str(flip_diagnostics.get("flip_cache_path") or flip_diagnostics.get("cache_path") or ""),
                 ),
-                make_timing_stage("flip_application", "Apply flip to 2D data", compute_time_s=0.0, source="cache", include_in_total=False),
+                make_timing_stage(
+                    "flip_application",
+                    "Apply flip to 2D data",
+                    compute_time_s=0.0,
+                    source="cache",
+                    include_in_total=False,
+                ),
             ]
         )
     pipeline_stages.extend(
@@ -1686,7 +1847,7 @@ def build_ekf_3d_bundle(
             ),
             make_timing_stage(
                 "triangulation",
-                f"{triangulation_method.title()} triangulation",
+                f"{effective_triangulation_method.title()} triangulation",
                 compute_time_s=reconstruction.triangulation_compute_time_s,
                 source=str(triangulation_source),
                 cache_path=str(reconstruction_cache_path),
@@ -1710,7 +1871,9 @@ def build_ekf_3d_bundle(
     summary = {
         "name": name,
         "family": "ekf_3d",
-        "fps": float(fps),
+        "fps": float(effective_fps),
+        "source_fps": float(fps),
+        "frame_stride": int(getattr(pose_data_used, "frame_stride", 1)),
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
@@ -1719,7 +1882,7 @@ def build_ekf_3d_bundle(
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
         "flip_left_right": bool(flip_left_right),
-        "triangulation_method": triangulation_method,
+        "triangulation_method": effective_triangulation_method,
         "coherence_method": coherence_method,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -1751,7 +1914,11 @@ def build_ekf_3d_bundle(
             "diagram": [str(stage["id"]) for stage in pipeline_stages],
             "stages": pipeline_stages,
             "objective_total_s": float(
-                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+                sum(
+                    float(stage.get("compute_time_s") or 0.0)
+                    for stage in pipeline_stages
+                    if bool(stage.get("include_in_total", True))
+                )
             ),
             "current_run_wall_s": float(triangulation_s + model_s + ekf3d_s),
         },
@@ -1824,6 +1991,10 @@ def build_ekf_2d_bundle(
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
 ) -> BundleBuildResult:
+    triangulation_method = canonical_triangulation_method(triangulation_method)
+    coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
+    effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
+    effective_fps = pose_effective_fps(pose_data, fps)
     if ekf2d_3d_source not in SUPPORTED_EKF2D_3D_SOURCE_MODES:
         raise ValueError(f"Unsupported ekf2d_3d_source: {ekf2d_3d_source}")
     if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"}:
@@ -1831,54 +2002,58 @@ def build_ekf_2d_bundle(
     if ekf2d_3d_source == "first_frame_only" and coherence_method != "epipolar":
         raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method=epipolar.")
 
-    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = prepare_pose_data_for_reconstruction(
-        output_dir=output_dir,
-        pose_data=pose_data,
-        calibrations=calibrations,
-        coherence_method=coherence_method,
-        reprojection_threshold_px=reprojection_threshold_px,
-        epipolar_threshold_px=epipolar_threshold_px,
-        pose_data_mode=pose_data_mode,
-        pose_filter_window=pose_filter_window,
-        pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-        pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-        pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-        flip_left_right=flip_left_right,
-        flip_improvement_ratio=flip_improvement_ratio,
-        flip_min_gain_px=flip_min_gain_px,
-        flip_min_other_cameras=flip_min_other_cameras,
-        flip_restrict_to_outliers=flip_restrict_to_outliers,
-        flip_outlier_percentile=flip_outlier_percentile,
-        flip_outlier_floor_px=flip_outlier_floor_px,
-        flip_temporal_weight=flip_temporal_weight,
-        flip_temporal_tau_px=flip_temporal_tau_px,
-        flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
-    )
-
-    print_step(2, 5, "Triangulation 3D")
-    tri_start = time.perf_counter()
-    if ekf2d_3d_source == "full_triangulation":
-        reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = load_or_compute_triangulation_cache(
+    pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
+        prepare_pose_data_for_reconstruction(
             output_dir=output_dir,
-            pose_data=pose_data_used,
+            pose_data=pose_data,
             calibrations=calibrations,
             coherence_method=coherence_method,
-            triangulation_method=triangulation_method,
             reprojection_threshold_px=reprojection_threshold_px,
-            min_cameras_for_triangulation=min_cameras_for_triangulation,
             epipolar_threshold_px=epipolar_threshold_px,
-            triangulation_workers=triangulation_workers,
             pose_data_mode=pose_data_mode,
             pose_filter_window=pose_filter_window,
             pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
             pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            flip_left_right=flip_left_right,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
+            flip_min_other_cameras=flip_min_other_cameras,
+            flip_restrict_to_outliers=flip_restrict_to_outliers,
+            flip_outlier_percentile=flip_outlier_percentile,
+            flip_outlier_floor_px=flip_outlier_floor_px,
+            flip_temporal_weight=flip_temporal_weight,
+            flip_temporal_tau_px=flip_temporal_tau_px,
+            flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+        )
+    )
+
+    print_step(2, 5, "Triangulation 3D")
+    tri_start = time.perf_counter()
+    if ekf2d_3d_source == "full_triangulation":
+        reconstruction, reconstruction_cache_path, epipolar_cache_path, triangulation_source = (
+            load_or_compute_triangulation_cache(
+                output_dir=output_dir,
+                pose_data=pose_data_used,
+                calibrations=calibrations,
+                coherence_method=coherence_method,
+                triangulation_method=effective_triangulation_method,
+                reprojection_threshold_px=reprojection_threshold_px,
+                min_cameras_for_triangulation=min_cameras_for_triangulation,
+                epipolar_threshold_px=epipolar_threshold_px,
+                triangulation_workers=triangulation_workers,
+                pose_data_mode=pose_data_mode,
+                pose_filter_window=pose_filter_window,
+                pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+                pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+                pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            )
         )
         save_legacy_triangulation(
             output_dir,
             reconstruction,
             pose_data_used,
-            triangulation_method=triangulation_method,
+            triangulation_method=effective_triangulation_method,
             error_threshold_px=reprojection_threshold_px,
             min_cameras_for_triangulation=min_cameras_for_triangulation,
             epipolar_threshold_px=epipolar_threshold_px,
@@ -1902,21 +2077,23 @@ def build_ekf_2d_bundle(
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
         )
         bootstrap_pose_data = slice_pose_data(pose_data_used, [0])
-        bootstrap_reconstruction, reconstruction_cache_path, _, triangulation_source = load_or_compute_triangulation_cache(
-            output_dir=output_dir,
-            pose_data=bootstrap_pose_data,
-            calibrations=calibrations,
-            coherence_method="epipolar",
-            triangulation_method=triangulation_method,
-            reprojection_threshold_px=reprojection_threshold_px,
-            min_cameras_for_triangulation=min_cameras_for_triangulation,
-            epipolar_threshold_px=epipolar_threshold_px,
-            triangulation_workers=triangulation_workers,
-            pose_data_mode=pose_data_mode,
-            pose_filter_window=pose_filter_window,
-            pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
-            pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
-            pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+        bootstrap_reconstruction, reconstruction_cache_path, _, triangulation_source = (
+            load_or_compute_triangulation_cache(
+                output_dir=output_dir,
+                pose_data=bootstrap_pose_data,
+                calibrations=calibrations,
+                coherence_method="epipolar",
+                triangulation_method=effective_triangulation_method,
+                reprojection_threshold_px=reprojection_threshold_px,
+                min_cameras_for_triangulation=min_cameras_for_triangulation,
+                epipolar_threshold_px=epipolar_threshold_px,
+                triangulation_workers=triangulation_workers,
+                pose_data_mode=pose_data_mode,
+                pose_filter_window=pose_filter_window,
+                pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
+                pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
+                pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
+            )
         )
         bootstrap_frame_idx = 0
         reconstruction = reconstruction_with_full_frame_support(
@@ -1931,14 +2108,16 @@ def build_ekf_2d_bundle(
 
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
-    lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx, model_compute_time_s, model_source = load_or_build_model_cache(
-        output_dir=output_dir,
-        reconstruction=reconstruction,
-        reconstruction_cache_path=reconstruction_cache_path,
-        fps=fps,
-        subject_mass_kg=subject_mass_kg,
-        initial_rotation_correction=initial_rotation_correction,
-        lengths_mode=ekf2d_3d_source,
+    lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx, model_compute_time_s, model_source = (
+        load_or_build_model_cache(
+            output_dir=output_dir,
+            reconstruction=reconstruction,
+            reconstruction_cache_path=reconstruction_cache_path,
+            fps=effective_fps,
+            subject_mass_kg=subject_mass_kg,
+            initial_rotation_correction=initial_rotation_correction,
+            lengths_mode=ekf2d_3d_source,
+        )
     )
     biomod_path = output_dir / "vitpose_chain.bioMod"
     shutil.copy2(biomod_cache_path, biomod_path)
@@ -1953,7 +2132,7 @@ def build_ekf_2d_bundle(
         calibrations=calibrations,
         pose_data=pose_data_used,
         reconstruction=reconstruction,
-        fps=fps,
+        fps=effective_fps,
         measurement_noise_scale=measurement_noise_scale,
         process_noise_scale=process_noise_scale,
         min_frame_coherence_for_update=min_frame_coherence_for_update,
@@ -1971,7 +2150,7 @@ def build_ekf_2d_bundle(
         calibrations=calibrations,
         pose_data=pose_data_used,
         reconstruction=reconstruction,
-        fps=fps,
+        fps=effective_fps,
         measurement_noise_scale=measurement_noise_scale,
         process_noise_scale=process_noise_scale,
         min_frame_coherence_for_update=min_frame_coherence_for_update,
@@ -1988,7 +2167,9 @@ def build_ekf_2d_bundle(
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
     q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
-    qdot_root = extract_root_from_q(result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False)
+    qdot_root = extract_root_from_q(
+        result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
+    )
     correction_angle = root_z_correction_angle_from_points(
         reconstruction.points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1996,7 +2177,9 @@ def build_ekf_2d_bundle(
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
     )
-    reprojection_errors = compute_points_reprojection_error_per_view(model_points_3d, reconstruction.frames, calibrations, pose_data_used)
+    reprojection_errors = compute_points_reprojection_error_per_view(
+        model_points_3d, reconstruction.frames, calibrations, pose_data_used
+    )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
     save_legacy_ekf_2d(output_dir, result, predictor, flip_left_right, model_points_3d)
     print_step(5, 5, "Export bundle EKF 2D")
@@ -2005,7 +2188,9 @@ def build_ekf_2d_bundle(
     pipeline_stages = []
     if pose_data_compute_time_s is not None:
         pipeline_stages.append(
-            make_timing_stage("pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now")
+            make_timing_stage(
+                "pose_data", "2D cleaning", compute_time_s=pose_data_compute_time_s, source="computed_now"
+            )
         )
     if flip_diagnostics is not None:
         flip_method_label = str(flip_diagnostics.get("method", "unknown"))
@@ -2018,7 +2203,13 @@ def build_ekf_2d_bundle(
                     source=pose_variant_source,
                     cache_path=str(flip_diagnostics.get("flip_cache_path") or flip_diagnostics.get("cache_path") or ""),
                 ),
-                make_timing_stage("flip_application", "Apply flip to 2D data", compute_time_s=0.0, source="cache", include_in_total=False),
+                make_timing_stage(
+                    "flip_application",
+                    "Apply flip to 2D data",
+                    compute_time_s=0.0,
+                    source="cache",
+                    include_in_total=False,
+                ),
             ]
         )
     if ekf2d_3d_source == "first_frame_only":
@@ -2034,7 +2225,7 @@ def build_ekf_2d_bundle(
         pipeline_stages.append(
             make_timing_stage(
                 "triangulation",
-                f"Bootstrap {triangulation_method} triangulation",
+                f"Bootstrap {effective_triangulation_method.title()} triangulation",
                 compute_time_s=bootstrap_reconstruction.triangulation_compute_time_s,
                 source=str(triangulation_source),
                 cache_path=str(reconstruction_cache_path),
@@ -2053,7 +2244,7 @@ def build_ekf_2d_bundle(
         pipeline_stages.append(
             make_timing_stage(
                 "triangulation",
-                f"{triangulation_method.title()} triangulation",
+                f"{effective_triangulation_method.title()} triangulation",
                 compute_time_s=reconstruction.triangulation_compute_time_s,
                 source=str(triangulation_source),
                 cache_path=str(reconstruction_cache_path),
@@ -2080,21 +2271,71 @@ def build_ekf_2d_bundle(
                 compute_time_s=ekf_s,
                 source="computed_now",
             ),
-            make_timing_stage("ekf_2d_init", "EKF 2D init", compute_time_s=float(ekf_timings["init_s"]), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_loop", "EKF 2D loop", compute_time_s=float(ekf_timings["loop_s"]), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_predict", "EKF 2D predict", compute_time_s=float(ekf_timings.get("predict_s", 0.0)), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_update", "EKF 2D update", compute_time_s=float(ekf_timings.get("update_s", 0.0)), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_markers", "EKF 2D markers", compute_time_s=float(ekf_timings.get("markers_s", 0.0)), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_marker_jacobians", "EKF 2D marker jacobians", compute_time_s=float(ekf_timings.get("marker_jacobians_s", 0.0)), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_assembly", "EKF 2D assembly", compute_time_s=float(ekf_timings.get("assembly_s", 0.0)), source="computed_now", include_in_total=False),
-            make_timing_stage("ekf_2d_solve", "EKF 2D solve", compute_time_s=float(ekf_timings.get("solve_s", 0.0)), source="computed_now", include_in_total=False),
+            make_timing_stage(
+                "ekf_2d_init",
+                "EKF 2D init",
+                compute_time_s=float(ekf_timings["init_s"]),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_loop",
+                "EKF 2D loop",
+                compute_time_s=float(ekf_timings["loop_s"]),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_predict",
+                "EKF 2D predict",
+                compute_time_s=float(ekf_timings.get("predict_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_update",
+                "EKF 2D update",
+                compute_time_s=float(ekf_timings.get("update_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_markers",
+                "EKF 2D markers",
+                compute_time_s=float(ekf_timings.get("markers_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_marker_jacobians",
+                "EKF 2D marker jacobians",
+                compute_time_s=float(ekf_timings.get("marker_jacobians_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_assembly",
+                "EKF 2D assembly",
+                compute_time_s=float(ekf_timings.get("assembly_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
+                "ekf_2d_solve",
+                "EKF 2D solve",
+                compute_time_s=float(ekf_timings.get("solve_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
         ]
     )
 
     summary = {
         "name": name,
         "family": "ekf_2d",
-        "fps": float(fps),
+        "fps": float(effective_fps),
+        "source_fps": float(fps),
+        "frame_stride": int(getattr(pose_data_used, "frame_stride", 1)),
         "n_frames": int(reconstruction.frames.shape[0]),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
@@ -2102,7 +2343,7 @@ def build_ekf_2d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
-        "triangulation_method": triangulation_method,
+        "triangulation_method": effective_triangulation_method,
         "coherence_method": coherence_method,
         "ekf2d_3d_source": ekf2d_3d_source,
         "ekf2d_initial_state_method": ekf2d_initial_state_method,
@@ -2126,7 +2367,9 @@ def build_ekf_2d_bundle(
             "flight_height_threshold_m": float(flight_height_threshold_m),
             "flight_min_consecutive_frames": int(flight_min_consecutive_frames),
         },
-        "bootstrap_frame_idx": int(model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx),
+        "bootstrap_frame_idx": int(
+            model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
+        ),
         "update_status_counts": {str(key): int(value) for key, value in result.get("update_status_counts", {}).items()},
         "left_right_flip_diagnostics": flip_diagnostics,
         "reprojection_px": {
@@ -2152,10 +2395,28 @@ def build_ekf_2d_bundle(
             "total_s": triangulation_s + model_s + initial_state_s + ekf_s,
         },
         "pipeline_timing": {
-            "diagram": [str(stage["id"]) for stage in pipeline_stages if str(stage["id"]) not in {"ekf_2d_init", "ekf_2d_loop", "ekf_2d_predict", "ekf_2d_update", "ekf_2d_markers", "ekf_2d_marker_jacobians", "ekf_2d_assembly", "ekf_2d_solve"}],
+            "diagram": [
+                str(stage["id"])
+                for stage in pipeline_stages
+                if str(stage["id"])
+                not in {
+                    "ekf_2d_init",
+                    "ekf_2d_loop",
+                    "ekf_2d_predict",
+                    "ekf_2d_update",
+                    "ekf_2d_markers",
+                    "ekf_2d_marker_jacobians",
+                    "ekf_2d_assembly",
+                    "ekf_2d_solve",
+                }
+            ],
             "stages": pipeline_stages,
             "objective_total_s": float(
-                sum(float(stage.get("compute_time_s") or 0.0) for stage in pipeline_stages if bool(stage.get("include_in_total", True)))
+                sum(
+                    float(stage.get("compute_time_s") or 0.0)
+                    for stage in pipeline_stages
+                    if bool(stage.get("include_in_total", True))
+                )
             ),
             "current_run_wall_s": float(triangulation_s + model_s + initial_state_s + ekf_s),
         },

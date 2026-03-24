@@ -2,6 +2,7 @@ import numpy as np
 
 from judging.dd_analysis import (
     JumpSegment,
+    analyze_dd_session,
     analyze_single_jump,
     default_body_shape_indices,
     signed_threshold_crossing_indices,
@@ -58,3 +59,32 @@ def test_analyze_single_jump_infers_last_salto_twist_from_end_of_jump(monkeypatc
     jump = analyze_single_jump(np.zeros((5, 6)), JumpSegment(start=0, end=4, peak_index=2))
     assert jump.twists_per_salto == [1.0, 0.5]
     assert jump.code == "821"
+
+
+def test_analyze_dd_session_ignores_first_frames_and_keeps_only_complete_jumps():
+    fps = 10.0
+    root_q = np.zeros((60, 6), dtype=float)
+    height = np.zeros(60, dtype=float)
+    height[4:9] = 1.0
+    height[20:26] = 1.2
+    height[55:60] = 1.1
+    root_q[:, 2] = height
+
+    analysis = analyze_dd_session(
+        root_q,
+        fps,
+        height_values=height,
+        height_threshold=0.5,
+        smoothing_window_s=0.0,
+        min_airtime_s=0.2,
+        min_gap_s=0.0,
+        min_peak_prominence_m=0.2,
+        contact_window_s=0.4,
+        analysis_start_frame=10,
+        require_complete_jumps=True,
+    )
+
+    assert analysis.analysis_start_frame == 10
+    assert len(analysis.jump_segments) == 1
+    assert analysis.jump_segments[0].start > 10
+    assert analysis.jump_segments[0].end < len(height) - 1

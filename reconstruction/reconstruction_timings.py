@@ -181,6 +181,8 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
         f"Name: {summary.get('name', '-')}",
         f"Family: {summary.get('family', '-')}",
         f"Frames: {summary.get('n_frames', '-')}",
+        f"Source FPS: {summary.get('source_fps', summary.get('fps', '-'))}",
+        f"Effective FPS: {summary.get('fps', '-')}",
         f"Sequence duration: {format_seconds_brief(_coerce_float(summary.get('duration_s')))}",
         f"Objective compute time: {format_seconds_brief(objective_time)}",
     ]
@@ -202,7 +204,9 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
             source = str(stage.get("source", "computed_now"))
             cache_path = stage.get("cache_path")
             suffix = " [cache]" if source == "cache" else ""
-            lines.append(f"  - {stage.get('label', humanize_stage_name(str(stage.get('id', ''))))}: {format_seconds_brief(value)}{suffix}")
+            lines.append(
+                f"  - {stage.get('label', humanize_stage_name(str(stage.get('id', ''))))}: {format_seconds_brief(value)}{suffix}"
+            )
             if cache_path:
                 lines.append(f"      cache: {cache_path}")
     else:
