@@ -105,6 +105,23 @@ def test_execution_analysis_caps_one_jump_at_half_point():
     assert session.execution_score == 19.5
 
 
+def test_execution_analysis_can_reach_stronger_body_straightness_deduction():
+    n_frames = 8
+    points = _base_points(n_frames)
+    points[:, 5] = (-0.6, 0.2, 1.0)
+    points[:, 6] = (-0.6, -0.2, 1.0)
+
+    q_names = np.asarray(["TRUNK:TransZ"], dtype=object)
+    q = np.zeros((n_frames, len(q_names)), dtype=float)
+
+    session = analyze_execution_session(_session_with_one_jump(n_frames), q, None, q_names, points, fs=120.0)
+
+    jump = session.jumps[0]
+    straightness_events = [event for event in jump.deduction_events if event.code == "form_hips"]
+    assert straightness_events
+    assert straightness_events[0].deduction == 0.2
+
+
 def test_compute_time_of_flight_robust_ignores_micro_bounces():
     time = np.array([0.0, 0.1, 0.2, 0.3, 0.35, 0.4, 0.6, 0.8], dtype=float)
     tz = np.array([0.0, 1.0, 0.0, 1.2, 0.95, 1.1, 0.0, 1.0], dtype=float)

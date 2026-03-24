@@ -62,6 +62,7 @@ from judging.dd_presenter import (
 from judging.dd_reference import default_dd_reference_path, load_dd_reference_codes
 from preview.dataset_preview_loader import load_dataset_preview_resources
 from preview.dataset_preview_state import build_dataset_preview_state
+from preview.shared_reconstruction_panel import SharedReconstructionPanel, show_placeholder_figure
 from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.preview_bundle import (
     align_to_reference,
@@ -135,6 +136,7 @@ from kinematics.root_series import (
     root_ordered_names,
     root_rotation_matrices_from_points,
     root_rotation_matrices_from_series,
+    root_series_from_model_markers,
     root_series_from_points,
     root_series_from_precomputed,
     root_series_from_q,
@@ -216,6 +218,13 @@ RIGHT_KEYPOINTS = {
     "right_knee",
     "right_ankle",
 }
+FACE_KEYPOINTS = {
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+}
+BODY_ONLY_KEYPOINTS = tuple(name for name in COCO17 if name not in FACE_KEYPOINTS)
 LOWER_LIMB_EDGES = {
     ("left_hip", "left_knee"),
     ("left_knee", "left_ankle"),
@@ -283,6 +292,17 @@ def finite_mean_std(values: np.ndarray) -> tuple[float | None, float | None]:
     if finite.size == 0:
         return None, None
     return float(np.mean(finite)), float(np.std(finite))
+
+
+def keypoint_preset_names(preset: str) -> list[str]:
+    """Return the keypoint names covered by one 2D-explorer selection preset."""
+
+    normalized = str(preset).strip().lower()
+    if normalized == "none":
+        return []
+    if normalized == "body_only":
+        return list(BODY_ONLY_KEYPOINTS)
+    return list(COCO17)
 
 
 def analysis_frame_slice(frame_count: int, start_frame: int = ANALYSIS_START_FRAME) -> slice:
@@ -1433,6 +1453,7 @@ class SharedAppState:
     shared_reconstruction_selection_listeners: list[callable] = field(default_factory=list)
     shared_reconstruction_panel: object | None = None
     active_reconstruction_consumer: object | None = None
+    clean_trial_outputs_callback: callable | None = None
 
     def set_profiles(self, profiles: list[ReconstructionProfile]) -> None:
         self.profiles = list(profiles)
@@ -1591,23 +1612,6 @@ def load_shared_reconstruction_preview_state(
         extra_rows=extra_rows,
     )
     return output_dir, bundle, preview_state
-
-
-def show_placeholder_figure(
-    figure: Figure,
-    canvas: FigureCanvasTkAgg,
-    message: str,
-    *,
-    fontsize: int = 11,
-    color: str = "#555555",
-) -> None:
-    """Render a lightweight placeholder message in one Matplotlib figure."""
-
-    figure.clear()
-    ax = figure.subplots(1, 1)
-    ax.axis("off")
-    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=fontsize, color=color)
-    canvas.draw_idle()
 
 
 def reconstruction_dir_by_name(dataset_dir: Path, reconstruction_name: str) -> Path | None:
@@ -2030,133 +2034,6 @@ class SelectionTable(ttk.Frame):
         if selected:
             return selected
         return [name for name in self._default_names if self.tree.exists(name)]
-
-
-class SharedReconstructionPanel(ttk.LabelFrame):
-    """Single reconstruction selector shared by the active analysis tab."""
-
-    def __init__(self, master, state: SharedAppState):
-        super().__init__(master, text="Reconstructions")
-        self.state = state
-        self._default_names: list[str] = []
-        self._selection_callback = None
-        self._refresh_callback = None
-        self._suspend_selection_callback = False
-
-        header = ttk.Frame(self)
-        header.pack(fill=tk.X, padx=8, pady=(6, 2))
-        self.title_var = tk.StringVar(value="Reconstructions")
-        ttk.Label(header, textvariable=self.title_var).pack(side=tk.LEFT)
-        self.refresh_button = ttk.Button(header, text="Refresh available")
-        self.refresh_button.pack(side=tk.RIGHT)
-
-        self.tree = ttk.Treeview(
-            self,
-            columns=("label", "family", "frames", "reproj", "path"),
-            show="headings",
-            height=5,
-            selectmode="extended",
-        )
-        self.tree.heading("label", text="Reconstruction")
-        self.tree.heading("family", text="Family")
-        self.tree.heading("frames", text="Frames")
-        self.tree.heading("reproj", text="Reproj (px)")
-        self.tree.heading("path", text="Path")
-        self.tree.column("label", width=240, anchor="w")
-        self.tree.column("family", width=90, anchor="w")
-        self.tree.column("frames", width=70, anchor="w")
-        self.tree.column("reproj", width=95, anchor="w")
-        self.tree.column("path", width=540, anchor="w")
-        self.tree.pack(fill=tk.X, expand=False, padx=8, pady=(0, 6))
-        self.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
-        attach_tooltip(self.tree, "Shared reconstruction selector used by the active analysis tab.")
-        self.show_placeholder("Select a tab that uses reconstruction comparisons.")
-
-    def configure_for_consumer(
-        self,
-        *,
-        title: str,
-        refresh_callback,
-        selection_callback,
-        selectmode: str = "extended",
-    ) -> None:
-        """Bind the shared panel to one tab consumer."""
-
-        self.title_var.set(title)
-        self._refresh_callback = refresh_callback
-        self._selection_callback = selection_callback
-        self.refresh_button.configure(command=refresh_callback)
-        self.tree.configure(selectmode=selectmode)
-
-    def set_rows(self, rows: list[dict[str, object]], default_names: list[str] | None = None) -> None:
-        """Populate the shared tree while preserving compatible selections."""
-
-        previous = set(self.selected_names())
-        self._default_names = list(default_names or [])
-        self._suspend_selection_callback = True
-        try:
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            row_names = []
-            for row in rows:
-                name = str(row.get("name", ""))
-                if not name:
-                    continue
-                row_names.append(name)
-                reproj_mean = row.get("reproj_mean")
-                self.tree.insert(
-                    "",
-                    "end",
-                    iid=name,
-                    values=(
-                        str(row.get("label", name)),
-                        str(row.get("family", "-")),
-                        row.get("frames", "-"),
-                        "-" if reproj_mean is None else f"{float(reproj_mean):.2f}",
-                        str(row.get("path", "")),
-                    ),
-                )
-            selection = [name for name in row_names if name in previous]
-            if not selection:
-                selection = [name for name in row_names if name in self._default_names]
-            self.tree.selection_set(selection)
-        finally:
-            self._suspend_selection_callback = False
-        self._publish_selection()
-
-    def selected_names(self) -> list[str]:
-        selected = list(self.tree.selection())
-        if selected:
-            return selected
-        return [name for name in self._default_names if self.tree.exists(name)]
-
-    def show_placeholder(self, message: str) -> None:
-        """Replace the table content with an empty informative state."""
-
-        self.title_var.set("Reconstructions")
-        self._default_names = []
-        self._selection_callback = None
-        self._refresh_callback = None
-        self.refresh_button.configure(command=lambda: None)
-        self._suspend_selection_callback = True
-        try:
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-            self.tree.insert("", "end", iid="__placeholder__", values=(message, "-", "-", "-", "-"))
-            self.tree.selection_remove(self.tree.selection())
-        finally:
-            self._suspend_selection_callback = False
-        self.state.set_shared_reconstruction_selection([])
-
-    def _publish_selection(self) -> None:
-        self.state.set_shared_reconstruction_selection(self.selected_names())
-
-    def _on_selection_changed(self, _event=None) -> None:
-        if self._suspend_selection_callback:
-            return
-        self._publish_selection()
-        if self._selection_callback is not None:
-            self._selection_callback()
 
 
 class CommandTab(ttk.Frame):
@@ -3751,12 +3628,6 @@ class DataExplorer2DTab(ttk.Frame):
 
         row_shared = ttk.Frame(controls)
         row_shared.pack(fill=tk.X, padx=8, pady=4)
-        self.output_root = LabeledEntry(
-            row_shared, "Output root", browse=True, directory=True, label_width=10, entry_width=24
-        )
-        self.output_root.var = state.output_root_var
-        self.output_root.entry_widget.configure(textvariable=self.output_root.var)
-        self.output_root.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.fps = LabeledEntry(row_shared, "FPS", label_width=4, entry_width=6)
         self.fps.var = state.fps_var
         self.fps.entry_widget.configure(textvariable=self.fps.var)
@@ -3783,9 +3654,6 @@ class DataExplorer2DTab(ttk.Frame):
         self.calibration_correction_box.pack(side=tk.LEFT, padx=(0, 6))
         self.selected_cameras_label_var = tk.StringVar(value="Cameras: all")
         ttk.Label(row_shared, textvariable=self.selected_cameras_label_var, foreground="#4f5b66").pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
-        ttk.Button(row_shared, text="Clean trial outputs", command=self.clean_trial_outputs).pack(
             side=tk.LEFT, padx=(8, 0)
         )
         ttk.Label(controls, textvariable=self.dataset_summary_var, foreground="#4f5b66", justify=tk.LEFT).pack(
@@ -3910,15 +3778,28 @@ class DataExplorer2DTab(ttk.Frame):
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
-        self.keypoint_list = tk.Listbox(controls, selectmode=tk.MULTIPLE, exportselection=False, height=5)
+        content = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        keypoint_box = ttk.LabelFrame(content, text="Keypoints")
+        figure_box = ttk.LabelFrame(content, text="Courbes temporelles par camera")
+        content.add(keypoint_box, weight=1)
+        content.add(figure_box, weight=4)
+
+        keypoint_actions = ttk.Frame(keypoint_box)
+        keypoint_actions.pack(fill=tk.X, padx=8, pady=(8, 0))
+        ttk.Button(keypoint_actions, text="All", command=self.select_all_keypoints).pack(side=tk.LEFT)
+        ttk.Button(keypoint_actions, text="None", command=self.clear_keypoints).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(keypoint_actions, text="Body only", command=self.select_body_keypoints).pack(
+            side=tk.LEFT, padx=(6, 0)
+        )
+
+        self.keypoint_list = tk.Listbox(keypoint_box, selectmode=tk.MULTIPLE, exportselection=False, height=18)
         for name in COCO17:
             self.keypoint_list.insert(tk.END, name)
         for idx in range(len(COCO17)):
             self.keypoint_list.selection_set(idx)
-        self.keypoint_list.pack(fill=tk.X, padx=8, pady=4)
+        self.keypoint_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        figure_box = ttk.LabelFrame(self, text="Courbes temporelles par camera")
-        figure_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
         self.figure = Figure(figsize=(12, 8))
         self.canvas = FigureCanvasTkAgg(self.figure, master=figure_box)
         self.toolbar = NavigationToolbar2Tk(self.canvas, figure_box, pack_toolbar=False)
@@ -3930,9 +3811,6 @@ class DataExplorer2DTab(ttk.Frame):
         self.keypoints.set_tooltip("Fichier JSON des détections 2D. Son nom détermine aussi le nom du dataset.")
         self.pose2sim_trc.set_tooltip(
             "TRC utilisé pour Pose2Sim. Il est recherché automatiquement à partir du JSON 2D."
-        )
-        self.output_root.set_tooltip(
-            "Dossier racine partagé des sorties. Le dataset sera créé automatiquement dessous."
         )
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
@@ -3997,6 +3875,10 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_temporal_tau.set_tooltip(
             "Echelle en pixels du coût temporel 2D utilisée pour normaliser sa contribution avant combinaison avec le coût épipolaire ou triangulation."
         )
+        attach_tooltip(
+            keypoint_actions,
+            "Quick keypoint-selection presets for the 2D explorer. 'Body only' keeps trunk and limb keypoints while removing eyes and ears.",
+        )
         self.component.trace_add("write", lambda *_args: self.refresh_plot())
         self.view_mode.trace_add("write", lambda *_args: self.refresh_plot())
         self.flip_mode.trace_add("write", lambda *_args: self.refresh_plot())
@@ -4016,6 +3898,7 @@ class DataExplorer2DTab(ttk.Frame):
             "write", lambda *_args: synchronize_profiles_initial_rotation_correction(self.state)
         )
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_dataset_summary())
+        self.state.clean_trial_outputs_callback = self.clean_trial_outputs
         self.on_keypoints_changed()
 
     def selected_triangulation_flip_method(self) -> str:
@@ -4112,6 +3995,31 @@ class DataExplorer2DTab(ttk.Frame):
         if not indices:
             return COCO17[:]
         return [COCO17[idx] for idx in indices]
+
+    def _apply_keypoint_preset(self, preset: str) -> None:
+        """Apply one named keypoint preset to the listbox selection."""
+
+        selected_names = set(keypoint_preset_names(preset))
+        self.keypoint_list.selection_clear(0, tk.END)
+        for idx, name in enumerate(COCO17):
+            if name in selected_names:
+                self.keypoint_list.selection_set(idx)
+        self.refresh_plot()
+
+    def select_all_keypoints(self) -> None:
+        """Select every available COCO keypoint in the 2D explorer."""
+
+        self._apply_keypoint_preset("all")
+
+    def clear_keypoints(self) -> None:
+        """Clear the 2D-explorer keypoint selection."""
+
+        self._apply_keypoint_preset("none")
+
+    def select_body_keypoints(self) -> None:
+        """Keep trunk and limb keypoints while removing face-side details."""
+
+        self._apply_keypoint_preset("body_only")
 
     def load_data(self) -> None:
         self.reload_data(show_errors=True)
@@ -6175,6 +6083,7 @@ class RootKinematicsTab(ttk.Frame):
         super().__init__(master)
         self.state = state
         self.bundle = None
+        self.model_marker_points_cache: dict[tuple[str, str, str], np.ndarray] = {}
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
 
@@ -6218,6 +6127,7 @@ class RootKinematicsTab(ttk.Frame):
         self.reextract_var = tk.BooleanVar(value=True)
         self.fd_qdot_var = tk.BooleanVar(value=True)
         self.matrix_ignore_alpha_var = tk.BooleanVar(value=False)
+        self.common_geometric_root_var = tk.BooleanVar(value=False)
         unwrap_check = ttk.Checkbutton(row2, text="unwrap rotations", variable=self.unwrap_var)
         unwrap_check.pack(side=tk.LEFT)
         reextract_check = ttk.Checkbutton(
@@ -6230,6 +6140,12 @@ class RootKinematicsTab(ttk.Frame):
             row2, text="matrix without alpha correction", variable=self.matrix_ignore_alpha_var
         )
         matrix_ignore_alpha_check.pack(side=tk.LEFT, padx=(12, 0))
+        common_geometric_root_check = ttk.Checkbutton(
+            row2,
+            text="common geometric root from model markers",
+            variable=self.common_geometric_root_var,
+        )
+        common_geometric_root_check.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row2, text="Load / refresh", command=self.refresh_plot).pack(side=tk.LEFT, padx=(12, 0))
 
         attach_tooltip(family_label, "Choisit si l'on compare les translations ou les rotations de la racine.")
@@ -6258,6 +6174,10 @@ class RootKinematicsTab(ttk.Frame):
             matrix_ignore_alpha_check,
             "En mode matrix, affiche la matrice brute issue des marqueurs sans retirer la correction alpha. Cette option n'affecte que les reconstructions géométriques.",
         )
+        attach_tooltip(
+            common_geometric_root_check,
+            "Pour les reconstructions basées sur q, reconstruit d'abord les marqueurs du modèle puis ré-extrait la racine géométrique avec la même méthode que triangulation/Pose2Sim.",
+        )
 
         plot_box = ttk.LabelFrame(self, text="Comparaison racine")
         plot_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -6275,6 +6195,7 @@ class RootKinematicsTab(ttk.Frame):
         self.reextract_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.matrix_ignore_alpha_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.common_geometric_root_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.after_idle(self.refresh_available_reconstructions)
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
@@ -6305,6 +6226,25 @@ class RootKinematicsTab(ttk.Frame):
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
+
+    def _model_marker_points_for_root(self, reconstruction_name: str, q_series: np.ndarray) -> np.ndarray | None:
+        """Return cached model-marker trajectories used for common geometric-root comparisons."""
+
+        dataset_dir = current_dataset_dir(self.state)
+        biomod_path = resolve_reconstruction_biomod(dataset_dir, reconstruction_name)
+        if biomod_path is None or not biomod_path.exists():
+            return None
+        cache_key = (
+            str(dataset_dir.resolve()),
+            str(reconstruction_name),
+            str(biomod_path.resolve()),
+        )
+        cached = self.model_marker_points_cache.get(cache_key)
+        if cached is not None and cached.shape[0] == np.asarray(q_series).shape[0]:
+            return cached
+        marker_points = biorbd_markers_from_q(biomod_path, np.asarray(q_series, dtype=float))
+        self.model_marker_points_cache[cache_key] = marker_points
+        return marker_points
 
     def refresh_available_reconstructions(self) -> None:
         try:
@@ -6382,13 +6322,32 @@ class RootKinematicsTab(ttk.Frame):
                 summary_family = str(summary.get("family", ""))
                 geometric_family = summary_family in {"pose2sim", "triangulation"}
                 geometric_rotfix_mismatch = False
+                model_marker_points = None
+                model_biomod_path = None
                 if name in recon_3d:
                     applied = summary.get("initial_rotation_correction_applied")
                     if applied is not None:
                         geometric_rotfix_mismatch = bool(applied) != bool(
                             self.state.initial_rotation_correction_var.get()
                         )
-                if geometric_family and name in recon_3d:
+                if bool(self.common_geometric_root_var.get()) and name in recon_q:
+                    model_marker_points = self._model_marker_points_for_root(
+                        name, np.asarray(recon_q[name], dtype=float)
+                    )
+                    if model_marker_points is not None:
+                        model_biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), name)
+                        series, model_marker_points = root_series_from_model_markers(
+                            np.asarray(recon_q[name], dtype=float),
+                            biomod_path=model_biomod_path,
+                            marker_builder=biorbd_markers_from_q,
+                            marker_points=model_marker_points,
+                            quantity=effective_quantity,
+                            dt=dt,
+                            initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+                            unwrap_rotations=bool(self.unwrap_var.get()),
+                        )
+                        geometric_family = True
+                if series is None and geometric_family and name in recon_3d:
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
                         quantity=effective_quantity,
@@ -6396,7 +6355,7 @@ class RootKinematicsTab(ttk.Frame):
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
                     )
-                elif name in recon_q:
+                elif series is None and name in recon_q:
                     series = root_series_from_q(
                         q_names,
                         recon_q[name],
@@ -6407,7 +6366,7 @@ class RootKinematicsTab(ttk.Frame):
                         unwrap_rotations=bool(self.unwrap_var.get()),
                         renormalize_rotations=bool(self.reextract_var.get()),
                     )
-                elif name in recon_3d:
+                elif series is None and name in recon_3d:
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
                         quantity=effective_quantity,
@@ -6415,7 +6374,7 @@ class RootKinematicsTab(ttk.Frame):
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
                     )
-                elif name in recon_q_root and not geometric_rotfix_mismatch:
+                elif series is None and name in recon_q_root and not geometric_rotfix_mismatch:
                     series = root_series_from_precomputed(
                         np.asarray(recon_q_root[name], dtype=float),
                         quantity=effective_quantity,
@@ -6431,7 +6390,15 @@ class RootKinematicsTab(ttk.Frame):
                 frame_indices = np.arange(np.asarray(series).shape[0], dtype=float)[frame_slice]
                 t = frame_indices * dt
                 if matrix_mode:
-                    if geometric_family and name in recon_3d:
+                    if model_marker_points is not None:
+                        matrices = root_rotation_matrices_from_points(
+                            model_marker_points,
+                            initial_rotation_correction=(
+                                bool(self.state.initial_rotation_correction_var.get())
+                                and not bool(self.matrix_ignore_alpha_var.get())
+                            ),
+                        )
+                    elif geometric_family and name in recon_3d:
                         matrices = root_rotation_matrices_from_points(
                             np.asarray(recon_3d[name], dtype=float),
                             initial_rotation_correction=(
@@ -7223,14 +7190,10 @@ class ExecutionTab(ttk.Frame):
         self.camera_box = ttk.Combobox(row, textvariable=self.camera_name, values=[], width=18, state="readonly")
         self.camera_box.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(row, text="Analyze / refresh", command=self.refresh_analysis).pack(side=tk.LEFT)
-        ttk.Label(
-            row,
-            text=(
-                "First pass: deductions are localized on one representative frame per error and "
-                "highlighted on 3D markers plus one selected camera view."
-            ),
-            foreground="#4f5b66",
-        ).pack(side=tk.LEFT, padx=(12, 0))
+        self.image_layer_status_var = tk.StringVar(
+            value="2D view currently shows 2D detections + reprojection. Image overlay is ready to plug in later."
+        )
+        ttk.Label(row, textvariable=self.image_layer_status_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(12, 0))
         attach_tooltip(camera_label, "Camera used for the 2D localization preview.")
         attach_tooltip(self.camera_box, "Camera used for the 2D localization preview.")
 
@@ -7757,6 +7720,8 @@ class CameraToolsTab(ttk.Frame):
         self.flip_diagnostics: dict[str, dict[str, object]] = {}
         self.flip_detail_arrays: dict[str, dict[str, np.ndarray]] = {}
         self.flip_frame_local_indices: list[int] = []
+        self.uses_shared_reconstruction_panel = True
+        self.shared_reconstruction_selectmode = "browse"
 
         controls = ttk.LabelFrame(self, text="Sélection de caméras + inspection flip L/R")
         controls.pack(fill=tk.X, padx=10, pady=10)
@@ -7765,11 +7730,6 @@ class CameraToolsTab(ttk.Frame):
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
-        reference_label = ttk.Label(row, text="Reference", width=10)
-        reference_label.pack(side=tk.LEFT)
-        self.reference_name_var = tk.StringVar(value="")
-        self.reference_box = ttk.Combobox(row, textvariable=self.reference_name_var, width=28, state="readonly")
-        self.reference_box.pack(side=tk.LEFT, padx=(0, 8))
         best_n_label = ttk.Label(row, text="Best N", width=8)
         best_n_label.pack(side=tk.LEFT)
         self.best_n_var = tk.StringVar(value="4")
@@ -7794,7 +7754,7 @@ class CameraToolsTab(ttk.Frame):
             controls,
             text=(
                 "Scores shown: valid 2D coverage, detector confidence, epipolar coherence, confidence x coherence, "
-                "reprojection quality, triangulation usage, and flip rates.\n"
+                "reprojection quality, triangulation usage, epipolar decision support, and flip rates.\n"
                 "Additional useful literature criteria: calibration uncertainty, baseline diversity, occlusion persistence, "
                 "view angle to the motion plane, and temporal stability of 2D tracks."
             ),
@@ -7823,6 +7783,8 @@ class CameraToolsTab(ttk.Frame):
                 "reproj",
                 "good",
                 "usage",
+                "epi_decision",
+                "epi_decision_smoothed",
                 "flip_epi",
                 "flip_epif",
                 "flip_tri",
@@ -7840,6 +7802,8 @@ class CameraToolsTab(ttk.Frame):
             "reproj": "Reproj px",
             "good": "Good reproj %",
             "usage": "Triang use %",
+            "epi_decision": "Epi score",
+            "epi_decision_smoothed": "Epi score sm",
             "flip_epi": "Flip epi %",
             "flip_epif": "Flip epiF %",
             "flip_tri": "Flip tri %",
@@ -7853,6 +7817,8 @@ class CameraToolsTab(ttk.Frame):
             "reproj": 85,
             "good": 95,
             "usage": 95,
+            "epi_decision": 80,
+            "epi_decision_smoothed": 90,
             "flip_epi": 85,
             "flip_epif": 90,
             "flip_tri": 85,
@@ -7872,8 +7838,14 @@ class CameraToolsTab(ttk.Frame):
         self.flip_method_box = ttk.Combobox(
             inspector_controls,
             textvariable=self.flip_method_var,
-            values=["epipolar", "epipolar_fast", "triangulation"],
-            width=16,
+            values=[
+                "epipolar",
+                "epipolar_fast",
+                "triangulation_once",
+                "triangulation_greedy",
+                "triangulation_exhaustive",
+            ],
+            width=24,
             state="readonly",
         )
         self.flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
@@ -7921,19 +7893,11 @@ class CameraToolsTab(ttk.Frame):
         self.dataset_dir.set_tooltip(
             "Dataset courant utilise pour calculer les scores caméra et relire les caches de flip."
         )
-        attach_tooltip(
-            reference_label,
-            "Reconstruction de référence utilisée pour relire epipolar coherence, reprojection per view et usage dans la triangulation.",
-        )
-        attach_tooltip(
-            self.reference_box,
-            "Reconstruction de référence utilisée pour relire epipolar coherence, reprojection per view et usage dans la triangulation.",
-        )
         attach_tooltip(best_n_label, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(best_n_entry, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(
             self.metrics_tree,
-            "Scores comparatifs pour choisir un sous-ensemble de caméras plus stable pour la reconstruction.",
+            "Scores comparatifs pour choisir un sous-ensemble de caméras plus stable pour la reconstruction, y compris le support moyen des décisions de flip épipolaires.",
         )
         attach_tooltip(
             method_label,
@@ -7953,8 +7917,6 @@ class CameraToolsTab(ttk.Frame):
             self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée."
         )
 
-        self.reference_name_var.trace_add("write", lambda *_args: self.on_reference_changed())
-        self.reference_box.bind("<<ComboboxSelected>>", lambda _event: self.on_reference_changed())
         self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.flip_camera_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
@@ -7965,7 +7927,8 @@ class CameraToolsTab(ttk.Frame):
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.load_resources())
         self.state.calibration_correction_var.trace_add("write", lambda *_args: self.load_resources())
-        self.state.register_reconstruction_listener(self.refresh_reference_choices)
+        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.state.register_shared_reconstruction_selection_listener(self._on_reconstruction_selection_changed)
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_camera_filter_status())
         self.sync_dataset_dir()
 
@@ -7976,7 +7939,7 @@ class CameraToolsTab(ttk.Frame):
 
     def sync_dataset_dir(self) -> None:
         self.dataset_dir.var.set(display_path(current_dataset_dir(self.state)))
-        self.refresh_reference_choices()
+        self.refresh_available_reconstructions()
         self.update_camera_filter_status()
         self.load_resources()
 
@@ -7993,27 +7956,40 @@ class CameraToolsTab(ttk.Frame):
             if self.metrics_tree.exists(camera_name):
                 self.metrics_tree.selection_add(camera_name)
 
-    def refresh_reference_choices(self) -> None:
-        dataset_dir = current_dataset_dir(self.state)
-        catalog = discover_reconstruction_catalog(
-            dataset_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get())
-        )
-        names = [str(row.get("name")) for row in catalog]
-        self.reference_box.configure(values=[""] + names)
-        current = self.reference_name_var.get()
-        if current in names:
-            return
-        for preferred in ("triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_3d"):
-            if preferred in names:
-                self.reference_name_var.set(preferred)
-                return
-        self.reference_name_var.set("")
-
-    def on_reference_changed(self) -> None:
+    def _on_reconstruction_selection_changed(self) -> None:
         if self.pose_data is None:
             return
         self.refresh_metrics()
         self.refresh_flip_frame_list()
+
+    def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
+        panel.configure_for_consumer(
+            title="Reconstructions | Caméras",
+            refresh_callback=self.refresh_available_reconstructions,
+            selection_callback=self._on_reconstruction_selection_changed,
+            selectmode=self.shared_reconstruction_selectmode,
+        )
+        self.refresh_available_reconstructions()
+
+    def refresh_available_reconstructions(self) -> None:
+        try:
+            _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_3d"],
+                fallback_count=1,
+                include_3d=True,
+                include_q=True,
+                include_q_root=True,
+            )
+            panel = self.state.shared_reconstruction_panel
+            if panel is not None and self.state.active_reconstruction_consumer is self:
+                panel.set_rows(preview_state.rows, preview_state.defaults[:1])
+        except Exception:
+            pass
+
+    def _selected_reconstruction(self) -> str | None:
+        selected = list(self.state.shared_reconstruction_selection)
+        return selected[-1] if selected else None
 
     def load_resources(self) -> None:
         try:
@@ -8056,7 +8032,13 @@ class CameraToolsTab(ttk.Frame):
             return
         dataset_dir = current_dataset_dir(self.state)
         pose_kwargs = shared_pose_data_kwargs(self.state)
-        for method in ("epipolar", "epipolar_fast", "triangulation"):
+        for method in (
+            "epipolar",
+            "epipolar_fast",
+            "triangulation_once",
+            "triangulation_greedy",
+            "triangulation_exhaustive",
+        ):
             suspect_mask, diagnostics, _compute_time_s, cache_path, _flip_source = (
                 load_or_compute_left_right_flip_cache(
                     output_dir=dataset_dir,
@@ -8086,9 +8068,12 @@ class CameraToolsTab(ttk.Frame):
             self.flip_masks[method] = suspect_mask
             self.flip_diagnostics[method] = diagnostics
             self.flip_detail_arrays[method] = load_flip_detail_arrays(cache_path)
+        self.flip_masks["triangulation"] = self.flip_masks.get("triangulation_exhaustive")
+        self.flip_diagnostics["triangulation"] = self.flip_diagnostics.get("triangulation_exhaustive", {})
+        self.flip_detail_arrays["triangulation"] = self.flip_detail_arrays.get("triangulation_exhaustive", {})
 
     def _reference_payload(self) -> dict[str, np.ndarray]:
-        reference_name = self.reference_name_var.get().strip()
+        reference_name = (self._selected_reconstruction() or "").strip()
         if not reference_name:
             return {}
         recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
@@ -8104,6 +8089,7 @@ class CameraToolsTab(ttk.Frame):
             reprojection_error_per_view=payload.get("reprojection_error_per_view"),
             excluded_views=payload.get("excluded_views"),
             flip_masks=self.flip_masks,
+            flip_detail_arrays=self.flip_detail_arrays,
             good_reprojection_threshold_px=DEFAULT_REPROJECTION_THRESHOLD_PX,
         )
         previous = set(self.metrics_tree.selection())
@@ -8123,6 +8109,8 @@ class CameraToolsTab(ttk.Frame):
                     self._fmt_float(row.reprojection_mean_px),
                     self._fmt_pct(row.reprojection_good_frame_ratio),
                     self._fmt_pct(row.triangulation_usage_ratio),
+                    self._fmt_float(row.epipolar_decision_score),
+                    self._fmt_float(row.epipolar_decision_score_smoothed),
                     self._fmt_pct(row.flip_rate_epipolar),
                     self._fmt_pct(row.flip_rate_epipolar_fast),
                     self._fmt_pct(row.flip_rate_triangulation),
@@ -8189,7 +8177,13 @@ class CameraToolsTab(ttk.Frame):
             frame_number = int(self.base_pose_data.frames[local_idx])
             nominal = self._flip_cost(detail_arrays, "nominal_combined_costs", cam_idx, local_idx)
             swapped = self._flip_cost(detail_arrays, "swapped_combined_costs", cam_idx, local_idx)
-            label = f"{'flip' if suspect_mask[cam_idx, local_idx] else 'candidate'} | frame {frame_number} | {self._fmt_float(nominal)} -> {self._fmt_float(swapped)}"
+            decision_score = self._flip_cost(detail_arrays, "decision_scores", cam_idx, local_idx)
+            smoothed_score = self._flip_cost(detail_arrays, "decision_scores_smoothed", cam_idx, local_idx)
+            label = (
+                f"{'flip' if suspect_mask[cam_idx, local_idx] else 'candidate'} | frame {frame_number} | "
+                f"{self._fmt_float(nominal)} -> {self._fmt_float(swapped)} | "
+                f"dec {self._fmt_float(decision_score)} / sm {self._fmt_float(smoothed_score)}"
+            )
             self.flip_frame_list.insert(tk.END, label)
         if local_indices:
             self.flip_frame_list.selection_set(0)
@@ -8204,7 +8198,7 @@ class CameraToolsTab(ttk.Frame):
         return self.flip_frame_local_indices[0] if self.flip_frame_local_indices else None
 
     def _reference_projection(self, camera_name: str, frame_local_idx: int) -> tuple[np.ndarray | None, str, str]:
-        reference_name = self.reference_name_var.get().strip()
+        reference_name = (self._selected_reconstruction() or "").strip()
         if not reference_name:
             return None, "none", "#444444"
         recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
@@ -8324,6 +8318,8 @@ class CameraToolsTab(ttk.Frame):
                     f"swapped temporal={self._fmt_float(self._flip_cost(detail_arrays, 'swapped_temporal_costs', cam_idx, frame_local_idx))}",
                     f"nominal combined={self._fmt_float(self._flip_cost(detail_arrays, 'nominal_combined_costs', cam_idx, frame_local_idx))}",
                     f"swapped combined={self._fmt_float(self._flip_cost(detail_arrays, 'swapped_combined_costs', cam_idx, frame_local_idx))}",
+                    f"decision score={self._fmt_float(self._flip_cost(detail_arrays, 'decision_scores', cam_idx, frame_local_idx))}",
+                    f"decision score smoothed={self._fmt_float(self._flip_cost(detail_arrays, 'decision_scores_smoothed', cam_idx, frame_local_idx))}",
                 ]
             ),
         )
@@ -8700,7 +8696,7 @@ class DDTab(ttk.Frame):
         comparison_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
         self.comparison_tree = ttk.Treeview(
             comparison_box,
-            columns=("reconstruction", "match", "status", "codes"),
+            columns=("reconstruction", "match", "status", "expected", "codes"),
             show="headings",
             height=6,
             selectmode="browse",
@@ -8708,11 +8704,13 @@ class DDTab(ttk.Frame):
         self.comparison_tree.heading("reconstruction", text="Reconstruction")
         self.comparison_tree.heading("match", text="Match")
         self.comparison_tree.heading("status", text="Status")
+        self.comparison_tree.heading("expected", text="Expected")
         self.comparison_tree.heading("codes", text="Detected codes")
         self.comparison_tree.column("reconstruction", width=190, anchor="w")
         self.comparison_tree.column("match", width=70, anchor="center")
         self.comparison_tree.column("status", width=70, anchor="center")
-        self.comparison_tree.column("codes", width=230, anchor="w")
+        self.comparison_tree.column("expected", width=160, anchor="w")
+        self.comparison_tree.column("codes", width=210, anchor="w")
         self.comparison_tree.tag_configure("ok", foreground="#1f7a1f")
         self.comparison_tree.tag_configure("partial", foreground="#b36b00")
         self.comparison_tree.tag_configure("bad", foreground="#b22222")
@@ -9039,6 +9037,7 @@ class DDTab(ttk.Frame):
             for name in available_names:
                 analysis = self.analysis_by_name.get(name)
                 comparison = compare_dd_to_reference(analysis, self.expected_dd_codes)
+                expected_codes = " | ".join(comparison.expected_codes) if comparison.expected_codes else "-"
                 detected_codes = " | ".join(comparison.detected_codes) if comparison.detected_codes else "-"
                 tag = dd_reference_status_color(comparison)
                 self.comparison_tree.insert(
@@ -9049,6 +9048,7 @@ class DDTab(ttk.Frame):
                         reconstruction_label(name),
                         dd_reference_status_text(comparison),
                         comparison.status.replace("_", " "),
+                        expected_codes,
                         detected_codes,
                     ),
                     tags=(tag,),
@@ -9243,7 +9243,7 @@ class LauncherApp(tk.Tk):
             calibration_correction_var=tk.StringVar(value="none"),
             initial_rotation_correction_var=tk.BooleanVar(value=True),
             selected_camera_names_var=tk.StringVar(value=""),
-            output_root_var=tk.StringVar(value="outputs"),
+            output_root_var=tk.StringVar(value="output"),
             profiles_config_var=tk.StringVar(value="reconstruction_profiles.json"),
         )
         profiles_path = ROOT / state.profiles_config_var.get()
@@ -9260,7 +9260,7 @@ class LauncherApp(tk.Tk):
         container = ttk.Frame(self)
         container.pack(fill=tk.BOTH, expand=True)
 
-        self.shared_reconstruction_panel = SharedReconstructionPanel(container, state)
+        self.shared_reconstruction_panel = SharedReconstructionPanel(container, state, tooltip_fn=attach_tooltip)
         self.shared_reconstruction_panel.pack(fill=tk.X, padx=10, pady=(10, 0))
         self.state.shared_reconstruction_panel = self.shared_reconstruction_panel
 

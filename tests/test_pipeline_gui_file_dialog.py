@@ -14,6 +14,17 @@ def test_normalize_pose_correction_mode_falls_back_to_none():
     assert pipeline_gui.normalize_pose_correction_mode("unexpected_mode") == "none"
 
 
+def test_keypoint_preset_names_body_only_removes_face_side_keypoints():
+    body_only = pipeline_gui.keypoint_preset_names("body_only")
+
+    assert "left_eye" not in body_only
+    assert "right_eye" not in body_only
+    assert "left_ear" not in body_only
+    assert "right_ear" not in body_only
+    assert "left_ankle" in body_only
+    assert "right_wrist" in body_only
+
+
 def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_state(monkeypatch):
     state = SimpleNamespace()
     bundle = {"recon_q": {"demo": object()}}

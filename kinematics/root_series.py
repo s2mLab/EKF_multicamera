@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from pathlib import Path
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -70,6 +73,36 @@ def root_series_from_points(
     if quantity == "q":
         return root_q
     return centered_finite_difference(root_q, dt)
+
+
+def root_series_from_model_markers(
+    q_series: np.ndarray,
+    *,
+    biomod_path: Path,
+    marker_builder: Callable[[Path, np.ndarray], np.ndarray],
+    marker_points: np.ndarray | None = None,
+    quantity: str,
+    dt: float,
+    initial_rotation_correction: bool,
+    unwrap_rotations: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one root series from model markers reconstructed from ``q``.
+
+    This helper is used when we want to compare q-based reconstructions against
+    triangulation/Pose2Sim using the same geometric trunk-frame extraction.
+    """
+
+    if marker_points is None:
+        marker_points = marker_builder(Path(biomod_path), np.asarray(q_series, dtype=float))
+    marker_points = np.asarray(marker_points, dtype=float)
+    series = root_series_from_points(
+        marker_points,
+        quantity=quantity,
+        dt=dt,
+        initial_rotation_correction=initial_rotation_correction,
+        unwrap_rotations=unwrap_rotations,
+    )
+    return series, marker_points
 
 
 def root_series_from_q(

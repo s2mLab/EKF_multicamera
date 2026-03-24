@@ -27,6 +27,12 @@ def test_compute_camera_metric_rows_summarizes_expected_ratios():
         "epipolar_fast": np.array([[False, False, True], [False, False, False]], dtype=bool),
         "triangulation": np.array([[False, False, False], [True, True, False]], dtype=bool),
     }
+    flip_detail_arrays = {
+        "epipolar": {
+            "decision_scores": np.array([[0.2, 0.4, np.nan], [0.1, 0.3, 0.5]], dtype=float),
+            "decision_scores_smoothed": np.array([[0.1, 0.3, np.nan], [0.0, 0.2, 0.4]], dtype=float),
+        }
+    }
 
     rows = compute_camera_metric_rows(
         pose_data,
@@ -34,6 +40,7 @@ def test_compute_camera_metric_rows_summarizes_expected_ratios():
         reprojection_error_per_view=reproj,
         excluded_views=excluded,
         flip_masks=flip_masks,
+        flip_detail_arrays=flip_detail_arrays,
         good_reprojection_threshold_px=5.0,
     )
     row1, row2 = rows
@@ -45,6 +52,8 @@ def test_compute_camera_metric_rows_summarizes_expected_ratios():
     assert abs(row1.triangulation_usage_ratio - (2 / 3)) < 1e-12
     assert abs(row1.flip_rate_epipolar - (1 / 3)) < 1e-12
     assert abs(row1.flip_rate_epipolar_fast - (1 / 3)) < 1e-12
+    assert abs(row1.epipolar_decision_score - 0.3) < 1e-12
+    assert abs(row1.epipolar_decision_score_smoothed - 0.2) < 1e-12
     assert row2.reprojection_good_frame_ratio == 0.0
 
 
@@ -55,7 +64,9 @@ def test_suggest_best_camera_names_prefers_high_confidence_low_flip_rows():
     scores[1, :, 0] = [0.6, 0.5]
     scores[2, :, 0] = [0.95, 0.95]
     keypoints[:, :, 0] = [[[1.0, 1.0], [1.0, 1.0]], [[1.0, 1.0], [1.0, 1.0]], [[1.0, 1.0], [1.0, 1.0]]]
-    pose_data = PoseData(camera_names=["cam1", "cam2", "cam3"], frames=np.array([0, 1]), keypoints=keypoints, scores=scores)
+    pose_data = PoseData(
+        camera_names=["cam1", "cam2", "cam3"], frames=np.array([0, 1]), keypoints=keypoints, scores=scores
+    )
     epipolar = np.full((2, 17, 3), np.nan)
     epipolar[:, 0, 0] = [0.8, 0.8]
     epipolar[:, 0, 1] = [0.6, 0.6]

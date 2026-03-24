@@ -119,7 +119,15 @@ def deduction_form_discrete(knee_angle: np.ndarray, hip_angle: np.ndarray) -> fl
 
 
 def deduction_opening_discrete(hip_angle: np.ndarray, time: np.ndarray) -> float:
-    """Compute the opening deduction from the timing of the return to straight."""
+    """Compute the opening deduction from the timing of the return to straight.
+
+    This mirrors the FIG late-opening ladder as closely as possible with the
+    information we currently have:
+    - before roughly 60% of the element: no deduction;
+    - between ~60% and ~75%: 0.1;
+    - between ~75% and ~90%: 0.2;
+    - later or never clearly straight: 0.3.
+    """
 
     error = np.abs(np.asarray(hip_angle, dtype=float) - np.pi)
     idx_open = int(np.nanargmin(error)) if error.size else 0
@@ -134,7 +142,7 @@ def deduction_opening_discrete(hip_angle: np.ndarray, time: np.ndarray) -> float
 
 
 def deduction_pike_down_discrete(hip_angle: np.ndarray) -> float:
-    """Compute the pike-down deduction from the minimum hip angle."""
+    """Compute the pike-down / kick-out deduction from the minimum hip angle."""
 
     min_angle = float(np.nanmin(np.asarray(hip_angle, dtype=float)))
     if min_angle > DEG170:
@@ -492,16 +500,17 @@ def compute_execution_jump_analysis(
         )
     if np.isfinite(mean_hip_error) and mean_hip_error > DEG10:
         local_idx = int(np.nanargmax(hip_error_series))
+        deduction = 0.2 if mean_hip_error > DEG20 else 0.1
         events.append(
             _event(
                 code="form_hips",
                 label="Body straightness",
-                deduction=0.1,
+                deduction=deduction,
                 segment=segment,
                 local_frame_idx=local_idx,
                 metric_value=np.rad2deg(hip_error_series[local_idx]),
                 metric_unit="deg",
-                detail="Hip angle departs from a straight body line.",
+                detail="Hip angle departs from a straight body line (FIG-style body straightness deduction).",
                 keypoint_names=("left_shoulder", "right_shoulder", "left_hip", "right_hip", "left_knee", "right_knee"),
             )
         )
@@ -520,7 +529,7 @@ def compute_execution_jump_analysis(
                     local_frame_idx=opening_idx,
                     metric_value=opening_ratio,
                     metric_unit="ratio",
-                    detail="The return to a straight body happens late in the element.",
+                    detail="The return to a straight body happens late in the element (late opening).",
                     keypoint_names=(
                         "left_shoulder",
                         "right_shoulder",
@@ -538,13 +547,13 @@ def compute_execution_jump_analysis(
             events.append(
                 _event(
                     code="pike_down",
-                    label="Pike down",
+                    label="Pike down / kick-out",
                     deduction=pike_deduction,
                     segment=segment,
                     local_frame_idx=pike_idx,
                     metric_value=np.rad2deg(hip_series_rad[pike_idx]),
                     metric_unit="deg",
-                    detail="The hip angle reaches a visible pike-down configuration.",
+                    detail="The hip angle reaches a visible pike-down / kick-out configuration.",
                     keypoint_names=(
                         "left_shoulder",
                         "right_shoulder",
@@ -556,18 +565,19 @@ def compute_execution_jump_analysis(
                 )
             )
 
-    if arm_series_rad.size and np.nanmax(arm_series_rad) > DEG90:
+    arm_deduction = deduction_arms_discrete(arm_series_rad)
+    if arm_deduction > 0.0 and arm_series_rad.size and np.any(np.isfinite(arm_series_rad)):
         arm_idx = int(np.nanargmax(arm_series_rad))
         events.append(
             _event(
                 code="arms",
                 label="Arm position",
-                deduction=0.1,
+                deduction=arm_deduction,
                 segment=segment,
                 local_frame_idx=arm_idx,
                 metric_value=np.rad2deg(arm_series_rad[arm_idx]),
                 metric_unit="deg",
-                detail="Arms move visibly away from the trunk line.",
+                detail="Arms move visibly away from the trunk line (arm-position deduction).",
                 keypoint_names=(
                     "left_shoulder",
                     "left_elbow",

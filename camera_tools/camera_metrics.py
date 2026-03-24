@@ -27,6 +27,8 @@ class CameraMetricRow:
     flip_rate_epipolar: float | None
     flip_rate_epipolar_fast: float | None
     flip_rate_triangulation: float | None
+    epipolar_decision_score: float | None
+    epipolar_decision_score_smoothed: float | None
 
 
 def camera_metric_sort_key(row: CameraMetricRow) -> tuple[float, ...]:
@@ -40,6 +42,8 @@ def camera_metric_sort_key(row: CameraMetricRow) -> tuple[float, ...]:
         -_sort_value(row.flip_rate_epipolar),
         -_sort_value(row.flip_rate_epipolar_fast),
         -_sort_value(row.flip_rate_triangulation),
+        _sort_value(row.epipolar_decision_score),
+        _sort_value(row.epipolar_decision_score_smoothed),
         _sort_value(row.valid_ratio),
         _sort_value(row.mean_score),
     )
@@ -59,12 +63,14 @@ def compute_camera_metric_rows(
     reprojection_error_per_view: np.ndarray | None = None,
     excluded_views: np.ndarray | None = None,
     flip_masks: dict[str, np.ndarray] | None = None,
+    flip_detail_arrays: dict[str, dict[str, np.ndarray]] | None = None,
     good_reprojection_threshold_px: float = 5.0,
 ) -> list[CameraMetricRow]:
     """Compute camera quality metrics from 2D validity, coherence, reprojection, and flip rates."""
 
     n_cams, n_frames, n_keypoints = pose_data.scores.shape
     flip_masks = flip_masks or {}
+    flip_detail_arrays = flip_detail_arrays or {}
     valid_measurements = (pose_data.scores > 0) & np.all(np.isfinite(pose_data.keypoints), axis=-1)
     rows: list[CameraMetricRow] = []
     for cam_idx, camera_name in enumerate(pose_data.camera_names):
@@ -84,7 +90,11 @@ def compute_camera_metric_rows(
 
         reproj_mean = None
         reproj_good_ratio = None
-        if reprojection_error_per_view is not None and reprojection_error_per_view.shape[:3] == (n_frames, n_keypoints, n_cams):
+        if reprojection_error_per_view is not None and reprojection_error_per_view.shape[:3] == (
+            n_frames,
+            n_keypoints,
+            n_cams,
+        ):
             reproj_cam = np.asarray(reprojection_error_per_view[:, :, cam_idx], dtype=float)
             reproj_mean = _finite_mean(np.where(valid_mask, reproj_cam, np.nan))
             masked_reproj = np.where(valid_mask, reproj_cam, np.nan)
@@ -106,6 +116,16 @@ def compute_camera_metric_rows(
         flip_rate_epipolar = _flip_rate(flip_masks.get("epipolar"), cam_idx, n_frames)
         flip_rate_epipolar_fast = _flip_rate(flip_masks.get("epipolar_fast"), cam_idx, n_frames)
         flip_rate_triangulation = _flip_rate(flip_masks.get("triangulation"), cam_idx, n_frames)
+        epipolar_decision_score = _camera_detail_stat(
+            flip_detail_arrays.get("epipolar"),
+            "decision_scores",
+            cam_idx,
+        )
+        epipolar_decision_score_smoothed = _camera_detail_stat(
+            flip_detail_arrays.get("epipolar"),
+            "decision_scores_smoothed",
+            cam_idx,
+        )
         rows.append(
             CameraMetricRow(
                 camera_name=str(camera_name),
@@ -119,6 +139,8 @@ def compute_camera_metric_rows(
                 flip_rate_epipolar=flip_rate_epipolar,
                 flip_rate_epipolar_fast=flip_rate_epipolar_fast,
                 flip_rate_triangulation=flip_rate_triangulation,
+                epipolar_decision_score=epipolar_decision_score,
+                epipolar_decision_score_smoothed=epipolar_decision_score_smoothed,
             )
         )
     return rows
@@ -142,6 +164,21 @@ def _flip_rate(mask: np.ndarray | None, cam_idx: int, n_frames: int) -> float | 
     if n_frames <= 0:
         return None
     return float(np.count_nonzero(mask[cam_idx]) / n_frames)
+
+
+def _camera_detail_stat(detail_arrays: dict[str, np.ndarray] | None, key: str, cam_idx: int) -> float | None:
+    """Return one robust per-camera summary from a flip-detail array."""
+
+    if not detail_arrays:
+        return None
+    values = detail_arrays.get(key)
+    if values is None or values.ndim != 2 or cam_idx >= values.shape[0]:
+        return None
+    finite = np.asarray(values[cam_idx], dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+    return float(np.nanmedian(finite))
 
 
 def _sort_value(value: float | None) -> float:
