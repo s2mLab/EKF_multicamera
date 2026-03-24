@@ -1525,6 +1525,71 @@ def current_dataset_preview_state(
     return output_dir, preview_state
 
 
+def load_current_dataset_bundle(
+    state: SharedAppState,
+    *,
+    biomod_path: Path | None = None,
+    pose2sim_trc: Path | None = None,
+    align_root: bool = False,
+) -> tuple[Path, dict[str, object]]:
+    """Load the cached preview bundle for the active dataset."""
+
+    output_dir = current_dataset_dir(state)
+    bundle = get_cached_preview_bundle(state, output_dir, biomod_path, pose2sim_trc, align_root=align_root)
+    return output_dir, bundle
+
+
+def load_shared_reconstruction_preview_state(
+    state: SharedAppState,
+    *,
+    preferred_names: list[str],
+    fallback_count: int,
+    include_3d: bool = True,
+    include_q: bool = True,
+    include_q_root: bool = False,
+    extra_rows: list[dict[str, object]] | None = None,
+    biomod_path: Path | None = None,
+    pose2sim_trc: Path | None = None,
+    align_root: bool = False,
+) -> tuple[Path, dict[str, object], DatasetPreviewState]:
+    """Load the active dataset bundle together with the shared selection state."""
+
+    output_dir, bundle = load_current_dataset_bundle(
+        state,
+        biomod_path=biomod_path,
+        pose2sim_trc=pose2sim_trc,
+        align_root=align_root,
+    )
+    _, preview_state = current_dataset_preview_state(
+        state,
+        bundle=bundle,
+        preferred_names=preferred_names,
+        fallback_count=fallback_count,
+        include_3d=include_3d,
+        include_q=include_q,
+        include_q_root=include_q_root,
+        extra_rows=extra_rows,
+    )
+    return output_dir, bundle, preview_state
+
+
+def show_placeholder_figure(
+    figure: Figure,
+    canvas: FigureCanvasTkAgg,
+    message: str,
+    *,
+    fontsize: int = 11,
+    color: str = "#555555",
+) -> None:
+    """Render a lightweight placeholder message in one Matplotlib figure."""
+
+    figure.clear()
+    ax = figure.subplots(1, 1)
+    ax.axis("off")
+    ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=fontsize, color=color)
+    canvas.draw_idle()
+
+
 def reconstruction_dir_by_name(dataset_dir: Path, reconstruction_name: str) -> Path | None:
     for recon_dir in reconstruction_dirs_for_path(dataset_dir):
         summary = load_bundle_summary(recon_dir)
@@ -6221,11 +6286,7 @@ class RootKinematicsTab(ttk.Frame):
     def _show_empty_plot(self, message: str) -> None:
         """Render a lightweight placeholder when no root plot can be produced."""
 
-        self.figure.clear()
-        ax = self.figure.subplots(1, 1)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
-        self.canvas.draw_idle()
+        show_placeholder_figure(self.figure, self.canvas, message)
 
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
@@ -6233,21 +6294,24 @@ class RootKinematicsTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = bundle_available_reconstruction_names(
-                bundle, include_3d=True, include_q=True, include_q_root=False
+            _output_dir, bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=[
+                    "triangulation_exhaustive",
+                    "triangulation_greedy",
+                    "pose2sim",
+                    "ekf_2d_acc",
+                    "ekf_3d",
+                ],
+                fallback_count=4,
+                include_3d=True,
+                include_q=True,
+                include_q_root=False,
             )
+            available_names = preview_state.available_names
             if available_names:
-                catalog = discover_reconstruction_catalog(
-                    ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-                )
-                rows = catalog_rows_for_names(catalog, available_names)
-                defaults = default_selection(
-                    available_names,
-                    ["triangulation_exhaustive", "triangulation_greedy", "pose2sim", "ekf_2d_acc", "ekf_3d"],
-                    fallback_count=4,
-                )
-                self._publish_reconstruction_rows(rows, defaults)
+                self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults)
+                self.bundle = bundle
                 self.refresh_plot()
             else:
                 self._publish_reconstruction_rows([], [])
@@ -6502,11 +6566,7 @@ class JointKinematicsTab(ttk.Frame):
     def _show_empty_plot(self, message: str) -> None:
         """Render a placeholder when no joint-kinematics plot can be produced."""
 
-        self.figure.clear()
-        ax = self.figure.subplots(1, 1)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
-        self.canvas.draw_idle()
+        show_placeholder_figure(self.figure, self.canvas, message)
 
     def sync_dataset_dir(self) -> None:
         self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
@@ -6514,21 +6574,17 @@ class JointKinematicsTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_q = bundle_available_reconstruction_names(
-                bundle, include_3d=False, include_q=True, include_q_root=False
+            _output_dir, bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                fallback_count=3,
+                include_3d=False,
+                include_q=True,
+                include_q_root=False,
             )
+            available_q = preview_state.available_names
             if available_q:
-                catalog = discover_reconstruction_catalog(
-                    ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-                )
-                rows = catalog_rows_for_names(catalog, available_q)
-                defaults = default_selection(
-                    available_q,
-                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
-                    fallback_count=3,
-                )
-                self._publish_reconstruction_rows(rows, defaults)
+                self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults)
                 self.bundle = bundle
                 self.refresh_plot()
             else:
@@ -6709,11 +6765,7 @@ class ObservabilityTab(ttk.Frame):
     def _show_empty_plot(self, message: str) -> None:
         """Render a lightweight placeholder when no observability plot can be produced."""
 
-        self.figure.clear()
-        ax = self.figure.subplots(1, 1)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
-        self.canvas.draw_idle()
+        show_placeholder_figure(self.figure, self.canvas, message)
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert("1.0", message)
 
@@ -6723,21 +6775,17 @@ class ObservabilityTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_q = bundle_available_reconstruction_names(
-                bundle, include_3d=False, include_q=True, include_q_root=False
+            _output_dir, bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
+                fallback_count=1,
+                include_3d=False,
+                include_q=True,
+                include_q_root=False,
             )
+            available_q = preview_state.available_names
             if available_q:
-                catalog = discover_reconstruction_catalog(
-                    ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-                )
-                rows = catalog_rows_for_names(catalog, available_q)
-                defaults = default_selection(
-                    available_q,
-                    ["ekf_2d_acc", "ekf_2d_flip_acc", "ekf_2d_dyn", "ekf_2d_flip_dyn", "ekf_3d"],
-                    fallback_count=1,
-                )
-                self._publish_reconstruction_rows(rows, defaults[:1])
+                self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
                 self.bundle = bundle
                 self.refresh_plot()
             else:
@@ -6928,11 +6976,7 @@ class Analysis3DTab(ttk.Frame):
     def _show_empty_plot(self, message: str) -> None:
         """Render one placeholder when the 3D analysis cannot be displayed."""
 
-        self.figure.clear()
-        ax = self.figure.subplots(1, 1)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
-        self.canvas.draw_idle()
+        show_placeholder_figure(self.figure, self.canvas, message)
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert("1.0", message)
 
@@ -6942,21 +6986,23 @@ class Analysis3DTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = bundle_available_reconstruction_names(
-                bundle, include_3d=True, include_q=True, include_q_root=False
+            _output_dir, bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=[
+                    "ekf_2d_acc",
+                    "ekf_3d",
+                    "pose2sim",
+                    "triangulation_exhaustive",
+                    "triangulation_greedy",
+                ],
+                fallback_count=3,
+                include_3d=True,
+                include_q=True,
+                include_q_root=False,
             )
+            available_names = preview_state.available_names
             if available_names:
-                catalog = discover_reconstruction_catalog(
-                    ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-                )
-                rows = catalog_rows_for_names(catalog, available_names)
-                defaults = default_selection(
-                    available_names,
-                    ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
-                    fallback_count=3,
-                )
-                self._publish_reconstruction_rows(rows, defaults)
+                self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults)
                 self.bundle = bundle
                 self.refresh_plot()
             else:
@@ -7265,22 +7311,18 @@ class ExecutionTab(ttk.Frame):
             pose2sim_trc = (
                 ROOT / self.state.pose2sim_trc_var.get() if self.state.pose2sim_trc_var.get().strip() else None
             )
-            bundle = get_cached_preview_bundle(self.state, dataset_dir, biomod_path, pose2sim_trc, align_root=False)
-            available_q = bundle_available_reconstruction_names(
-                bundle, include_3d=True, include_q=True, include_q_root=False
-            )
-            rows = catalog_rows_for_names(
-                discover_reconstruction_catalog(
-                    dataset_dir, optional_root_relative_path(self.state.pose2sim_trc_var.get())
-                ),
-                available_q,
-            )
-            defaults = default_selection(
-                available_q,
-                ["ekf_2d_acc", "ekf_3d"],
+            _output_dir, bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["ekf_2d_acc", "ekf_3d"],
                 fallback_count=2,
+                include_3d=True,
+                include_q=True,
+                include_q_root=False,
+                biomod_path=biomod_path,
+                pose2sim_trc=pose2sim_trc,
             )
-            self._publish_reconstruction_rows(rows, defaults[:1])
+            available_q = preview_state.available_names
+            self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
             self.bundle = bundle
             if available_q:
                 self.refresh_analysis()
@@ -7293,11 +7335,7 @@ class ExecutionTab(ttk.Frame):
     def _show_empty_plot(self, message: str) -> None:
         """Render a placeholder when execution localization cannot be shown."""
 
-        self.figure.clear()
-        ax = self.figure.subplots(1, 1)
-        ax.axis("off")
-        ax.text(0.5, 0.5, message, ha="center", va="center", fontsize=11, color="#555555")
-        self.canvas.draw_idle()
+        show_placeholder_figure(self.figure, self.canvas, message)
         self.summary_text.delete("1.0", tk.END)
         self.summary_text.insert("1.0", message)
 
@@ -8381,20 +8419,21 @@ class TrampolineTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = bundle_available_reconstruction_names(
-                bundle, include_3d=True, include_q=True, include_q_root=True
-            )
-            catalog = discover_reconstruction_catalog(
-                ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-            )
-            rows = catalog_rows_for_names(catalog, available_names)
-            defaults = default_selection(
-                available_names,
-                ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
+            _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=[
+                    "ekf_2d_acc",
+                    "ekf_3d",
+                    "pose2sim",
+                    "triangulation_exhaustive",
+                    "triangulation_greedy",
+                ],
                 fallback_count=4,
+                include_3d=True,
+                include_q=True,
+                include_q_root=True,
             )
-            self._publish_reconstruction_rows(rows, defaults[:1])
+            self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
         except Exception:
             pass
 
@@ -8782,21 +8821,25 @@ class DDTab(ttk.Frame):
     def refresh_available_reconstructions(self) -> None:
         try:
             gui_debug(f"DD refresh_available_reconstructions start dataset={ROOT / self.output_dir.get()}")
-            bundle = get_cached_preview_bundle(self.state, ROOT / self.output_dir.get(), None, None, align_root=False)
-            available_names = bundle_available_reconstruction_names(
-                bundle, include_3d=True, include_q=True, include_q_root=True
-            )
-            catalog = discover_reconstruction_catalog(
-                ROOT / self.output_dir.get(), optional_root_relative_path(self.state.pose2sim_trc_var.get())
-            )
-            rows = catalog_rows_for_names(catalog, available_names)
-            defaults = default_selection(
-                available_names,
-                ["ekf_2d_acc", "ekf_3d", "pose2sim", "triangulation_exhaustive", "triangulation_greedy"],
+            _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=[
+                    "ekf_2d_acc",
+                    "ekf_3d",
+                    "pose2sim",
+                    "triangulation_exhaustive",
+                    "triangulation_greedy",
+                ],
                 fallback_count=5,
+                include_3d=True,
+                include_q=True,
+                include_q_root=True,
             )
-            self._publish_reconstruction_rows(rows, defaults[:1])
-            gui_debug("DD refresh_available_reconstructions done " f"available={len(available_names)} rows={len(rows)}")
+            self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
+            gui_debug(
+                "DD refresh_available_reconstructions done "
+                f"available={len(preview_state.available_names)} rows={len(preview_state.rows)}"
+            )
         except Exception:
             pass
 
