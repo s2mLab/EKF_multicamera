@@ -34,6 +34,16 @@ class DDReferenceComparison:
     expected_codes: list[str]
 
 
+@dataclass
+class DDCodeCharacterComparison:
+    """Character-level DD comparison annotated with its semantic role."""
+
+    role: str
+    expected_char: str
+    detected_char: str
+    matches: bool
+
+
 def compare_dd_to_reference(
     analysis: DDSessionAnalysis | None,
     expected_codes_by_jump: dict[int, str] | None,
@@ -73,6 +83,45 @@ def compare_dd_to_reference(
         detected_codes=detected_codes,
         expected_codes=expected_codes,
     )
+
+
+def split_dd_code(code: str | None) -> tuple[str, str, str]:
+    """Split one DD code into somersault, twist, and body-shape parts."""
+
+    raw_code = "" if code is None else str(code).strip()
+    if not raw_code or raw_code == "-":
+        return "", "", ""
+    body_shape = raw_code[-1] if (not raw_code[-1].isdigit() and raw_code[-1] != "+") else ""
+    core = raw_code[:-1] if body_shape else raw_code
+    somersault = core[:2]
+    twist = core[2:]
+    return somersault, twist, body_shape
+
+
+def compare_dd_code_characters(expected_code: str | None, detected_code: str | None) -> list[DDCodeCharacterComparison]:
+    """Compare two DD codes character by character inside each semantic block."""
+
+    expected_som, expected_twist, expected_body = split_dd_code(expected_code)
+    detected_som, detected_twist, detected_body = split_dd_code(detected_code)
+    comparisons: list[DDCodeCharacterComparison] = []
+    for role, expected_part, detected_part in (
+        ("somersault", expected_som, detected_som),
+        ("twist", expected_twist, detected_twist),
+        ("body", expected_body, detected_body),
+    ):
+        block_len = max(len(expected_part), len(detected_part))
+        for idx in range(block_len):
+            expected_char = expected_part[idx] if idx < len(expected_part) else "_"
+            detected_char = detected_part[idx] if idx < len(detected_part) else "_"
+            comparisons.append(
+                DDCodeCharacterComparison(
+                    role=role,
+                    expected_char=expected_char,
+                    detected_char=detected_char,
+                    matches=expected_char == detected_char and expected_char != "_" and detected_char != "_",
+                )
+            )
+    return comparisons
 
 
 def dd_reference_status_text(comparison: DDReferenceComparison) -> str:

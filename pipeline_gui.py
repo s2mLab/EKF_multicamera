@@ -56,6 +56,7 @@ from judging.execution import (
 )
 from judging.dd_presenter import (
     build_jump_plot_data,
+    compare_dd_code_characters,
     compare_dd_to_reference,
     dd_reference_status_color,
     dd_reference_status_text,
@@ -2101,9 +2102,18 @@ class SelectionTable(ttk.Frame):
 
 
 class CommandTab(ttk.Frame):
-    """Base pour un onglet qui construit et lance une commande."""
+    """Base class for tabs that build and execute one command."""
 
-    def __init__(self, master, title: str):
+    def __init__(
+        self,
+        master,
+        title: str,
+        *,
+        show_default_buttons: bool = True,
+        show_progress: bool = True,
+        show_command_preview: bool = True,
+        show_output: bool = True,
+    ):
         super().__init__(master)
         self.title = title
         self.process: subprocess.Popen[str] | None = None
@@ -2119,29 +2129,43 @@ class CommandTab(ttk.Frame):
         self.main = ttk.Frame(self)
         self.main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.buttons_frame = ttk.Frame(self.main)
-        self.buttons_frame.pack(fill=tk.X, pady=(8, 8))
-        self.preview_button = ttk.Button(self.buttons_frame, text="Preview command", command=self.update_preview)
-        self.preview_button.pack(side=tk.LEFT)
-        self.copy_button = ttk.Button(self.buttons_frame, text="Copy command", command=self.copy_command)
-        self.copy_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.run_button = ttk.Button(self.buttons_frame, text="Run", command=self.run_command)
-        self.run_button.pack(side=tk.LEFT, padx=(8, 0))
-        self.stop_button = ttk.Button(self.buttons_frame, text="Stop", command=self.stop_command)
-        self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.buttons_frame: ttk.Frame | None = None
+        self.preview_button: ttk.Button | None = None
+        self.copy_button: ttk.Button | None = None
+        self.run_button: ttk.Button | None = None
+        self.stop_button: ttk.Button | None = None
+        if show_default_buttons:
+            self.buttons_frame = ttk.Frame(self.main)
+            self.buttons_frame.pack(fill=tk.X, pady=(8, 8))
+            self.preview_button = ttk.Button(self.buttons_frame, text="Preview command", command=self.update_preview)
+            self.preview_button.pack(side=tk.LEFT)
+            self.copy_button = ttk.Button(self.buttons_frame, text="Copy command", command=self.copy_command)
+            self.copy_button.pack(side=tk.LEFT, padx=(8, 0))
+            self.run_button = ttk.Button(self.buttons_frame, text="Run", command=self.run_command)
+            self.run_button.pack(side=tk.LEFT, padx=(8, 0))
+            self.stop_button = ttk.Button(self.buttons_frame, text="Stop", command=self.stop_command)
+            self.stop_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.progress_row = ttk.Frame(self.main)
-        self.progress_row.pack(fill=tk.X, pady=(0, 8))
-        self.progress_bar = ttk.Progressbar(self.progress_row, mode="determinate", maximum=1.0, value=0.0)
-        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Label(self.progress_row, textvariable=self.progress_text, width=48).pack(side=tk.LEFT, padx=(10, 0))
+        self.progress_row: ttk.Frame | None = None
+        self.progress_bar: ttk.Progressbar | None = None
+        if show_progress:
+            self.progress_row = ttk.Frame(self.main)
+            self.progress_row.pack(fill=tk.X, pady=(0, 8))
+            self.progress_bar = ttk.Progressbar(self.progress_row, mode="determinate", maximum=1.0, value=0.0)
+            self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            ttk.Label(self.progress_row, textvariable=self.progress_text, width=48).pack(side=tk.LEFT, padx=(10, 0))
 
-        self.command_preview_label = ttk.Label(
-            self.main, textvariable=self.command_preview, wraplength=1100, justify=tk.LEFT
-        )
-        self.command_preview_label.pack(fill=tk.X, pady=(0, 8))
-        self.output = ScrolledText(self.main, height=18, wrap=tk.WORD)
-        self.output.pack(fill=tk.BOTH, expand=True)
+        self.command_preview_label: ttk.Label | None = None
+        if show_command_preview:
+            self.command_preview_label = ttk.Label(
+                self.main, textvariable=self.command_preview, wraplength=1100, justify=tk.LEFT
+            )
+            self.command_preview_label.pack(fill=tk.X, pady=(0, 8))
+
+        self.output: ScrolledText | None = None
+        if show_output:
+            self.output = ScrolledText(self.main, height=18, wrap=tk.WORD)
+            self.output.pack(fill=tk.BOTH, expand=True)
 
     def build_command(self) -> list[str]:
         raise NotImplementedError
@@ -2150,7 +2174,8 @@ class CommandTab(ttk.Frame):
         self.command_preview.set(shlex.join(self.build_command()))
 
     def set_run_button_text(self, text: str) -> None:
-        self.run_button.configure(text=text)
+        if self.run_button is not None:
+            self.run_button.configure(text=text)
 
     def attach_primary_action_button(self, button: ttk.Button, run_text: str = "Run", stop_text: str = "Stop") -> None:
         """Register a tab-local action button that mirrors the process state."""
@@ -2161,19 +2186,26 @@ class CommandTab(ttk.Frame):
 
     def hide_default_command_buttons(self) -> None:
         """Hide only the shared command buttons while keeping progress and logs visible."""
-        self.buttons_frame.pack_forget()
+        if self.buttons_frame is not None:
+            self.buttons_frame.pack_forget()
 
     def hide_preview_copy_buttons(self) -> None:
         """Hide only preview/copy controls while keeping run/progress/output available."""
 
-        self.preview_button.pack_forget()
-        self.copy_button.pack_forget()
+        if self.preview_button is not None:
+            self.preview_button.pack_forget()
+        if self.copy_button is not None:
+            self.copy_button.pack_forget()
 
     def hide_command_controls(self) -> None:
-        self.buttons_frame.pack_forget()
-        self.progress_row.pack_forget()
-        self.command_preview_label.pack_forget()
-        self.output.pack_forget()
+        if self.buttons_frame is not None:
+            self.buttons_frame.pack_forget()
+        if self.progress_row is not None:
+            self.progress_row.pack_forget()
+        if self.command_preview_label is not None:
+            self.command_preview_label.pack_forget()
+        if self.output is not None:
+            self.output.pack_forget()
 
     def update_action_button_state(self) -> None:
         """Keep the primary action button label in sync with the process state."""
@@ -2196,28 +2228,33 @@ class CommandTab(ttk.Frame):
         self.command_preview.set(cmd)
 
     def append_output(self, text: str) -> None:
+        if self.output is None:
+            return
         self.output.insert(tk.END, text)
         self.output.see(tk.END)
 
     def reset_progress(self) -> None:
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate", maximum=1.0, value=0.0)
+        if self.progress_bar is not None:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", maximum=1.0, value=0.0)
         self.progress_text.set("Idle")
         self._profile_total = 0
         self._profile_index = 0
         self._profile_name = ""
 
     def start_indeterminate_progress(self, label: str = "Running...") -> None:
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="indeterminate")
-        self.progress_bar.start(12)
+        if self.progress_bar is not None:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="indeterminate")
+            self.progress_bar.start(12)
         self.progress_text.set(label)
 
     def set_progress(self, current: float, total: float, label: str) -> None:
         total = max(float(total), 1.0)
         current = min(max(float(current), 0.0), total)
-        self.progress_bar.stop()
-        self.progress_bar.configure(mode="determinate", maximum=total, value=current)
+        if self.progress_bar is not None:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", maximum=total, value=current)
         self.progress_text.set(label)
 
     def prepare_progress(self) -> None:
@@ -2272,17 +2309,19 @@ class CommandTab(ttk.Frame):
         assert self.process is not None
         if self.process.stdout is not None:
             for line in self.process.stdout:
-                self.output.after(0, self.append_output, line)
-                self.output.after(0, self.handle_output_line, line)
+                self.after(0, self.append_output, line)
+                self.after(0, self.handle_output_line, line)
         return_code = self.process.wait()
-        self.output.after(0, self.append_output, f"\n[exit code {return_code}]\n")
-        self.output.after(0, self.finish_progress, return_code)
+        self.after(0, self.append_output, f"\n[exit code {return_code}]\n")
+        self.after(0, self.finish_progress, return_code)
 
     def finish_progress(self, return_code: int) -> None:
-        self.progress_bar.stop()
+        if self.progress_bar is not None:
+            self.progress_bar.stop()
         if return_code == 0:
-            maximum = float(self.progress_bar.cget("maximum") or 1.0)
-            self.progress_bar.configure(mode="determinate", value=maximum)
+            if self.progress_bar is not None:
+                maximum = float(self.progress_bar.cget("maximum") or 1.0)
+                self.progress_bar.configure(mode="determinate", value=maximum)
             self.progress_text.set("Done")
             try:
                 self.on_command_success()
@@ -2296,7 +2335,8 @@ class CommandTab(ttk.Frame):
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             self.append_output("\n[process terminated]\n")
-            self.progress_bar.stop()
+            if self.progress_bar is not None:
+                self.progress_bar.stop()
             self.progress_text.set("Stopped")
         self.update_action_button_state()
 
@@ -2684,21 +2724,26 @@ class PipelineTab(CommandTab):
 
 class DualAnimationTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
-        super().__init__(master, "3D animation")
+        super().__init__(
+            master,
+            "3D animation",
+            show_default_buttons=False,
+            show_command_preview=False,
+            show_output=False,
+        )
         self.state = state
         self.bundle: dict[str, object] | None = None
         self._view_state: tuple[float, float, float] | None = None
         self._dragging_frame_scale = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
-        self.output.pack_forget()
 
         body = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
         body.add(left, weight=1)
-        body.add(right, weight=3)
+        body.add(right, weight=4)
 
         form = ttk.LabelFrame(left, text="animation/animate_dual_stick_comparison.py")
         form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
@@ -2732,7 +2777,6 @@ class DualAnimationTab(CommandTab):
         self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
-        self.hide_default_command_buttons()
 
         preview_box = ttk.LabelFrame(right, text="Preview 3D")
         preview_box.pack(fill=tk.BOTH, expand=True)
@@ -3043,7 +3087,13 @@ class DualAnimationTab(CommandTab):
 
 class MultiViewTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
-        super().__init__(master, "2D multiview")
+        super().__init__(
+            master,
+            "2D multiview",
+            show_default_buttons=False,
+            show_command_preview=False,
+            show_output=False,
+        )
         self.state = state
         self.pose_data = None
         self.calibrations = None
@@ -3054,14 +3104,13 @@ class MultiViewTab(CommandTab):
         self._dragging_frame_scale = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
-        self.output.pack_forget()
 
         body = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
         body.add(left, weight=1)
-        body.add(right, weight=3)
+        body.add(right, weight=4)
 
         form = ttk.LabelFrame(left, text="animation/animate_multiview_2d_comparison.py")
         form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
@@ -3087,10 +3136,9 @@ class MultiViewTab(CommandTab):
         self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
-        self.hide_default_command_buttons()
 
         preview_box = ttk.LabelFrame(right, text="Preview 2D multivues")
-        preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
+        preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         preview_controls = ttk.Frame(preview_box)
         preview_controls.pack(fill=tk.X, padx=8, pady=4)
         ttk.Button(preview_controls, text="Load preview", command=self.load_preview).pack(side=tk.LEFT)
@@ -6144,8 +6192,6 @@ class RootKinematicsTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Cinématiques de la racine")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -6279,7 +6325,6 @@ class RootKinematicsTab(ttk.Frame):
         show_placeholder_figure(self.figure, self.canvas, message)
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def _model_marker_points_for_root(self, reconstruction_name: str, q_series: np.ndarray) -> np.ndarray | None:
@@ -6332,7 +6377,7 @@ class RootKinematicsTab(ttk.Frame):
     def refresh_plot(self) -> None:
         try:
             self.bundle = get_cached_preview_bundle(
-                self.state, ROOT / self.output_dir.get(), None, None, align_root=False
+                self.state, current_dataset_dir(self.state), None, None, align_root=False
             )
             available_names = bundle_available_reconstruction_names(
                 self.bundle, include_3d=True, include_q=True, include_q_root=False
@@ -6547,8 +6592,6 @@ class JointKinematicsTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Autres DoF")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -6605,7 +6648,6 @@ class JointKinematicsTab(ttk.Frame):
         show_placeholder_figure(self.figure, self.canvas, message)
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -6634,7 +6676,7 @@ class JointKinematicsTab(ttk.Frame):
     def refresh_plot(self) -> None:
         try:
             self.bundle = get_cached_preview_bundle(
-                self.state, ROOT / self.output_dir.get(), None, None, align_root=False
+                self.state, current_dataset_dir(self.state), None, None, align_root=False
             )
             available_q = bundle_available_reconstruction_names(
                 self.bundle, include_3d=False, include_q=True, include_q_root=False
@@ -6744,8 +6786,6 @@ class ObservabilityTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Observabilité du modèle")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -6806,7 +6846,6 @@ class ObservabilityTab(ttk.Frame):
         self.summary_text.insert("1.0", message)
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -6833,7 +6872,7 @@ class ObservabilityTab(ttk.Frame):
 
     def refresh_plot(self) -> None:
         try:
-            dataset_dir = ROOT / self.output_dir.get()
+            dataset_dir = current_dataset_dir(self.state)
             self.bundle = get_cached_preview_bundle(self.state, dataset_dir, None, None, align_root=False)
             available_q = bundle_available_reconstruction_names(
                 self.bundle, include_3d=False, include_q=True, include_q_root=False
@@ -6953,8 +6992,6 @@ class Analysis3DTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Analyse 3D")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -7017,7 +7054,6 @@ class Analysis3DTab(ttk.Frame):
         self.summary_text.insert("1.0", message)
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -7050,7 +7086,7 @@ class Analysis3DTab(ttk.Frame):
 
     def refresh_plot(self) -> None:
         try:
-            dataset_dir = ROOT / self.output_dir.get()
+            dataset_dir = current_dataset_dir(self.state)
             self.bundle = get_cached_preview_bundle(self.state, dataset_dir, None, None, align_root=False)
             available_names = bundle_available_reconstruction_names(
                 self.bundle, include_3d=True, include_q=True, include_q_root=False
@@ -7235,8 +7271,6 @@ class ExecutionTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Analyse d'execution")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -7334,12 +7368,11 @@ class ExecutionTab(ttk.Frame):
         self.refresh_analysis()
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            dataset_dir = ROOT / self.output_dir.get()
+            dataset_dir = current_dataset_dir(self.state)
             biomod_path = resolve_preview_biomod(dataset_dir)
             pose2sim_trc = (
                 ROOT / self.state.pose2sim_trc_var.get() if self.state.pose2sim_trc_var.get().strip() else None
@@ -7387,7 +7420,7 @@ class ExecutionTab(ttk.Frame):
 
     def refresh_analysis(self) -> None:
         try:
-            dataset_dir = ROOT / self.output_dir.get()
+            dataset_dir = current_dataset_dir(self.state)
             biomod_path = resolve_preview_biomod(dataset_dir)
             pose2sim_trc = (
                 ROOT / self.state.pose2sim_trc_var.get() if self.state.pose2sim_trc_var.get().strip() else None
@@ -7789,8 +7822,6 @@ class CameraToolsTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Sélection de caméras + inspection flip L/R")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.dataset_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.dataset_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(controls)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -7954,9 +7985,6 @@ class CameraToolsTab(ttk.Frame):
         self.flip_toolbar.update()
         self.flip_toolbar.pack(fill=tk.X)
 
-        self.dataset_dir.set_tooltip(
-            "Dataset courant utilise pour calculer les scores caméra et relire les caches de flip."
-        )
         attach_tooltip(best_n_label, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(best_n_entry, "Nombre de caméras à présélectionner automatiquement selon le classement courant.")
         attach_tooltip(
@@ -8002,7 +8030,6 @@ class CameraToolsTab(ttk.Frame):
         return "break"
 
     def sync_dataset_dir(self) -> None:
-        self.dataset_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
         self.update_camera_filter_status()
         self.load_resources()
@@ -8425,8 +8452,6 @@ class TrampolineTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Déplacement dans la toile")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(
             controls,
             text=(
@@ -8488,7 +8513,6 @@ class TrampolineTab(ttk.Frame):
         self.refresh_analysis()
 
     def sync_dataset_dir(self) -> None:
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -8518,7 +8542,7 @@ class TrampolineTab(ttk.Frame):
     def refresh_analysis(self) -> None:
         try:
             self.bundle = get_cached_preview_bundle(
-                self.state, ROOT / self.output_dir.get(), None, None, align_root=False
+                self.state, current_dataset_dir(self.state), None, None, align_root=False
             )
             self.current_reconstruction_name = self._selected_reconstruction()
             if self.current_reconstruction_name is None:
@@ -8656,8 +8680,6 @@ class DDTab(ttk.Frame):
 
         controls = ttk.LabelFrame(self, text="Analyse DD")
         controls.pack(fill=tk.X, padx=10, pady=10)
-        self.output_dir = LabeledEntry(controls, "Dataset", display_path(current_dataset_dir(state)), readonly=True)
-        self.output_dir.pack(fill=tk.X, padx=8, pady=4)
         self.dd_reference_path = LabeledEntry(
             controls,
             "DD JSON",
@@ -8795,6 +8817,13 @@ class DDTab(ttk.Frame):
         summary_box.pack(fill=tk.BOTH, expand=True)
         self.summary = ScrolledText(summary_box, height=18, wrap=tk.WORD)
         self.summary.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.summary.tag_configure("dd_role_somersault", foreground="#4c72b0")
+        self.summary.tag_configure("dd_role_twist", foreground="#dd8452")
+        self.summary.tag_configure("dd_role_body", foreground="#8172b3")
+        self.summary.tag_configure("dd_match", background="#e8f5e9")
+        self.summary.tag_configure("dd_mismatch", background="#fdecea")
+        self.summary.tag_configure("dd_missing", foreground="#666666", background="#fff5d6")
+        self.summary.tag_configure("dd_legend", foreground="#4f5b66")
 
         figure_box = ttk.LabelFrame(right, text="Segmentation et rotations")
         figure_box.pack(fill=tk.BOTH, expand=True)
@@ -8877,7 +8906,6 @@ class DDTab(ttk.Frame):
 
     def sync_dataset_dir(self) -> None:
         gui_debug("DD sync_dataset_dir")
-        self.output_dir.var.set(display_path(current_dataset_dir(self.state)))
         self.sync_dd_reference_path()
         self.refresh_available_reconstructions()
 
@@ -8901,7 +8929,7 @@ class DDTab(ttk.Frame):
 
     def refresh_available_reconstructions(self) -> None:
         try:
-            gui_debug(f"DD refresh_available_reconstructions start dataset={ROOT / self.output_dir.get()}")
+            gui_debug(f"DD refresh_available_reconstructions start dataset={current_dataset_dir(self.state)}")
             _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
                 self.state,
                 preferred_names=[
@@ -8976,9 +9004,9 @@ class DDTab(ttk.Frame):
 
     def refresh_analysis(self) -> None:
         try:
-            gui_debug(f"DD refresh_analysis start dataset={ROOT / self.output_dir.get()}")
+            gui_debug(f"DD refresh_analysis start dataset={current_dataset_dir(self.state)}")
             self.bundle = get_cached_preview_bundle(
-                self.state, ROOT / self.output_dir.get(), None, None, align_root=False
+                self.state, current_dataset_dir(self.state), None, None, align_root=False
             )
             available_names = bundle_available_reconstruction_names(
                 self.bundle, include_3d=True, include_q=True, include_q_root=True
@@ -9139,6 +9167,61 @@ class DDTab(ttk.Frame):
             expected_codes_by_jump=self.expected_dd_codes,
         )
         self.summary.insert(tk.END, summary_text)
+        self._render_dd_code_comparison_details()
+
+    def _insert_role_colored_code(
+        self,
+        code_comparison: list,
+        *,
+        expected: bool,
+    ) -> None:
+        """Insert one role-colored DD code into the summary panel."""
+
+        last_role = None
+        for char_info in code_comparison:
+            if char_info.role != last_role and last_role is not None:
+                self.summary.insert(tk.END, " ")
+            role_tag = {
+                "somersault": "dd_role_somersault",
+                "twist": "dd_role_twist",
+                "body": "dd_role_body",
+            }.get(char_info.role, "")
+            character = char_info.expected_char if expected else char_info.detected_char
+            tags = [role_tag] if role_tag else []
+            if character == "_":
+                tags.append("dd_missing")
+            elif not expected and not char_info.matches:
+                tags.append("dd_mismatch")
+            elif not expected and char_info.matches:
+                tags.append("dd_match")
+            self.summary.insert(tk.END, character, tuple(tag for tag in tags if tag))
+            last_role = char_info.role
+
+    def _render_dd_code_comparison_details(self) -> None:
+        """Append a character-level, role-colored DD comparison to the summary."""
+
+        if self.analysis is None or not self.expected_dd_codes:
+            return
+        self.summary.insert(tk.END, "\nRole-colored DD comparison\n", ("dd_legend",))
+        self.summary.insert(
+            tk.END,
+            "Blue=somersault block | orange=twists | purple=body shape | red background=mismatch\n\n",
+            ("dd_legend",),
+        )
+        for jump_idx, jump in enumerate(self.analysis.jumps, start=1):
+            expected_code = self.expected_dd_codes.get(jump_idx)
+            if not expected_code:
+                continue
+            detected_code = str(jump.code or "-")
+            code_comparison = compare_dd_code_characters(expected_code, detected_code)
+            match_label = "match" if code_comparison and all(item.matches for item in code_comparison) else "diff"
+            self.summary.insert(tk.END, f"S{jump_idx}: ", ())
+            self.summary.insert(tk.END, "expected ", ("dd_legend",))
+            self._insert_role_colored_code(code_comparison, expected=True)
+            self.summary.insert(tk.END, " | ", ())
+            self.summary.insert(tk.END, "detected ", ("dd_legend",))
+            self._insert_role_colored_code(code_comparison, expected=False)
+            self.summary.insert(tk.END, f" | {match_label}\n", ("dd_legend",))
 
     def refresh_plot(self) -> None:
         gui_debug("DD refresh_plot start")

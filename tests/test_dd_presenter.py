@@ -3,12 +3,14 @@ import numpy as np
 from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis, JumpSegment
 from judging.dd_presenter import (
     build_jump_plot_data,
+    compare_dd_code_characters,
     compare_dd_to_reference,
     dd_reference_status_color,
     dd_reference_status_text,
     format_dd_summary,
     jump_list_label,
     jump_list_label_with_reference,
+    split_dd_code,
 )
 
 
@@ -123,3 +125,20 @@ def test_compare_dd_to_reference_reports_partial_match():
     assert comparison.status == "partial"
     assert dd_reference_status_text(comparison) == "1/2"
     assert dd_reference_status_color(comparison) == "partial"
+
+
+def test_split_dd_code_separates_somersault_twist_and_body_shape():
+    assert split_dd_code("821o") == ("82", "1", "o")
+    assert split_dd_code("42/") == ("42", "", "/")
+    assert split_dd_code("00") == ("00", "", "")
+
+
+def test_compare_dd_code_characters_marks_only_the_wrong_role_characters():
+    comparison = compare_dd_code_characters("821o", "812/")
+
+    assert [(item.role, item.expected_char, item.detected_char, item.matches) for item in comparison] == [
+        ("somersault", "8", "8", True),
+        ("somersault", "2", "1", False),
+        ("twist", "1", "2", False),
+        ("body", "o", "/", False),
+    ]

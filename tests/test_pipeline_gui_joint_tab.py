@@ -87,7 +87,6 @@ def test_joint_kinematics_refresh_plot_does_not_repopulate_rows(monkeypatch):
         fps_var=SimpleNamespace(get=lambda: "120"),
         shared_reconstruction_selection=["demo"],
     )
-    tab.output_dir = SimpleNamespace(get=lambda: "outputs/1_partie_0429")
     tab.pair_list = _FakeListbox(["Knee"], [0])
     tab.figure = _FakeFigure()
     tab.canvas = _FakeCanvas()
@@ -101,6 +100,7 @@ def test_joint_kinematics_refresh_plot_does_not_repopulate_rows(monkeypatch):
     )
 
     monkeypatch.setattr(pipeline_gui, "get_cached_preview_bundle", lambda *_args, **_kwargs: bundle)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: "output/1_partie_0429")
     monkeypatch.setattr(pipeline_gui, "bundle_available_reconstruction_names", lambda *_args, **_kwargs: ["demo"])
     monkeypatch.setattr(
         pipeline_gui, "pair_dof_names", lambda _q_names: [("Knee", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY")]
@@ -112,3 +112,14 @@ def test_joint_kinematics_refresh_plot_does_not_repopulate_rows(monkeypatch):
     )
 
     pipeline_gui.JointKinematicsTab.refresh_plot(tab)
+
+
+def test_joint_kinematics_sync_dataset_dir_only_refreshes(monkeypatch):
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+    tab.state = SimpleNamespace()
+    calls = []
+    tab.refresh_available_reconstructions = lambda: calls.append("refresh")
+
+    pipeline_gui.JointKinematicsTab.sync_dataset_dir(tab)
+
+    assert calls == ["refresh"]

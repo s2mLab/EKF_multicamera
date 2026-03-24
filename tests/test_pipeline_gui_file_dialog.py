@@ -95,6 +95,18 @@ def test_sync_dd_reference_path_ignores_empty_keypoints_path():
     assert tab._dd_value == ""
 
 
+def test_dd_sync_dataset_dir_no_longer_depends_on_local_dataset_widget():
+    tab = pipeline_gui.DDTab.__new__(pipeline_gui.DDTab)
+    tab.state = SimpleNamespace()
+    calls = []
+    tab.sync_dd_reference_path = lambda: calls.append("dd")
+    tab.refresh_available_reconstructions = lambda: calls.append("refresh")
+
+    pipeline_gui.DDTab.sync_dataset_dir(tab)
+
+    assert calls == ["dd", "refresh"]
+
+
 def test_sanitize_filetypes_keeps_regular_patterns(monkeypatch):
     filetypes = (
         ("JSON files", "*.json"),
