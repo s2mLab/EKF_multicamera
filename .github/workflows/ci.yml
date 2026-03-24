@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  black-and-tests:
+  lint-and-tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,8 +24,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .[test]
 
+      - name: Run isort --check-only
+        run: isort . --check-only --profile black
+
       - name: Run black --check
         run: black . --check --verbose
+
+      - name: Run flake8
+        run: flake8 .
 
       - name: Run test suite
         run: pytest -q

@@ -31,6 +31,8 @@ dependencies = [
 test = [
     "pytest",
     "black",
+    "isort",
+    "flake8",
 ]
 full = [
     "opencv-python",
@@ -67,3 +69,7 @@ testpaths = ["tests"]
 
 [tool.black]
 line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120

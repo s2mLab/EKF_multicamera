@@ -19,4 +19,6 @@ dependencies:
   - python-kaleido
   - bioviz
   - black
+  - isort
+  - flake8
 prefix: /Users/mickaelbegon/miniconda3/envs/vitpose-ekf

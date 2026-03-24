@@ -6,7 +6,7 @@ This repository contains:
 
 - a desktop GUI to inspect 2D detections, reconstructions, and analyses
 - command-line tools to generate reconstruction bundles and run named profiles
-- analysis utilities for root kinematics, DD estimation, trampoline displacement, observability, and 3D segment analysis
+- analysis utilities for root kinematics, DD estimation, execution deductions, trampoline displacement, observability, and 3D segment analysis
 
 ## Repository Overview
 
@@ -49,6 +49,12 @@ conda create -n vitpose-ekf python=3.11
 conda activate vitpose-ekf
 ```
 
+If you already use the project Conda environment files, they now include:
+
+- `black`
+- `isort`
+- `flake8`
+
 ### 2. Install Python dependencies
 
 Minimal install:
@@ -86,17 +92,18 @@ If you use the GUI, make sure your Python installation has Tk support.
 Formatting and tests:
 
 ```bash
-pip install black pytest
+pip install black isort flake8 pytest
 ```
 
 ## Input Data
 
-Typical inputs:
+Typical inputs are organized under `inputs/`:
 
 - calibration file: `inputs/calibration/Calib.toml`
-- 2D detections: `inputs/<trial>_keypoints.json`
-- optional Pose2Sim TRC: `inputs/<trial>.trc`
-- optional DD reference file: `inputs/<trial>_DD.json`
+- 2D detections: `inputs/keypoints/<trial>_keypoints.json`
+- optional Pose2Sim TRC: `inputs/trc/<trial>.trc`
+- optional DD reference file: `inputs/dd/<trial>_DD.json`
+- optional images or extracted frames: typically `inputs/images/<trial>/...` or another sibling folder inferred from the keypoint file
 
 Example:
 
@@ -106,9 +113,9 @@ Example:
 
 Outputs are typically written under:
 
-- `outputs/<dataset>/models`
-- `outputs/<dataset>/reconstructions`
-- `outputs/<dataset>/figures`
+- `output/<dataset>/models`
+- `output/<dataset>/reconstructions`
+- `output/<dataset>/figures`
 
 ## Launching the GUI
 
@@ -118,9 +125,11 @@ Run:
 python /Users/mickaelbegon/Documents/Playground/pipeline_gui.py
 ```
 
-The GUI is organized around a single workflow:
+The GUI now uses a shared reconstruction selector at the top of the window. Most analysis tabs reuse that selector instead of maintaining their own reconstruction table.
 
-1. Choose the 2D input and dataset root in `2D explorer`
+Typical workflow:
+
+1. Choose the 2D input in `2D explorer`
 2. Inspect cameras, flips, and candidate issues in `Caméras`
 3. Generate models in `Modèle`
 4. Define named reconstruction profiles in `Profiles`
@@ -132,6 +141,7 @@ Main analysis tabs:
 - `3D animation`: export comparative 3D GIFs
 - `2D multiview`: export multi-camera 2D GIFs
 - `DD`: jump segmentation and DD estimation
+- `Execution`: localized execution deductions with 3D and 2D overlays, ready for future image overlays
 - `Toile`: horizontal displacement scoring on the trampoline bed
 - `Racine`: root translations, rotations, or rotation matrices
 - `Autres DoF`: left/right joint comparison
@@ -150,9 +160,10 @@ python /Users/mickaelbegon/Documents/Playground/export_reconstruction_bundle.py 
   --family triangulation \
   --calib inputs/calibration/Calib.toml \
   --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
-  --output-dir outputs/1_partie_0429/reconstructions/triangulation_exhaustive_flip_rotfix \
+  --output-dir output/1_partie_0429/reconstructions/triangulation_exhaustive_flip_rotfix \
   --pose-data-mode cleaned \
   --triangulation-method exhaustive \
+  --flip-method epipolar_fast \
   --flip-left-right \
   --initial-rotation-correction \
   --fps 120 \
@@ -173,7 +184,6 @@ Example:
 ```bash
 python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
-  --output-root outputs \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
   --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
@@ -187,7 +197,6 @@ To run only some profiles:
 ```bash
 python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
-  --output-root outputs \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
   --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
@@ -214,7 +223,7 @@ The project includes several strategies to detect left/right label swaps:
 
 - epipolar Sampson-based scoring
 - fast epipolar symmetric-distance scoring
-- triangulation + reprojection scoring
+- triangulation + reprojection scoring with `once`, `greedy`, or `exhaustive` variants
 
 Corrected 2D variants are cached, so downstream stages can reuse:
 
@@ -224,10 +233,15 @@ Corrected 2D variants are cached, so downstream stages can reuse:
 - cleaned + fast epipolar flip
 - cleaned + triangulation-based flip
 
+For epipolar-family methods, the current implementation also applies a simple
+2-state Viterbi decoding (`normal` / `flipped`) per camera so isolated local
+positives do not dominate the final correction mask.
+
 ### 3. Triangulation
 
-Two main triangulation modes are available:
+Three triangulation modes are available:
 
+- `once`
 - `greedy`
 - `exhaustive`
 
@@ -274,6 +288,7 @@ Important improvements already integrated in the codebase:
 - sequential camera updates
 - vectorized measurement assembly
 - root-pose bootstrap initialization (`root_pose_bootstrap`)
+- configurable coherence families: `epipolar`, `epipolar_fast`, `triangulation_once`, `triangulation_greedy`, `triangulation_exhaustive`
 
 ### 7. DD estimation
 
@@ -283,8 +298,18 @@ The `DD` tab and [judging/dd_analysis.py](/Users/mickaelbegon/Documents/Playgrou
 - salto / tilt / twist analysis
 - DD code inference
 - comparison with expected codes loaded from `*_DD.json`
+- comparison of each reconstruction against the expected DD reference with color-coded status
 
-### 8. Trampoline displacement
+### 8. Execution deductions
+
+The `Execution` tab and [judging/execution.py](/Users/mickaelbegon/Documents/Playground/judging/execution.py) provide:
+
+- per-jump localized deductions
+- a synchronized 3D view and 2D camera overlay
+- session-level time-of-flight scoring
+- a structure ready for direct image overlays as soon as camera frames are available
+
+### 9. Trampoline displacement
 
 The `Toile` tab estimates horizontal displacement penalties:
 
@@ -292,7 +317,7 @@ The `Toile` tab estimates horizontal displacement penalties:
 - contact position currently uses the feet as a proxy
 - the bed geometry is based on a calibrated set of trampoline reference markers
 
-### 9. Observability analysis
+### 10. Observability analysis
 
 The `Observabilité` tab computes frame-wise ranks of:
 
@@ -304,7 +329,9 @@ This helps visualize when the marker or image Jacobians lose rank.
 ## Project Conventions
 
 - default worker count is `6`
-- formatting uses `black` with line length `120`
+- default output root is `output/`
+- formatting uses `isort` + `black`
+- linting uses `flake8`
 - tests live in [tests](/Users/mickaelbegon/Documents/Playground/tests)
 - the project uses a local Matplotlib cache under `.cache/matplotlib`
 
@@ -319,13 +346,19 @@ pytest -q
 Format code:
 
 ```bash
+isort . --profile black
 black .
 ```
 
-The repository also contains CI workflows under:
+Lint code:
 
-- [.github/workflows/black.yml](/Users/mickaelbegon/Documents/Playground/.github/workflows/black.yml)
-- [.github/workflows/tests.yml](/Users/mickaelbegon/Documents/Playground/.github/workflows/tests.yml)
+```bash
+flake8 .
+```
+
+The repository contains a single CI workflow under:
+
+- [.github/workflows/ci.yml](/Users/mickaelbegon/Documents/Playground/.github/workflows/ci.yml)
 
 ## Notes
 
