@@ -44,7 +44,7 @@ SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
     "root_pose_zero_rest",
 )
 SUPPORTED_FRAME_STRIDES = (1, 2, 3, 4)
-DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
+DEFAULT_POSE2SIM_TRC = Path("inputs/trc/1_partie_0429.trc")
 
 
 @dataclass

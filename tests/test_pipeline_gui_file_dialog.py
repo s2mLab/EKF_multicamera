@@ -40,6 +40,32 @@ def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_sta
     assert loaded_preview_state is preview_state
 
 
+def test_infer_pose2sim_trc_from_keypoints_uses_inputs_trc_folder(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    (root / "inputs" / "keypoints").mkdir(parents=True)
+    (root / "inputs" / "trc").mkdir(parents=True)
+    keypoints_path = root / "inputs" / "keypoints" / "trial_keypoints.json"
+    trc_path = root / "inputs" / "trc" / "trial.trc"
+    keypoints_path.write_text("{}", encoding="utf-8")
+    trc_path.write_text("dummy", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", root)
+    monkeypatch.setattr(pipeline_gui, "infer_dataset_name", lambda **_kwargs: "trial")
+
+    assert pipeline_gui.infer_pose2sim_trc_from_keypoints(keypoints_path) == trc_path
+
+
+def test_sync_dd_reference_path_ignores_empty_keypoints_path():
+    tab = pipeline_gui.DDTab.__new__(pipeline_gui.DDTab)
+    tab.state = SimpleNamespace(keypoints_var=SimpleNamespace(get=lambda: ""))
+    tab.dd_reference_path = SimpleNamespace(var=SimpleNamespace(set=lambda value: setattr(tab, "_dd_value", value)))
+    tab._dd_value = "unchanged"
+
+    pipeline_gui.DDTab.sync_dd_reference_path(tab)
+
+    assert tab._dd_value == ""
+
+
 def test_sanitize_filetypes_keeps_regular_patterns(monkeypatch):
     filetypes = (
         ("JSON files", "*.json"),

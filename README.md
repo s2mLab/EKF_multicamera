@@ -93,16 +93,16 @@ pip install black pytest
 
 Typical inputs:
 
-- calibration file: `inputs/Calib.toml`
+- calibration file: `inputs/calibration/Calib.toml`
 - 2D detections: `inputs/<trial>_keypoints.json`
 - optional Pose2Sim TRC: `inputs/<trial>.trc`
 - optional DD reference file: `inputs/<trial>_DD.json`
 
 Example:
 
-- [inputs/1_partie_0429_keypoints.json](/Users/mickaelbegon/Documents/Playground/inputs/1_partie_0429_keypoints.json)
-- [inputs/1_partie_0429.trc](/Users/mickaelbegon/Documents/Playground/inputs/1_partie_0429.trc)
-- [inputs/1_partie_0429_DD.json](/Users/mickaelbegon/Documents/Playground/inputs/1_partie_0429_DD.json)
+- [inputs/keypoints/1_partie_0429_keypoints.json](/Users/mickaelbegon/Documents/Playground/inputs/keypoints/1_partie_0429_keypoints.json)
+- [inputs/trc/1_partie_0429.trc](/Users/mickaelbegon/Documents/Playground/inputs/trc/1_partie_0429.trc)
+- [inputs/dd/1_partie_0429_DD.json](/Users/mickaelbegon/Documents/Playground/inputs/dd/1_partie_0429_DD.json)
 
 Outputs are typically written under:
 
@@ -148,8 +148,8 @@ Example:
 python /Users/mickaelbegon/Documents/Playground/export_reconstruction_bundle.py \
   --name triangulation_exhaustive_flip_rotfix \
   --family triangulation \
-  --calib inputs/Calib.toml \
-  --keypoints inputs/1_partie_0429_keypoints.json \
+  --calib inputs/calibration/Calib.toml \
+  --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
   --output-dir outputs/1_partie_0429/reconstructions/triangulation_exhaustive_flip_rotfix \
   --pose-data-mode cleaned \
   --triangulation-method exhaustive \
@@ -175,9 +175,9 @@ python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
   --output-root outputs \
   --dataset-name 1_partie_0429 \
-  --calib inputs/Calib.toml \
-  --keypoints inputs/1_partie_0429_keypoints.json \
-  --pose2sim-trc inputs/1_partie_0429.trc \
+  --calib inputs/calibration/Calib.toml \
+  --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
+  --pose2sim-trc inputs/trc/1_partie_0429.trc \
   --fps 120 \
   --triangulation-workers 6
 ```
@@ -189,9 +189,9 @@ python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
   --output-root outputs \
   --dataset-name 1_partie_0429 \
-  --calib inputs/Calib.toml \
-  --keypoints inputs/1_partie_0429_keypoints.json \
-  --pose2sim-trc inputs/1_partie_0429.trc \
+  --calib inputs/calibration/Calib.toml \
+  --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
+  --pose2sim-trc inputs/trc/1_partie_0429.trc \
   --profile ekf_2d_acc_rootq0_boot15_flip_rotfix \
   --profile triangulation_exhaustive_flip_rotfix
 ```

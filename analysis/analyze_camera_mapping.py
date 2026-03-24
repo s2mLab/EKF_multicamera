@@ -10,6 +10,7 @@ plusieurs hypothese de mapping:
 Un score plus faible indique qu'un mapping est plus coherent avec la geometrie
 des calibrations.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -38,7 +39,9 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/vitpose_full/triangulation_pose2sim_like.npz"),
         help="NPZ de triangulation pour lire les stats d'utilisation des vues.",
     )
-    parser.add_argument("--frame-stride", type=int, default=10, help="Sous-echantillonnage temporel pour accelerer l'analyse.")
+    parser.add_argument(
+        "--frame-stride", type=int, default=10, help="Sous-echantillonnage temporel pour accelerer l'analyse."
+    )
     parser.add_argument("--score-threshold", type=float, default=0.2, help="Score 2D minimal pour garder un point.")
     parser.add_argument("--top-swaps", type=int, default=10, help="Nombre de swaps a afficher.")
     return parser.parse_args()
@@ -76,7 +79,9 @@ def median_sampson_for_assignment(
         if valid.sum() < 20:
             continue
 
-        errors = np.array([vp.sampson_error_pixels(a, b, F_ij) for a, b in zip(pts_i[valid], pts_j[valid])], dtype=float)
+        errors = np.array(
+            [vp.sampson_error_pixels(a, b, F_ij) for a, b in zip(pts_i[valid], pts_j[valid])], dtype=float
+        )
         finite = errors[np.isfinite(errors)]
         if finite.size == 0:
             continue
@@ -124,7 +129,9 @@ def main() -> None:
         cost, n_pairs = median_sampson_for_assignment(
             pose, calibrations, tuple(perm), args.frame_stride, args.score_threshold
         )
-        swap_results.append((cost - baseline_cost, tuple(perm), f"{pose.camera_names[i]} <-> {pose.camera_names[j]} ({n_pairs} paires)"))
+        swap_results.append(
+            (cost - baseline_cost, tuple(perm), f"{pose.camera_names[i]} <-> {pose.camera_names[j]} ({n_pairs} paires)")
+        )
 
     low_usage_idx = list(np.argsort(usage_counts)[:3])
     targeted = []

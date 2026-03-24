@@ -33,9 +33,9 @@ def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     cmd = build_pipeline_command(
         profile=profile,
         output_root=Path("outputs"),
-        calib=Path("inputs/Calib.toml"),
-        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
-        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
         camera_names_override=["M11141", "M11458"],
         python_executable="python",
     )
@@ -90,9 +90,9 @@ def test_build_pipeline_command_includes_ekf3d_init_method():
     cmd = build_pipeline_command(
         profile=profile,
         output_root=Path("outputs"),
-        calib=Path("inputs/Calib.toml"),
-        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
-        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
         python_executable="python",
     )
     assert "--biorbd-kalman-init-method" in cmd
@@ -110,9 +110,9 @@ def test_build_pipeline_command_includes_frame_stride():
     cmd = build_pipeline_command(
         profile=profile,
         output_root=Path("outputs"),
-        calib=Path("inputs/Calib.toml"),
-        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
-        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
         python_executable="python",
     )
     assert "--frame-stride" in cmd
@@ -131,9 +131,9 @@ def test_build_pipeline_command_includes_frame_stride_for_ekf2d():
     cmd = build_pipeline_command(
         profile=profile,
         output_root=Path("outputs"),
-        calib=Path("inputs/Calib.toml"),
-        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
-        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
         python_executable="python",
     )
     assert "--frame-stride" in cmd
@@ -192,9 +192,9 @@ def test_build_pipeline_command_includes_explicit_coherence_and_once_triangulati
     cmd = build_pipeline_command(
         profile=profile,
         output_root=Path("outputs"),
-        calib=Path("inputs/Calib.toml"),
-        keypoints=Path("inputs/1_partie_0429_keypoints.json"),
-        pose2sim_trc=Path("inputs/1_partie_0429.trc"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
         python_executable="python",
     )
 

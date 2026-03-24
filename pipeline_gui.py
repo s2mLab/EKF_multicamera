@@ -442,7 +442,7 @@ def discover_reconstruction_catalog(output_dir: Path, pose2sim_trc: Path | None 
     bundle_summary = load_bundle_summary(output_dir)
     rows: list[dict[str, object]] = []
 
-    pose2sim_path = pose2sim_trc or ROOT / "inputs/1_partie_0429.trc"
+    pose2sim_path = pose2sim_trc or ROOT / "inputs/trc/1_partie_0429.trc"
     rows.append(
         {
             "name": "pose2sim",
@@ -1227,10 +1227,12 @@ class LabeledEntry(ttk.Frame):
         label_width: int = 18,
         entry_width: int = 70,
         filetypes: tuple[tuple[str, str], ...] | None = None,
+        browse_initialdir: str | None = None,
     ):
         super().__init__(master)
         self.directory = directory
         self.filetypes = filetypes
+        self.browse_initialdir = browse_initialdir
         self.label_widget = ttk.Label(self, text=label, width=label_width)
         self.label_widget.pack(side=tk.LEFT, padx=(0, 6))
         self.var = tk.StringVar(value=default)
@@ -1277,7 +1279,25 @@ class LabeledEntry(ttk.Frame):
         return tuple(normalized) or None
 
     def _browse(self) -> None:
-        initial_dir = str(ROOT)
+        current_value = self.get()
+        initial_dir_path: Path | None = None
+        if current_value:
+            current_path = Path(current_value)
+            if not current_path.is_absolute():
+                current_path = ROOT / current_path
+            candidate_dir = current_path if self.directory else current_path.parent
+            if candidate_dir.exists():
+                initial_dir_path = candidate_dir
+        if initial_dir_path is None and self.browse_initialdir:
+            candidate_dir = Path(self.browse_initialdir)
+            if not candidate_dir.is_absolute():
+                candidate_dir = ROOT / candidate_dir
+            if candidate_dir.exists():
+                initial_dir_path = candidate_dir
+        if initial_dir_path is None:
+            fallback_dir = ROOT if self.directory else ROOT / "inputs"
+            initial_dir_path = fallback_dir
+        initial_dir = str(initial_dir_path)
         if self.directory:
             path = filedialog.askdirectory(initialdir=initial_dir)
         else:
@@ -1643,10 +1663,12 @@ def display_path(path: Path) -> str:
 
 def infer_pose2sim_trc_from_keypoints(keypoints_path: Path) -> Path | None:
     dataset_name = infer_dataset_name(keypoints_path=keypoints_path)
+    inputs_root = ROOT / "inputs"
     candidates = [
         keypoints_path.with_name(f"{dataset_name}.trc"),
         keypoints_path.with_name(f"{keypoints_path.stem.replace('_keypoints', '')}.trc"),
-        ROOT / "inputs" / f"{dataset_name}.trc",
+        inputs_root / "trc" / f"{dataset_name}.trc",
+        inputs_root / f"{dataset_name}.trc",
     ]
     seen: set[Path] = set()
     for candidate in candidates:
@@ -2346,7 +2368,7 @@ class PipelineTab(CommandTab):
         self.calib = LabeledEntry(
             form,
             "Calib",
-            "inputs/Calib.toml",
+            "inputs/calibration/Calib.toml",
             browse=True,
             filetypes=(("TOML calibration", "*.toml"), ("All files", "*.*")),
         )
@@ -2354,7 +2376,7 @@ class PipelineTab(CommandTab):
         self.keypoints = LabeledEntry(
             form,
             "Keypoints",
-            "inputs/1_partie_0429_keypoints.json",
+            "inputs/keypoints/1_partie_0429_keypoints.json",
             browse=True,
             filetypes=(("2D keypoints JSON", "*_keypoints.json"), ("JSON files", "*.json"), ("All files", "*.*")),
         )
@@ -2694,7 +2716,7 @@ class PipelineTab(CommandTab):
     def refresh_status_table(self) -> None:
         for item in self.status_tree.get_children():
             self.status_tree.delete(item)
-        catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), ROOT / "inputs/1_partie_0429.trc")
+        catalog = discover_reconstruction_catalog(ROOT / self.output_dir.get(), ROOT / "inputs/trc/1_partie_0429.trc")
         for row in catalog:
             self.status_tree.insert(
                 "",
@@ -3591,7 +3613,7 @@ class AnalysisTab(CommandTab):
             self.opt_3.var.set("2")
         else:
             self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
-            self.entry_b.var.set("inputs/Calib.toml")
+            self.entry_b.var.set("inputs/calibration/Calib.toml")
             self.entry_c.var.set("outputs/vitpose_full/posture_snapshots_3d.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("7")
@@ -3690,6 +3712,7 @@ class DataExplorer2DTab(ttk.Frame):
             "Calib",
             browse=True,
             filetypes=(("TOML calibration", "*.toml"), ("All files", "*.*")),
+            browse_initialdir="inputs/calibration",
         )
         self.calib.var = state.calib_var
         self.calib.entry_widget.configure(textvariable=self.calib.var)
@@ -3704,6 +3727,7 @@ class DataExplorer2DTab(ttk.Frame):
             label_width=10,
             entry_width=34,
             filetypes=(("2D keypoints JSON", "*_keypoints.json"), ("JSON files", "*.json"), ("All files", "*.*")),
+            browse_initialdir="inputs/keypoints",
         )
         self.keypoints.var = state.keypoints_var
         self.keypoints.entry_widget.configure(textvariable=self.keypoints.var)
@@ -3715,6 +3739,7 @@ class DataExplorer2DTab(ttk.Frame):
             label_width=12,
             entry_width=32,
             filetypes=(("TRC files", "*.trc"), ("All files", "*.*")),
+            browse_initialdir="inputs/trc",
         )
         self.pose2sim_trc.var = state.pose2sim_trc_var
         self.pose2sim_trc.entry_widget.configure(textvariable=self.pose2sim_trc.var)
@@ -4076,18 +4101,7 @@ class DataExplorer2DTab(ttk.Frame):
 
     def update_dataset_summary(self) -> None:
         ensure_dataset_layout(self.state)
-        dataset_name = current_dataset_name(self.state)
-        dataset_dir = current_dataset_dir(self.state)
-        models_dir = current_models_dir(self.state)
-        recon_dir = current_reconstructions_dir(self.state)
-        figures_dir = current_figures_dir(self.state)
-        self.dataset_summary_var.set(
-            f"Dataset: {dataset_name}\n"
-            f"Dataset root: {display_path(dataset_dir)}\n"
-            f"Models: {display_path(models_dir)}\n"
-            f"Reconstructions: {display_path(recon_dir)}\n"
-            f"Figures: {display_path(figures_dir)}"
-        )
+        self.dataset_summary_var.set("")
         selected_cameras = current_selected_camera_names(self.state)
         self.selected_cameras_label_var.set(
             "Cameras: all" if not selected_cameras else f"Cameras: {format_camera_names(selected_cameras)}"
@@ -8590,6 +8604,7 @@ class DDTab(ttk.Frame):
             "",
             browse=True,
             filetypes=(("DD JSON", "*_DD.json"), ("JSON files", "*.json"), ("All files", "*.*")),
+            browse_initialdir="inputs/dd",
         )
         self.dd_reference_path.pack(fill=tk.X, padx=8, pady=(0, 4))
 
@@ -8807,9 +8822,13 @@ class DDTab(ttk.Frame):
     def sync_dd_reference_path(self) -> None:
         """Auto-select the `*_DD.json` file matching the current keypoints file when it exists."""
 
-        keypoints_path = ROOT / self.state.keypoints_var.get()
+        raw_keypoints_path = self.state.keypoints_var.get().strip()
+        if not raw_keypoints_path:
+            self.dd_reference_path.var.set("")
+            return
+        keypoints_path = ROOT / raw_keypoints_path
         candidate_path = default_dd_reference_path(keypoints_path)
-        if candidate_path.exists():
+        if candidate_path is not None and candidate_path.exists():
             try:
                 rel = candidate_path.resolve().relative_to(ROOT)
                 self.dd_reference_path.var.set(str(rel))
@@ -9203,9 +9222,9 @@ class LauncherApp(tk.Tk):
         self.geometry("1450x950")
 
         state = SharedAppState(
-            calib_var=tk.StringVar(value="inputs/Calib.toml"),
-            keypoints_var=tk.StringVar(value="inputs/1_partie_0429_keypoints.json"),
-            pose2sim_trc_var=tk.StringVar(value="inputs/1_partie_0429.trc"),
+            calib_var=tk.StringVar(value="inputs/calibration/Calib.toml"),
+            keypoints_var=tk.StringVar(value="inputs/keypoints/1_partie_0429_keypoints.json"),
+            pose2sim_trc_var=tk.StringVar(value="inputs/trc/1_partie_0429.trc"),
             fps_var=tk.StringVar(value="120"),
             workers_var=tk.StringVar(value="6"),
             pose_data_mode_var=tk.StringVar(value="cleaned"),

@@ -31,9 +31,8 @@ from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from analysis.plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
 from vitpose_ekf_pipeline import load_calibrations
 
-
 DEFAULT_TRIANGULATION = Path("outputs/vitpose_full/triangulation_pose2sim_like.npz")
-DEFAULT_CALIB = Path("inputs/Calib.toml")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_OUTPUT = Path("outputs/vitpose_full/posture_snapshots_3d.png")
 DEFAULT_FIRST_FRAME_OUTPUT = Path("outputs/vitpose_full/first_frame_root_coordinate_system.png")
 DEFAULT_FPS = 120.0
@@ -206,7 +205,9 @@ def draw_world_coordinate_system(ax, mins: np.ndarray, maxs: np.ndarray) -> None
         ax.text(end[0], end[1], end[2], axis_name, color=color, fontsize=10)
 
 
-def draw_coordinate_system(ax, origin: np.ndarray, rotation_matrix: np.ndarray, axis_length: float, label_prefix: str) -> None:
+def draw_coordinate_system(
+    ax, origin: np.ndarray, rotation_matrix: np.ndarray, axis_length: float, label_prefix: str
+) -> None:
     """Dessine un repere local 3D a partir d'une origine et d'une matrice de rotation."""
     axes_spec = (
         (f"{label_prefix}X", rotation_matrix[:, 0], "#d62728"),
@@ -232,7 +233,9 @@ def draw_coordinate_system(ax, origin: np.ndarray, rotation_matrix: np.ndarray, 
         ax.text(end[0], end[1], end[2], axis_name, color=color, fontsize=10)
 
 
-def draw_translated_global_coordinate_system(ax, origin: np.ndarray, axis_length: float, label_prefix: str = "G_") -> None:
+def draw_translated_global_coordinate_system(
+    ax, origin: np.ndarray, axis_length: float, label_prefix: str = "G_"
+) -> None:
     """Dessine un repere global translate a une origine donnee avec des couleurs plus claires."""
     axes_spec = (
         (f"{label_prefix}X", np.array([1.0, 0.0, 0.0]), "#f4a6a6"),
@@ -262,7 +265,9 @@ def draw_frame_skeleton(ax, points_frame: np.ndarray, color: str = "#444444") ->
     """Dessine un stick figure 3D pour une frame donnee."""
     valid = np.all(np.isfinite(points_frame), axis=1)
     if np.any(valid):
-        ax.scatter(points_frame[valid, 0], points_frame[valid, 1], points_frame[valid, 2], s=22, color=color, alpha=0.95)
+        ax.scatter(
+            points_frame[valid, 0], points_frame[valid, 1], points_frame[valid, 2], s=22, color=color, alpha=0.95
+        )
     for name_a, name_b in SKELETON_EDGES:
         point_a = points_frame[KP_INDEX[name_a]]
         point_b = points_frame[KP_INDEX[name_b]]
@@ -277,7 +282,9 @@ def draw_frame_skeleton(ax, points_frame: np.ndarray, color: str = "#444444") ->
             )
 
 
-def export_first_frame_with_root_coordinate_system(points_3d: np.ndarray, frames: np.ndarray, fps: float, output_path: Path) -> None:
+def export_first_frame_with_root_coordinate_system(
+    points_3d: np.ndarray, frames: np.ndarray, fps: float, output_path: Path
+) -> None:
     """Exporte la premiere frame avec le repere monde et le repere racine du tronc."""
     from scipy.spatial.transform import Rotation
 

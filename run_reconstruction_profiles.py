@@ -27,11 +27,10 @@ from reconstruction.reconstruction_profiles import (
     variant_output_dir,
 )
 
-
 DEFAULT_CONFIG = Path("reconstruction_profiles.json")
 DEFAULT_OUTPUT_ROOT = Path("outputs")
-DEFAULT_CALIB = Path("inputs/Calib.toml")
-DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
+DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,10 +42,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=120.0)
     parser.add_argument("--triangulation-workers", type=int, default=6)
-    parser.add_argument("--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules.")
+    parser.add_argument(
+        "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
+    )
     parser.add_argument("--dataset-name", type=str, default=None, help="Nom du dataset; sinon derive du fichier 2D.")
     parser.add_argument("--profile", action="append", default=None, help="Nom de profil a lancer. Peut etre repete.")
-    parser.add_argument("--write-example-config", action="store_true", help="Ecrit un fichier de profils d'exemple puis s'arrete.")
+    parser.add_argument(
+        "--write-example-config", action="store_true", help="Ecrit un fichier de profils d'exemple puis s'arrete."
+    )
     parser.add_argument("--continue-on-error", action="store_true", help="Continue meme si un profil echoue.")
     return parser.parse_args()
 
@@ -58,7 +61,9 @@ def main() -> None:
         print(f"Configuration d'exemple ecrite dans {args.config}")
         return
 
-    dataset_name = infer_dataset_name(keypoints_path=args.keypoints, pose2sim_trc=args.pose2sim_trc, dataset_name=args.dataset_name)
+    dataset_name = infer_dataset_name(
+        keypoints_path=args.keypoints, pose2sim_trc=args.pose2sim_trc, dataset_name=args.dataset_name
+    )
     profiles = load_profiles_json(args.config)
     if args.profile:
         selected = set(args.profile)

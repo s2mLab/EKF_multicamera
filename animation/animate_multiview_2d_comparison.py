@@ -31,6 +31,7 @@ LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -48,13 +49,17 @@ from animation.animate_dual_stick_comparison import (
     parse_trc,
     resample_points,
 )
-from reconstruction.reconstruction_dataset import dataset_source_paths, reconstruction_color, reconstruction_label, resolve_requested_names
+from reconstruction.reconstruction_dataset import (
+    dataset_source_paths,
+    reconstruction_color,
+    reconstruction_label,
+    resolve_requested_names,
+)
 from vitpose_ekf_pipeline import COCO17, fundamental_matrix, load_calibrations, load_pose_data, sampson_error_pixels
 
-
 DEFAULT_CAMERA_FPS = 120.0
-DEFAULT_CALIB = Path("inputs/Calib.toml")
-DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
+DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 LEFT_RIGHT_SWAP_PAIRS = [
     ("left_eye", "right_eye"),
     ("left_ear", "right_ear"),
@@ -69,7 +74,9 @@ LEFT_RIGHT_SWAP_PAIRS = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Animation 2D multi-vues des donnees brutes et des reprojections 3D.")
-    parser.add_argument("--dataset-dir", type=Path, default=None, help="Dossier dataset contenant les bundles de reconstruction.")
+    parser.add_argument(
+        "--dataset-dir", type=Path, default=None, help="Dossier dataset contenant les bundles de reconstruction."
+    )
     parser.add_argument("--calib", type=Path, default=None, help="Fichier de calibration TOML")
     parser.add_argument("--keypoints", type=Path, default=None, help="JSON des detections 2D brutes")
     parser.add_argument(
@@ -80,7 +87,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
     parser.add_argument("--ekf-states", type=Path, default=Path("outputs") / "vitpose_full" / "ekf_states.npz")
-    parser.add_argument("--kalman-comparison", type=Path, default=Path("outputs") / "vitpose_full" / "kalman_comparison.npz")
+    parser.add_argument(
+        "--kalman-comparison", type=Path, default=Path("outputs") / "vitpose_full" / "kalman_comparison.npz"
+    )
     parser.add_argument("--biomod", type=Path, default=Path("outputs") / "vitpose_full" / "vitpose_chain.bioMod")
     parser.add_argument(
         "--output",
@@ -94,7 +103,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--marker-size", type=float, default=18.0, help="Taille des points")
     parser.add_argument("--max-frames", type=int, default=None, help="Limite optionnelle de frames")
     parser.add_argument("--workers", type=int, default=1, help="Nombre de workers pour rendre les frames en parallele.")
-    parser.add_argument("--show", nargs="+", default=None, help="Liste des couches a afficher dans l'animation 2D multi-vues.")
+    parser.add_argument(
+        "--show", nargs="+", default=None, help="Liste des couches a afficher dans l'animation 2D multi-vues."
+    )
     parser.add_argument(
         "--crop-mode",
         choices=("full", "pose"),
@@ -141,7 +152,9 @@ def load_q_reconstructions(
     ekf = np.load(ekf_states_path, allow_pickle=True)
     comparison = np.load(kalman_comparison_path, allow_pickle=True)
     q_ekf_3d = comparison["q_ekf_3d"] if "q_ekf_3d" in comparison else comparison["q_biorbd_kalman"]
-    q_ekf_2d_acc = np.asarray(ekf["q_ekf_2d_acc"], dtype=float) if "q_ekf_2d_acc" in ekf else np.asarray(ekf["q"], dtype=float)
+    q_ekf_2d_acc = (
+        np.asarray(ekf["q_ekf_2d_acc"], dtype=float) if "q_ekf_2d_acc" in ekf else np.asarray(ekf["q"], dtype=float)
+    )
     q_ekf_2d_dyn = np.asarray(ekf["q_ekf_2d_dyn"], dtype=float) if "q_ekf_2d_dyn" in ekf else None
     q_ekf_2d_flip_acc = np.asarray(ekf["q_ekf_2d_flip_acc"], dtype=float) if "q_ekf_2d_flip_acc" in ekf else None
     q_ekf_2d_flip_dyn = np.asarray(ekf["q_ekf_2d_flip_dyn"], dtype=float) if "q_ekf_2d_flip_dyn" in ekf else None
@@ -162,7 +175,9 @@ def project_points(points_3d: np.ndarray, calibrations: dict, camera_names: list
     return projections
 
 
-def subsample_all(arrays: list[np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1) -> list[np.ndarray]:
+def subsample_all(
+    arrays: list[np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
+) -> list[np.ndarray]:
     out = []
     for array in arrays:
         if array is None:
@@ -180,7 +195,9 @@ def subsample_all(arrays: list[np.ndarray], stride: int, max_frames: int | None,
     return out
 
 
-def subsample_layer_dict(layers: dict[str, np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1) -> dict[str, np.ndarray]:
+def subsample_layer_dict(
+    layers: dict[str, np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
+) -> dict[str, np.ndarray]:
     keys = list(layers.keys())
     values = [layers[key] for key in keys]
     subsampled = subsample_all(values, stride=stride, max_frames=max_frames, frame_axis=frame_axis)
@@ -236,7 +253,9 @@ def scatter_markers(name: str) -> dict[str, str]:
     return {"center": center, "left": "^", "right": "s"}
 
 
-def compute_pose_crop_limits(raw_2d: np.ndarray, calibrations: dict, camera_names: list[str], margin: float) -> dict[str, np.ndarray]:
+def compute_pose_crop_limits(
+    raw_2d: np.ndarray, calibrations: dict, camera_names: list[str], margin: float
+) -> dict[str, np.ndarray]:
     """Calcule des bornes de crop par frame et par camera a partir des keypoints 2D."""
     limits: dict[str, np.ndarray] = {}
     for cam_idx, cam_name in enumerate(camera_names):
@@ -306,7 +325,9 @@ def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
     for left_name, right_name in LEFT_RIGHT_SWAP_PAIRS:
         left_idx = KP_INDEX[left_name]
         right_idx = KP_INDEX[right_name]
-        swapped[left_idx], swapped[right_idx] = np.array(points_2d[right_idx], copy=True), np.array(points_2d[left_idx], copy=True)
+        swapped[left_idx], swapped[right_idx] = np.array(points_2d[right_idx], copy=True), np.array(
+            points_2d[left_idx], copy=True
+        )
     return swapped
 
 
@@ -367,11 +388,23 @@ def detect_face_back_confusions(
         raw_points_frame = raw_2d[:, frame_idx]
         raw_scores_frame = raw_scores[:, frame_idx]
         for cam_idx in range(n_cams):
-            nominal_cost = compute_camera_epipolar_cost(cam_idx, raw_points_frame[cam_idx], raw_points_frame, raw_scores_frame, fundamental_matrices)
-            swapped_cost = compute_camera_epipolar_cost(cam_idx, swap_left_right_keypoints(raw_points_frame[cam_idx]), raw_points_frame, raw_scores_frame, fundamental_matrices)
+            nominal_cost = compute_camera_epipolar_cost(
+                cam_idx, raw_points_frame[cam_idx], raw_points_frame, raw_scores_frame, fundamental_matrices
+            )
+            swapped_cost = compute_camera_epipolar_cost(
+                cam_idx,
+                swap_left_right_keypoints(raw_points_frame[cam_idx]),
+                raw_points_frame,
+                raw_scores_frame,
+                fundamental_matrices,
+            )
             if not (np.isfinite(nominal_cost) and np.isfinite(swapped_cost)):
                 continue
-            if nominal_cost > 0 and swapped_cost < improvement_ratio * nominal_cost and (nominal_cost - swapped_cost) >= min_gain_px:
+            if (
+                nominal_cost > 0
+                and swapped_cost < improvement_ratio * nominal_cost
+                and (nominal_cost - swapped_cost) >= min_gain_px
+            ):
                 suspect_mask[cam_idx, frame_idx] = True
 
     return suspect_mask
@@ -399,13 +432,17 @@ def create_animation(
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
     axes = np.atleast_1d(axes).ravel()
 
-    display_names = ([] if "raw" not in show else ["raw"]) + [name for name in show if name != "raw" and name in layer_2d]
+    display_names = ([] if "raw" not in show else ["raw"]) + [
+        name for name in show if name != "raw" and name in layer_2d
+    ]
     styles = {name: layer_style(name, marker_size) for name in display_names}
 
     artists: dict[str, list[dict[str, object]]] = {key: [] for key in display_names}
     line_artists: dict[str, list[list]] = {key: [] for key in display_names}
     title = fig.suptitle("", fontsize=14)
-    crop_limits = compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
+    crop_limits = (
+        compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
+    )
 
     for ax_idx, ax in enumerate(axes):
         if ax_idx >= n_cameras:
@@ -429,9 +466,21 @@ def create_animation(
             style = styles[key]
             markers = scatter_markers(key)
             artist = {
-                "center": ax.scatter([], [], s=marker_size, c=style["color"], marker=markers["center"], label=style["label"], alpha=style["alpha"]),
-                "left": ax.scatter([], [], s=marker_size * 1.3, c=style["color"], marker=markers["left"], alpha=style["alpha"]),
-                "right": ax.scatter([], [], s=marker_size * 1.3, c=style["color"], marker=markers["right"], alpha=style["alpha"]),
+                "center": ax.scatter(
+                    [],
+                    [],
+                    s=marker_size,
+                    c=style["color"],
+                    marker=markers["center"],
+                    label=style["label"],
+                    alpha=style["alpha"],
+                ),
+                "left": ax.scatter(
+                    [], [], s=marker_size * 1.3, c=style["color"], marker=markers["left"], alpha=style["alpha"]
+                ),
+                "right": ax.scatter(
+                    [], [], s=marker_size * 1.3, c=style["color"], marker=markers["right"], alpha=style["alpha"]
+                ),
             }
             artists[key].append(artist)
             lines = []
@@ -447,7 +496,9 @@ def create_animation(
                 lines.append(line)
             line_artists[key].append(lines)
 
-    legend_handles = [artists[key][0]["center"] for key in display_names if artists[key] and artists[key][0] is not None]
+    legend_handles = [
+        artists[key][0]["center"] for key in display_names if artists[key] and artists[key][0] is not None
+    ]
     fig.legend(
         legend_handles,
         [styles[key]["label"] for key in display_names if artists[key] and artists[key][0] is not None],
@@ -501,7 +552,17 @@ def create_animation(
         phase = "AIR" if airborne_mask[frame_idx] else "TOILE"
         warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
         title.set_text(f"Frame {frame_idx} | {phase}{warning}")
-        return [scatter for groups in artists.values() for group in groups for scatter in group.values() if scatter is not None] + [line for groups in line_artists.values() for group in groups for line in group] + [title]
+        return (
+            [
+                scatter
+                for groups in artists.values()
+                for group in groups
+                for scatter in group.values()
+                if scatter is not None
+            ]
+            + [line for groups in line_artists.values() for group in groups for line in group]
+            + [title]
+        )
 
     anim = FuncAnimation(fig, update, frames=n_frames, interval=1000 / gif_fps, blit=False)
     anim.save(output_path, writer=PillowWriter(fps=gif_fps))
@@ -513,11 +574,32 @@ def draw_points_and_lines(ax, points: np.ndarray, style: dict) -> None:
     grouped = grouped_points_2d(points)
     markers = {"center": "o", "left": "^", "right": "s"}
     if grouped["center"].size:
-        ax.scatter(grouped["center"][:, 0], grouped["center"][:, 1], s=style["marker_size"], c=style["color"], marker=markers["center"], alpha=style["alpha"])
+        ax.scatter(
+            grouped["center"][:, 0],
+            grouped["center"][:, 1],
+            s=style["marker_size"],
+            c=style["color"],
+            marker=markers["center"],
+            alpha=style["alpha"],
+        )
     if grouped["left"].size:
-        ax.scatter(grouped["left"][:, 0], grouped["left"][:, 1], s=style["marker_size"] * 1.3, c=style["color"], marker=markers["left"], alpha=style["alpha"])
+        ax.scatter(
+            grouped["left"][:, 0],
+            grouped["left"][:, 1],
+            s=style["marker_size"] * 1.3,
+            c=style["color"],
+            marker=markers["left"],
+            alpha=style["alpha"],
+        )
     if grouped["right"].size:
-        ax.scatter(grouped["right"][:, 0], grouped["right"][:, 1], s=style["marker_size"] * 1.3, c=style["color"], marker=markers["right"], alpha=style["alpha"])
+        ax.scatter(
+            grouped["right"][:, 0],
+            grouped["right"][:, 1],
+            s=style["marker_size"] * 1.3,
+            c=style["color"],
+            marker=markers["right"],
+            alpha=style["alpha"],
+        )
     for name_a, name_b in SKELETON_EDGES:
         point_a = points[KP_INDEX[name_a]]
         point_b = points[KP_INDEX[name_b]]
@@ -551,8 +633,12 @@ def render_frame(
     nrows, ncols = camera_layout(n_cameras)
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
     axes = np.atleast_1d(axes).ravel()
-    crop_limits = compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
-    display_names = ([] if "raw" not in show else ["raw"]) + [name for name in show if name != "raw" and name in layer_2d]
+    crop_limits = (
+        compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
+    )
+    display_names = ([] if "raw" not in show else ["raw"]) + [
+        name for name in show if name != "raw" and name in layer_2d
+    ]
     styles = {name: layer_style(name, marker_size) for name in display_names}
 
     for ax_idx, ax in enumerate(axes):
@@ -597,9 +683,18 @@ def render_frame(
         )
         for key in display_names
     ]
-    fig.legend(handles, [styles[key]["label"] for key in display_names], loc="lower right", bbox_to_anchor=(0.995, 0.02), ncol=1, frameon=True)
+    fig.legend(
+        handles,
+        [styles[key]["label"] for key in display_names],
+        loc="lower right",
+        bbox_to_anchor=(0.995, 0.02),
+        ncol=1,
+        frameon=True,
+    )
     phase = "AIR" if airborne_mask[frame_idx] else "TOILE"
-    suspect_labels = [camera_names[i] for i in range(n_cameras) if confusion_mask is not None and confusion_mask[i, frame_idx]]
+    suspect_labels = [
+        camera_names[i] for i in range(n_cameras) if confusion_mask is not None and confusion_mask[i, frame_idx]
+    ]
     warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
     fig.suptitle(f"Frame {frame_idx} | {phase}{warning}", fontsize=14)
     fig.tight_layout()
@@ -684,7 +779,9 @@ def create_animation_parallel(
 def main() -> None:
     args = parse_args()
     if args.dataset_dir is not None:
-        sources = dataset_source_paths(args.dataset_dir, calib=args.calib, keypoints=args.keypoints, pose2sim_trc=args.pose2sim_trc)
+        sources = dataset_source_paths(
+            args.dataset_dir, calib=args.calib, keypoints=args.keypoints, pose2sim_trc=args.pose2sim_trc
+        )
         calib_path = Path(sources["calib"])
         keypoints_path = Path(sources["keypoints"])
         calibrations = load_calibrations(calib_path)
@@ -694,7 +791,7 @@ def main() -> None:
     else:
         calib_path = args.calib if args.calib is not None else DEFAULT_CALIB
         keypoints_path = args.keypoints if args.keypoints is not None else DEFAULT_KEYPOINTS
-        pose2sim_trc = args.pose2sim_trc if args.pose2sim_trc is not None else Path("inputs/1_partie_0429.trc")
+        pose2sim_trc = args.pose2sim_trc if args.pose2sim_trc is not None else Path("inputs/trc/1_partie_0429.trc")
         calibrations = load_calibrations(calib_path)
         pose_data = load_pose_data(keypoints_path, calibrations, max_frames=None)
         camera_names = pose_data.camera_names
@@ -713,9 +810,13 @@ def main() -> None:
         if ekf_2d_dyn_q is not None:
             recon_3d["ekf_2d_dyn"] = biorbd_markers_from_q(args.biomod, ekf_2d_dyn_q[: triangulation_3d.shape[0]])
         if ekf_2d_flip_acc_q is not None:
-            recon_3d["ekf_2d_flip_acc"] = biorbd_markers_from_q(args.biomod, ekf_2d_flip_acc_q[: triangulation_3d.shape[0]])
+            recon_3d["ekf_2d_flip_acc"] = biorbd_markers_from_q(
+                args.biomod, ekf_2d_flip_acc_q[: triangulation_3d.shape[0]]
+            )
         if ekf_2d_flip_dyn_q is not None:
-            recon_3d["ekf_2d_flip_dyn"] = biorbd_markers_from_q(args.biomod, ekf_2d_flip_dyn_q[: triangulation_3d.shape[0]])
+            recon_3d["ekf_2d_flip_dyn"] = biorbd_markers_from_q(
+                args.biomod, ekf_2d_flip_dyn_q[: triangulation_3d.shape[0]]
+            )
 
         pose2sim_3d, pose2sim_time, _ = parse_trc(pose2sim_trc)
         recon_3d["pose2sim"] = resample_points(pose2sim_3d, pose2sim_time, local_time)
@@ -731,14 +832,18 @@ def main() -> None:
     raw_2d = np.asarray(pose_data.keypoints[:, selected_raw_idx], dtype=float)
     raw_scores = np.asarray(pose_data.scores[:, selected_raw_idx], dtype=float)
 
-    projected_layers = {name: project_points(points_3d, calibrations, camera_names) for name, points_3d in recon_3d.items()}
+    projected_layers = {
+        name: project_points(points_3d, calibrations, camera_names) for name, points_3d in recon_3d.items()
+    }
 
     raw_2d, airborne_mask, raw_scores = subsample_all(
         [raw_2d, airborne_mask, raw_scores],
         stride=args.stride,
         max_frames=args.max_frames,
     )
-    projected_layers = subsample_layer_dict(projected_layers, stride=args.stride, max_frames=args.max_frames, frame_axis=1)
+    projected_layers = subsample_layer_dict(
+        projected_layers, stride=args.stride, max_frames=args.max_frames, frame_axis=1
+    )
     confusion_mask = detect_face_back_confusions(raw_2d, raw_scores, calibrations, camera_names)
 
     include_raw = args.show is None or "raw" in args.show

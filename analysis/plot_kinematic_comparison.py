@@ -6,6 +6,7 @@ Ce script lit les sorties du pipeline d'estimation (`ekf_states.npz`,
 figures pour comparer le nouvel EKF multi-vues avec le Kalman classique de
 `biorbd`.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -40,8 +41,8 @@ from vitpose_ekf_pipeline import (
 )
 
 DEFAULT_CAMERA_FPS = 120.0
-DEFAULT_CALIB = Path("inputs/Calib.toml")
-DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
+DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 TRIANGULATION_ROOT_LABELS = np.asarray(
     [
         "Triangulation:TRUNK:TransX",
@@ -68,7 +69,9 @@ TRIANGULATION_ROOT_VELOCITY_LABELS = np.asarray(
 
 def parse_args() -> argparse.Namespace:
     """Construit l'interface CLI du script de visualisation."""
-    parser = argparse.ArgumentParser(description="Genere des figures de comparaison cinematique a partir des sorties du pipeline.")
+    parser = argparse.ArgumentParser(
+        description="Genere des figures de comparaison cinematique a partir des sorties du pipeline."
+    )
     parser.add_argument(
         "--input-dir",
         type=Path,
@@ -87,9 +90,18 @@ def parse_args() -> argparse.Namespace:
         default="acc",
         help="Version EKF 2D a comparer a EKF 3D.",
     )
-    parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB, help="Fichier de calibration pour reconstruire les poids camera.")
-    parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS, help="JSON des detections 2D pour reconstruire les poids camera.")
-    parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence d'echantillonnage pour l'axe temporel.")
+    parser.add_argument(
+        "--calib", type=Path, default=DEFAULT_CALIB, help="Fichier de calibration pour reconstruire les poids camera."
+    )
+    parser.add_argument(
+        "--keypoints",
+        type=Path,
+        default=DEFAULT_KEYPOINTS,
+        help="JSON des detections 2D pour reconstruire les poids camera.",
+    )
+    parser.add_argument(
+        "--fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence d'echantillonnage pour l'axe temporel."
+    )
     parser.add_argument("--top-dofs", type=int, default=8, help="Nombre de DoF les plus divergents a mettre en avant.")
     return parser.parse_args()
 
@@ -145,7 +157,11 @@ def select_ekf_2d_variant(input_dir: Path, variant: str) -> tuple[np.ndarray, np
     if variant == "both":
         if "q_ekf_2d_dyn" not in ekf:
             raise FileNotFoundError("La variante EKF 2D DYN n'est pas disponible dans ce dossier.")
-        return np.asarray(ekf["q_ekf_2d_dyn"], dtype=float), comparison_dyn["rmse_per_dof"] if comparison_dyn is not None else comparison_default["rmse_per_dof"], "DYN"
+        return (
+            np.asarray(ekf["q_ekf_2d_dyn"], dtype=float),
+            comparison_dyn["rmse_per_dof"] if comparison_dyn is not None else comparison_default["rmse_per_dof"],
+            "DYN",
+        )
 
     q_acc = np.asarray(ekf["q_ekf_2d_acc"], dtype=float) if "q_ekf_2d_acc" in ekf else np.asarray(ekf["q"], dtype=float)
     rmse_acc = comparison_acc["rmse_per_dof"] if comparison_acc is not None else comparison_default["rmse_per_dof"]
@@ -278,9 +294,11 @@ def plot_summary_metrics(summary: dict, output_dir: Path) -> None:
 
     lines = [
         f"Frames: {summary.get('n_frames', 'n/a')}",
-        f"Erreur moyenne de reprojection: {summary.get('mean_reprojection_error_px', float('nan')):.2f} px"
-        if "mean_reprojection_error_px" in summary
-        else "Erreur moyenne de reprojection: n/a",
+        (
+            f"Erreur moyenne de reprojection: {summary.get('mean_reprojection_error_px', float('nan')):.2f} px"
+            if "mean_reprojection_error_px" in summary
+            else "Erreur moyenne de reprojection: n/a"
+        ),
     ]
     kalman = summary.get("kalman_comparison", {})
     if kalman:
@@ -288,10 +306,14 @@ def plot_summary_metrics(summary: dict, output_dir: Path) -> None:
         lines.append(f"MAE moyenne q: {kalman.get('mean_mae_rad_or_m', float('nan')):.4f}")
         ekf_2d_reproj = kalman.get("ekf_2d_reprojection_px")
         if ekf_2d_reproj:
-            lines.append(f"Reproj EKF 2D: {ekf_2d_reproj.get('mean', float('nan')):.2f} +/- {ekf_2d_reproj.get('std', float('nan')):.2f} px")
+            lines.append(
+                f"Reproj EKF 2D: {ekf_2d_reproj.get('mean', float('nan')):.2f} +/- {ekf_2d_reproj.get('std', float('nan')):.2f} px"
+            )
         ekf_3d_reproj = kalman.get("ekf_3d_reprojection_px")
         if ekf_3d_reproj:
-            lines.append(f"Reproj EKF 3D: {ekf_3d_reproj.get('mean', float('nan')):.2f} +/- {ekf_3d_reproj.get('std', float('nan')):.2f} px")
+            lines.append(
+                f"Reproj EKF 3D: {ekf_3d_reproj.get('mean', float('nan')):.2f} +/- {ekf_3d_reproj.get('std', float('nan')):.2f} px"
+            )
 
     ax.text(0.02, 0.95, "\n".join(lines), va="top", ha="left", fontsize=12, family="monospace")
     ax.set_title("Resume des metriques")
@@ -442,7 +464,9 @@ def plot_velocity_acceleration_summary(
     save_figure(fig, output_dir / "05_velocity_acceleration_focus.png")
 
 
-def plot_scatter_identity(q_names: np.ndarray, q_ekf: np.ndarray, q_ekf_3d: np.ndarray, rmse: np.ndarray, output_dir: Path, top_dofs: int) -> None:
+def plot_scatter_identity(
+    q_names: np.ndarray, q_ekf: np.ndarray, q_ekf_3d: np.ndarray, rmse: np.ndarray, output_dir: Path, top_dofs: int
+) -> None:
     """Trace des scatter plots EKF 2D vs EKF 3D avec la diagonale d'identite."""
     top_indices = np.argsort(rmse)[::-1][:top_dofs]
     ncols = 2
@@ -509,7 +533,9 @@ def plot_trunk_root_comparison(
         q_ax.set_ylabel("m")
         q_ax.grid(alpha=0.3)
 
-        qdot_ax.plot(t, triangulation_root_vel[:n_frames, axis_idx], color="#dd8452", linewidth=2.0, label="Triangulation")
+        qdot_ax.plot(
+            t, triangulation_root_vel[:n_frames, axis_idx], color="#dd8452", linewidth=2.0, label="Triangulation"
+        )
         qdot_ax.plot(t, ekf_2d_root_vel[:n_frames, axis_idx], color="#c44e52", linewidth=1.7, label="EKF 2D")
         qdot_ax.plot(t, ekf_3d_root_vel[:n_frames, axis_idx], color="#55a868", linewidth=1.7, label="EKF 3D")
         qdot_ax.set_title(f"{label} - qdot")
@@ -599,7 +625,9 @@ def plot_trunk_root_velocity_comparison(
     )
 
 
-def plot_acc_vs_dyn(q_names: np.ndarray, q_acc: np.ndarray, q_dyn: np.ndarray, t: np.ndarray, output_dir: Path, top_dofs: int) -> None:
+def plot_acc_vs_dyn(
+    q_names: np.ndarray, q_acc: np.ndarray, q_dyn: np.ndarray, t: np.ndarray, output_dir: Path, top_dofs: int
+) -> None:
     """Compare directement les variantes EKF 2D ACC et DYN."""
     diff = np.sqrt(np.mean((q_acc - q_dyn) ** 2, axis=0))
     top_indices = np.argsort(diff)[::-1][:top_dofs]
@@ -779,7 +807,9 @@ def compute_ekf2d_camera_weights(
 
     reconstruction_frames = np.asarray(triangulation["frames"], dtype=int)
     frame_to_idx = {int(frame): idx for idx, frame in enumerate(np.asarray(pose_data.frames, dtype=int))}
-    selected_raw_idx = np.array([frame_to_idx[int(frame)] for frame in reconstruction_frames if int(frame) in frame_to_idx], dtype=int)
+    selected_raw_idx = np.array(
+        [frame_to_idx[int(frame)] for frame in reconstruction_frames if int(frame) in frame_to_idx], dtype=int
+    )
     if selected_raw_idx.size != reconstruction_frames.size:
         raise ValueError("Les frames du cache de triangulation et des detections 2D ne correspondent pas.")
 
@@ -896,7 +926,9 @@ def main() -> None:
     t = time_vector(q_ekf.shape[0], args.fps)
     flight_threshold = float(summary.get("flight_height_threshold_m", 0.0))
     flight_min_consecutive = int(summary.get("flight_min_consecutive_frames", 1))
-    airborne_mask = compute_airborne_mask(np.asarray(triangulation["points_3d"], dtype=float), flight_threshold, flight_min_consecutive)
+    airborne_mask = compute_airborne_mask(
+        np.asarray(triangulation["points_3d"], dtype=float), flight_threshold, flight_min_consecutive
+    )
 
     if args.ekf_2d_variant == "dyn":
         comparison_dyn = load_optional_npz(args.input_dir / "kalman_comparison_dyn.npz")
@@ -931,7 +963,15 @@ def main() -> None:
             airborne_mask,
         )
     plot_scatter_identity(q_names, q_ekf, q_ekf_3d, rmse, output_dir, args.top_dofs)
-    plot_trunk_root_comparison(np.asarray(triangulation["points_3d"], dtype=float), q_names, q_ekf, q_ekf_3d, args.fps, output_dir, airborne_mask)
+    plot_trunk_root_comparison(
+        np.asarray(triangulation["points_3d"], dtype=float),
+        q_names,
+        q_ekf,
+        q_ekf_3d,
+        args.fps,
+        output_dir,
+        airborne_mask,
+    )
     plot_trunk_root_velocity_comparison(
         np.asarray(triangulation["points_3d"], dtype=float),
         q_names,

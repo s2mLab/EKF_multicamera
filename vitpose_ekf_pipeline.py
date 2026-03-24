@@ -43,8 +43,8 @@ except ImportError:  # pragma: no cover - optional but useful for distortion-awa
     cv2 = None
 
 
-DEFAULT_CALIB = Path("inputs/Calib.toml")
-DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
+DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 LOCAL_BIOBUDDY = Path("/Users/mickaelbegon/Documents/GIT/biobuddy")
 LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)

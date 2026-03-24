@@ -155,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pose2sim-trc",
         type=Path,
-        default=Path("inputs/1_partie_0429.trc"),
+        default=Path("inputs/trc/1_partie_0429.trc"),
         help="TRC produit par Pose2Sim",
     )
     parser.add_argument(

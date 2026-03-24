@@ -10,7 +10,7 @@ import numpy as np
 
 from reconstruction.reconstruction_registry import scan_reconstruction_dirs
 
-DEFAULT_CALIB = Path("inputs/Calib.toml")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 
 KNOWN_RECONSTRUCTION_LABELS = {
     "pose2sim": "Pose2Sim",
@@ -89,7 +89,11 @@ def reconstruction_dirs_for_path(path: Path) -> list[Path]:
     path = Path(path)
     if (path / "reconstruction_bundle.npz").exists():
         return [path]
-    return [bundle_dir for bundle_dir in scan_reconstruction_dirs(path) if (bundle_dir / "reconstruction_bundle.npz").exists()]
+    return [
+        bundle_dir
+        for bundle_dir in scan_reconstruction_dirs(path)
+        if (bundle_dir / "reconstruction_bundle.npz").exists()
+    ]
 
 
 def dataset_manifest(dataset_dir: Path) -> dict[str, object]:
@@ -117,7 +121,9 @@ def dataset_source_paths(
         "dataset_name": Path(dataset_name),
         "calib": Path(calib) if calib is not None else Path(manifest.get("calib", DEFAULT_CALIB)),
         "keypoints": Path(keypoints) if keypoints is not None else Path(manifest.get("keypoints", default_keypoints)),
-        "pose2sim_trc": Path(pose2sim_trc) if pose2sim_trc is not None else Path(manifest.get("pose2sim_trc", default_trc)),
+        "pose2sim_trc": (
+            Path(pose2sim_trc) if pose2sim_trc is not None else Path(manifest.get("pose2sim_trc", default_trc))
+        ),
     }
 
 
@@ -185,7 +191,9 @@ def resolve_requested_names(requested: list[str] | tuple[str, ...] | None, avail
     return resolved
 
 
-def align_array_to_frames(array: np.ndarray, source_frames: np.ndarray, target_frames: np.ndarray, fill_value: float = np.nan) -> np.ndarray:
+def align_array_to_frames(
+    array: np.ndarray, source_frames: np.ndarray, target_frames: np.ndarray, fill_value: float = np.nan
+) -> np.ndarray:
     source_frames = np.asarray(source_frames, dtype=int)
     target_frames = np.asarray(target_frames, dtype=int)
     aligned_shape = (len(target_frames),) + tuple(array.shape[1:])
@@ -206,14 +214,32 @@ def load_bundle_entries(path: Path) -> list[dict[str, object]]:
             continue
         data = np.load(bundle_path, allow_pickle=True)
         name = str(np.asarray(data["bundle_name"]).item()) if "bundle_name" in data else bundle_dir.name
-        frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(np.asarray(data["points_3d"]).shape[0], dtype=int)
+        frames = (
+            np.asarray(data["frames"], dtype=int)
+            if "frames" in data
+            else np.arange(np.asarray(data["points_3d"]).shape[0], dtype=int)
+        )
         time_s = np.asarray(data["time_s"], dtype=float) if "time_s" in data else frames.astype(float) / 120.0
         q_names = np.asarray(data["q_names"], dtype=object) if "q_names" in data else np.array([], dtype=object)
-        q_root = np.asarray(data["q_root"], dtype=float) if "q_root" in data else np.empty((len(frames), 0), dtype=float)
-        qdot_root = np.asarray(data["qdot_root"], dtype=float) if "qdot_root" in data else np.empty((len(frames), 0), dtype=float)
+        q_root = (
+            np.asarray(data["q_root"], dtype=float) if "q_root" in data else np.empty((len(frames), 0), dtype=float)
+        )
+        qdot_root = (
+            np.asarray(data["qdot_root"], dtype=float)
+            if "qdot_root" in data
+            else np.empty((len(frames), 0), dtype=float)
+        )
         summary = load_json_if_exists(bundle_dir / "bundle_summary.json")
-        points_3d = np.asarray(data["points_3d"], dtype=float) if "points_3d" in data else np.empty((len(frames), 0, 3), dtype=float)
-        support_points_3d = np.asarray(data["support_points_3d"], dtype=float) if "support_points_3d" in data else np.empty((len(frames), 0, 3), dtype=float)
+        points_3d = (
+            np.asarray(data["points_3d"], dtype=float)
+            if "points_3d" in data
+            else np.empty((len(frames), 0, 3), dtype=float)
+        )
+        support_points_3d = (
+            np.asarray(data["support_points_3d"], dtype=float)
+            if "support_points_3d" in data
+            else np.empty((len(frames), 0, 3), dtype=float)
+        )
         q = np.asarray(data["q"], dtype=float) if "q" in data else np.empty((len(frames), 0), dtype=float)
         qdot = np.asarray(data["qdot"], dtype=float) if "qdot" in data else np.empty((len(frames), 0), dtype=float)
         entries.append(
@@ -233,7 +259,11 @@ def load_bundle_entries(path: Path) -> list[dict[str, object]]:
                 "points_3d_source": str(summary.get("points_3d_source", "")),
             }
         )
-    entries.sort(key=lambda entry: list(PREFERRED_MASTER_NAMES).index(entry["name"]) if entry["name"] in PREFERRED_MASTER_NAMES else 999)
+    entries.sort(
+        key=lambda entry: (
+            list(PREFERRED_MASTER_NAMES).index(entry["name"]) if entry["name"] in PREFERRED_MASTER_NAMES else 999
+        )
+    )
     return entries
 
 

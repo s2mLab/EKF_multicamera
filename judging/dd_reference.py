@@ -7,13 +7,19 @@ import json
 from pathlib import Path
 
 
-def default_dd_reference_path(keypoints_path: Path) -> Path:
+def default_dd_reference_path(keypoints_path: Path) -> Path | None:
     """Return the default `*_DD.json` path associated with one keypoints file."""
 
+    if not str(keypoints_path).strip():
+        return None
     if keypoints_path.name.endswith("_keypoints.json"):
         stem = keypoints_path.name[: -len("_keypoints.json")]
-        return keypoints_path.with_name(f"{stem}_DD.json")
-    return keypoints_path.with_name(f"{keypoints_path.stem}_DD.json")
+    else:
+        stem = keypoints_path.stem
+
+    if keypoints_path.parent.name == "keypoints" and keypoints_path.parent.parent.name == "inputs":
+        return keypoints_path.parent.parent / "dd" / f"{stem}_DD.json"
+    return keypoints_path.with_name(f"{stem}_DD.json")
 
 
 def load_dd_reference_codes(path: Path) -> dict[int, str]:

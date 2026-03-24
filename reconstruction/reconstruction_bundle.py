@@ -91,7 +91,7 @@ from vitpose_ekf_pipeline import (
     triangulation_method_from_coherence_method,
 )
 
-DEFAULT_POSE2SIM_TRC = Path("inputs/1_partie_0429.trc")
+DEFAULT_POSE2SIM_TRC = Path("inputs/trc/1_partie_0429.trc")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 
 

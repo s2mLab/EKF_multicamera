@@ -32,9 +32,8 @@ from matplotlib.widgets import CheckButtons, RadioButtons
 
 from vitpose_ekf_pipeline import COCO17, load_calibrations, load_pose_data
 
-
-DEFAULT_CALIB = Path("inputs/Calib.toml")
-DEFAULT_KEYPOINTS = Path("inputs/1_partie_0429_keypoints.json")
+DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
+DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 DEFAULT_FPS = 120.0
 
 
