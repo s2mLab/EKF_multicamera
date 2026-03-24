@@ -46,10 +46,13 @@ from camera_tools.camera_selection import format_camera_names, parse_camera_name
 from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session
 from judging.execution import (
     ExecutionDeductionEvent,
+    ExecutionOverlayFrame,
     ExecutionJumpAnalysis,
     ExecutionSessionAnalysis,
     analyze_execution_session,
+    build_execution_overlay_frame,
     execution_focus_frame,
+    infer_execution_images_root,
 )
 from judging.dd_presenter import (
     build_jump_plot_data,
@@ -7225,6 +7228,7 @@ class ExecutionTab(ttk.Frame):
         self.current_reconstruction_name: str | None = None
         self.calibrations = None
         self.pose_data = None
+        self.images_root: Path | None = None
         self._suspend_selection_callbacks = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
@@ -7451,6 +7455,7 @@ class ExecutionTab(ttk.Frame):
                 )
             except Exception:
                 self.calibrations, self.pose_data = None, None
+            self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
             self._update_camera_choices()
             self._populate_jump_list()
             self._populate_deduction_tree()
@@ -7640,6 +7645,18 @@ class ExecutionTab(ttk.Frame):
             return
         frame_points_3d = points_3d[focus_frame_idx]
         keypoint_names = event.keypoint_names if event is not None else tuple()
+        bundle_frames = np.asarray(self.bundle.get("frames", np.arange(points_3d.shape[0], dtype=int)), dtype=int)
+        frame_number = int(bundle_frames[min(focus_frame_idx, len(bundle_frames) - 1)])
+        overlay_frame = build_execution_overlay_frame(
+            camera_name=self.camera_name.get().strip(),
+            frame_idx=focus_frame_idx,
+            frame_number=frame_number,
+            frame_points_3d=frame_points_3d,
+            calibrations=self.calibrations,
+            pose_data=self.pose_data,
+            keypoint_names=keypoint_names,
+            images_root=self.images_root,
+        )
 
         self.figure.clear()
         metrics_ax = self.figure.add_subplot(2, 2, (1, 2))
@@ -7686,26 +7703,21 @@ class ExecutionTab(ttk.Frame):
         set_equal_3d_limits(view_3d_ax, {"focus": points_3d}, focus_frame_idx)
         view_3d_ax.set_title(f"3D localization | frame {focus_frame_idx}")
 
-        projected_points = np.full((len(COCO17), 2), np.nan, dtype=float)
-        raw_points = np.full((len(COCO17), 2), np.nan, dtype=float)
-        camera_name = self.camera_name.get().strip()
-        if camera_name and isinstance(self.calibrations, dict) and camera_name in self.calibrations:
-            calibration = self.calibrations[camera_name]
-            for point_idx, point in enumerate(frame_points_3d):
-                if np.all(np.isfinite(point)):
-                    projected_points[point_idx] = calibration.project_point(point)
-            if self.pose_data is not None and getattr(self.pose_data, "camera_names", None) is not None:
-                camera_names = [str(name) for name in self.pose_data.camera_names]
-                if camera_name in camera_names:
-                    cam_idx = camera_names.index(camera_name)
-                    pose_frames = np.asarray(self.pose_data.frames, dtype=int)
-                    bundle_frames = np.asarray(
-                        self.bundle.get("frames", np.arange(points_3d.shape[0], dtype=int)), dtype=int
-                    )
-                    frame_number = int(bundle_frames[min(focus_frame_idx, len(bundle_frames) - 1)])
-                    pose_idx = np.where(pose_frames == frame_number)[0]
-                    if pose_idx.size:
-                        raw_points = np.asarray(self.pose_data.keypoints[cam_idx, int(pose_idx[0])], dtype=float)
+        image_path = overlay_frame.image_path
+        raw_points = overlay_frame.raw_points_2d
+        projected_points = overlay_frame.projected_points_2d
+        if image_path is not None and image_path.exists():
+            image = plt.imread(str(image_path))
+            view_2d_ax.imshow(image)
+            self.image_layer_status_var.set(f"Image overlay: {display_path(image_path)}")
+        elif overlay_frame.image_root is not None:
+            self.image_layer_status_var.set(
+                f"No image found for {overlay_frame.camera_name} frame {overlay_frame.frame_number} under {display_path(overlay_frame.image_root)}."
+            )
+        else:
+            self.image_layer_status_var.set(
+                "No image directory detected yet. 2D view shows 2D detections + reprojection."
+            )
         if np.any(np.isfinite(raw_points)):
             draw_skeleton_2d(
                 view_2d_ax,
@@ -7745,7 +7757,7 @@ class ExecutionTab(ttk.Frame):
             view_2d_ax.set_ylim(maxs[1] + margin, mins[1] - margin)
         view_2d_ax.set_aspect("equal", adjustable="box")
         view_2d_ax.grid(alpha=0.20)
-        view_2d_ax.set_title(f"2D localization | {camera_name or 'no camera'}")
+        view_2d_ax.set_title(f"2D localization | {overlay_frame.camera_name or 'no camera'}")
         handles, labels = view_2d_ax.get_legend_handles_labels()
         if handles:
             unique = {}

@@ -3,9 +3,12 @@ import numpy as np
 from judging.dd_analysis import DDSessionAnalysis, JumpSegment
 from judging.execution import (
     analyze_execution_session,
+    build_execution_overlay_frame,
     compute_time_of_flight_robust,
     detect_contacts_velocity,
     execution_focus_frame,
+    infer_execution_images_root,
+    resolve_execution_image_path,
 )
 
 
@@ -141,3 +144,66 @@ def test_execution_analysis_reports_session_time_of_flight():
     session = analyze_execution_session(_session_with_one_jump(n_frames), q, qdot, q_names, points, fs=10.0)
 
     assert np.isclose(session.time_of_flight_s, 0.6)
+
+
+def test_infer_execution_images_root_finds_dataset_images_folder(tmp_path):
+    keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
+    images_root = tmp_path / "inputs" / "images" / "trial"
+    images_root.mkdir(parents=True)
+    keypoints_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}")
+
+    inferred = infer_execution_images_root(keypoints_path)
+
+    assert inferred == images_root
+
+
+def test_resolve_execution_image_path_matches_camera_folder_and_frame(tmp_path):
+    images_root = tmp_path / "images"
+    camera_dir = images_root / "camA"
+    camera_dir.mkdir(parents=True)
+    image_path = camera_dir / "frame_000123.png"
+    image_path.write_bytes(b"fake")
+
+    resolved = resolve_execution_image_path(images_root, "camA", 123)
+
+    assert resolved == image_path
+
+
+def test_build_execution_overlay_frame_collects_raw_projected_points_and_image(tmp_path):
+    class _Calibration:
+        def project_point(self, point):
+            return np.asarray(point[:2], dtype=float)
+
+    pose_data = type(
+        "PoseDataStub",
+        (),
+        {
+            "camera_names": ["camA"],
+            "frames": np.array([10], dtype=int),
+            "keypoints": np.zeros((1, 1, 17, 2), dtype=float),
+        },
+    )()
+    pose_data.keypoints[0, 0, 11] = np.array([12.0, 34.0], dtype=float)
+    images_root = tmp_path / "images"
+    camera_dir = images_root / "camA"
+    camera_dir.mkdir(parents=True)
+    image_path = camera_dir / "000010.png"
+    image_path.write_bytes(b"fake")
+    frame_points_3d = np.zeros((17, 3), dtype=float)
+    frame_points_3d[11] = np.array([1.0, 2.0, 3.0], dtype=float)
+
+    overlay = build_execution_overlay_frame(
+        camera_name="camA",
+        frame_idx=0,
+        frame_number=10,
+        frame_points_3d=frame_points_3d,
+        calibrations={"camA": _Calibration()},
+        pose_data=pose_data,
+        keypoint_names=("left_hip",),
+        images_root=images_root,
+    )
+
+    assert overlay.image_path == image_path
+    np.testing.assert_allclose(overlay.raw_points_2d[11], np.array([12.0, 34.0], dtype=float))
+    np.testing.assert_allclose(overlay.projected_points_2d[11], np.array([1.0, 2.0], dtype=float))

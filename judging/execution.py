@@ -15,6 +15,7 @@ to claim full FIG compliance yet.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 from scipy.signal import butter, filtfilt
@@ -73,6 +74,20 @@ class ExecutionSessionAnalysis:
     total_deduction: float
     execution_score: float
     time_of_flight_s: float
+
+
+@dataclass
+class ExecutionOverlayFrame:
+    """All display data required for one execution 2D overlay frame."""
+
+    camera_name: str
+    frame_idx: int
+    frame_number: int
+    image_root: Path | None
+    image_path: Path | None
+    raw_points_2d: np.ndarray
+    projected_points_2d: np.ndarray
+    keypoint_names: tuple[str, ...]
 
 
 def lowpass_filter(signal: np.ndarray, fs: float, fc: float = 10.0) -> np.ndarray:
@@ -398,6 +413,123 @@ def compute_time_of_flight_robust(Tz: np.ndarray, time: np.ndarray) -> float:
         if dt > 0.2:
             total += dt
     return total
+
+
+def _normalize_overlay_token(value: str) -> str:
+    """Normalize camera and dataset tokens for loose filesystem matching."""
+
+    return "".join(ch for ch in str(value).lower() if ch.isalnum())
+
+
+def infer_execution_images_root(keypoints_path: Path | str | None) -> Path | None:
+    """Infer the most likely image root for a keypoint file.
+
+    The GUI does not expose image selection yet, so this helper looks for a few
+    pragmatic directory conventions around the keypoint JSON.
+    """
+
+    if keypoints_path is None:
+        return None
+    keypoints_path = Path(keypoints_path)
+    dataset_stem = keypoints_path.stem
+    if dataset_stem.endswith("_keypoints"):
+        dataset_stem = dataset_stem[: -len("_keypoints")]
+    candidates = [
+        keypoints_path.parent.parent / "images" / dataset_stem,
+        keypoints_path.parent.parent / "frames" / dataset_stem,
+        keypoints_path.parent / dataset_stem,
+        keypoints_path.parent.parent / "images",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+    return None
+
+
+def resolve_execution_image_path(images_root: Path | str | None, camera_name: str, frame_number: int) -> Path | None:
+    """Resolve one image path from a root, camera name, and frame number."""
+
+    if images_root is None:
+        return None
+    images_root = Path(images_root)
+    if not images_root.exists():
+        return None
+
+    frame_number = int(frame_number)
+    camera_name = str(camera_name)
+    extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+    frame_tokens = (
+        f"{frame_number}",
+        f"{frame_number:04d}",
+        f"{frame_number:05d}",
+        f"{frame_number:06d}",
+        f"frame_{frame_number}",
+        f"frame_{frame_number:04d}",
+        f"frame_{frame_number:05d}",
+        f"frame_{frame_number:06d}",
+    )
+    camera_tokens = {camera_name, camera_name.lower(), _normalize_overlay_token(camera_name)}
+
+    candidate_dirs = [images_root]
+    for child in images_root.iterdir():
+        if child.is_dir() and _normalize_overlay_token(child.name) in camera_tokens:
+            candidate_dirs.insert(0, child)
+
+    for directory in candidate_dirs:
+        for frame_token in frame_tokens:
+            for extension in extensions:
+                direct_path = directory / f"{frame_token}{extension}"
+                if direct_path.exists():
+                    return direct_path
+                camera_prefixed = directory / f"{camera_name}_{frame_token}{extension}"
+                if camera_prefixed.exists():
+                    return camera_prefixed
+    return None
+
+
+def build_execution_overlay_frame(
+    *,
+    camera_name: str,
+    frame_idx: int,
+    frame_number: int,
+    frame_points_3d: np.ndarray,
+    calibrations: dict[str, object] | None,
+    pose_data,
+    keypoint_names: tuple[str, ...] = (),
+    images_root: Path | None = None,
+) -> ExecutionOverlayFrame:
+    """Build the 2D overlay payload used by the execution-inspection tab."""
+
+    frame_points_3d = np.asarray(frame_points_3d, dtype=float)
+    projected_points = np.full((len(KP_INDEX), 2), np.nan, dtype=float)
+    raw_points = np.full((len(KP_INDEX), 2), np.nan, dtype=float)
+
+    if isinstance(calibrations, dict) and camera_name in calibrations:
+        calibration = calibrations[camera_name]
+        for point_idx, point in enumerate(frame_points_3d):
+            if np.all(np.isfinite(point)):
+                projected_points[point_idx] = calibration.project_point(point)
+
+    if pose_data is not None and getattr(pose_data, "camera_names", None) is not None:
+        camera_names = [str(name) for name in pose_data.camera_names]
+        if camera_name in camera_names:
+            cam_idx = camera_names.index(camera_name)
+            pose_frames = np.asarray(pose_data.frames, dtype=int)
+            pose_idx = np.where(pose_frames == int(frame_number))[0]
+            if pose_idx.size:
+                raw_points = np.asarray(pose_data.keypoints[cam_idx, int(pose_idx[0])], dtype=float)
+
+    image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
+    return ExecutionOverlayFrame(
+        camera_name=str(camera_name),
+        frame_idx=int(frame_idx),
+        frame_number=int(frame_number),
+        image_root=None if images_root is None else Path(images_root),
+        image_path=image_path,
+        raw_points_2d=raw_points,
+        projected_points_2d=projected_points,
+        keypoint_names=tuple(str(name) for name in keypoint_names),
+    )
 
 
 def execution_focus_frame(jump: ExecutionJumpAnalysis) -> int:
