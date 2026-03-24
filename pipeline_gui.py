@@ -35,8 +35,8 @@ LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 os.environ.setdefault("XDG_CACHE_HOME", str(LOCAL_CACHE))
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from scipy.spatial.transform import Rotation
@@ -44,16 +44,6 @@ from scipy.spatial.transform import Rotation
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
 from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session
-from judging.execution import (
-    ExecutionDeductionEvent,
-    ExecutionOverlayFrame,
-    ExecutionJumpAnalysis,
-    ExecutionSessionAnalysis,
-    analyze_execution_session,
-    build_execution_overlay_frame,
-    execution_focus_frame,
-    infer_execution_images_root,
-)
 from judging.dd_presenter import (
     build_jump_plot_data,
     compare_dd_code_characters,
@@ -64,10 +54,57 @@ from judging.dd_presenter import (
     jump_list_label_with_reference,
 )
 from judging.dd_reference import default_dd_reference_path, load_dd_reference_codes
+from judging.execution import (
+    ExecutionDeductionEvent,
+    ExecutionJumpAnalysis,
+    ExecutionOverlayFrame,
+    ExecutionSessionAnalysis,
+    analyze_execution_session,
+    build_execution_overlay_frame,
+    execution_focus_frame,
+    infer_execution_images_root,
+)
+from judging.trampoline_displacement import (
+    BED_X_MAX,
+    BED_Y_MAX,
+    TRAMPOLINE_GEOMETRY,
+    X_INNER,
+    X_MAX,
+    Y_INNER,
+    Y_MAX,
+    analyze_trampoline_contacts,
+    total_trampoline_penalty,
+)
+from kinematics.analysis_3d import (
+    SEGMENT_LENGTH_DEFINITIONS,
+    angular_momentum_plot_data,
+    segment_length_series,
+    valid_segment_length_samples,
+)
+from kinematics.root_kinematics import (
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    TRUNK_ROTATION_NAMES,
+    TRUNK_TRANSLATION_NAMES,
+    centered_finite_difference,
+    compute_trunk_dofs_from_points,
+    extract_root_from_q,
+    normalize,
+)
+from kinematics.root_series import (
+    quantity_unit_label,
+    root_axis_display_labels,
+    root_ordered_names,
+    root_rotation_matrices_from_points,
+    root_rotation_matrices_from_series,
+    root_series_from_model_markers,
+    root_series_from_points,
+    root_series_from_precomputed,
+    root_series_from_q,
+    scale_root_series_rotations,
+)
+from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.dataset_preview_loader import load_dataset_preview_resources
 from preview.dataset_preview_state import build_dataset_preview_state
-from preview.shared_reconstruction_panel import SharedReconstructionPanel, show_placeholder_figure
-from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -75,24 +112,33 @@ from preview.preview_bundle import (
     root_center,
 )
 from preview.preview_navigation import clamp_frame_index, frame_from_slider_click, step_frame_index
-from reconstruction.reconstruction_presenter import (
-    bundle_available_reconstruction_names,
-    catalog_rows_for_names,
-    default_selection,
-)
+from preview.shared_reconstruction_panel import SharedReconstructionPanel, show_placeholder_figure
 from reconstruction.reconstruction_bundle import (
     extract_root_from_points,
     load_or_compute_left_right_flip_cache,
     load_or_compute_pose_data_variant_cache,
     load_or_compute_triangulation_cache,
-    parse_trc_points as parse_reconstruction_trc_points,
+)
+from reconstruction.reconstruction_bundle import parse_trc_points as parse_reconstruction_trc_points
+from reconstruction.reconstruction_bundle import (
     slice_pose_data,
 )
+from reconstruction.reconstruction_dataset import (
+    dataset_source_paths,
+    reconstruction_color,
+    reconstruction_label,
+    write_trc_file,
+)
+from reconstruction.reconstruction_presenter import (
+    bundle_available_reconstruction_names,
+    catalog_rows_for_names,
+    default_selection,
+)
 from reconstruction.reconstruction_profiles import (
-    ReconstructionProfile,
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_FLIP_METHODS,
     SUPPORTED_TRIANGULATION_METHODS,
+    ReconstructionProfile,
     build_pipeline_command,
     canonical_profile_name,
     example_profiles,
@@ -101,12 +147,6 @@ from reconstruction.reconstruction_profiles import (
     profile_to_dict,
     save_profiles_json,
     validate_profile,
-)
-from reconstruction.reconstruction_dataset import (
-    dataset_source_paths,
-    reconstruction_color,
-    reconstruction_label,
-    write_trc_file,
 )
 from reconstruction.reconstruction_registry import (
     dataset_figures_dir,
@@ -121,44 +161,6 @@ from reconstruction.reconstruction_registry import (
     scan_reconstruction_dirs,
 )
 from reconstruction.reconstruction_timings import format_reconstruction_timing_details, objective_total_seconds
-from kinematics.root_kinematics import (
-    TRUNK_ROOT_ROTATION_SEQUENCE,
-    TRUNK_ROTATION_NAMES,
-    TRUNK_TRANSLATION_NAMES,
-    centered_finite_difference,
-    compute_trunk_dofs_from_points,
-    extract_root_from_q,
-    normalize,
-)
-from kinematics.analysis_3d import (
-    SEGMENT_LENGTH_DEFINITIONS,
-    angular_momentum_plot_data,
-    segment_length_series,
-    valid_segment_length_samples,
-)
-from kinematics.root_series import (
-    quantity_unit_label,
-    root_axis_display_labels,
-    root_ordered_names,
-    root_rotation_matrices_from_points,
-    root_rotation_matrices_from_series,
-    root_series_from_model_markers,
-    root_series_from_points,
-    root_series_from_precomputed,
-    root_series_from_q,
-    scale_root_series_rotations,
-)
-from judging.trampoline_displacement import (
-    BED_X_MAX,
-    BED_Y_MAX,
-    TRAMPOLINE_GEOMETRY,
-    X_INNER,
-    X_MAX,
-    Y_INNER,
-    Y_MAX,
-    analyze_trampoline_contacts,
-    total_trampoline_penalty,
-)
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_METHOD,
@@ -177,8 +179,8 @@ from vitpose_ekf_pipeline import (
     apply_left_right_flip_to_points,
     initial_state_from_triangulation,
     load_calibrations,
-    load_reconstruction_cache,
     load_pose_data,
+    load_reconstruction_cache,
     metadata_cache_matches,
     reconstruction_cache_metadata,
     swap_left_right_keypoints,
@@ -5449,7 +5451,7 @@ class ProfilesTab(CommandTab):
         flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
         flip_hint = ttk.Label(
             self.flip_frame,
-            text="epipolar/epipolar_fast stay local; *_viterbi adds temporal decoding; triangulation_* is slower",
+            text="epipolar stays local; *_viterbi adds temporal decoding; ekf_prediction_gate is EKF2D-only; triangulation_* is slower",
             foreground="#5a6570",
         )
         flip_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -5579,15 +5581,15 @@ class ProfilesTab(CommandTab):
         )
         attach_tooltip(
             flip_method_label,
-            "Technique de flip L/R. Les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
+            "Technique de flip L/R. ekf_prediction_gate agit dans l'update EKF 2D; les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
         )
         attach_tooltip(
             flip_method_box,
-            "epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
+            "epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. ekf_prediction_gate: test raw vs swapped contre la projection prédite par l'EKF 2D. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
         )
         attach_tooltip(
             flip_hint,
-            "Raccourci pratique: epipolar_fast est le moins coûteux; *_viterbi ajoute de la stabilité temporelle; exhaustive est le plus coûteux.",
+            "Raccourci pratique: epipolar_fast est le moins coûteux; ekf_prediction_gate exploite la prediction EKF 2D; *_viterbi ajoute de la stabilité temporelle; exhaustive est le plus coûteux.",
         )
         attach_tooltip(predictor_label, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")

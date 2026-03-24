@@ -2,38 +2,39 @@ import json
 from pathlib import Path
 
 import numpy as np
-import vitpose_ekf_pipeline
 
+import vitpose_ekf_pipeline
 from vitpose_ekf_pipeline import (
-    CameraCalibration,
-    compute_biorbd_kalman_initial_state,
     KP_INDEX,
+    CameraCalibration,
     PoseData,
     align_root_translation_guess_to_frame_zero,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
     apply_root_pose_guess_to_state,
+    build_flip_epipolar_pair_weight_array,
+    build_flip_epipolar_pair_weights,
+    build_fundamental_matrix_array,
+    canonical_coherence_method,
+    canonical_triangulation_method,
+    choose_ekf_prediction_gate_measurements,
+    compute_biorbd_kalman_initial_state,
     compute_camera_epipolar_cost,
     compute_camera_epipolar_cost_legacy,
     compute_camera_epipolar_costs_vectorized,
     compute_camera_triangulation_cost,
-    canonical_coherence_method,
-    canonical_triangulation_method,
-    build_flip_epipolar_pair_weight_array,
-    build_flip_epipolar_pair_weights,
-    build_fundamental_matrix_array,
     load_pose_data,
     project_point_with_projection_matrices,
     q_names_from_model,
-    sampson_error_pixels_vectorized,
     sample_frames_uniformly,
+    sampson_error_pixels_vectorized,
     smooth_camera_time_series,
     symmetric_epipolar_distance_vectorized,
-    triangulation_reference_from_other_views,
     triangulation_method_from_coherence_method,
+    triangulation_reference_from_other_views,
     viterbi_flip_state_path,
-    weighted_triangulation,
     weighted_median,
+    weighted_triangulation,
 )
 
 
@@ -594,3 +595,31 @@ def test_sample_frames_uniformly_spreads_indices_over_range():
     frames = np.arange(100, 110, dtype=int)
     sampled = sample_frames_uniformly(frames, 4)
     np.testing.assert_array_equal(sampled, np.array([100, 103, 106, 109], dtype=int))
+
+
+def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction_matches():
+    frame_keypoints = np.full((17, 2), np.nan, dtype=float)
+    frame_variances = np.full(17, np.inf, dtype=float)
+    left_idx = KP_INDEX["left_shoulder"]
+    right_idx = KP_INDEX["right_shoulder"]
+    frame_keypoints[left_idx] = [20.0, 0.0]
+    frame_keypoints[right_idx] = [10.0, 0.0]
+    frame_variances[left_idx] = 1.0
+    frame_variances[right_idx] = 1.0
+    predicted_uv = np.array([[10.0, 0.0], [20.0, 0.0]], dtype=float)
+
+    selected_mask, selected_points, selected_variances, diagnostics = choose_ekf_prediction_gate_measurements(
+        frame_keypoints,
+        frame_variances,
+        predicted_uv,
+        np.array([left_idx, right_idx], dtype=int),
+        improvement_ratio=0.7,
+        min_gain_px=3.0,
+        min_valid_keypoints=2,
+    )
+
+    np.testing.assert_array_equal(selected_mask, np.array([True, True], dtype=bool))
+    np.testing.assert_allclose(selected_points, predicted_uv)
+    np.testing.assert_allclose(selected_variances, np.array([1.0, 1.0], dtype=float))
+    assert diagnostics["used_swapped"] is True
+    assert diagnostics["decision"] == "swapped"

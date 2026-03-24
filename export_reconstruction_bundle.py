@@ -42,10 +42,10 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     DEFAULT_SUBJECT_MASS_KG,
-    SUPPORTED_COHERENCE_METHODS,
-    SUPPORTED_TRIANGULATION_METHODS,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    SUPPORTED_COHERENCE_METHODS,
+    SUPPORTED_TRIANGULATION_METHODS,
     load_calibrations,
 )
 
@@ -108,6 +108,7 @@ def parse_args() -> argparse.Namespace:
             "epipolar_fast",
             "epipolar_viterbi",
             "epipolar_fast_viterbi",
+            "ekf_prediction_gate",
             "triangulation_once",
             "triangulation_greedy",
             "triangulation_exhaustive",

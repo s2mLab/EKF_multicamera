@@ -235,6 +235,35 @@ def test_validate_profile_accepts_explicit_viterbi_flip_method():
     assert "flip_epipolar_fast_viterbi" in canonical_profile_name(profile)
 
 
+def test_validate_profile_accepts_ekf_prediction_gate_for_ekf2d_only():
+    ekf2d_profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            flip=True,
+            flip_method="ekf_prediction_gate",
+        )
+    )
+
+    assert ekf2d_profile.flip_method == "ekf_prediction_gate"
+    assert "flip_ekf_prediction_gate" in canonical_profile_name(ekf2d_profile)
+
+    try:
+        validate_profile(
+            ReconstructionProfile(
+                name="",
+                family="triangulation",
+                flip=True,
+                flip_method="ekf_prediction_gate",
+            )
+        )
+    except ValueError as exc:
+        assert "ekf_prediction_gate" in str(exc)
+    else:
+        raise AssertionError("triangulation profiles should reject ekf_prediction_gate")
+
+
 def test_build_pipeline_command_includes_flip_method():
     profile = validate_profile(
         ReconstructionProfile(

@@ -18,8 +18,8 @@ import argparse
 import concurrent.futures as cf
 import functools
 import hashlib
-import json
 import itertools as it
+import json
 import math
 import os
 import sys
@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations
 from kinematics.root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
 
@@ -75,6 +76,7 @@ SUPPORTED_FLIP_METHODS = (
     "epipolar_fast",
     "epipolar_viterbi",
     "epipolar_fast_viterbi",
+    "ekf_prediction_gate",
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
@@ -94,6 +96,7 @@ DEFAULT_FLIP_OUTLIER_FLOOR_PX = 5.0
 DEFAULT_FLIP_TEMPORAL_WEIGHT = 0.35
 DEFAULT_FLIP_TEMPORAL_TAU_PX = 20.0
 DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS = 4
+DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS = 4
 DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW = 5
 DEFAULT_FLIP_EPIPOLAR_PAIR_WEIGHT_EXPONENT = 0.5
 MODEL_STAGE_VERSION = 7
@@ -946,6 +949,100 @@ def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
             points_2d[left_idx], copy=True
         )
     return swapped
+
+
+def swap_left_right_keypoint_values(values: np.ndarray) -> np.ndarray:
+    """Swap left/right entries for any keypoint-indexed array.
+
+    The first axis must match the COCO17 keypoint order. This is used for
+    both 2D coordinates and per-keypoint scalar arrays such as variances.
+    """
+
+    swapped = np.array(values, copy=True)
+    for left_name, right_name in LEFT_RIGHT_SWAP_PAIRS:
+        left_idx = KP_INDEX[left_name]
+        right_idx = KP_INDEX[right_name]
+        swapped[left_idx], swapped[right_idx] = np.array(values[right_idx], copy=True), np.array(
+            values[left_idx], copy=True
+        )
+    return swapped
+
+
+def choose_ekf_prediction_gate_measurements(
+    frame_keypoints: np.ndarray,
+    frame_variances: np.ndarray,
+    predicted_uv: np.ndarray,
+    keypoint_indices: np.ndarray,
+    *,
+    improvement_ratio: float,
+    min_gain_px: float,
+    min_valid_keypoints: int = DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    """Choose between raw and globally swapped 2D measurements for one camera.
+
+    The decision is made against the current EKF prediction in image space.
+    We keep the existing acceptance rule semantics:
+    - swapped RMS reprojection error must beat `improvement_ratio * nominal`
+    - and the absolute RMS gain must be at least `min_gain_px`
+    """
+
+    keypoint_indices = np.asarray(keypoint_indices, dtype=int).reshape(-1)
+    predicted_uv = np.asarray(predicted_uv, dtype=float).reshape(-1, 2)
+    raw_points = np.asarray(frame_keypoints, dtype=float)
+    raw_variances = np.asarray(frame_variances, dtype=float)
+    swapped_points = swap_left_right_keypoints(raw_points)
+    swapped_variances = swap_left_right_keypoint_values(raw_variances)
+
+    raw_selected_points = raw_points[keypoint_indices]
+    raw_selected_variances = raw_variances[keypoint_indices]
+    swapped_selected_points = swapped_points[keypoint_indices]
+    swapped_selected_variances = swapped_variances[keypoint_indices]
+
+    finite_prediction = np.all(np.isfinite(predicted_uv), axis=1)
+    raw_valid = (
+        finite_prediction & np.all(np.isfinite(raw_selected_points), axis=1) & np.isfinite(raw_selected_variances)
+    )
+    raw_valid &= raw_selected_variances < np.inf
+    swapped_valid = (
+        finite_prediction
+        & np.all(np.isfinite(swapped_selected_points), axis=1)
+        & np.isfinite(swapped_selected_variances)
+        & (swapped_selected_variances < np.inf)
+    )
+    comparable = raw_valid & swapped_valid
+
+    diagnostics: dict[str, object] = {
+        "used_swapped": False,
+        "decision": "raw",
+        "n_comparable_keypoints": int(np.sum(comparable)),
+        "n_raw_valid_keypoints": int(np.sum(raw_valid)),
+        "n_swapped_valid_keypoints": int(np.sum(swapped_valid)),
+        "nominal_rms_px": float("nan"),
+        "swapped_rms_px": float("nan"),
+    }
+
+    if int(np.sum(comparable)) >= int(max(1, min_valid_keypoints)):
+        raw_errors = np.linalg.norm(raw_selected_points[comparable] - predicted_uv[comparable], axis=1)
+        swapped_errors = np.linalg.norm(swapped_selected_points[comparable] - predicted_uv[comparable], axis=1)
+        nominal_rms_px = float(np.sqrt(np.mean(raw_errors**2)))
+        swapped_rms_px = float(np.sqrt(np.mean(swapped_errors**2)))
+        diagnostics["nominal_rms_px"] = nominal_rms_px
+        diagnostics["swapped_rms_px"] = swapped_rms_px
+        use_swapped = (
+            np.isfinite(nominal_rms_px)
+            and np.isfinite(swapped_rms_px)
+            and (swapped_rms_px < float(improvement_ratio) * nominal_rms_px)
+            and ((nominal_rms_px - swapped_rms_px) >= float(min_gain_px))
+        )
+        if use_swapped:
+            diagnostics["used_swapped"] = True
+            diagnostics["decision"] = "swapped"
+            final_mask = swapped_valid
+            return final_mask, swapped_selected_points, swapped_selected_variances, diagnostics
+
+    if int(np.sum(comparable)) < int(max(1, min_valid_keypoints)):
+        diagnostics["decision"] = "raw_insufficient_support"
+    return raw_valid, raw_selected_points, raw_selected_variances, diagnostics
 
 
 def build_temporal_reference_points(pose_data: PoseData) -> tuple[np.ndarray, np.ndarray]:
@@ -2972,6 +3069,10 @@ class MultiViewKinematicEKF:
         root_flight_dynamics: bool = False,
         flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
         flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
+        flip_method: str | None = None,
+        flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+        flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+        flip_min_valid_keypoints: int = DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS,
     ):
         self.model = model
         self.calibrations = calibrations
@@ -2987,6 +3088,11 @@ class MultiViewKinematicEKF:
         self.root_flight_dynamics = root_flight_dynamics
         self.flight_height_threshold_m = flight_height_threshold_m
         self.flight_min_consecutive_frames = max(1, int(flight_min_consecutive_frames))
+        self.flip_method = None if flip_method is None else str(flip_method)
+        self.flip_improvement_ratio = float(flip_improvement_ratio)
+        self.flip_min_gain_px = float(flip_min_gain_px)
+        self.flip_min_valid_keypoints = max(1, int(flip_min_valid_keypoints))
+        self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
         self.nq = model.nbQ()
         self.nx = 3 * self.nq
         self.n_root = int(model.nbRoot()) if hasattr(model, "nbRoot") else 0
@@ -3014,6 +3120,9 @@ class MultiViewKinematicEKF:
             "pred_only_no_measurement": 0,
             "pred_only_low_coherence": 0,
             "pred_only_cooldown": 0,
+            "flip_prediction_gate_swapped": 0,
+            "flip_prediction_gate_raw": 0,
+            "flip_prediction_gate_raw_insufficient_support": 0,
         }
         self.profiling = {
             "predict_s": 0.0,
@@ -3022,6 +3131,7 @@ class MultiViewKinematicEKF:
             "marker_jacobians_s": 0.0,
             "assembly_s": 0.0,
             "solve_s": 0.0,
+            "flip_gate_s": 0.0,
         }
         self.effective_confidences, self.measurement_variances = self._precompute_measurement_variances()
 
@@ -3259,6 +3369,14 @@ class MultiViewKinematicEKF:
             valid_keypoints = (
                 np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
             )
+            if self.use_prediction_flip_gate:
+                swapped_keypoints = swap_left_right_keypoints(frame_keypoints)
+                swapped_variances = swap_left_right_keypoint_values(frame_variances)
+                valid_keypoints |= (
+                    np.all(np.isfinite(swapped_keypoints), axis=1)
+                    & np.isfinite(swapped_variances)
+                    & (swapped_variances < np.inf)
+                )
             if not np.any(valid_keypoints):
                 continue
             valid_pairs = finite_marker_points & valid_keypoints[self.marker_pair_keypoint_indices]
@@ -3277,12 +3395,45 @@ class MultiViewKinematicEKF:
             if not np.any(finite_pairs):
                 continue
             keypoint_indices = keypoint_indices[finite_pairs]
+            projected_uv = projected_uv[finite_pairs]
+            H_q_blocks = H_q_blocks[finite_pairs]
+            gate_t0 = time.perf_counter()
+            if self.use_prediction_flip_gate:
+                selected_mask, selected_points, selected_variances, gate_diagnostics = (
+                    choose_ekf_prediction_gate_measurements(
+                        frame_keypoints,
+                        frame_variances,
+                        projected_uv,
+                        keypoint_indices,
+                        improvement_ratio=self.flip_improvement_ratio,
+                        min_gain_px=self.flip_min_gain_px,
+                        min_valid_keypoints=self.flip_min_valid_keypoints,
+                    )
+                )
+                self.profiling["flip_gate_s"] += time.perf_counter() - gate_t0
+                decision_label = str(gate_diagnostics.get("decision", "raw"))
+                status_key = f"flip_prediction_gate_{decision_label}"
+                if status_key in self.update_status:
+                    self.update_status[status_key] += 1
+                elif bool(gate_diagnostics.get("used_swapped")):
+                    self.update_status["flip_prediction_gate_swapped"] += 1
+                else:
+                    self.update_status["flip_prediction_gate_raw"] += 1
+            else:
+                selected_mask = np.all(np.isfinite(frame_keypoints[keypoint_indices]), axis=1) & np.isfinite(
+                    frame_variances[keypoint_indices]
+                )
+                selected_mask &= frame_variances[keypoint_indices] < np.inf
+                selected_points = frame_keypoints[keypoint_indices]
+                selected_variances = frame_variances[keypoint_indices]
+            if not np.any(selected_mask):
+                continue
             measurement_blocks.append(
                 (
-                    frame_keypoints[keypoint_indices].reshape(-1),
-                    projected_uv[finite_pairs].reshape(-1),
-                    H_q_blocks[finite_pairs].reshape(-1, self.nq),
-                    np.repeat(frame_variances[keypoint_indices], 2).astype(float, copy=False),
+                    selected_points[selected_mask].reshape(-1),
+                    projected_uv[selected_mask].reshape(-1),
+                    H_q_blocks[selected_mask].reshape(-1, self.nq),
+                    np.repeat(selected_variances[selected_mask], 2).astype(float, copy=False),
                 )
             )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
@@ -3531,6 +3682,9 @@ def initial_state_from_ekf_bootstrap(
     passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     tolerance: float = 1e-6,
     initial_state: np.ndarray | None = None,
+    flip_method: str | None = None,
+    flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+    flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -3575,6 +3729,9 @@ def initial_state_from_ekf_bootstrap(
         root_flight_dynamics=False,
         flight_height_threshold_m=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
         flight_min_consecutive_frames=DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
+        flip_method=flip_method,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -3622,6 +3779,9 @@ def initial_state_from_root_pose_bootstrap(
     coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     enable_dof_locking: bool = False,
     passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
+    flip_method: str | None = None,
+    flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+    flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -3648,6 +3808,9 @@ def initial_state_from_root_pose_bootstrap(
             coherence_confidence_floor=coherence_confidence_floor,
             enable_dof_locking=enable_dof_locking,
             passes=passes,
+            flip_method=flip_method,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -3665,6 +3828,9 @@ def initial_state_from_root_pose_bootstrap(
         enable_dof_locking=enable_dof_locking,
         passes=passes,
         initial_state=root_seed_state,
+        flip_method=flip_method,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -3688,6 +3854,9 @@ def compute_ekf2d_initial_state(
     enable_dof_locking: bool,
     method: str = DEFAULT_EKF2D_INITIAL_STATE_METHOD,
     bootstrap_passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
+    flip_method: str | None = None,
+    flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+    flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -3717,6 +3886,9 @@ def compute_ekf2d_initial_state(
             coherence_confidence_floor=coherence_confidence_floor,
             enable_dof_locking=enable_dof_locking,
             passes=bootstrap_passes,
+            flip_method=flip_method,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -3732,6 +3904,9 @@ def compute_ekf2d_initial_state(
             coherence_confidence_floor=coherence_confidence_floor,
             enable_dof_locking=enable_dof_locking,
             passes=bootstrap_passes,
+            flip_method=flip_method,
+            flip_improvement_ratio=flip_improvement_ratio,
+            flip_min_gain_px=flip_min_gain_px,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -3756,6 +3931,9 @@ def run_ekf(
     debug_console: bool = False,
     initial_state: np.ndarray | None = None,
     model=None,
+    flip_method: str | None = None,
+    flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
+    flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -3785,6 +3963,9 @@ def run_ekf(
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
+        flip_method=flip_method,
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -3836,6 +4017,23 @@ def run_ekf(
             "q_names": np.asarray(ekf.q_names, dtype=object),
             "update_status_per_frame": np.asarray(update_status_per_frame, dtype=object),
             "update_status_counts": dict(ekf.update_status),
+            "flip_diagnostics": (
+                {
+                    "method": str(flip_method),
+                    "decision_stage": "ekf_update_prediction_gate",
+                    "improvement_ratio": float(flip_improvement_ratio),
+                    "min_gain_px": float(flip_min_gain_px),
+                    "min_valid_keypoints": int(ekf.flip_min_valid_keypoints),
+                    "n_camera_updates_swapped": int(ekf.update_status.get("flip_prediction_gate_swapped", 0)),
+                    "n_camera_updates_raw": int(ekf.update_status.get("flip_prediction_gate_raw", 0)),
+                    "n_camera_updates_raw_insufficient_support": int(
+                        ekf.update_status.get("flip_prediction_gate_raw_insufficient_support", 0)
+                    ),
+                    "compute_time_s": float(ekf.profiling.get("flip_gate_s", 0.0)),
+                }
+                if flip_method == "ekf_prediction_gate"
+                else None
+            ),
         },
         timings,
     )

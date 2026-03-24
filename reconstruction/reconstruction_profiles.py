@@ -42,6 +42,7 @@ SUPPORTED_FLIP_METHODS = (
     "epipolar_fast",
     "epipolar_viterbi",
     "epipolar_fast_viterbi",
+    "ekf_prediction_gate",
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
@@ -227,6 +228,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             "epipolar_fast",
         ):
             raise ValueError("ekf2d_3d_source=first_frame_only requires an epipolar coherence method.")
+    elif profile.flip and profile.flip_method == "ekf_prediction_gate":
+        raise ValueError("flip_method=ekf_prediction_gate is only supported for family='ekf_2d'.")
     else:
         profile.predictor = None
         profile.ekf2d_3d_source = "full_triangulation"

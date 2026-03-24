@@ -15,11 +15,9 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
-from reconstruction.reconstruction_timings import make_timing_stage
 from kinematics.root_kinematics import (
-    ROOT_ROTATION_SLICE,
     ROOT_Q_NAMES,
+    ROOT_ROTATION_SLICE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
     centered_finite_difference,
@@ -28,16 +26,20 @@ from kinematics.root_kinematics import (
     root_z_correction_angle_from_points,
     unwrap_with_gaps,
 )
+from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
+from reconstruction.reconstruction_timings import make_timing_stage
 from vitpose_ekf_pipeline import (
     COCO17,
-    KP_INDEX,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
+    DEFAULT_CALIB,
     DEFAULT_CAMERA_FPS,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     DEFAULT_COHERENCE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
+    DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
     DEFAULT_FLIP_MIN_OTHER_CAMERAS,
@@ -47,10 +49,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
-    DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
-    DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_KEYPOINTS,
-    DEFAULT_CALIB,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
@@ -58,6 +57,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    KP_INDEX,
     CameraCalibration,
     PoseData,
     ReconstructionResult,
@@ -66,12 +66,12 @@ from vitpose_ekf_pipeline import (
     build_biomod,
     canonical_coherence_method,
     canonical_triangulation_method,
+    compute_ekf2d_initial_state,
     compute_epipolar_coherence,
     detect_left_right_flip_diagnostics,
     estimate_segment_lengths,
     frame_signature,
     fundamental_matrix,
-    compute_ekf2d_initial_state,
     load_calibrations,
     load_model_stage,
     load_pose_data,
@@ -1487,6 +1487,8 @@ def build_triangulation_bundle(
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
+    if flip_left_right and flip_method == "ekf_prediction_gate":
+        raise ValueError("flip_method=ekf_prediction_gate is only supported for ekf_2d reconstructions.")
     effective_fps = pose_effective_fps(pose_data, fps)
     pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
         prepare_pose_data_for_reconstruction(
@@ -1717,6 +1719,8 @@ def build_ekf_3d_bundle(
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
+    if flip_left_right and flip_method == "ekf_prediction_gate":
+        raise ValueError("flip_method=ekf_prediction_gate is only supported for ekf_2d reconstructions.")
     effective_fps = pose_effective_fps(pose_data, fps)
     pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
         prepare_pose_data_for_reconstruction(
@@ -2018,6 +2022,7 @@ def build_ekf_2d_bundle(
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
     effective_fps = pose_effective_fps(pose_data, fps)
+    use_runtime_flip_gate = bool(flip_left_right and flip_method == "ekf_prediction_gate")
     if ekf2d_3d_source not in SUPPORTED_EKF2D_3D_SOURCE_MODES:
         raise ValueError(f"Unsupported ekf2d_3d_source: {ekf2d_3d_source}")
     if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"}:
@@ -2038,7 +2043,7 @@ def build_ekf_2d_bundle(
             pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
             pose_amplitude_lower_percentile=pose_amplitude_lower_percentile,
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
-            flip_left_right=flip_left_right,
+            flip_left_right=(flip_left_right and not use_runtime_flip_gate),
             flip_improvement_ratio=flip_improvement_ratio,
             flip_min_gain_px=flip_min_gain_px,
             flip_min_other_cameras=flip_min_other_cameras,
@@ -2165,6 +2170,9 @@ def build_ekf_2d_bundle(
         enable_dof_locking=enable_dof_locking,
         method=ekf2d_initial_state_method,
         bootstrap_passes=ekf2d_bootstrap_passes,
+        flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2187,6 +2195,9 @@ def build_ekf_2d_bundle(
         unwrap_root=unwrap_root,
         model=model,
         initial_state=initial_state,
+        flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
+        flip_improvement_ratio=flip_improvement_ratio,
+        flip_min_gain_px=flip_min_gain_px,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
@@ -2207,6 +2218,9 @@ def build_ekf_2d_bundle(
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
     save_legacy_ekf_2d(output_dir, result, predictor, flip_left_right, model_points_3d)
     print_step(5, 5, "Export bundle EKF 2D")
+
+    if use_runtime_flip_gate:
+        flip_diagnostics = dict(result.get("flip_diagnostics") or {})
 
     time_s = reconstruction.frames / float(fps)
     pipeline_stages = []
@@ -2324,6 +2338,13 @@ def build_ekf_2d_bundle(
                 include_in_total=False,
             ),
             make_timing_stage(
+                "ekf_prediction_gate",
+                "EKF prediction-gated L/R flip",
+                compute_time_s=float(ekf_timings.get("flip_gate_s", 0.0)),
+                source="computed_now",
+                include_in_total=False,
+            ),
+            make_timing_stage(
                 "ekf_2d_markers",
                 "EKF 2D markers",
                 compute_time_s=float(ekf_timings.get("markers_s", 0.0)),
@@ -2390,6 +2411,7 @@ def build_ekf_2d_bundle(
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
             "flight_min_consecutive_frames": int(flight_min_consecutive_frames),
+            "flip_method": str(flip_method or "epipolar"),
         },
         "bootstrap_frame_idx": int(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
@@ -2412,6 +2434,7 @@ def build_ekf_2d_bundle(
             "ekf_2d_s": ekf_s,
             "ekf_2d_predict_s": float(ekf_timings.get("predict_s", 0.0)),
             "ekf_2d_update_s": float(ekf_timings.get("update_s", 0.0)),
+            "ekf_prediction_gate_s": float(ekf_timings.get("flip_gate_s", 0.0)),
             "ekf_2d_markers_s": float(ekf_timings.get("markers_s", 0.0)),
             "ekf_2d_marker_jacobians_s": float(ekf_timings.get("marker_jacobians_s", 0.0)),
             "ekf_2d_assembly_s": float(ekf_timings.get("assembly_s", 0.0)),
