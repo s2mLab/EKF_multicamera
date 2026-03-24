@@ -103,7 +103,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flip-left-right", action="store_true")
     parser.add_argument(
         "--flip-method",
-        choices=("epipolar", "epipolar_fast", "triangulation_once", "triangulation_greedy", "triangulation_exhaustive"),
+        choices=(
+            "epipolar",
+            "epipolar_fast",
+            "epipolar_viterbi",
+            "epipolar_fast_viterbi",
+            "triangulation_once",
+            "triangulation_greedy",
+            "triangulation_exhaustive",
+        ),
         default="epipolar",
     )
     parser.add_argument("--flip-improvement-ratio", type=float, default=0.7)

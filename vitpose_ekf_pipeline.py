@@ -70,6 +70,15 @@ SUPPORTED_COHERENCE_METHODS = (
     "triangulation_greedy",
     "triangulation_exhaustive",
 )
+SUPPORTED_FLIP_METHODS = (
+    "epipolar",
+    "epipolar_fast",
+    "epipolar_viterbi",
+    "epipolar_fast_viterbi",
+    "triangulation_once",
+    "triangulation_greedy",
+    "triangulation_exhaustive",
+)
 DEFAULT_COHERENCE_CONFIDENCE_FLOOR = 0.35
 DEFAULT_SUBJECT_MASS_KG = 55.0
 DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
@@ -1541,7 +1550,10 @@ def detect_left_right_flip_diagnostics(
     fundamental_matrices = None
     pair_weights = None
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
-    epipolar_family = method in {"epipolar", "epipolar_fast"}
+    local_epipolar_methods = {"epipolar", "epipolar_fast"}
+    viterbi_epipolar_methods = {"epipolar_viterbi", "epipolar_fast_viterbi"}
+    epipolar_family = method in local_epipolar_methods | viterbi_epipolar_methods
+    use_viterbi_decoding = method in viterbi_epipolar_methods
     triangulation_family = method in {
         "triangulation",
         "triangulation_once",
@@ -1555,7 +1567,9 @@ def detect_left_right_flip_diagnostics(
         else ("greedy" if method == "triangulation_greedy" else "exhaustive")
     )
     epipolar_distance_mode = (
-        "sampson" if method == "epipolar" else ("symmetric" if method == "epipolar_fast" else "reprojection")
+        "sampson"
+        if method in {"epipolar", "epipolar_viterbi"}
+        else ("symmetric" if method in {"epipolar_fast", "epipolar_fast_viterbi"} else "reprojection")
     )
     smoothing_window = DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW if epipolar_family else 1
     if epipolar_family:
@@ -1753,7 +1767,7 @@ def detect_left_right_flip_diagnostics(
         window=smoothing_window,
     )
     strong_positive_margin = 0.5 * float(min_gain_px) if epipolar_family else 0.0
-    if epipolar_family:
+    if epipolar_family and use_viterbi_decoding:
         viterbi_transition_cost = max(float(min_gain_px), 0.25 * float(geometry_tau_px))
         viterbi_state_mask = np.zeros_like(candidate_mask, dtype=bool)
         for cam_idx in range(n_cams):
@@ -1769,6 +1783,10 @@ def detect_left_right_flip_diagnostics(
             & np.isfinite(decision_score)
             & ((smoothed_decision_score > 0.0) | (decision_score >= strong_positive_margin))
         )
+    elif epipolar_family:
+        viterbi_transition_cost = 0.0
+        viterbi_state_mask = np.zeros_like(candidate_mask, dtype=bool)
+        suspect_mask = candidate_mask & np.isfinite(decision_score) & (decision_score > 0.0)
     else:
         viterbi_transition_cost = 0.0
         viterbi_state_mask = np.zeros_like(candidate_mask, dtype=bool)
@@ -1801,7 +1819,7 @@ def detect_left_right_flip_diagnostics(
         "epipolar_pair_weighting": "baseline_confidence_weighted" if epipolar_family else "n/a",
         "epipolar_keypoint_weighting": "torso_proximal_priority" if epipolar_family else "n/a",
         "temporal_smoothing_window": int(smoothing_window),
-        "temporal_decision_method": "viterbi_two_state" if epipolar_family else "local_threshold",
+        "temporal_decision_method": ("viterbi_two_state" if use_viterbi_decoding else "local_threshold"),
         "viterbi_transition_cost_px": float(viterbi_transition_cost),
         "n_camera_frame_temporal_support": int(np.count_nonzero(temporal_support_mask)),
         "n_candidate_camera_frames_with_temporal_support": int(np.count_nonzero(candidate_temporal_support_mask)),
@@ -4603,9 +4621,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose-correction-mode",
-        choices=("none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"),
+        choices=(
+            "none",
+            "flip_epipolar",
+            "flip_epipolar_fast",
+            "flip_epipolar_viterbi",
+            "flip_epipolar_fast_viterbi",
+            "flip_triangulation",
+        ),
         default="none",
-        help="Correction optionnelle des 2D apres chargement: aucune, flip L/R detecte par epipolaire, epipolaire rapide (distance symétrique), ou flip L/R detecte par triangulation/reprojection.",
+        help="Correction optionnelle des 2D apres chargement: aucune, flip L/R local par epipolaire Sampson, local par epipolaire rapide (distance symétrique), variante Viterbi explicite, ou flip L/R detecte par triangulation/reprojection.",
     )
     parser.add_argument(
         "--pose-filter-window",
@@ -4901,6 +4926,10 @@ def main() -> None:
             flip_method = "epipolar"
         elif args.pose_correction_mode == "flip_epipolar_fast":
             flip_method = "epipolar_fast"
+        elif args.pose_correction_mode == "flip_epipolar_viterbi":
+            flip_method = "epipolar_viterbi"
+        elif args.pose_correction_mode == "flip_epipolar_fast_viterbi":
+            flip_method = "epipolar_fast_viterbi"
         else:
             flip_method = "triangulation"
         t0 = time.perf_counter()

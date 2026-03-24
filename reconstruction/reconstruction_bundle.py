@@ -254,9 +254,15 @@ def flip_cache_metadata(
         "temporal_min_valid_keypoints": int(temporal_min_valid_keypoints),
         "epipolar_pair_weighting": "baseline_confidence_weighted",
         "epipolar_keypoint_weighting": "torso_proximal_priority",
-        "epipolar_distance_mode": "symmetric" if str(method) == "epipolar_fast" else "sampson",
-        "epipolar_flip_scoring_version": 6 if str(method) in {"epipolar", "epipolar_fast"} else 1,
-        "temporal_smoothing_window": 5 if str(method) in {"epipolar", "epipolar_fast"} else 1,
+        "epipolar_distance_mode": (
+            "symmetric" if str(method) in {"epipolar_fast", "epipolar_fast_viterbi"} else "sampson"
+        ),
+        "epipolar_flip_scoring_version": (
+            7 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
+        ),
+        "temporal_smoothing_window": (
+            5 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
+        ),
     }
 
 

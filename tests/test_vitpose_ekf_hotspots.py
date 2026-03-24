@@ -1,27 +1,30 @@
-import numpy as np
-import vitpose_ekf_pipeline
 import json
 from pathlib import Path
 
+import numpy as np
+import vitpose_ekf_pipeline
+
 from vitpose_ekf_pipeline import (
     CameraCalibration,
+    compute_biorbd_kalman_initial_state,
+    KP_INDEX,
+    PoseData,
+    align_root_translation_guess_to_frame_zero,
     apply_measurement_update_batch,
     apply_measurement_update_sequential,
-    align_root_translation_guess_to_frame_zero,
-    compute_biorbd_kalman_initial_state,
     apply_root_pose_guess_to_state,
-    build_fundamental_matrix_array,
-    build_flip_epipolar_pair_weights,
-    build_flip_epipolar_pair_weight_array,
-    compute_camera_epipolar_costs_vectorized,
-    compute_camera_triangulation_cost,
     compute_camera_epipolar_cost,
     compute_camera_epipolar_cost_legacy,
+    compute_camera_epipolar_costs_vectorized,
+    compute_camera_triangulation_cost,
     canonical_coherence_method,
     canonical_triangulation_method,
+    build_flip_epipolar_pair_weight_array,
+    build_flip_epipolar_pair_weights,
+    build_fundamental_matrix_array,
+    load_pose_data,
     project_point_with_projection_matrices,
     q_names_from_model,
-    load_pose_data,
     sampson_error_pixels_vectorized,
     sample_frames_uniformly,
     smooth_camera_time_series,
@@ -31,7 +34,6 @@ from vitpose_ekf_pipeline import (
     viterbi_flip_state_path,
     weighted_triangulation,
     weighted_median,
-    KP_INDEX,
 )
 
 
@@ -269,6 +271,111 @@ def test_viterbi_flip_state_path_keeps_sustained_positive_run():
     decoded = viterbi_flip_state_path(nominal, swapped, candidate_mask, transition_cost=6.0)
 
     np.testing.assert_array_equal(decoded, np.array([False, True, True, True, False], dtype=bool))
+
+
+def test_epipolar_flip_diagnostics_keep_local_decision_by_default(monkeypatch):
+    pose_data = PoseData(
+        camera_names=["cam0"],
+        frames=np.arange(5, dtype=int),
+        keypoints=np.zeros((1, 5, 17, 2), dtype=float),
+        scores=np.ones((1, 5, 17), dtype=float),
+    )
+
+    cost_sequence = iter(
+        [
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (13.0, 13.0),
+            (13.0, 13.0),
+            (2.0, 13.0),
+            (13.0, 13.0),
+            (13.0, 13.0),
+        ]
+    )
+
+    monkeypatch.setattr(vitpose_ekf_pipeline, "build_fundamental_matrix_array", lambda _calibs: np.zeros((1, 1, 3, 3)))
+    monkeypatch.setattr(vitpose_ekf_pipeline, "build_flip_epipolar_pair_weight_array", lambda _calibs: np.ones((1, 1)))
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "compute_camera_epipolar_costs_vectorized",
+        lambda *_args, **_kwargs: next(cost_sequence),
+    )
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "build_temporal_reference_points",
+        lambda _pose_data: (np.zeros((1, 5, 17, 2), dtype=float), np.zeros((1, 5), dtype=int)),
+    )
+    monkeypatch.setattr(vitpose_ekf_pipeline, "compute_camera_temporal_cost", lambda *_args, **_kwargs: np.nan)
+
+    suspect_mask, diagnostics, _details = vitpose_ekf_pipeline.detect_left_right_flip_diagnostics(
+        pose_data=pose_data,
+        calibrations={"cam0": object()},
+        method="epipolar",
+        improvement_ratio=0.7,
+        min_gain_px=3.0,
+        temporal_weight=0.0,
+    )
+
+    np.testing.assert_array_equal(suspect_mask[0], np.array([False, False, True, False, False], dtype=bool))
+    assert diagnostics["temporal_decision_method"] == "local_threshold"
+
+
+def test_epipolar_viterbi_flip_diagnostics_remain_explicit(monkeypatch):
+    pose_data = PoseData(
+        camera_names=["cam0"],
+        frames=np.arange(5, dtype=int),
+        keypoints=np.zeros((1, 5, 17, 2), dtype=float),
+        scores=np.ones((1, 5, 17), dtype=float),
+    )
+
+    cost_sequence = iter(
+        [
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (12.0, 12.0),
+            (13.0, 13.0),
+            (13.0, 13.0),
+            (2.0, 13.0),
+            (13.0, 13.0),
+            (13.0, 13.0),
+        ]
+    )
+
+    monkeypatch.setattr(vitpose_ekf_pipeline, "build_fundamental_matrix_array", lambda _calibs: np.zeros((1, 1, 3, 3)))
+    monkeypatch.setattr(vitpose_ekf_pipeline, "build_flip_epipolar_pair_weight_array", lambda _calibs: np.ones((1, 1)))
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "compute_camera_epipolar_costs_vectorized",
+        lambda *_args, **_kwargs: next(cost_sequence),
+    )
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "build_temporal_reference_points",
+        lambda _pose_data: (np.zeros((1, 5, 17, 2), dtype=float), np.zeros((1, 5), dtype=int)),
+    )
+    monkeypatch.setattr(vitpose_ekf_pipeline, "compute_camera_temporal_cost", lambda *_args, **_kwargs: np.nan)
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "viterbi_flip_state_path",
+        lambda *_args, **_kwargs: np.zeros(5, dtype=bool),
+    )
+
+    suspect_mask, diagnostics, _details = vitpose_ekf_pipeline.detect_left_right_flip_diagnostics(
+        pose_data=pose_data,
+        calibrations={"cam0": object()},
+        method="epipolar_viterbi",
+        improvement_ratio=0.7,
+        min_gain_px=3.0,
+        temporal_weight=0.0,
+    )
+
+    np.testing.assert_array_equal(suspect_mask[0], np.zeros(5, dtype=bool))
+    assert diagnostics["temporal_decision_method"] == "viterbi_two_state"
 
 
 def test_load_pose_data_applies_frame_stride(tmp_path: Path):

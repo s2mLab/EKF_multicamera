@@ -220,6 +220,21 @@ def test_validate_profile_accepts_epipolar_fast_coherence_and_flip_method():
     assert "flip_triangulation_greedy" in canonical_profile_name(profile)
 
 
+def test_validate_profile_accepts_explicit_viterbi_flip_method():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            flip=True,
+            flip_method="epipolar_fast_viterbi",
+        )
+    )
+
+    assert profile.flip_method == "epipolar_fast_viterbi"
+    assert "flip_epipolar_fast_viterbi" in canonical_profile_name(profile)
+
+
 def test_build_pipeline_command_includes_flip_method():
     profile = validate_profile(
         ReconstructionProfile(

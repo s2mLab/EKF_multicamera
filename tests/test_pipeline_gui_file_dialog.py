@@ -10,6 +10,11 @@ def test_normalize_pose_correction_mode_accepts_epipolar_fast():
     assert pipeline_gui.normalize_pose_correction_mode("flip_epipolar_fast") == "flip_epipolar_fast"
 
 
+def test_normalize_pose_correction_mode_accepts_explicit_viterbi_modes():
+    assert pipeline_gui.normalize_pose_correction_mode("flip_epipolar_viterbi") == "flip_epipolar_viterbi"
+    assert pipeline_gui.normalize_pose_correction_mode("flip_epipolar_fast_viterbi") == "flip_epipolar_fast_viterbi"
+
+
 def test_normalize_pose_correction_mode_falls_back_to_none():
     assert pipeline_gui.normalize_pose_correction_mode("unexpected_mode") == "none"
 

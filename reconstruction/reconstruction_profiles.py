@@ -40,6 +40,8 @@ SUPPORTED_COHERENCE_METHODS = (
 SUPPORTED_FLIP_METHODS = (
     "epipolar",
     "epipolar_fast",
+    "epipolar_viterbi",
+    "epipolar_fast_viterbi",
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",

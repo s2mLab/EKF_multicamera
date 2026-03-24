@@ -1558,12 +1558,36 @@ def current_selected_camera_names(state: SharedAppState) -> list[str]:
 
 def current_calibration_correction_mode(state: SharedAppState) -> str:
     raw = state.calibration_correction_var.get().strip()
-    return raw if raw in {"none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"} else "none"
+    return (
+        raw
+        if raw
+        in {
+            "none",
+            "flip_epipolar",
+            "flip_epipolar_fast",
+            "flip_epipolar_viterbi",
+            "flip_epipolar_fast_viterbi",
+            "flip_triangulation",
+        }
+        else "none"
+    )
 
 
 def normalize_pose_correction_mode(raw: str) -> str:
     value = str(raw).strip()
-    return value if value in {"none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"} else "none"
+    return (
+        value
+        if value
+        in {
+            "none",
+            "flip_epipolar",
+            "flip_epipolar_fast",
+            "flip_epipolar_viterbi",
+            "flip_epipolar_fast_viterbi",
+            "flip_triangulation",
+        }
+        else "none"
+    )
 
 
 def shared_pose_data_kwargs(state: SharedAppState, *, data_mode: str | None = None) -> dict[str, object]:
@@ -1880,6 +1904,10 @@ def get_pose_data_with_correction(
         flip_method = "epipolar"
     elif correction_mode == "flip_epipolar_fast":
         flip_method = "epipolar_fast"
+    elif correction_mode == "flip_epipolar_viterbi":
+        flip_method = "epipolar_viterbi"
+    elif correction_mode == "flip_epipolar_fast_viterbi":
+        flip_method = "epipolar_fast_viterbi"
     else:
         flip_method = "triangulation"
     corrected_pose_data, diagnostics, _compute_time_s, _cache_path, _source = load_or_compute_pose_data_variant_cache(
@@ -1901,7 +1929,7 @@ def get_pose_data_with_correction(
         outlier_floor_px=float(state.flip_outlier_floor_px_var.get()),
         tau_px=(
             DEFAULT_EPIPOLAR_THRESHOLD_PX
-            if flip_method in {"epipolar", "epipolar_fast"}
+            if flip_method in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
             else DEFAULT_REPROJECTION_THRESHOLD_PX
         ),
         temporal_weight=float(state.flip_temporal_weight_var.get()),
@@ -3775,7 +3803,14 @@ class DataExplorer2DTab(ttk.Frame):
         self.calibration_correction_box = ttk.Combobox(
             row_shared,
             textvariable=self.calibration_correction,
-            values=["none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"],
+            values=[
+                "none",
+                "flip_epipolar",
+                "flip_epipolar_fast",
+                "flip_epipolar_viterbi",
+                "flip_epipolar_fast_viterbi",
+                "flip_triangulation",
+            ],
             width=18,
             state="readonly",
         )
@@ -3814,8 +3849,8 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_mode_menu = ttk.Combobox(
             row_display,
             textvariable=self.flip_mode,
-            values=["none", "epipolar", "epipolar_fast", "triangulation"],
-            width=12,
+            values=["none", "epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi", "triangulation"],
+            width=22,
             state="readonly",
         )
         self.flip_mode_menu.pack(side=tk.LEFT, padx=(0, 8))
@@ -3948,11 +3983,11 @@ class DataExplorer2DTab(ttk.Frame):
         )
         attach_tooltip(
             calib_correction_label,
-            "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire Sampson, flip épipolaire rapide par distance symétrique, ou flip détecté par triangulation.",
+            "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip local épipolaire, flip local épipolaire rapide, variantes Viterbi explicites, ou flip détecté par triangulation.",
         )
         attach_tooltip(
             self.calibration_correction_box,
-            "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip détecté par épipolaire Sampson, flip épipolaire rapide par distance symétrique, ou flip détecté par triangulation.",
+            "Choisit quelle variante 2D sera utilisée par les outils de calibration/caméras: aucune correction, flip local épipolaire, flip local épipolaire rapide, variantes Viterbi explicites, ou flip détecté par triangulation.",
         )
         attach_tooltip(component_label, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(component_box, "Composante 2D affichée sur les courbes temporelles.")
@@ -3960,11 +3995,11 @@ class DataExplorer2DTab(ttk.Frame):
         attach_tooltip(self.view_mode_menu, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
         attach_tooltip(
             flip_mode_label,
-            "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent les suspicions épipolaires Sampson (rouge), épipolaires rapides distance symétrique (orange) et triangulation (bleu).",
+            "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les variantes sans suffixe utilisent une décision locale frame par frame; les variantes *_viterbi appliquent un lissage explicite par Viterbi.",
         )
         attach_tooltip(
             self.flip_mode_menu,
-            "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les lignes verticales montrent les suspicions épipolaires Sampson (rouge), épipolaires rapides distance symétrique (orange) et triangulation (bleu).",
+            "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les variantes sans suffixe utilisent une décision locale frame par frame; les variantes *_viterbi appliquent un lissage explicite par Viterbi.",
         )
         self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour construire la référence filtrée 2D.")
         self.pose_outlier_ratio.set_tooltip("Seuil de rejet des points 2D trop éloignés de la référence filtrée.")
@@ -4054,9 +4089,15 @@ class DataExplorer2DTab(ttk.Frame):
         self.update_flip_status_text()
 
     def on_flip_settings_changed(self) -> None:
-        self.flip_masks = {key: value for key, value in self.flip_masks.items() if key in {"epipolar", "epipolar_fast"}}
+        self.flip_masks = {
+            key: value
+            for key, value in self.flip_masks.items()
+            if key in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
+        }
         self.flip_diagnostics = {
-            key: value for key, value in self.flip_diagnostics.items() if key in {"epipolar", "epipolar_fast"}
+            key: value
+            for key, value in self.flip_diagnostics.items()
+            if key in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
         }
         self.update_flip_status_text()
         if self.pose_data is not None and self.calibrations is not None:
@@ -4185,7 +4226,13 @@ class DataExplorer2DTab(ttk.Frame):
         temporal_weight = float(self.state.flip_temporal_weight_var.get())
         temporal_tau_px = float(self.state.flip_temporal_tau_px_var.get())
         selected_triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
-        for method in ("epipolar", "epipolar_fast", selected_triangulation_method):
+        for method in (
+            "epipolar",
+            "epipolar_fast",
+            "epipolar_viterbi",
+            "epipolar_fast_viterbi",
+            selected_triangulation_method,
+        ):
             if method in self.flip_masks:
                 continue
             suspect_mask, diagnostics, _compute_time_s, _cache_path, _flip_source = (
@@ -4207,7 +4254,7 @@ class DataExplorer2DTab(ttk.Frame):
                     outlier_floor_px=outlier_floor_px,
                     tau_px=(
                         DEFAULT_EPIPOLAR_THRESHOLD_PX
-                        if method in {"epipolar", "epipolar_fast"}
+                        if method in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
                         else DEFAULT_REPROJECTION_THRESHOLD_PX
                     ),
                     temporal_weight=temporal_weight,
@@ -4240,7 +4287,10 @@ class DataExplorer2DTab(ttk.Frame):
         else:
             points = np.asarray(self.pose_data.keypoints, dtype=float)
         correction_mode = self.flip_mode.get()
-        if correction_mode in {"epipolar", "epipolar_fast"} and correction_mode in self.flip_masks:
+        if (
+            correction_mode in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
+            and correction_mode in self.flip_masks
+        ):
             points = apply_left_right_flip_to_points(points, self.flip_masks[correction_mode])
         elif correction_mode == "triangulation":
             triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
@@ -4282,6 +4332,12 @@ class DataExplorer2DTab(ttk.Frame):
             if "epipolar_fast" in self.flip_masks:
                 for frame_idx in np.flatnonzero(self.flip_masks["epipolar_fast"][ax_idx]):
                     ax.axvline(t[frame_idx], color="#dd8452", linestyle="-.", linewidth=0.9, alpha=0.26)
+            if "epipolar_viterbi" in self.flip_masks:
+                for frame_idx in np.flatnonzero(self.flip_masks["epipolar_viterbi"][ax_idx]):
+                    ax.axvline(t[frame_idx], color="#8c564b", linestyle="--", linewidth=0.9, alpha=0.20)
+            if "epipolar_fast_viterbi" in self.flip_masks:
+                for frame_idx in np.flatnonzero(self.flip_masks["epipolar_fast_viterbi"][ax_idx]):
+                    ax.axvline(t[frame_idx], color="#e377c2", linestyle="-.", linewidth=0.9, alpha=0.20)
             triangulation_method = f"triangulation_{self.selected_triangulation_flip_method()}"
             if triangulation_method in self.flip_masks:
                 for frame_idx in np.flatnonzero(self.flip_masks[triangulation_method][ax_idx]):
@@ -4303,7 +4359,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.figure.suptitle(
             f"2D {self.view_mode.get()} | composante {self.component.get()} | correction L/R {self.flip_mode.get()} | "
             f"tau epi {DEFAULT_EPIPOLAR_THRESHOLD_PX:.1f}px | tau triang {DEFAULT_REPROJECTION_THRESHOLD_PX:.1f}px | "
-            f"triang mode {self.selected_triangulation_flip_method()} | flips: epi rouge --, epi fast orange -., triang bleu :",
+            f"triang mode {self.selected_triangulation_flip_method()} | flips: epi rouge --, epi fast orange -., epi Viterbi brun --, epiF Viterbi rose -., triang bleu :",
             y=0.98,
         )
         self.figure.tight_layout()
@@ -4371,8 +4427,15 @@ class ModelTab(CommandTab):
         pose_correction_box = ttk.Combobox(
             row2b,
             textvariable=self.pose_correction_mode,
-            values=["none", "flip_epipolar", "flip_epipolar_fast", "flip_triangulation"],
-            width=16,
+            values=[
+                "none",
+                "flip_epipolar",
+                "flip_epipolar_fast",
+                "flip_epipolar_viterbi",
+                "flip_epipolar_fast_viterbi",
+                "flip_triangulation",
+            ],
+            width=24,
             state="readonly",
         )
         pose_correction_box.pack(side=tk.LEFT, padx=(0, 8))
@@ -5386,7 +5449,7 @@ class ProfilesTab(CommandTab):
         flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
         flip_hint = ttk.Label(
             self.flip_frame,
-            text="epipolar/epipolar_fast are cheaper; triangulation_* is usually more robust but slower",
+            text="epipolar/epipolar_fast stay local; *_viterbi adds temporal decoding; triangulation_* is slower",
             foreground="#5a6570",
         )
         flip_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -5520,11 +5583,11 @@ class ProfilesTab(CommandTab):
         )
         attach_tooltip(
             flip_method_box,
-            "epipolar: Sampson. epipolar_fast: distance symétrique. triangulation_once/greedy/exhaustive: validation par reconstruction 3D croissante en coût.",
+            "epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
         )
         attach_tooltip(
             flip_hint,
-            "Raccourci pratique: epipolar_fast est le moins coûteux, exhaustive le plus coûteux.",
+            "Raccourci pratique: epipolar_fast est le moins coûteux; *_viterbi ajoute de la stabilité temporelle; exhaustive est le plus coûteux.",
         )
         attach_tooltip(predictor_label, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")
@@ -7936,6 +7999,8 @@ class CameraToolsTab(ttk.Frame):
             values=[
                 "epipolar",
                 "epipolar_fast",
+                "epipolar_viterbi",
+                "epipolar_fast_viterbi",
                 "triangulation_once",
                 "triangulation_greedy",
                 "triangulation_exhaustive",
@@ -8104,6 +8169,10 @@ class CameraToolsTab(ttk.Frame):
                     method = "epipolar"
                 elif correction_mode == "flip_epipolar_fast":
                     method = "epipolar_fast"
+                elif correction_mode == "flip_epipolar_viterbi":
+                    method = "epipolar_viterbi"
+                elif correction_mode == "flip_epipolar_fast_viterbi":
+                    method = "epipolar_fast_viterbi"
                 else:
                     method = "triangulation"
                 suspect_count = (
@@ -8126,6 +8195,8 @@ class CameraToolsTab(ttk.Frame):
         for method in (
             "epipolar",
             "epipolar_fast",
+            "epipolar_viterbi",
+            "epipolar_fast_viterbi",
             "triangulation_once",
             "triangulation_greedy",
             "triangulation_exhaustive",
@@ -8149,7 +8220,7 @@ class CameraToolsTab(ttk.Frame):
                     outlier_floor_px=float(self.state.flip_outlier_floor_px_var.get()),
                     tau_px=(
                         DEFAULT_EPIPOLAR_THRESHOLD_PX
-                        if method in {"epipolar", "epipolar_fast"}
+                        if method in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"}
                         else DEFAULT_REPROJECTION_THRESHOLD_PX
                     ),
                     temporal_weight=float(self.state.flip_temporal_weight_var.get()),
