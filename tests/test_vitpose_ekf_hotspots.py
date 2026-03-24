@@ -28,6 +28,7 @@ from vitpose_ekf_pipeline import (
     symmetric_epipolar_distance_vectorized,
     triangulation_reference_from_other_views,
     triangulation_method_from_coherence_method,
+    viterbi_flip_state_path,
     weighted_triangulation,
     weighted_median,
     KP_INDEX,
@@ -248,6 +249,26 @@ def test_symmetric_epipolar_distance_vectorized_is_zero_on_perfect_matches():
 
     distances = symmetric_epipolar_distance_vectorized(points, other_points, f_matrix)
     np.testing.assert_allclose(distances, np.zeros_like(distances), atol=1e-12)
+
+
+def test_viterbi_flip_state_path_rejects_isolated_positive_frame():
+    nominal = np.array([12.0, 12.0, 12.0, 12.0, 12.0], dtype=float)
+    swapped = np.array([13.0, 13.0, 2.0, 13.0, 13.0], dtype=float)
+    candidate_mask = np.ones(5, dtype=bool)
+
+    decoded = viterbi_flip_state_path(nominal, swapped, candidate_mask, transition_cost=6.0)
+
+    np.testing.assert_array_equal(decoded, np.zeros(5, dtype=bool))
+
+
+def test_viterbi_flip_state_path_keeps_sustained_positive_run():
+    nominal = np.array([12.0, 12.0, 12.0, 12.0, 12.0], dtype=float)
+    swapped = np.array([13.0, 2.0, 2.0, 2.0, 13.0], dtype=float)
+    candidate_mask = np.ones(5, dtype=bool)
+
+    decoded = viterbi_flip_state_path(nominal, swapped, candidate_mask, transition_cost=6.0)
+
+    np.testing.assert_array_equal(decoded, np.array([False, True, True, True, False], dtype=bool))
 
 
 def test_load_pose_data_applies_frame_stride(tmp_path: Path):

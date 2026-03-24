@@ -1099,6 +1099,79 @@ def smooth_camera_time_series(values: np.ndarray, window: int = DEFAULT_FLIP_EPI
     return smoothed
 
 
+def viterbi_flip_state_path(
+    nominal_costs: np.ndarray,
+    swapped_costs: np.ndarray,
+    candidate_mask: np.ndarray,
+    *,
+    transition_cost: float,
+) -> np.ndarray:
+    """Decode a temporally consistent normal/flipped path for one camera.
+
+    State 0 corresponds to the nominal left/right assignment, while state 1
+    corresponds to the swapped hypothesis. The decoder combines the per-frame
+    costs already computed by the flip detector with a constant transition
+    penalty so isolated local positives do not fragment the sequence.
+    """
+
+    nominal_costs = np.asarray(nominal_costs, dtype=float)
+    swapped_costs = np.asarray(swapped_costs, dtype=float)
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    if nominal_costs.ndim != 1 or swapped_costs.ndim != 1 or candidate_mask.ndim != 1:
+        raise ValueError("Viterbi flip decoding expects 1D arrays per camera.")
+    if nominal_costs.shape != swapped_costs.shape or nominal_costs.shape != candidate_mask.shape:
+        raise ValueError("Nominal, swapped, and candidate arrays must share the same shape.")
+
+    n_frames = nominal_costs.shape[0]
+    if n_frames == 0:
+        return np.zeros(0, dtype=bool)
+
+    transition_cost = max(float(transition_cost), 1e-6)
+    unavailable_flip_penalty = transition_cost
+    start_flipped_penalty = transition_cost
+    end_flipped_penalty = transition_cost
+
+    emissions = np.full((2, n_frames), np.inf, dtype=float)
+    finite_nominal = np.isfinite(nominal_costs)
+    finite_swapped = np.isfinite(swapped_costs)
+
+    flipped_available = candidate_mask & finite_swapped
+    comparable = finite_nominal & flipped_available
+    baseline = np.full(n_frames, np.nan, dtype=float)
+    baseline[comparable] = np.minimum(nominal_costs[comparable], swapped_costs[comparable])
+
+    emissions[0, finite_nominal] = 0.0
+    emissions[1, flipped_available] = unavailable_flip_penalty
+    emissions[0, comparable] = nominal_costs[comparable] - baseline[comparable]
+    emissions[1, comparable] = swapped_costs[comparable] - baseline[comparable]
+
+    fallback_flipped = finite_nominal & ~flipped_available
+    emissions[1, fallback_flipped] = unavailable_flip_penalty
+
+    missing_frames = ~finite_nominal & ~finite_swapped
+    emissions[:, missing_frames] = 0.0
+
+    cumulative_cost = np.full((2, n_frames), np.inf, dtype=float)
+    backpointers = np.zeros((2, n_frames), dtype=np.int8)
+    cumulative_cost[0, 0] = emissions[0, 0]
+    cumulative_cost[1, 0] = emissions[1, 0] + start_flipped_penalty
+
+    transition_matrix = np.array([[0.0, transition_cost], [transition_cost, 0.0]], dtype=float)
+    for frame_idx in range(1, n_frames):
+        for state_idx in range(2):
+            candidate_costs = cumulative_cost[:, frame_idx - 1] + transition_matrix[:, state_idx]
+            best_prev_state = int(np.argmin(candidate_costs))
+            cumulative_cost[state_idx, frame_idx] = emissions[state_idx, frame_idx] + candidate_costs[best_prev_state]
+            backpointers[state_idx, frame_idx] = best_prev_state
+
+    final_state = int(np.argmin(cumulative_cost[:, -1] + np.array([0.0, end_flipped_penalty], dtype=float)))
+    states = np.zeros(n_frames, dtype=np.int8)
+    states[-1] = final_state
+    for frame_idx in range(n_frames - 1, 0, -1):
+        states[frame_idx - 1] = backpointers[states[frame_idx], frame_idx]
+    return states.astype(bool)
+
+
 def sampson_error_pixels_vectorized(
     candidate_points: np.ndarray,
     other_points: np.ndarray,
@@ -1680,11 +1753,30 @@ def detect_left_right_flip_diagnostics(
         window=smoothing_window,
     )
     strong_positive_margin = 0.5 * float(min_gain_px) if epipolar_family else 0.0
-    suspect_mask = (
-        candidate_mask
-        & np.isfinite(decision_score)
-        & (((decision_score > 0.0) & (smoothed_decision_score > 0.0)) | (decision_score >= strong_positive_margin))
-    )
+    if epipolar_family:
+        viterbi_transition_cost = max(float(min_gain_px), 0.25 * float(geometry_tau_px))
+        viterbi_state_mask = np.zeros_like(candidate_mask, dtype=bool)
+        for cam_idx in range(n_cams):
+            viterbi_state_mask[cam_idx] = viterbi_flip_state_path(
+                effective_nominal_costs[cam_idx],
+                effective_swapped_costs[cam_idx],
+                candidate_mask[cam_idx],
+                transition_cost=viterbi_transition_cost,
+            )
+        suspect_mask = (
+            candidate_mask
+            & viterbi_state_mask
+            & np.isfinite(decision_score)
+            & ((smoothed_decision_score > 0.0) | (decision_score >= strong_positive_margin))
+        )
+    else:
+        viterbi_transition_cost = 0.0
+        viterbi_state_mask = np.zeros_like(candidate_mask, dtype=bool)
+        suspect_mask = (
+            candidate_mask
+            & np.isfinite(decision_score)
+            & (((decision_score > 0.0) & (smoothed_decision_score > 0.0)) | (decision_score >= strong_positive_margin))
+        )
     suspect_mask |= legacy_decision
     frames_with_any_suspect = np.any(suspect_mask, axis=0)
     temporal_support_mask = np.isfinite(nominal_temporal_costs)
@@ -1709,6 +1801,8 @@ def detect_left_right_flip_diagnostics(
         "epipolar_pair_weighting": "baseline_confidence_weighted" if epipolar_family else "n/a",
         "epipolar_keypoint_weighting": "torso_proximal_priority" if epipolar_family else "n/a",
         "temporal_smoothing_window": int(smoothing_window),
+        "temporal_decision_method": "viterbi_two_state" if epipolar_family else "local_threshold",
+        "viterbi_transition_cost_px": float(viterbi_transition_cost),
         "n_camera_frame_temporal_support": int(np.count_nonzero(temporal_support_mask)),
         "n_candidate_camera_frames_with_temporal_support": int(np.count_nonzero(candidate_temporal_support_mask)),
         "outlier_thresholds_by_camera": {
@@ -1779,6 +1873,7 @@ def detect_left_right_flip_diagnostics(
         "decision_scores": decision_score,
         "decision_scores_smoothed": smoothed_decision_score,
         "strong_positive_margin": np.full_like(decision_score, strong_positive_margin, dtype=float),
+        "viterbi_state_mask": viterbi_state_mask.astype(bool),
         "candidate_mask": candidate_mask.astype(bool),
         "legacy_candidate_mask": legacy_candidate_mask.astype(bool),
         "temporal_support_mask": temporal_support_mask.astype(bool),
