@@ -200,3 +200,44 @@ def test_build_pipeline_command_includes_explicit_coherence_and_once_triangulati
 
     assert cmd[cmd.index("--triangulation-method") + 1] == "once"
     assert cmd[cmd.index("--coherence-method") + 1] == "triangulation_greedy"
+
+
+def test_validate_profile_accepts_epipolar_fast_coherence_and_flip_method():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            coherence_method="epipolar_fast",
+            flip=True,
+            flip_method="triangulation_greedy",
+        )
+    )
+
+    assert profile.coherence_method == "epipolar_fast"
+    assert profile.flip_method == "triangulation_greedy"
+    assert "coh_epipolar_fast" in canonical_profile_name(profile)
+    assert "flip_triangulation_greedy" in canonical_profile_name(profile)
+
+
+def test_build_pipeline_command_includes_flip_method():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="tri_flip_fast",
+            family="triangulation",
+            flip=True,
+            flip_method="epipolar_fast",
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--flip-method" in cmd
+    assert cmd[cmd.index("--flip-method") + 1] == "epipolar_fast"

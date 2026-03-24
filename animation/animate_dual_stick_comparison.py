@@ -30,6 +30,7 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
+from judging.trampoline_displacement import BED_X_MAX, BED_Y_MAX, TRAMPOLINE_GEOMETRY, X_MAX, Y_MAX
 
 from reconstruction.reconstruction_dataset import (
     align_array_to_frames,
@@ -201,6 +202,11 @@ def parse_args() -> argparse.Namespace:
         "--show-trunk-frames",
         action="store_true",
         help="Affiche les reperes locaux du tronc pour chaque reconstruction.",
+    )
+    parser.add_argument(
+        "--show-trampoline",
+        action="store_true",
+        help="Affiche un contour simplifié du trampoline dans la vue 3D.",
     )
     parser.add_argument(
         "--align-root",
@@ -441,6 +447,50 @@ def apply_axis_limits(ax, limits: tuple[tuple[float, float], tuple[float, float]
     ax.set_zlim(*zlim)
 
 
+def draw_trampoline_bed(ax, z_level: float) -> None:
+    """Draw a simple trampoline reference bed below the athlete trajectories."""
+
+    outer = np.array(
+        [
+            [-BED_X_MAX, -BED_Y_MAX, z_level],
+            [BED_X_MAX, -BED_Y_MAX, z_level],
+            [BED_X_MAX, BED_Y_MAX, z_level],
+            [-BED_X_MAX, BED_Y_MAX, z_level],
+            [-BED_X_MAX, -BED_Y_MAX, z_level],
+        ],
+        dtype=float,
+    )
+    big_rect = np.array(
+        [
+            [-X_MAX, -Y_MAX, z_level],
+            [X_MAX, -Y_MAX, z_level],
+            [X_MAX, Y_MAX, z_level],
+            [-X_MAX, Y_MAX, z_level],
+            [-X_MAX, -Y_MAX, z_level],
+        ],
+        dtype=float,
+    )
+    cross = TRAMPOLINE_GEOMETRY.cross
+    ax.plot(outer[:, 0], outer[:, 1], outer[:, 2], color="#2b6cb0", linewidth=1.8, alpha=0.45)
+    ax.plot(big_rect[:, 0], big_rect[:, 1], big_rect[:, 2], color="#b56576", linewidth=1.2, alpha=0.35)
+    ax.plot(
+        [cross["left"][0], cross["right"][0]],
+        [cross["left"][1], cross["right"][1]],
+        [z_level, z_level],
+        color="#b56576",
+        linewidth=1.0,
+        alpha=0.35,
+    )
+    ax.plot(
+        [cross["bottom"][0], cross["top"][0]],
+        [cross["bottom"][1], cross["top"][1]],
+        [z_level, z_level],
+        color="#b56576",
+        linewidth=1.0,
+        alpha=0.35,
+    )
+
+
 def grouped_marker_points(frame_points: np.ndarray) -> dict[str, np.ndarray]:
     groups = {
         "left": [KP_INDEX[name] for name in COCO17 if name in LEFT_KEYPOINTS],
@@ -559,6 +609,7 @@ def create_animation(
     airborne_mask: np.ndarray,
     show_trunk_frames: bool,
     framing: str,
+    show_trampoline: bool,
 ) -> None:
     """Exporte un GIF comparatif pour l'ensemble des reconstructions demandees."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,6 +619,9 @@ def create_animation(
     if not show_names:
         raise ValueError("Aucune reconstruction selectionnee n'est disponible pour l'animation 3D.")
     full_limits = compute_axis_limits(*[recon_points[name] for name in show_names])
+    stacked_points = np.concatenate([recon_points[name].reshape(-1, 3) for name in show_names], axis=0)
+    valid_points = stacked_points[np.all(np.isfinite(stacked_points), axis=1)]
+    trampoline_z = float(np.nanpercentile(valid_points[:, 2], 5)) if valid_points.size else 0.0
 
     artists: dict[str, tuple[object | None, list]] = {}
     for name in show_names:
@@ -585,6 +639,8 @@ def create_animation(
         ax.set_title("Comparaison 3D des reconstructions selectionnees")
         ax.view_init(elev=18, azim=-65)
         ax.legend(loc="upper right")
+        if show_trampoline:
+            draw_trampoline_bed(ax, trampoline_z)
         init_artists = [label]
         for scatter, lines in artists.values():
             if scatter is not None:
@@ -716,6 +772,7 @@ def main() -> None:
         airborne_mask=airborne_mask,
         show_trunk_frames=bool(args.show_trunk_frames),
         framing=str(args.framing),
+        show_trampoline=bool(args.show_trampoline),
     )
     print(f"Animation comparative exportee dans: {args.output}")
 

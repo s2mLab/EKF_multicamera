@@ -807,19 +807,31 @@ def prepare_pose_data_for_reconstruction(
     flip_temporal_weight: float,
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
+    flip_method: str | None = None,
 ) -> tuple[PoseData, dict[str, object] | None, Path | None, str]:
     coherence_method = canonical_coherence_method(coherence_method)
     if not flip_left_right:
         return pose_data, None, None, "computed_now"
 
-    flip_method = "epipolar" if coherence_method == "epipolar" else "triangulation"
+    active_flip_method = flip_method
+    if active_flip_method is None:
+        if coherence_method in {"epipolar", "epipolar_fast"}:
+            active_flip_method = coherence_method
+        else:
+            active_flip_method = "triangulation_exhaustive"
+    if active_flip_method == "triangulation":
+        active_flip_method = "triangulation_exhaustive"
+    if active_flip_method.startswith("triangulation_"):
+        tau_px = reprojection_threshold_px
+    else:
+        tau_px = epipolar_threshold_px
     pose_data_used, flip_diagnostics, _compute_time_s, pose_variant_cache_path, pose_variant_source = (
         load_or_compute_pose_data_variant_cache(
             output_dir=output_dir,
             pose_data=pose_data,
             calibrations=calibrations,
             correction_mode="flip",
-            flip_method=flip_method,
+            flip_method=active_flip_method,
             pose_data_mode=pose_data_mode,
             pose_filter_window=pose_filter_window,
             pose_outlier_threshold_ratio=pose_outlier_threshold_ratio,
@@ -831,7 +843,7 @@ def prepare_pose_data_for_reconstruction(
             restrict_to_outliers=flip_restrict_to_outliers,
             outlier_percentile=flip_outlier_percentile,
             outlier_floor_px=flip_outlier_floor_px,
-            tau_px=epipolar_threshold_px if flip_method == "epipolar" else reprojection_threshold_px,
+            tau_px=tau_px,
             temporal_weight=flip_temporal_weight,
             temporal_tau_px=flip_temporal_tau_px,
             temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
@@ -1464,6 +1476,7 @@ def build_triangulation_bundle(
     flip_temporal_weight: float,
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
+    flip_method: str | None = None,
 ) -> tuple[BundleBuildResult, ReconstructionResult]:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -1492,6 +1505,7 @@ def build_triangulation_bundle(
             flip_temporal_weight=flip_temporal_weight,
             flip_temporal_tau_px=flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+            flip_method=flip_method,
         )
     )
 
@@ -1688,6 +1702,7 @@ def build_ekf_3d_bundle(
     flip_temporal_weight: float,
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
+    flip_method: str | None = None,
     subject_mass_kg: float,
     biorbd_kalman_noise_factor: float,
     biorbd_kalman_error_factor: float,
@@ -1720,6 +1735,7 @@ def build_ekf_3d_bundle(
             flip_temporal_weight=flip_temporal_weight,
             flip_temporal_tau_px=flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+            flip_method=flip_method,
         )
     )
 
@@ -1982,6 +1998,7 @@ def build_ekf_2d_bundle(
     flip_temporal_weight: float,
     flip_temporal_tau_px: float,
     flip_temporal_min_valid_keypoints: int,
+    flip_method: str | None = None,
     enable_dof_locking: bool,
     measurement_noise_scale: float,
     process_noise_scale: float,
@@ -2025,6 +2042,7 @@ def build_ekf_2d_bundle(
             flip_temporal_weight=flip_temporal_weight,
             flip_temporal_tau_px=flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=flip_temporal_min_valid_keypoints,
+            flip_method=flip_method,
         )
     )
 

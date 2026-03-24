@@ -64,6 +64,7 @@ DEFAULT_TRIANGULATION_WORKERS = 6
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
+    "epipolar_fast",
     "triangulation",
     "triangulation_once",
     "triangulation_greedy",
@@ -364,7 +365,7 @@ def select_active_coherence(
 ) -> np.ndarray:
     """Selectionne le score de coherence actif selon la methode demandee."""
     coherence_method = canonical_coherence_method(coherence_method)
-    if coherence_method == "epipolar":
+    if coherence_method in {"epipolar", "epipolar_fast"}:
         return np.array(epipolar_coherence, copy=True)
     if coherence_method in {"triangulation_once", "triangulation_greedy", "triangulation_exhaustive"}:
         return np.array(triangulation_coherence, copy=True)
@@ -400,7 +401,7 @@ def triangulation_method_from_coherence_method(
     """Return the triangulation variant required by the active coherence method."""
 
     normalized = canonical_coherence_method(coherence_method, triangulation_method)
-    if normalized == "epipolar":
+    if normalized in {"epipolar", "epipolar_fast"}:
         return canonical_triangulation_method(triangulation_method)
     return normalized.replace("triangulation_", "", 1)
 

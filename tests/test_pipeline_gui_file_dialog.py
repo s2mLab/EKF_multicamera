@@ -14,6 +14,24 @@ def test_normalize_pose_correction_mode_falls_back_to_none():
     assert pipeline_gui.normalize_pose_correction_mode("unexpected_mode") == "none"
 
 
+def test_append_default_pose2sim_profile_adds_pose2sim_when_trc_exists():
+    triangulation = pipeline_gui.ReconstructionProfile(name="tri", family="triangulation")
+    pose2sim = pipeline_gui.ReconstructionProfile(name="p2s", family="pose2sim")
+
+    selected = pipeline_gui.append_default_pose2sim_profile([triangulation], [triangulation, pose2sim], "trial.trc")
+
+    assert [profile.name for profile in selected] == ["tri", "p2s"]
+
+
+def test_append_default_pose2sim_profile_keeps_explicit_selection_without_trc():
+    triangulation = pipeline_gui.ReconstructionProfile(name="tri", family="triangulation")
+    pose2sim = pipeline_gui.ReconstructionProfile(name="p2s", family="pose2sim")
+
+    selected = pipeline_gui.append_default_pose2sim_profile([triangulation], [triangulation, pose2sim], "")
+
+    assert [profile.name for profile in selected] == ["tri"]
+
+
 def test_keypoint_preset_names_body_only_removes_face_side_keypoints():
     body_only = pipeline_gui.keypoint_preset_names("body_only")
 

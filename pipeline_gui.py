@@ -86,6 +86,9 @@ from reconstruction.reconstruction_bundle import (
 )
 from reconstruction.reconstruction_profiles import (
     ReconstructionProfile,
+    SUPPORTED_COHERENCE_METHODS,
+    SUPPORTED_FLIP_METHODS,
+    SUPPORTED_TRIANGULATION_METHODS,
     build_pipeline_command,
     canonical_profile_name,
     example_profiles,
@@ -93,7 +96,6 @@ from reconstruction.reconstruction_profiles import (
     load_profiles_json,
     profile_to_dict,
     save_profiles_json,
-    scan_variant_output_dirs,
     validate_profile,
 )
 from reconstruction.reconstruction_dataset import (
@@ -982,6 +984,50 @@ def draw_trampoline_bed(ax) -> None:
     ax.set_ylabel("Y on bed (m)")
 
 
+def draw_trampoline_bed_3d(ax, z_level: float) -> None:
+    """Draw a lightweight 3D trampoline outline for animation previews."""
+
+    outer = np.array(
+        [
+            [-BED_X_MAX, -BED_Y_MAX, z_level],
+            [BED_X_MAX, -BED_Y_MAX, z_level],
+            [BED_X_MAX, BED_Y_MAX, z_level],
+            [-BED_X_MAX, BED_Y_MAX, z_level],
+            [-BED_X_MAX, -BED_Y_MAX, z_level],
+        ],
+        dtype=float,
+    )
+    big_rect = np.array(
+        [
+            [-X_MAX, -Y_MAX, z_level],
+            [X_MAX, -Y_MAX, z_level],
+            [X_MAX, Y_MAX, z_level],
+            [-X_MAX, Y_MAX, z_level],
+            [-X_MAX, -Y_MAX, z_level],
+        ],
+        dtype=float,
+    )
+    cross = TRAMPOLINE_GEOMETRY.cross
+    ax.plot(outer[:, 0], outer[:, 1], outer[:, 2], color="#2b6cb0", linewidth=1.8, alpha=0.45)
+    ax.plot(big_rect[:, 0], big_rect[:, 1], big_rect[:, 2], color="#b56576", linewidth=1.3, alpha=0.4)
+    ax.plot(
+        [cross["left"][0], cross["right"][0]],
+        [cross["left"][1], cross["right"][1]],
+        [z_level, z_level],
+        color="#b56576",
+        linewidth=1.0,
+        alpha=0.35,
+    )
+    ax.plot(
+        [cross["bottom"][0], cross["top"][0]],
+        [cross["bottom"][1], cross["top"][1]],
+        [z_level, z_level],
+        color="#b56576",
+        linewidth=1.0,
+        alpha=0.35,
+    )
+
+
 def camera_layout(n_cameras: int) -> tuple[int, int]:
     ncols = 4
     nrows = int(math.ceil(n_cameras / ncols))
@@ -1692,6 +1738,21 @@ def optional_root_relative_path(raw: str) -> Path | None:
     return ROOT / raw
 
 
+def append_default_pose2sim_profile(
+    selected_profiles: list[ReconstructionProfile],
+    all_profiles: list[ReconstructionProfile],
+    pose2sim_trc_raw: str,
+) -> list[ReconstructionProfile]:
+    """Append the first configured Pose2Sim profile when a TRC is available and none was selected."""
+
+    if not pose2sim_trc_raw.strip() or any(profile.family == "pose2sim" for profile in selected_profiles):
+        return list(selected_profiles)
+    pose2sim_profile = next((profile for profile in all_profiles if profile.family == "pose2sim"), None)
+    if pose2sim_profile is None:
+        return list(selected_profiles)
+    return [*selected_profiles, pose2sim_profile]
+
+
 def calibration_cache_key(calib_path: Path) -> str:
     return str(calib_path.resolve())
 
@@ -2057,8 +2118,10 @@ class CommandTab(ttk.Frame):
 
         self.buttons_frame = ttk.Frame(self.main)
         self.buttons_frame.pack(fill=tk.X, pady=(8, 8))
-        ttk.Button(self.buttons_frame, text="Preview command", command=self.update_preview).pack(side=tk.LEFT)
-        ttk.Button(self.buttons_frame, text="Copy command", command=self.copy_command).pack(side=tk.LEFT, padx=(8, 0))
+        self.preview_button = ttk.Button(self.buttons_frame, text="Preview command", command=self.update_preview)
+        self.preview_button.pack(side=tk.LEFT)
+        self.copy_button = ttk.Button(self.buttons_frame, text="Copy command", command=self.copy_command)
+        self.copy_button.pack(side=tk.LEFT, padx=(8, 0))
         self.run_button = ttk.Button(self.buttons_frame, text="Run", command=self.run_command)
         self.run_button.pack(side=tk.LEFT, padx=(8, 0))
         self.stop_button = ttk.Button(self.buttons_frame, text="Stop", command=self.stop_command)
@@ -2096,6 +2159,12 @@ class CommandTab(ttk.Frame):
     def hide_default_command_buttons(self) -> None:
         """Hide only the shared command buttons while keeping progress and logs visible."""
         self.buttons_frame.pack_forget()
+
+    def hide_preview_copy_buttons(self) -> None:
+        """Hide only preview/copy controls while keeping run/progress/output available."""
+
+        self.preview_button.pack_forget()
+        self.copy_button.pack_forget()
 
     def hide_command_controls(self) -> None:
         self.buttons_frame.pack_forget()
@@ -2361,7 +2430,7 @@ class PipelineTab(CommandTab):
         coherence_box = ttk.Combobox(
             row5,
             textvariable=self.coherence_method,
-            values=["epipolar", "triangulation_once", "triangulation_greedy", "triangulation_exhaustive"],
+            values=list(SUPPORTED_COHERENCE_METHODS),
             width=24,
             state="readonly",
         )
@@ -2619,8 +2688,17 @@ class DualAnimationTab(CommandTab):
         self._dragging_frame_scale = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
-        form = ttk.LabelFrame(self.main, text="animation/animate_dual_stick_comparison.py")
-        form.pack(fill=tk.X, pady=(0, 8), before=self.output)
+        self.output.pack_forget()
+
+        body = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=3)
+
+        form = ttk.LabelFrame(left, text="animation/animate_dual_stick_comparison.py")
+        form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
 
         self.output_gif = LabeledEntry(
             form, "Output GIF", display_path(current_figures_dir(state) / "dual_animation.gif")
@@ -2638,13 +2716,14 @@ class DualAnimationTab(CommandTab):
             row, text="Show trunk local frames", variable=self.show_trunk_frames_var, command=self.refresh_preview
         )
         show_trunk_check.pack(side=tk.LEFT, padx=(0, 8))
-        framing_label = ttk.Label(row, text="Framing", width=8)
-        framing_label.pack(side=tk.LEFT)
-        self.framing_var = tk.StringVar(value="full")
-        framing_box = ttk.Combobox(
-            row, textvariable=self.framing_var, values=["tight", "full"], width=8, state="readonly"
+        self.show_trampoline_var = tk.BooleanVar(value=False)
+        show_trampoline_check = ttk.Checkbutton(
+            row, text="Show trampoline", variable=self.show_trampoline_var, command=self.refresh_preview
         )
-        framing_box.pack(side=tk.LEFT, padx=(0, 6))
+        show_trampoline_check.pack(side=tk.LEFT, padx=(0, 8))
+        self.crop_var = tk.BooleanVar(value=False)
+        crop_check = ttk.Checkbutton(row, text="Crop", variable=self.crop_var, command=self.refresh_preview)
+        crop_check.pack(side=tk.LEFT, padx=(0, 8))
         self.marker_size = LabeledEntry(row, "Marker size", "8", label_width=10, entry_width=4)
         self.marker_size.pack(side=tk.LEFT, padx=(0, 6))
         self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
@@ -2652,7 +2731,7 @@ class DualAnimationTab(CommandTab):
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
         self.hide_default_command_buttons()
 
-        preview_box = ttk.LabelFrame(self.main, text="Preview 3D")
+        preview_box = ttk.LabelFrame(right, text="Preview 3D")
         preview_box.pack(fill=tk.BOTH, expand=True)
         preview_controls = ttk.Frame(preview_box)
         preview_controls.pack(fill=tk.X, padx=8, pady=4)
@@ -2688,11 +2767,9 @@ class DualAnimationTab(CommandTab):
         self.stride.set_tooltip("Une frame sur N est exportee dans le GIF.")
         self.marker_size.set_tooltip("Taille visuelle des marqueurs du squelette 3D.")
         attach_tooltip(show_trunk_check, "Affiche le repere local du tronc pour chaque reconstruction selectionnee.")
+        attach_tooltip(show_trampoline_check, "Affiche un contour simplifié du trampoline dans le preview et le GIF.")
         attach_tooltip(
-            framing_label, "Tight adapte le cadrage a chaque frame; full garde le meme volume pour toute la sequence."
-        )
-        attach_tooltip(
-            framing_box, "Tight adapte le cadrage a chaque frame; full garde le meme volume pour toute la sequence."
+            crop_check, "Recadre la vue sur la frame courante. Sinon, garde les limites globales de tout l'essai."
         )
         attach_tooltip(self.generate_button, "Genere le GIF 3D, puis devient STOP tant que l'export est en cours.")
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 3D.")
@@ -2700,7 +2777,6 @@ class DualAnimationTab(CommandTab):
         self.extra.set_tooltip(
             "Options CLI supplémentaires pour animation/animate_dual_stick_comparison.py, par exemple: --align-root"
         )
-        self.framing_var.trace_add("write", lambda *_args: self.refresh_preview())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
@@ -2847,13 +2923,15 @@ class DualAnimationTab(CommandTab):
             "--marker-size",
             self.marker_size.get(),
             "--framing",
-            self.framing_var.get(),
+            "tight" if self.crop_var.get() else "full",
         ]
         selected = [name for name in self.selected_reconstruction_names() if name in available]
         if selected:
             cmd.extend(["--show", *selected])
         if self.show_trunk_frames_var.get():
             cmd.append("--show-trunk-frames")
+        if self.show_trampoline_var.get():
+            cmd.append("--show-trampoline")
         cmd.extend(self.parse_extra_args(self.extra.get()))
         return cmd
 
@@ -2940,7 +3018,12 @@ class DualAnimationTab(CommandTab):
                         show_labels=False,
                         line_width=2.2,
                     )
-        set_equal_3d_limits(ax, points_dict, None if self.framing_var.get() == "full" else frame_idx)
+        set_equal_3d_limits(ax, points_dict, frame_idx if self.crop_var.get() else None)
+        if self.show_trampoline_var.get():
+            stacked = np.concatenate([points.reshape(-1, 3) for points in points_dict.values()], axis=0)
+            valid_points = stacked[np.all(np.isfinite(stacked), axis=1)]
+            if valid_points.size:
+                draw_trampoline_bed_3d(ax, float(np.nanpercentile(valid_points[:, 2], 5)))
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -2968,8 +3051,17 @@ class MultiViewTab(CommandTab):
         self._dragging_frame_scale = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
-        form = ttk.LabelFrame(self.main, text="animation/animate_multiview_2d_comparison.py")
-        form.pack(fill=tk.X, pady=(0, 8), before=self.output)
+        self.output.pack_forget()
+
+        body = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=3)
+
+        form = ttk.LabelFrame(left, text="animation/animate_multiview_2d_comparison.py")
+        form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
 
         defaults = [("Output GIF", display_path(current_figures_dir(state) / "multiview_2d_comparison.gif"))]
         self.entries: dict[str, LabeledEntry] = {}
@@ -2984,23 +3076,17 @@ class MultiViewTab(CommandTab):
         self.gif_fps.pack(side=tk.LEFT, padx=(0, 6))
         self.stride = LabeledEntry(row, "Stride", "5", label_width=6, entry_width=4)
         self.stride.pack(side=tk.LEFT, padx=(0, 6))
-        crop_mode_label = ttk.Label(row, text="Crop mode", width=10)
-        crop_mode_label.pack(side=tk.LEFT)
-        self.crop_mode = tk.StringVar(value="pose")
-        crop_mode_box = ttk.Combobox(
-            row, textvariable=self.crop_mode, values=["full", "pose"], width=10, state="readonly"
-        )
-        crop_mode_box.pack(side=tk.LEFT, padx=(0, 6))
+        self.crop_var = tk.BooleanVar(value=True)
+        crop_check = ttk.Checkbutton(row, text="Crop", variable=self.crop_var, command=self.refresh_preview)
+        crop_check.pack(side=tk.LEFT, padx=(0, 8))
         self.marker_size = LabeledEntry(row, "Marker size", "18", label_width=10, entry_width=5)
         self.marker_size.pack(side=tk.LEFT, padx=(0, 6))
-        self.crop_margin = LabeledEntry(row, "Crop margin", "0.1", label_width=10, entry_width=5)
-        self.crop_margin.pack(side=tk.LEFT, padx=(0, 6))
         self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
         self.hide_default_command_buttons()
 
-        preview_box = ttk.LabelFrame(self.main, text="Preview 2D multivues")
+        preview_box = ttk.LabelFrame(right, text="Preview 2D multivues")
         preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
         preview_controls = ttk.Frame(preview_box)
         preview_controls.pack(fill=tk.X, padx=8, pady=4)
@@ -3031,20 +3117,14 @@ class MultiViewTab(CommandTab):
         self.entries["Output GIF"].set_tooltip("Chemin du GIF multivues 2D a exporter.")
         self.gif_fps.set_tooltip("Frequence d'images du GIF 2D exporte.")
         self.stride.set_tooltip("Une frame sur N est exportee dans le GIF 2D.")
-        attach_tooltip(crop_mode_label, "Choisit entre le champ complet de l'image ou un crop autour de la pose.")
-        attach_tooltip(crop_mode_box, "Choisit entre le champ complet de l'image ou un crop autour de la pose.")
+        attach_tooltip(crop_check, "Recadre chaque vue autour de la pose. Décochez pour garder le champ complet.")
         self.marker_size.set_tooltip("Taille visuelle des marqueurs 2D dans le preview et le GIF.")
-        self.crop_margin.set_tooltip("Marge ajoutee autour de la pose quand le crop est actif.")
         attach_tooltip(
             self.generate_button, "Genere le GIF 2D multivues, puis devient STOP tant que l'export est en cours."
         )
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 2D.")
         attach_tooltip(self.frame_label, "Index de frame actuellement affiche dans le preview 2D.")
-        self.extra.set_tooltip(
-            "Options CLI supplémentaires pour animation/animate_multiview_2d_comparison.py, par exemple: --crop-mode full"
-        )
-        self.crop_mode.trace_add("write", lambda *_args: self.refresh_preview())
-        self.crop_margin.var.trace_add("write", lambda *_args: self.refresh_preview())
+        self.extra.set_tooltip("Options CLI supplémentaires pour animation/animate_multiview_2d_comparison.py.")
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
@@ -3179,9 +3259,9 @@ class MultiViewTab(CommandTab):
             "--marker-size",
             self.marker_size.get(),
             "--crop-mode",
-            self.crop_mode.get(),
+            ("pose" if self.crop_var.get() else "full"),
             "--crop-margin",
-            self.crop_margin.get(),
+            "0.1",
         ]
         selected = [name for name in self.selected_reconstruction_names() if name in available]
         if selected:
@@ -3268,11 +3348,8 @@ class MultiViewTab(CommandTab):
             dtype=float,
         )
         crop_points = np.asarray(self.pose_data.keypoints, dtype=float)
-        crop_mode = self.crop_mode.get()
-        try:
-            crop_margin = float(self.crop_margin.get())
-        except ValueError:
-            crop_margin = 0.1
+        crop_mode = "pose" if self.crop_var.get() else "full"
+        crop_margin = 0.1
         crop_limits = self._ensure_crop_limits(crop_points, camera_names, crop_margin) if crop_mode == "pose" else {}
 
         for ax_idx, ax in enumerate(axes):
@@ -3753,7 +3830,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_min_cameras.pack(side=tk.LEFT, padx=(0, 10))
         triang_flip_label = ttk.Label(row_flip, text="Triang flip", width=9)
         triang_flip_label.pack(side=tk.LEFT)
-        self.triang_flip_method = tk.StringVar(value="raw")
+        self.triang_flip_method = tk.StringVar(value="once")
         self.triang_flip_method_box = ttk.Combobox(
             row_flip,
             textvariable=self.triang_flip_method,
@@ -5160,7 +5237,7 @@ class ProfilesTab(CommandTab):
 
         info = ttk.Label(
             form,
-            text="Les chemins source, le dossier de sortie, le FPS et les workers sont repris depuis le 1er onglet.",
+            text="Les chemins source, le FPS et les workers sont repris depuis le 1er onglet.",
         )
         info.pack(fill=tk.X, padx=8, pady=(0, 6))
 
@@ -5245,6 +5322,23 @@ class ProfilesTab(CommandTab):
         self.flip_var = tk.BooleanVar(value=False)
         flip_check = ttk.Checkbutton(self.flip_frame, text="flip left/right", variable=self.flip_var)
         flip_check.pack(side=tk.LEFT, padx=(0, 12))
+        flip_method_label = ttk.Label(self.flip_frame, text="Method", width=8)
+        flip_method_label.pack(side=tk.LEFT)
+        self.flip_method = tk.StringVar(value="epipolar")
+        flip_method_box = ttk.Combobox(
+            self.flip_frame,
+            textvariable=self.flip_method,
+            values=list(SUPPORTED_FLIP_METHODS),
+            width=24,
+            state="readonly",
+        )
+        flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
+        flip_hint = ttk.Label(
+            self.flip_frame,
+            text="epipolar/epipolar_fast are cheaper; triangulation_* is usually more robust but slower",
+            foreground="#5a6570",
+        )
+        flip_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf2d_frame = ttk.Frame(form)
         predictor_label = ttk.Label(self.ekf2d_frame, text="Predictor", width=10)
@@ -5271,7 +5365,7 @@ class ProfilesTab(CommandTab):
         coherence_box = ttk.Combobox(
             self.ekf2d_frame,
             textvariable=self.coherence_method,
-            values=["epipolar", "triangulation_once", "triangulation_greedy", "triangulation_exhaustive"],
+            values=list(SUPPORTED_COHERENCE_METHODS),
             width=24,
             state="readonly",
         )
@@ -5369,6 +5463,18 @@ class ProfilesTab(CommandTab):
         attach_tooltip(
             flip_check, "Autorise une correction globale gauche/droite des keypoints 2D avant reconstruction."
         )
+        attach_tooltip(
+            flip_method_label,
+            "Technique de flip L/R. Les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
+        )
+        attach_tooltip(
+            flip_method_box,
+            "epipolar: Sampson. epipolar_fast: distance symétrique. triangulation_once/greedy/exhaustive: validation par reconstruction 3D croissante en coût.",
+        )
+        attach_tooltip(
+            flip_hint,
+            "Raccourci pratique: epipolar_fast est le moins coûteux, exhaustive le plus coûteux.",
+        )
         attach_tooltip(predictor_label, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(ekf2d_source_label, "Choisit comment obtenir l'information 3D de support pour EKF 2D.")
@@ -5378,11 +5484,11 @@ class ProfilesTab(CommandTab):
         )
         attach_tooltip(
             coherence_label,
-            "Pondération multivue de l'EKF 2D: épipolaire, ou basée sur une triangulation once, greedy, ou exhaustive.",
+            "Pondération multivue de l'EKF 2D: épipolaire classique, épipolaire rapide, ou basée sur une triangulation once, greedy, ou exhaustive.",
         )
         attach_tooltip(
             coherence_box,
-            "Chaque variante triangulation_* choisit explicitement la cohérence issue de cette variante de triangulation.",
+            "Chaque variante triangulation_* choisit explicitement la cohérence issue de cette variante de triangulation. epipolar_fast garde une cohérence épipolaire mais simplifie le score rapide.",
         )
         attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
         attach_tooltip(
@@ -5426,9 +5532,6 @@ class ProfilesTab(CommandTab):
         )
         ttk.Button(actions, text="Load JSON", command=self.load_profiles_from_json).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Save JSON", command=self.save_profiles_to_json).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(actions, text="Refresh variants scan", command=self.refresh_variant_tree).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
 
         cols = ("enabled", "name", "family", "mode", "triang", "flags")
         self.profile_tree = ttk.Treeview(form, columns=cols, show="headings", height=8, selectmode="extended")
@@ -5448,32 +5551,19 @@ class ProfilesTab(CommandTab):
         self.profile_tree.bind("<Delete>", lambda _event: self.remove_selected_profiles())
         self.profile_tree.bind("<BackSpace>", lambda _event: self.remove_selected_profiles())
 
-        variants_box = ttk.LabelFrame(self.main, text="Reconstructions détectées pour le dataset courant")
-        variants_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
-        self.variant_tree = ttk.Treeview(
-            variants_box, columns=("name", "family", "latest", "path"), show="headings", height=5
-        )
-        for col, label, width in [
-            ("name", "Variant", 220),
-            ("family", "Family", 100),
-            ("latest", "A jour", 80),
-            ("path", "Path", 620),
-        ]:
-            self.variant_tree.heading(col, text=label)
-            self.variant_tree.column(col, width=width, anchor="w")
-        self.variant_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
         self.family.trace_add("write", lambda *_args: self.sync_profile_name())
         self.pose_data_mode.trace_add("write", lambda *_args: self.sync_profile_name())
         self.frame_stride.trace_add("write", lambda *_args: self.sync_profile_name())
         self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.coherence_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_3d_source.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.flip_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.flip_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.flip_improvement_ratio_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -5488,12 +5578,10 @@ class ProfilesTab(CommandTab):
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_profile_camera_summary())
         self.profile_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_camera_selection_changed())
         self.state.register_profile_listener(self.refresh_profile_tree)
-        self.state.register_reconstruction_listener(self.refresh_variant_tree)
         self.refresh_profile_camera_choices()
         self.update_family_controls()
         self.sync_profile_name()
         self.refresh_profile_tree()
-        self.refresh_variant_tree()
         self.hide_command_controls()
 
     def update_family_controls(self) -> None:
@@ -5582,6 +5670,7 @@ class ProfilesTab(CommandTab):
             ekf2d_initial_state_method=self.ekf2d_initial_state_method.get() if family == "ekf_2d" else "ekf_bootstrap",
             ekf2d_bootstrap_passes=int(self.ekf2d_bootstrap_passes.get()) if family == "ekf_2d" else 5,
             flip=self.flip_var.get() if family in ("triangulation", "ekf_2d", "ekf_3d") else False,
+            flip_method=self.flip_method.get() if family in ("triangulation", "ekf_2d", "ekf_3d") else "epipolar",
             flip_improvement_ratio=float(self.state.flip_improvement_ratio_var.get()),
             flip_min_gain_px=float(self.state.flip_min_gain_px_var.get()),
             flip_min_other_cameras=int(self.state.flip_min_other_cameras_var.get()),
@@ -5653,6 +5742,8 @@ class ProfilesTab(CommandTab):
             if profile.initial_rotation_correction:
                 flags.append("rotfix")
             if profile.flip:
+                if getattr(profile, "flip_method", "epipolar") != "epipolar":
+                    flags.append(f"flip:{getattr(profile, 'flip_method', 'epipolar')}")
                 flags.append("flip")
             if profile.dof_locking:
                 flags.append("lock")
@@ -5682,23 +5773,6 @@ class ProfilesTab(CommandTab):
                 ),
             )
 
-    def refresh_variant_tree(self) -> None:
-        for item in self.variant_tree.get_children():
-            self.variant_tree.delete(item)
-        dataset_dir = current_dataset_dir(self.state)
-        valid_parents = {dataset_dir, current_reconstructions_dir(self.state)}
-        for path in scan_variant_output_dirs(dataset_dir.parent):
-            if path.parent not in valid_parents:
-                continue
-            summary = load_bundle_summary(path)
-            family = summary.get("family", "-")
-            latest = summary.get("is_latest_family_version")
-            self.variant_tree.insert(
-                "",
-                "end",
-                values=(path.name, family, "-" if latest is None else ("oui" if latest else "non"), str(path)),
-            )
-
     def add_current_profile(self) -> None:
         try:
             profile = self.current_profile()
@@ -5709,7 +5783,6 @@ class ProfilesTab(CommandTab):
         profiles.append(profile)
         profiles.sort(key=lambda item: item.name)
         self.state.set_profiles(profiles)
-        self.refresh_variant_tree()
 
     def remove_selected_profiles(self) -> None:
         selected = self.profile_tree.selection()
@@ -5725,7 +5798,6 @@ class ProfilesTab(CommandTab):
     def generate_examples(self) -> None:
         self.state.set_profiles(example_profiles())
         synchronize_profiles_initial_rotation_correction(self.state)
-        self.refresh_variant_tree()
 
     def generate_all_supported(self) -> None:
         self.state.set_profiles(generate_supported_profiles())
@@ -5735,7 +5807,6 @@ class ProfilesTab(CommandTab):
         try:
             self.state.set_profiles(load_profiles_json(ROOT / self.config_path.get()))
             synchronize_profiles_initial_rotation_correction(self.state)
-            self.refresh_variant_tree()
         except Exception as exc:
             messagebox.showerror("Profiles", str(exc))
 
@@ -5749,7 +5820,8 @@ class ProfilesTab(CommandTab):
     def selected_profiles(self) -> list[ReconstructionProfile]:
         selected = self.profile_tree.selection()
         if not selected:
-            return [profile for profile in self.state.profiles if profile.enabled]
+            profiles = [profile for profile in self.state.profiles if profile.enabled]
+            return append_default_pose2sim_profile(profiles, self.state.profiles, self.state.pose2sim_trc_var.get())
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
@@ -5782,7 +5854,6 @@ class ProfilesTab(CommandTab):
         return cmd
 
     def on_command_success(self) -> None:
-        self.refresh_variant_tree()
         self.state.notify_reconstructions_updated()
 
 
@@ -5791,6 +5862,8 @@ class ReconstructionsTab(CommandTab):
         super().__init__(master, "Reconstructions")
         self.state = state
         self.status_summaries: dict[str, dict[str, object]] = {}
+        self.uses_shared_reconstruction_panel = True
+        self.shared_reconstruction_selectmode = "browse"
 
         form = ttk.LabelFrame(self.main, text="Lancer les reconstructions depuis les profils")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -5805,11 +5878,12 @@ class ReconstructionsTab(CommandTab):
         self.config_path.var = state.profiles_config_var
         self.config_path.entry_widget.configure(textvariable=self.config_path.var)
         self.config_path.pack(fill=tk.X, padx=8, pady=4)
+        self.config_path.set_tooltip("Configuration JSON des profils de reconstruction.")
 
         controls = ttk.Frame(form)
         controls.pack(fill=tk.X, padx=8, pady=6)
         ttk.Button(controls, text="Refresh profiles", command=self.refresh_profile_tree).pack(side=tk.LEFT)
-        ttk.Button(controls, text="Refresh caches", command=self.refresh_status_tree).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(controls, text="Refresh caches", command=self.refresh_status_rows).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(controls, text="Clear reconstructions", command=self.clear_reconstructions).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -5829,39 +5903,6 @@ class ReconstructionsTab(CommandTab):
             self.profile_tree.column(col, width=width, anchor="w")
         self.profile_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         attach_tooltip(self.profile_tree, "Selectionnez les profils a executer pour le dataset courant.")
-
-        status_box = ttk.LabelFrame(self.main, text="Reconstructions disponibles pour le dataset courant")
-        status_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8), before=self.output)
-        cols = ("name", "family", "latest", "frames", "compute_s", "reproj_mean", "reproj_std", "path")
-        self.status_tree = ttk.Treeview(status_box, columns=cols, show="headings", height=8)
-        headings = {
-            "name": "Reconstruction",
-            "family": "Family",
-            "latest": "A jour",
-            "frames": "Frames",
-            "compute_s": "Compute (s)",
-            "reproj_mean": "Reproj mean (px)",
-            "reproj_std": "Reproj std (px)",
-            "path": "Path",
-        }
-        widths = {
-            "name": 220,
-            "family": 90,
-            "latest": 70,
-            "frames": 70,
-            "compute_s": 95,
-            "reproj_mean": 110,
-            "reproj_std": 110,
-            "path": 360,
-        }
-        for col in cols:
-            self.status_tree.heading(col, text=headings[col])
-            self.status_tree.column(col, width=widths[col], anchor="w")
-        self.status_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        attach_tooltip(
-            self.status_tree,
-            "Tableau des reconstructions du dataset courant, avec temps de calcul total et erreurs de reprojection.",
-        )
         attach_tooltip(
             self.export_trc_button,
             "Reconstruit les marqueurs du modèle depuis q pour la reconstruction sélectionnée et écrit un fichier TRC dans son dossier.",
@@ -5873,15 +5914,37 @@ class ReconstructionsTab(CommandTab):
         self.timing_details.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.timing_details.insert("1.0", "Select a reconstruction to inspect timing details.")
         self.timing_details.configure(state=tk.DISABLED)
-        self.status_tree.bind("<<TreeviewSelect>>", lambda _event: self.refresh_timing_details())
 
         self.state.register_profile_listener(self.refresh_profile_tree)
-        self.state.register_reconstruction_listener(self.refresh_status_tree)
-        self.state.calib_var.trace_add("write", lambda *_args: self.refresh_status_tree())
-        self.state.keypoints_var.trace_add("write", lambda *_args: self.refresh_status_tree())
-        self.state.output_root_var.trace_add("write", lambda *_args: self.refresh_status_tree())
+        self.state.register_reconstruction_listener(self.refresh_status_rows)
+        self.state.calib_var.trace_add("write", lambda *_args: self.refresh_status_rows())
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.refresh_status_rows())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.refresh_status_rows())
         self.refresh_profile_tree()
-        self.refresh_status_tree()
+        self.refresh_status_rows()
+        self.hide_preview_copy_buttons()
+
+    def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
+        panel.configure_for_consumer(
+            title="Reconstructions",
+            refresh_callback=self.refresh_status_rows,
+            selection_callback=self.refresh_timing_details,
+            selectmode=self.shared_reconstruction_selectmode,
+        )
+        self.refresh_status_rows()
+
+    def _publish_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        panel = self.state.shared_reconstruction_panel
+        if panel is not None and self.state.active_reconstruction_consumer is self:
+            panel.set_rows(rows, defaults)
+
+    def _selected_reconstruction_dir(self) -> Path | None:
+        selected = list(self.state.shared_reconstruction_selection)
+        if not selected:
+            return None
+        recon_name = selected[-1]
+        recon_dir = current_reconstructions_dir(self.state) / recon_name
+        return recon_dir if recon_dir.exists() else None
 
     def refresh_profile_tree(self) -> None:
         for item in self.profile_tree.get_children():
@@ -5908,13 +5971,10 @@ class ReconstructionsTab(CommandTab):
                 "", "end", iid=str(idx), values=(profile.name, profile.family, profile.pose_data_mode, ",".join(flags))
             )
 
-    def refresh_status_tree(self) -> None:
-        selected = self.status_tree.selection()
-        selected_iid = selected[0] if selected else None
-        for item in self.status_tree.get_children():
-            self.status_tree.delete(item)
+    def refresh_status_rows(self) -> None:
         self.status_summaries = {}
         dataset_dir = current_dataset_dir(self.state)
+        rows: list[dict[str, object]] = []
         for recon_dir in reconstruction_dirs_for_path(dataset_dir):
             summary = load_bundle_summary(recon_dir)
             if not summary:
@@ -5922,41 +5982,32 @@ class ReconstructionsTab(CommandTab):
             reproj = summary.get("reprojection_px", {})
             latest = summary.get("is_latest_family_version")
             compute_s = objective_total_seconds(summary)
-            iid = str(recon_dir)
-            self.status_summaries[iid] = summary
-            self.status_tree.insert(
-                "",
-                "end",
-                iid=iid,
-                values=(
-                    summary.get("name", recon_dir.name),
-                    summary.get("family", "-"),
-                    "-" if latest is None else ("oui" if latest else "non"),
-                    summary.get("n_frames", "-"),
-                    "-" if compute_s is None else f"{compute_s:.2f}",
-                    "-" if reproj.get("mean") is None else f"{float(reproj.get('mean')):.2f}",
-                    "-" if reproj.get("std") is None else f"{float(reproj.get('std')):.2f}",
-                    str(recon_dir),
-                ),
+            recon_name = str(summary.get("name", recon_dir.name))
+            self.status_summaries[recon_name] = summary
+            rows.append(
+                {
+                    "name": recon_name,
+                    "label": recon_name,
+                    "family": summary.get("family", "-"),
+                    "frames": summary.get("n_frames", "-"),
+                    "reproj_mean": reproj.get("mean"),
+                    "path": str(recon_dir),
+                    "compute_s": compute_s,
+                    "reproj_std": reproj.get("std"),
+                    "is_latest": latest,
+                }
             )
-        if selected_iid and self.status_tree.exists(selected_iid):
-            self.status_tree.selection_set(selected_iid)
-            self.status_tree.focus(selected_iid)
-        elif self.status_tree.get_children():
-            first = self.status_tree.get_children()[0]
-            self.status_tree.selection_set(first)
-            self.status_tree.focus(first)
+        default_names = [rows[0]["name"]] if rows else []
+        self._publish_reconstruction_rows(rows, default_names)
         self.refresh_timing_details()
 
     def export_selected_trc_from_q(self) -> None:
         """Export the selected q-based reconstruction as a TRC marker trajectory."""
 
-        selected = self.status_tree.selection()
-        if not selected:
+        recon_dir = self._selected_reconstruction_dir()
+        if recon_dir is None:
             messagebox.showinfo("Export TRC from q", "Select one reconstruction first.")
             return
-
-        recon_dir = Path(selected[0])
         bundle_path = recon_dir / "reconstruction_bundle.npz"
         if not bundle_path.exists():
             messagebox.showerror("Export TRC from q", f"Bundle not found:\n{bundle_path}")
@@ -5977,7 +6028,7 @@ class ReconstructionsTab(CommandTab):
             else np.arange(q.shape[0], dtype=float) / max(float(self.state.fps_var.get()), 1.0)
         )
         biomod_path = resolve_reconstruction_biomod(
-            current_dataset_dir(self.state), self.status_summaries.get(str(recon_dir), {}).get("name", recon_dir.name)
+            current_dataset_dir(self.state), self.status_summaries.get(recon_dir.name, {}).get("name", recon_dir.name)
         )
         if biomod_path is None or not biomod_path.exists():
             messagebox.showerror("Export TRC from q", f"No bioMod found for:\n{recon_dir.name}")
@@ -6004,10 +6055,10 @@ class ReconstructionsTab(CommandTab):
         messagebox.showinfo("Export TRC from q", f"TRC written to:\n{output_path}")
 
     def refresh_timing_details(self) -> None:
-        selected = self.status_tree.selection()
         text = "Select a reconstruction to inspect timing details."
+        selected = list(self.state.shared_reconstruction_selection)
         if selected:
-            summary = self.status_summaries.get(selected[0], {})
+            summary = self.status_summaries.get(selected[-1], {})
             if summary:
                 text = format_reconstruction_timing_details(summary)
         self.timing_details.configure(state=tk.NORMAL)
@@ -6034,7 +6085,7 @@ class ReconstructionsTab(CommandTab):
                 shutil.rmtree(recon_dir)
             except Exception as exc:
                 errors.append(f"{recon_dir.name}: {exc}")
-        self.refresh_status_tree()
+        self.refresh_status_rows()
         self.state.notify_reconstructions_updated()
         if errors:
             messagebox.showerror("Reconstructions", "Certaines suppressions ont échoué:\n\n" + "\n".join(errors))
@@ -6044,7 +6095,8 @@ class ReconstructionsTab(CommandTab):
     def selected_profiles(self) -> list[ReconstructionProfile]:
         selected = self.profile_tree.selection()
         if not selected:
-            return [profile for profile in self.state.profiles if profile.enabled]
+            profiles = [profile for profile in self.state.profiles if profile.enabled]
+            return append_default_pose2sim_profile(profiles, self.state.profiles, self.state.pose2sim_trc_var.get())
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
@@ -6074,7 +6126,7 @@ class ReconstructionsTab(CommandTab):
         return cmd
 
     def on_command_success(self) -> None:
-        self.refresh_status_tree()
+        self.refresh_status_rows()
         self.state.notify_reconstructions_updated()
 
 

@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ekf2d-bootstrap-passes", type=int, default=5)
     parser.add_argument("--flip-left-right", action="store_true")
+    parser.add_argument(
+        "--flip-method",
+        choices=("epipolar", "epipolar_fast", "triangulation_once", "triangulation_greedy", "triangulation_exhaustive"),
+        default="epipolar",
+    )
     parser.add_argument("--flip-improvement-ratio", type=float, default=0.7)
     parser.add_argument("--flip-min-gain-px", type=float, default=3.0)
     parser.add_argument("--flip-min-other-cameras", type=int, default=2)
@@ -200,6 +205,7 @@ def main() -> None:
             flip_temporal_weight=args.flip_temporal_weight,
             flip_temporal_tau_px=args.flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+            flip_method=args.flip_method,
         )
     elif args.family == "ekf_3d":
         build_ekf_3d_bundle(
@@ -232,6 +238,7 @@ def main() -> None:
             flip_temporal_weight=args.flip_temporal_weight,
             flip_temporal_tau_px=args.flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+            flip_method=args.flip_method,
             subject_mass_kg=args.subject_mass_kg,
             biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
             biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
@@ -273,6 +280,7 @@ def main() -> None:
             flip_temporal_weight=args.flip_temporal_weight,
             flip_temporal_tau_px=args.flip_temporal_tau_px,
             flip_temporal_min_valid_keypoints=args.flip_temporal_min_valid_keypoints,
+            flip_method=args.flip_method,
             enable_dof_locking=args.enable_dof_locking,
             measurement_noise_scale=args.measurement_noise_scale,
             process_noise_scale=args.process_noise_scale,

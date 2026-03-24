@@ -31,7 +31,15 @@ SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
+    "epipolar_fast",
     "triangulation",
+    "triangulation_once",
+    "triangulation_greedy",
+    "triangulation_exhaustive",
+)
+SUPPORTED_FLIP_METHODS = (
+    "epipolar",
+    "epipolar_fast",
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
@@ -58,6 +66,7 @@ class ReconstructionProfile:
     ekf2d_initial_state_method: str = "ekf_bootstrap"
     ekf2d_bootstrap_passes: int = 5
     flip: bool = False
+    flip_method: str = "epipolar"
     flip_improvement_ratio: float = 0.7
     flip_min_gain_px: float = 3.0
     flip_min_other_cameras: int = 2
@@ -107,6 +116,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if profile.flip:
+            if profile.flip_method != "epipolar":
+                parts.append(f"flip_{profile.flip_method}")
             parts.append("flip")
         if profile.dof_locking:
             parts.append("lock")
@@ -120,12 +131,16 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
         elif profile.biorbd_kalman_init_method == "root_pose_zero_rest":
             parts.append("rootq0")
         if profile.flip:
+            if profile.flip_method != "epipolar":
+                parts.append(f"flip_{profile.flip_method}")
             parts.append("flip")
         if profile.initial_rotation_correction:
             parts.append("rotfix")
     elif profile.family == "triangulation":
         parts.append(profile.triangulation_method)
         if profile.flip:
+            if profile.flip_method != "epipolar":
+                parts.append(f"flip_{profile.flip_method}")
             parts.append("flip")
         if profile.initial_rotation_correction:
             parts.append("rotfix")
@@ -165,6 +180,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported triangulation_method: {profile.triangulation_method}")
     if profile.coherence_method not in SUPPORTED_COHERENCE_METHODS:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
+    if profile.flip_method not in SUPPORTED_FLIP_METHODS:
+        raise ValueError(f"Unsupported flip_method: {profile.flip_method}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
     profile.frame_stride = int(profile.frame_stride)
@@ -203,8 +220,11 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"):
             raise ValueError(f"Unsupported ekf2d_initial_state_method: {profile.ekf2d_initial_state_method}")
         profile.ekf2d_bootstrap_passes = max(1, int(profile.ekf2d_bootstrap_passes))
-        if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method != "epipolar":
-            raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method='epipolar'.")
+        if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
+            "epipolar",
+            "epipolar_fast",
+        ):
+            raise ValueError("ekf2d_3d_source=first_frame_only requires an epipolar coherence method.")
     else:
         profile.predictor = None
         profile.ekf2d_3d_source = "full_triangulation"
@@ -229,6 +249,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
     profile.flip_temporal_min_valid_keypoints = max(1, int(profile.flip_temporal_min_valid_keypoints))
     if profile.family not in ("triangulation", "ekf_2d", "ekf_3d"):
         profile.flip = False
+    if not profile.flip:
+        profile.flip_method = "epipolar"
 
     if profile.family in ("triangulation", "pose2sim"):
         profile.compare_biorbd_kalman = False
@@ -486,15 +508,18 @@ def build_pipeline_command(
         cmd.extend(["--ekf2d-bootstrap-passes", str(profile.ekf2d_bootstrap_passes)])
         if profile.flip:
             cmd.append("--flip-left-right")
+            cmd.extend(["--flip-method", profile.flip_method])
         if profile.dof_locking:
             cmd.append("--enable-dof-locking")
     elif profile.family == "triangulation":
         if profile.flip:
             cmd.append("--flip-left-right")
+            cmd.extend(["--flip-method", profile.flip_method])
     elif profile.family == "ekf_3d":
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")
+            cmd.extend(["--flip-method", profile.flip_method])
     if profile.family in ("triangulation", "ekf_2d", "ekf_3d"):
         cmd.extend(["--flip-improvement-ratio", str(profile.flip_improvement_ratio)])
         cmd.extend(["--flip-min-gain-px", str(profile.flip_min_gain_px)])
