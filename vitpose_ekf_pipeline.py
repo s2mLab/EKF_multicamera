@@ -97,6 +97,8 @@ DEFAULT_FLIP_TEMPORAL_WEIGHT = 0.35
 DEFAULT_FLIP_TEMPORAL_TAU_PX = 20.0
 DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS = 4
 DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS = 4
+DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX = 12.0
+DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX = 4.0
 DEFAULT_FLIP_EPIPOLAR_SMOOTH_WINDOW = 5
 DEFAULT_FLIP_EPIPOLAR_PAIR_WEIGHT_EXPONENT = 0.5
 MODEL_STAGE_VERSION = 7
@@ -977,6 +979,9 @@ def choose_ekf_prediction_gate_measurements(
     improvement_ratio: float,
     min_gain_px: float,
     min_valid_keypoints: int = DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS,
+    activation_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+    activation_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    previous_nominal_rms_px: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
     """Choose between raw and globally swapped 2D measurements for one camera.
 
@@ -1019,6 +1024,12 @@ def choose_ekf_prediction_gate_measurements(
         "n_swapped_valid_keypoints": int(np.sum(swapped_valid)),
         "nominal_rms_px": float("nan"),
         "swapped_rms_px": float("nan"),
+        "previous_nominal_rms_px": (
+            float(previous_nominal_rms_px) if previous_nominal_rms_px is not None else float("nan")
+        ),
+        "nominal_rms_delta_px": float("nan"),
+        "activation_error_threshold_px": float(activation_error_threshold_px),
+        "activation_error_delta_threshold_px": float(activation_error_delta_threshold_px),
     }
 
     if int(np.sum(comparable)) >= int(max(1, min_valid_keypoints)):
@@ -1028,6 +1039,17 @@ def choose_ekf_prediction_gate_measurements(
         swapped_rms_px = float(np.sqrt(np.mean(swapped_errors**2)))
         diagnostics["nominal_rms_px"] = nominal_rms_px
         diagnostics["swapped_rms_px"] = swapped_rms_px
+        if previous_nominal_rms_px is not None and np.isfinite(previous_nominal_rms_px):
+            diagnostics["nominal_rms_delta_px"] = nominal_rms_px - float(previous_nominal_rms_px)
+        if nominal_rms_px < float(activation_error_threshold_px):
+            diagnostics["decision"] = "raw_below_error_threshold"
+            return raw_valid, raw_selected_points, raw_selected_variances, diagnostics
+        if previous_nominal_rms_px is None or not np.isfinite(previous_nominal_rms_px):
+            diagnostics["decision"] = "raw_no_previous_error"
+            return raw_valid, raw_selected_points, raw_selected_variances, diagnostics
+        if diagnostics["nominal_rms_delta_px"] < float(activation_error_delta_threshold_px):
+            diagnostics["decision"] = "raw_below_error_delta"
+            return raw_valid, raw_selected_points, raw_selected_variances, diagnostics
         use_swapped = (
             np.isfinite(nominal_rms_px)
             and np.isfinite(swapped_rms_px)
@@ -3073,6 +3095,8 @@ class MultiViewKinematicEKF:
         flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
         flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
         flip_min_valid_keypoints: int = DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS,
+        flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+        flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     ):
         self.model = model
         self.calibrations = calibrations
@@ -3092,6 +3116,8 @@ class MultiViewKinematicEKF:
         self.flip_improvement_ratio = float(flip_improvement_ratio)
         self.flip_min_gain_px = float(flip_min_gain_px)
         self.flip_min_valid_keypoints = max(1, int(flip_min_valid_keypoints))
+        self.flip_error_threshold_px = float(flip_error_threshold_px)
+        self.flip_error_delta_threshold_px = float(flip_error_delta_threshold_px)
         self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
         self.nq = model.nbQ()
         self.nx = 3 * self.nq
@@ -3133,6 +3159,7 @@ class MultiViewKinematicEKF:
             "solve_s": 0.0,
             "flip_gate_s": 0.0,
         }
+        self.previous_prediction_gate_nominal_rms_px = np.full(len(self.camera_calibrations), np.nan, dtype=float)
         self.effective_confidences, self.measurement_variances = self._precompute_measurement_variances()
 
     def _make_q_names(self) -> list[str]:
@@ -3408,9 +3435,15 @@ class MultiViewKinematicEKF:
                         improvement_ratio=self.flip_improvement_ratio,
                         min_gain_px=self.flip_min_gain_px,
                         min_valid_keypoints=self.flip_min_valid_keypoints,
+                        activation_error_threshold_px=self.flip_error_threshold_px,
+                        activation_error_delta_threshold_px=self.flip_error_delta_threshold_px,
+                        previous_nominal_rms_px=self.previous_prediction_gate_nominal_rms_px[cam_idx],
                     )
                 )
                 self.profiling["flip_gate_s"] += time.perf_counter() - gate_t0
+                current_nominal_rms_px = float(gate_diagnostics.get("nominal_rms_px", float("nan")))
+                if np.isfinite(current_nominal_rms_px):
+                    self.previous_prediction_gate_nominal_rms_px[cam_idx] = current_nominal_rms_px
                 decision_label = str(gate_diagnostics.get("decision", "raw"))
                 status_key = f"flip_prediction_gate_{decision_label}"
                 if status_key in self.update_status:
@@ -3685,6 +3718,8 @@ def initial_state_from_ekf_bootstrap(
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+    flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+    flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -3732,6 +3767,8 @@ def initial_state_from_ekf_bootstrap(
         flip_method=flip_method,
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
+        flip_error_threshold_px=flip_error_threshold_px,
+        flip_error_delta_threshold_px=flip_error_delta_threshold_px,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -3782,6 +3819,8 @@ def initial_state_from_root_pose_bootstrap(
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+    flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+    flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -3811,6 +3850,8 @@ def initial_state_from_root_pose_bootstrap(
             flip_method=flip_method,
             flip_improvement_ratio=flip_improvement_ratio,
             flip_min_gain_px=flip_min_gain_px,
+            flip_error_threshold_px=flip_error_threshold_px,
+            flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -3831,6 +3872,8 @@ def initial_state_from_root_pose_bootstrap(
         flip_method=flip_method,
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
+        flip_error_threshold_px=flip_error_threshold_px,
+        flip_error_delta_threshold_px=flip_error_delta_threshold_px,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -3857,6 +3900,8 @@ def compute_ekf2d_initial_state(
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+    flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+    flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -3889,6 +3934,8 @@ def compute_ekf2d_initial_state(
             flip_method=flip_method,
             flip_improvement_ratio=flip_improvement_ratio,
             flip_min_gain_px=flip_min_gain_px,
+            flip_error_threshold_px=flip_error_threshold_px,
+            flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -3907,6 +3954,8 @@ def compute_ekf2d_initial_state(
             flip_method=flip_method,
             flip_improvement_ratio=flip_improvement_ratio,
             flip_min_gain_px=flip_min_gain_px,
+            flip_error_threshold_px=flip_error_threshold_px,
+            flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -3934,6 +3983,8 @@ def run_ekf(
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
+    flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
+    flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -3966,6 +4017,8 @@ def run_ekf(
         flip_method=flip_method,
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
+        flip_error_threshold_px=flip_error_threshold_px,
+        flip_error_delta_threshold_px=flip_error_delta_threshold_px,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -4024,6 +4077,8 @@ def run_ekf(
                     "improvement_ratio": float(flip_improvement_ratio),
                     "min_gain_px": float(flip_min_gain_px),
                     "min_valid_keypoints": int(ekf.flip_min_valid_keypoints),
+                    "error_threshold_px": float(flip_error_threshold_px),
+                    "error_delta_threshold_px": float(flip_error_delta_threshold_px),
                     "n_camera_updates_swapped": int(ekf.update_status.get("flip_prediction_gate_swapped", 0)),
                     "n_camera_updates_raw": int(ekf.update_status.get("flip_prediction_gate_raw", 0)),
                     "n_camera_updates_raw_insufficient_support": int(

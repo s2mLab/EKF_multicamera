@@ -2173,6 +2173,8 @@ def build_ekf_2d_bundle(
         flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
+        flip_error_threshold_px=epipolar_threshold_px,
+        flip_error_delta_threshold_px=flip_min_gain_px,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2198,6 +2200,8 @@ def build_ekf_2d_bundle(
         flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
+        flip_error_threshold_px=epipolar_threshold_px,
+        flip_error_delta_threshold_px=flip_min_gain_px,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])

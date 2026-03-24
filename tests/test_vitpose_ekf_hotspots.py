@@ -616,6 +616,9 @@ def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction
         improvement_ratio=0.7,
         min_gain_px=3.0,
         min_valid_keypoints=2,
+        activation_error_threshold_px=8.0,
+        activation_error_delta_threshold_px=3.0,
+        previous_nominal_rms_px=5.0,
     )
 
     np.testing.assert_array_equal(selected_mask, np.array([True, True], dtype=bool))
@@ -623,3 +626,61 @@ def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction
     np.testing.assert_allclose(selected_variances, np.array([1.0, 1.0], dtype=float))
     assert diagnostics["used_swapped"] is True
     assert diagnostics["decision"] == "swapped"
+
+
+def test_choose_ekf_prediction_gate_measurements_skips_when_error_is_not_high_enough():
+    frame_keypoints = np.full((17, 2), np.nan, dtype=float)
+    frame_variances = np.full(17, np.inf, dtype=float)
+    left_idx = KP_INDEX["left_shoulder"]
+    right_idx = KP_INDEX["right_shoulder"]
+    frame_keypoints[left_idx] = [13.0, 0.0]
+    frame_keypoints[right_idx] = [11.0, 0.0]
+    frame_variances[left_idx] = 1.0
+    frame_variances[right_idx] = 1.0
+    predicted_uv = np.array([[10.0, 0.0], [12.0, 0.0]], dtype=float)
+
+    _selected_mask, selected_points, _selected_variances, diagnostics = choose_ekf_prediction_gate_measurements(
+        frame_keypoints,
+        frame_variances,
+        predicted_uv,
+        np.array([left_idx, right_idx], dtype=int),
+        improvement_ratio=0.7,
+        min_gain_px=3.0,
+        min_valid_keypoints=2,
+        activation_error_threshold_px=6.0,
+        activation_error_delta_threshold_px=2.0,
+        previous_nominal_rms_px=3.5,
+    )
+
+    np.testing.assert_allclose(selected_points, frame_keypoints[[left_idx, right_idx]])
+    assert diagnostics["used_swapped"] is False
+    assert diagnostics["decision"] == "raw_below_error_threshold"
+
+
+def test_choose_ekf_prediction_gate_measurements_skips_when_error_delta_is_too_small():
+    frame_keypoints = np.full((17, 2), np.nan, dtype=float)
+    frame_variances = np.full(17, np.inf, dtype=float)
+    left_idx = KP_INDEX["left_shoulder"]
+    right_idx = KP_INDEX["right_shoulder"]
+    frame_keypoints[left_idx] = [20.0, 0.0]
+    frame_keypoints[right_idx] = [10.0, 0.0]
+    frame_variances[left_idx] = 1.0
+    frame_variances[right_idx] = 1.0
+    predicted_uv = np.array([[10.0, 0.0], [20.0, 0.0]], dtype=float)
+
+    _selected_mask, selected_points, _selected_variances, diagnostics = choose_ekf_prediction_gate_measurements(
+        frame_keypoints,
+        frame_variances,
+        predicted_uv,
+        np.array([left_idx, right_idx], dtype=int),
+        improvement_ratio=0.7,
+        min_gain_px=3.0,
+        min_valid_keypoints=2,
+        activation_error_threshold_px=7.0,
+        activation_error_delta_threshold_px=3.0,
+        previous_nominal_rms_px=7.5,
+    )
+
+    np.testing.assert_allclose(selected_points, frame_keypoints[[left_idx, right_idx]])
+    assert diagnostics["used_swapped"] is False
+    assert diagnostics["decision"] == "raw_below_error_delta"
