@@ -285,3 +285,24 @@ def test_build_pipeline_command_includes_flip_method():
 
     assert "--flip-method" in cmd
     assert cmd[cmd.index("--flip-method") + 1] == "epipolar_fast"
+
+
+def test_build_pipeline_command_uses_trc_file_flag():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="trc_import",
+            family="pose2sim",
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--trc-file" in cmd
+    assert "--pose2sim-trc" not in cmd

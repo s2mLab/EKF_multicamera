@@ -4,15 +4,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-from datetime import datetime
+
 from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
-    TRUNK_ROOT_ROTATION_SEQUENCE,
     reextract_euler_with_gaps,
     unwrap_with_gaps,
 )
@@ -56,6 +57,10 @@ class DDJumpAnalysis:
     somersault_curve_turns: np.ndarray
     twist_curve_turns: np.ndarray
     tilt_curve_rad: np.ndarray
+    hip_flex_curve_rad: np.ndarray
+    knee_flex_curve_rad: np.ndarray
+    grouped_mask: np.ndarray
+    piked_mask: np.ndarray
     angle_mode: str
 
 
@@ -398,6 +403,35 @@ def detect_body_shape(
     return "straight"
 
 
+def flexion_curves_from_segment(
+    q_segment: np.ndarray,
+    hip_indices: list[int],
+    knee_indices: list[int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return aggregate hip and knee flexion curves for one jump segment."""
+
+    hip_curve = np.nanmax(np.abs(np.asarray(q_segment[:, hip_indices], dtype=float)), axis=1)
+    knee_curve = np.nanmax(np.abs(np.asarray(q_segment[:, knee_indices], dtype=float)), axis=1)
+    return hip_curve, knee_curve
+
+
+def body_shape_phase_masks(
+    hip_curve_rad: np.ndarray,
+    knee_curve_rad: np.ndarray,
+    *,
+    hip_threshold_deg: float = 70.0,
+    knee_tuck_threshold_deg: float = 70.0,
+    knee_pike_threshold_deg: float = 20.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return boolean masks marking grouped and piked phases within a jump."""
+
+    hip_deg = np.rad2deg(np.asarray(hip_curve_rad, dtype=float))
+    knee_deg = np.rad2deg(np.asarray(knee_curve_rad, dtype=float))
+    grouped_mask = (hip_deg >= float(hip_threshold_deg)) & (knee_deg >= float(knee_tuck_threshold_deg))
+    piked_mask = (hip_deg >= float(hip_threshold_deg)) & (knee_deg <= float(knee_pike_threshold_deg)) & ~grouped_mask
+    return grouped_mask, piked_mask
+
+
 def body_shape_suffix(body_shape: str) -> str:
     """Map a body-shape label to the suffix used in DD codes."""
 
@@ -476,11 +510,17 @@ def analyze_single_jump(
 
     body_shape = None
     code = None
+    hip_flex_curve = np.full_like(som, np.nan)
+    knee_flex_curve = np.full_like(som, np.nan)
+    grouped_mask = np.zeros_like(som, dtype=bool)
+    piked_mask = np.zeros_like(som, dtype=bool)
     if full_q is not None and q_names is not None:
         body_indices = default_body_shape_indices(q_names)
         if body_indices is not None:
             hip_indices, knee_indices = body_indices
             q_segment = full_q[segment.start : segment.end + 1]
+            hip_flex_curve, knee_flex_curve = flexion_curves_from_segment(q_segment, hip_indices, knee_indices)
+            grouped_mask, piked_mask = body_shape_phase_masks(hip_flex_curve, knee_flex_curve)
             body_shape = detect_body_shape(q_segment, hip_indices, knee_indices)
     if np.isfinite(total_saltos):
         twist_tokens = "".join(str(int(round(value * 2.0))) for value in twists_per_salto) if twists_per_salto else "0"
@@ -504,6 +544,10 @@ def analyze_single_jump(
         somersault_curve_turns=somersault_curve_turns,
         twist_curve_turns=twist_curve_turns,
         tilt_curve_rad=tilt,
+        hip_flex_curve_rad=hip_flex_curve,
+        knee_flex_curve_rad=knee_flex_curve,
+        grouped_mask=grouped_mask,
+        piked_mask=piked_mask,
         angle_mode=angle_mode,
     )
 

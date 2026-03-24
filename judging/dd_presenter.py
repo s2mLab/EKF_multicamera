@@ -191,7 +191,8 @@ def format_dd_summary(
         lines.append(
             f"  somersault={jump.somersault_turns:.2f} turns | "
             f"twist={jump.twist_turns:.2f} turns | "
-            f"tilt max={np.rad2deg(jump.max_tilt_rad):.1f} deg | "
+            f"hip max={np.rad2deg(np.nanmax(jump.hip_flex_curve_rad)):.1f} deg | "
+            f"knee max={np.rad2deg(np.nanmax(jump.knee_flex_curve_rad)):.1f} deg | "
             f"{jump.classification}"
         )
         code_text = jump.code if jump.code is not None else "-"

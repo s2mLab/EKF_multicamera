@@ -31,6 +31,10 @@ def make_jump() -> DDJumpAnalysis:
         somersault_curve_turns=np.linspace(0.0, 2.25, 16),
         twist_curve_turns=np.linspace(0.0, 1.5, 16),
         tilt_curve_rad=np.linspace(0.0, np.deg2rad(25.0), 16),
+        hip_flex_curve_rad=np.linspace(np.deg2rad(20.0), np.deg2rad(95.0), 16),
+        knee_flex_curve_rad=np.linspace(np.deg2rad(10.0), np.deg2rad(85.0), 16),
+        grouped_mask=np.array([False] * 8 + [True] * 8, dtype=bool),
+        piked_mask=np.zeros(16, dtype=bool),
         angle_mode="euler",
     )
 
@@ -58,15 +62,16 @@ def test_format_dd_summary_handles_missing_body_shape_and_code():
     )
     summary = format_dd_summary(
         analysis,
-        reconstruction_label_text="Pose2Sim",
+        reconstruction_label_text="TRC file",
         height_dof="TRUNK:TransZ",
         angle_mode="euler",
         fps=120.0,
         expected_codes_by_jump={1: "821o"},
     )
-    assert "Reconstruction: Pose2Sim" in summary
+    assert "Reconstruction: TRC file" in summary
     assert "body shape=- | code=82+33" in summary
     assert "reference code=821o | diff" in summary
+    assert "hip max=95.0 deg | knee max=85.0 deg" in summary
     assert "twists by salto=[S1: 0.5, S2: 1.0]" in summary
 
 

@@ -1369,7 +1369,7 @@ def build_pose2sim_bundle(
     initial_rotation_correction: bool,
     unwrap_root: bool,
 ) -> BundleBuildResult:
-    print_step(2, 2, "Pose2Sim + export bundle")
+    print_step(2, 2, "TRC file import + export bundle")
     t0 = time.perf_counter()
     frames, time_s, points_3d, trc_rate = parse_trc_points(pose2sim_trc)
     q_root, correction_applied = extract_root_from_points(points_3d, initial_rotation_correction, unwrap_root)
@@ -1391,9 +1391,7 @@ def build_pose2sim_bundle(
             )
         )
     pipeline_stages.append(
-        make_timing_stage(
-            "pose2sim", "Load Pose2Sim 3D", compute_time_s=time.perf_counter() - t0, source="computed_now"
-        )
+        make_timing_stage("pose2sim", "Load TRC 3D", compute_time_s=time.perf_counter() - t0, source="computed_now")
     )
 
     summary = {

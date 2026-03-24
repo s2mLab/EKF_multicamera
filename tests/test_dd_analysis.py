@@ -4,6 +4,7 @@ from judging.dd_analysis import (
     JumpSegment,
     analyze_dd_session,
     analyze_single_jump,
+    body_shape_phase_masks,
     default_body_shape_indices,
     signed_threshold_crossing_indices,
 )
@@ -88,3 +89,13 @@ def test_analyze_dd_session_ignores_first_frames_and_keeps_only_complete_jumps()
     assert len(analysis.jump_segments) == 1
     assert analysis.jump_segments[0].start > 10
     assert analysis.jump_segments[0].end < len(height) - 1
+
+
+def test_body_shape_phase_masks_separate_grouped_and_piked_frames():
+    hip_curve = np.deg2rad(np.array([30.0, 80.0, 85.0, 90.0]))
+    knee_curve = np.deg2rad(np.array([10.0, 85.0, 15.0, 5.0]))
+
+    grouped_mask, piked_mask = body_shape_phase_masks(hip_curve, knee_curve)
+
+    assert grouped_mask.tolist() == [False, True, False, False]
+    assert piked_mask.tolist() == [False, False, True, True]

@@ -16,7 +16,6 @@ LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
-from reconstruction.reconstruction_registry import infer_dataset_name, latest_version_for_family
 from reconstruction.reconstruction_profiles import (
     build_pipeline_command,
     example_profiles,
@@ -26,9 +25,10 @@ from reconstruction.reconstruction_profiles import (
     validate_profile,
     variant_output_dir,
 )
+from reconstruction.reconstruction_registry import infer_dataset_name, latest_version_for_family
 
 DEFAULT_CONFIG = Path("reconstruction_profiles.json")
-DEFAULT_OUTPUT_ROOT = Path("outputs")
+DEFAULT_OUTPUT_ROOT = Path("output")
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
 
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Dossier racine des sorties.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
-    parser.add_argument("--pose2sim-trc", type=Path, default=None)
+    parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=120.0)
     parser.add_argument("--triangulation-workers", type=int, default=6)
     parser.add_argument(

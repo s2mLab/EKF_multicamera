@@ -580,7 +580,7 @@ def load_pose_data(
     if keypoints_path.suffix.lower() != ".json":
         raise ValueError(
             f"2D keypoints must come from a JSON file, got '{keypoints_path.name}'. "
-            "If you selected a Pose2Sim .trc file by mistake, choose the matching '*_keypoints.json' file instead."
+            "If you selected a .trc file by mistake, choose the matching '*_keypoints.json' file instead."
         )
 
     try:
@@ -4955,7 +4955,7 @@ def parse_args() -> argparse.Namespace:
         "--reprojection-threshold-px",
         type=float,
         default=DEFAULT_REPROJECTION_THRESHOLD_PX,
-        help="Seuil de reprojection pour la triangulation robuste type Pose2Sim.",
+        help="Seuil de reprojection pour la triangulation robuste type TRC-style.",
     )
     parser.add_argument(
         "--epipolar-threshold-px",

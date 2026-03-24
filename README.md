@@ -30,32 +30,30 @@ Main packages:
 
 ## Installation
 
-### 1. Create a Python environment
+### 1. Create the environment from the YAML file
 
-The project targets Python `>= 3.11`.
-
-Example with `venv`:
+The simplest setup is:
 
 ```bash
 cd /Users/mickaelbegon/Documents/Playground
-python3.11 -m venv .venv
-source .venv/bin/activate
-```
-
-Example with Conda:
-
-```bash
-conda create -n vitpose-ekf python=3.11
+conda env create -f environment.vitpose-ekf.yml
 conda activate vitpose-ekf
 ```
 
-If you already use the project Conda environment files, they now include:
+If the environment already exists:
+
+```bash
+conda env update -f environment.vitpose-ekf.yml --prune
+conda activate vitpose-ekf
+```
+
+These environment files already include the developer tools used in the repo:
 
 - `black`
 - `isort`
 - `flake8`
 
-### 2. Install Python dependencies
+### 2. Install the project in editable mode
 
 Minimal install:
 
@@ -75,7 +73,7 @@ With a few extra utilities:
 pip install -e .[full]
 ```
 
-### 3. Install non-PyPI dependencies
+### 3. Optional: install non-PyPI dependencies manually
 
 Some parts of the project depend on `biorbd`, and optionally on OpenSim-related tooling depending on your workflow.
 
@@ -101,7 +99,7 @@ Typical inputs are organized under `inputs/`:
 
 - calibration file: `inputs/calibration/Calib.toml`
 - 2D detections: `inputs/keypoints/<trial>_keypoints.json`
-- optional Pose2Sim TRC: `inputs/trc/<trial>.trc`
+- optional TRC file: `inputs/trc/<trial>.trc`
 - optional DD reference file: `inputs/dd/<trial>_DD.json`
 - optional images or extracted frames: typically `inputs/images/<trial>/...` or another sibling folder inferred from the keypoint file
 
@@ -172,7 +170,7 @@ python /Users/mickaelbegon/Documents/Playground/export_reconstruction_bundle.py 
 
 Supported families:
 
-- `pose2sim`
+- `pose2sim` (TRC file import)
 - `triangulation`
 - `ekf_3d`
 - `ekf_2d`
@@ -187,7 +185,7 @@ python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
   --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
-  --pose2sim-trc inputs/trc/1_partie_0429.trc \
+  --trc-file inputs/trc/1_partie_0429.trc \
   --fps 120 \
   --triangulation-workers 6
 ```
@@ -200,7 +198,7 @@ python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
   --keypoints inputs/keypoints/1_partie_0429_keypoints.json \
-  --pose2sim-trc inputs/trc/1_partie_0429.trc \
+  --trc-file inputs/trc/1_partie_0429.trc \
   --profile ekf_2d_acc_rootq0_boot15_flip_rotfix \
   --profile triangulation_exhaustive_flip_rotfix
 ```
@@ -234,16 +232,16 @@ Corrected 2D variants are cached, so downstream stages can reuse:
 - cleaned + triangulation-based flip
 
 For epipolar-family methods, the current implementation also applies a simple
-2-state Viterbi decoding (`normal` / `flipped`) per camera so isolated local
-positives do not dominate the final correction mask.
+2-state Viterbi decoding (`normal` / `flipped`) only when you explicitly pick
+`epipolar_viterbi` or `epipolar_fast_viterbi`.
 
 ### 3. Triangulation
 
 Three triangulation modes are available:
 
-- `once`
-- `greedy`
-- `exhaustive`
+- `once`: one weighted triangulation pass using the currently available views.
+- `greedy`: starts from all available views and removes the worst ones step by step.
+- `exhaustive`: tests more camera combinations and is the most robust, but also the slowest.
 
 The triangulation stage also stores:
 
@@ -254,7 +252,7 @@ The triangulation stage also stores:
 
 ### 4. Root orientation extraction
 
-For geometric reconstructions such as triangulation or Pose2Sim:
+For geometric reconstructions such as triangulation or a TRC file import:
 
 - the trunk frame is built from hips and shoulders
 - the root orientation is expressed with the `YXZ` Euler sequence

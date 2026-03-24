@@ -498,7 +498,7 @@ def build_pipeline_command(
         str(profile.coherence_confidence_floor),
     ]
     if pose2sim_trc is not None:
-        cmd.extend(["--pose2sim-trc", str(pose2sim_trc)])
+        cmd.extend(["--trc-file", str(pose2sim_trc)])
     camera_names = profile.camera_names or camera_names_override
     if camera_names:
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])

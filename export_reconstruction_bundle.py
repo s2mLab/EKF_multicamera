@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
-    parser.add_argument("--pose2sim-trc", type=Path, default=None)
+    parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
         "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
@@ -151,7 +151,7 @@ def main() -> None:
         calibrations = subset_calibrations(calibrations, selected_camera_names)
     if args.family == "pose2sim":
         if args.pose2sim_trc is None:
-            raise ValueError("pose2sim reconstruction requires --pose2sim-trc.")
+            raise ValueError("TRC-file reconstruction requires --trc-file.")
         print("[STEP 1/2] Load 2D data", flush=True)
     elif args.family == "triangulation":
         print("[STEP 1/3] Load 2D data", flush=True)

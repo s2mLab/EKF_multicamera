@@ -43,7 +43,7 @@ from scipy.spatial.transform import Rotation
 
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
-from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session
+from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session, contiguous_true_regions
 from judging.dd_presenter import (
     build_jump_plot_data,
     compare_dd_code_characters,
@@ -252,7 +252,7 @@ RECONSTRUCTION_ORDER = [
     "ekf_3d",
 ]
 RECONSTRUCTION_LABELS = {
-    "pose2sim": "Pose2Sim",
+    "pose2sim": "TRC file",
     "triangulation_once": "Triangulation once",
     "triangulation_adaptive": "Triangulation adaptive",
     "triangulation_fast": "Triangulation fast",
@@ -1773,7 +1773,7 @@ def append_default_pose2sim_profile(
     all_profiles: list[ReconstructionProfile],
     pose2sim_trc_raw: str,
 ) -> list[ReconstructionProfile]:
-    """Append the first configured Pose2Sim profile when a TRC is available and none was selected."""
+    """Append the first configured TRC-file profile when a TRC is available and none was selected."""
 
     if not pose2sim_trc_raw.strip() or any(profile.family == "pose2sim" for profile in selected_profiles):
         return list(selected_profiles)
@@ -1781,6 +1781,32 @@ def append_default_pose2sim_profile(
     if pose2sim_profile is None:
         return list(selected_profiles)
     return [*selected_profiles, pose2sim_profile]
+
+
+FLIP_METHOD_DISPLAY_NAMES = {
+    "epipolar": "Epipolar (local)",
+    "epipolar_fast": "Epipolar fast (local)",
+    "epipolar_viterbi": "Epipolar (Viterbi)",
+    "epipolar_fast_viterbi": "Epipolar fast (Viterbi)",
+    "ekf_prediction_gate": "EKF prediction gate",
+    "triangulation_once": "Triangulation once",
+    "triangulation_greedy": "Triangulation greedy",
+    "triangulation_exhaustive": "Triangulation exhaustive",
+}
+
+
+def flip_method_display_name(method: str) -> str:
+    """Return a user-facing label for a profile flip method."""
+
+    return FLIP_METHOD_DISPLAY_NAMES.get(str(method).strip(), str(method).strip() or "Epipolar (local)")
+
+
+def write_runtime_profiles_config(state: SharedAppState) -> Path:
+    """Persist the in-memory profiles to a cache file used only for command execution."""
+
+    runtime_path = LOCAL_CACHE / "runtime_profiles.json"
+    save_profiles_json(runtime_path, state.profiles)
+    return runtime_path
 
 
 def calibration_cache_key(calib_path: Path) -> str:
@@ -2772,39 +2798,46 @@ class DualAnimationTab(CommandTab):
         body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
-        body.add(left, weight=1)
-        body.add(right, weight=4)
+        body.add(left, weight=3)
+        body.add(right, weight=7)
 
         form = ttk.LabelFrame(left, text="animation/animate_dual_stick_comparison.py")
         form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
 
-        self.output_gif = LabeledEntry(
-            form, "Output GIF", display_path(current_figures_dir(state) / "dual_animation.gif")
-        )
+        self.output_gif = LabeledEntry(form, "GIF name", self.default_gif_name())
         self.output_gif.pack(fill=tk.X, padx=8, pady=4)
 
-        row = ttk.Frame(form)
-        row.pack(fill=tk.X, padx=8, pady=4)
-        self.fps = LabeledEntry(row, "GIF fps", "12", label_width=7, entry_width=5)
+        row2 = ttk.Frame(form)
+        row2.pack(fill=tk.X, padx=8, pady=4)
+        self.fps = LabeledEntry(row2, "GIF fps", "12", label_width=7, entry_width=5)
         self.fps.pack(side=tk.LEFT, padx=(0, 6))
-        self.stride = LabeledEntry(row, "Stride", "5", label_width=6, entry_width=4)
+        self.stride = LabeledEntry(row2, "Stride", "5", label_width=6, entry_width=4)
         self.stride.pack(side=tk.LEFT, padx=(0, 6))
+
+        row3 = ttk.Frame(form)
+        row3.pack(fill=tk.X, padx=8, pady=4)
         self.show_trunk_frames_var = tk.BooleanVar(value=False)
         show_trunk_check = ttk.Checkbutton(
-            row, text="Show trunk local frames", variable=self.show_trunk_frames_var, command=self.refresh_preview
+            row3, text="Show trunk frames", variable=self.show_trunk_frames_var, command=self.refresh_preview
         )
         show_trunk_check.pack(side=tk.LEFT, padx=(0, 8))
         self.show_trampoline_var = tk.BooleanVar(value=False)
         show_trampoline_check = ttk.Checkbutton(
-            row, text="Show trampoline", variable=self.show_trampoline_var, command=self.refresh_preview
+            row3, text="Show trampoline", variable=self.show_trampoline_var, command=self.refresh_preview
         )
         show_trampoline_check.pack(side=tk.LEFT, padx=(0, 8))
+
+        row4 = ttk.Frame(form)
+        row4.pack(fill=tk.X, padx=8, pady=4)
         self.crop_var = tk.BooleanVar(value=False)
-        crop_check = ttk.Checkbutton(row, text="Crop", variable=self.crop_var, command=self.refresh_preview)
+        crop_check = ttk.Checkbutton(row4, text="Crop", variable=self.crop_var, command=self.refresh_preview)
         crop_check.pack(side=tk.LEFT, padx=(0, 8))
-        self.marker_size = LabeledEntry(row, "Marker size", "8", label_width=10, entry_width=4)
+        self.marker_size = LabeledEntry(row4, "Marker size", "8", label_width=10, entry_width=4)
         self.marker_size.pack(side=tk.LEFT, padx=(0, 6))
-        self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
+
+        row5 = ttk.Frame(form)
+        row5.pack(fill=tk.X, padx=8, pady=4)
+        self.generate_button = ttk.Button(row5, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
 
@@ -2839,11 +2872,13 @@ class DualAnimationTab(CommandTab):
 
         self.extra = LabeledEntry(form, "Extra args", "")
         self.extra.pack(fill=tk.X, padx=8, pady=4)
-        self.output_gif.set_tooltip("Chemin du GIF 3D a exporter.")
+        self.output_gif.set_tooltip(
+            "Nom du GIF 3D exporté. Le fichier sera enregistré automatiquement dans ./output/<trial>/figures/."
+        )
         self.fps.set_tooltip("Frequence d'images du GIF exporte.")
         self.stride.set_tooltip("Une frame sur N est exportee dans le GIF.")
         self.marker_size.set_tooltip("Taille visuelle des marqueurs du squelette 3D.")
-        attach_tooltip(show_trunk_check, "Affiche le repere local du tronc pour chaque reconstruction selectionnee.")
+        attach_tooltip(show_trunk_check, "Affiche le repere du tronc pour chaque reconstruction selectionnee.")
         attach_tooltip(show_trampoline_check, "Affiche un contour simplifié du trampoline dans le preview et le GIF.")
         attach_tooltip(
             crop_check, "Recadre la vue sur la frame courante. Sinon, garde les limites globales de tout l'essai."
@@ -2858,6 +2893,20 @@ class DualAnimationTab(CommandTab):
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.refresh_available_reconstructions()
+
+    def default_gif_name(self) -> str:
+        """Return the default GIF filename for the current dataset."""
+
+        return f"{current_dataset_name(self.state)}_3d_animation.gif"
+
+    def resolved_output_gif_path(self) -> Path:
+        """Resolve the GIF output path inside the current dataset figures directory."""
+
+        raw_name = self.output_gif.get().strip()
+        gif_name = Path(raw_name).name if raw_name else self.default_gif_name()
+        if not gif_name.lower().endswith(".gif"):
+            gif_name = f"{gif_name}.gif"
+        return current_figures_dir(self.state) / gif_name
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
         panel.configure_for_consumer(
@@ -2942,7 +2991,7 @@ class DualAnimationTab(CommandTab):
         return "break"
 
     def sync_dataset_defaults(self) -> None:
-        self.output_gif.var.set(display_path(current_figures_dir(self.state) / "dual_animation.gif"))
+        self.output_gif.var.set(self.default_gif_name())
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -2992,7 +3041,7 @@ class DualAnimationTab(CommandTab):
             "--dataset-dir",
             display_path(current_dataset_dir(self.state)),
             "--output",
-            self.output_gif.get(),
+            display_path(self.resolved_output_gif_path()),
             "--fps",
             self.fps.get(),
             "--stride",
@@ -3139,31 +3188,33 @@ class MultiViewTab(CommandTab):
         body.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         left = ttk.Frame(body)
         right = ttk.Frame(body)
-        body.add(left, weight=1)
-        body.add(right, weight=4)
+        body.add(left, weight=3)
+        body.add(right, weight=7)
 
         form = ttk.LabelFrame(left, text="animation/animate_multiview_2d_comparison.py")
         form.pack(fill=tk.BOTH, expand=False, padx=(0, 8), pady=(0, 8))
 
-        defaults = [("Output GIF", display_path(current_figures_dir(state) / "multiview_2d_comparison.gif"))]
-        self.entries: dict[str, LabeledEntry] = {}
-        for label, default in defaults:
-            entry = LabeledEntry(form, label, default, browse=False, directory=False, readonly=False)
-            entry.pack(fill=tk.X, padx=8, pady=4)
-            self.entries[label] = entry
+        self.output_gif = LabeledEntry(form, "GIF name", self.default_gif_name(), browse=False, directory=False)
+        self.output_gif.pack(fill=tk.X, padx=8, pady=4)
 
-        row = ttk.Frame(form)
-        row.pack(fill=tk.X, padx=8, pady=4)
-        self.gif_fps = LabeledEntry(row, "GIF fps", "10", label_width=7, entry_width=6)
+        row2 = ttk.Frame(form)
+        row2.pack(fill=tk.X, padx=8, pady=4)
+        self.gif_fps = LabeledEntry(row2, "GIF fps", "10", label_width=7, entry_width=6)
         self.gif_fps.pack(side=tk.LEFT, padx=(0, 6))
-        self.stride = LabeledEntry(row, "Stride", "5", label_width=6, entry_width=4)
+        self.stride = LabeledEntry(row2, "Stride", "5", label_width=6, entry_width=4)
         self.stride.pack(side=tk.LEFT, padx=(0, 6))
+
+        row3 = ttk.Frame(form)
+        row3.pack(fill=tk.X, padx=8, pady=4)
         self.crop_var = tk.BooleanVar(value=True)
-        crop_check = ttk.Checkbutton(row, text="Crop", variable=self.crop_var, command=self.refresh_preview)
+        crop_check = ttk.Checkbutton(row3, text="Crop", variable=self.crop_var, command=self.refresh_preview)
         crop_check.pack(side=tk.LEFT, padx=(0, 8))
-        self.marker_size = LabeledEntry(row, "Marker size", "18", label_width=10, entry_width=5)
+        self.marker_size = LabeledEntry(row3, "Marker size", "18", label_width=10, entry_width=5)
         self.marker_size.pack(side=tk.LEFT, padx=(0, 6))
-        self.generate_button = ttk.Button(row, text="GENERATE GIF", command=self.toggle_run_command)
+
+        row4 = ttk.Frame(form)
+        row4.pack(fill=tk.X, padx=8, pady=4)
+        self.generate_button = ttk.Button(row4, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
 
@@ -3195,7 +3246,9 @@ class MultiViewTab(CommandTab):
 
         self.extra = LabeledEntry(form, "Extra args", "")
         self.extra.pack(fill=tk.X, padx=8, pady=4)
-        self.entries["Output GIF"].set_tooltip("Chemin du GIF multivues 2D a exporter.")
+        self.output_gif.set_tooltip(
+            "Nom du GIF 2D exporté. Le fichier sera enregistré automatiquement dans ./output/<trial>/figures/."
+        )
         self.gif_fps.set_tooltip("Frequence d'images du GIF 2D exporte.")
         self.stride.set_tooltip("Une frame sur N est exportee dans le GIF 2D.")
         attach_tooltip(crop_check, "Recadre chaque vue autour de la pose. Décochez pour garder le champ complet.")
@@ -3210,6 +3263,20 @@ class MultiViewTab(CommandTab):
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.refresh_available_reconstructions()
+
+    def default_gif_name(self) -> str:
+        """Return the default GIF filename for the current dataset."""
+
+        return f"{current_dataset_name(self.state)}_2d_multiview.gif"
+
+    def resolved_output_gif_path(self) -> Path:
+        """Resolve the GIF output path inside the current dataset figures directory."""
+
+        raw_name = self.output_gif.get().strip()
+        gif_name = Path(raw_name).name if raw_name else self.default_gif_name()
+        if not gif_name.lower().endswith(".gif"):
+            gif_name = f"{gif_name}.gif"
+        return current_figures_dir(self.state) / gif_name
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
         panel.configure_for_consumer(
@@ -3291,9 +3358,7 @@ class MultiViewTab(CommandTab):
         return "break"
 
     def sync_dataset_defaults(self) -> None:
-        self.entries["Output GIF"].var.set(
-            display_path(current_figures_dir(self.state) / "multiview_2d_comparison.gif")
-        )
+        self.output_gif.var.set(self.default_gif_name())
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -3328,7 +3393,7 @@ class MultiViewTab(CommandTab):
             "--dataset-dir",
             display_path(current_dataset_dir(self.state)),
             "--output",
-            self.entries["Output GIF"].get(),
+            display_path(self.resolved_output_gif_path()),
             "--data-fps",
             self.state.fps_var.get(),
             "--gif-fps",
@@ -3769,7 +3834,7 @@ class DataExplorer2DTab(ttk.Frame):
         self.keypoints.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.pose2sim_trc = LabeledEntry(
             row_sources,
-            "Pose2Sim TRC",
+            "TRC file",
             browse=True,
             label_width=12,
             entry_width=32,
@@ -3974,9 +4039,7 @@ class DataExplorer2DTab(ttk.Frame):
 
         self.calib.set_tooltip("Fichier de calibration partagé par tous les onglets.")
         self.keypoints.set_tooltip("Fichier JSON des détections 2D. Son nom détermine aussi le nom du dataset.")
-        self.pose2sim_trc.set_tooltip(
-            "TRC utilisé pour Pose2Sim. Il est recherché automatiquement à partir du JSON 2D."
-        )
+        self.pose2sim_trc.set_tooltip("TRC file used for direct 3D import. It is auto-detected from the 2D JSON.")
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
         attach_tooltip(
@@ -4079,13 +4142,13 @@ class DataExplorer2DTab(ttk.Frame):
             rel = display_path(trc_path)
             if self.state.pose2sim_trc_var.get() != rel:
                 self.state.pose2sim_trc_var.set(rel)
-            self.trc_status_var.set(f"Pose2Sim TRC auto-détecté: {rel}")
+            self.trc_status_var.set(f"TRC file auto-detected: {rel}")
         else:
             if self.state.pose2sim_trc_var.get():
                 self.state.pose2sim_trc_var.set("")
             self.trc_status_var.set(
                 f"Aucun fichier TRC correspondant n'a été trouvé pour {keypoints_path.name}. "
-                "Les reconstructions Pose2Sim resteront indisponibles tant qu'un TRC ne sera pas fourni."
+                "The TRC-file reconstruction will stay unavailable until a matching TRC file is provided."
             )
         self.update_dataset_summary()
         self.update_flip_status_text()
@@ -4370,7 +4433,7 @@ class DataExplorer2DTab(ttk.Frame):
 
 class ModelTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
-        super().__init__(master, "Model")
+        super().__init__(master, "Model", show_command_preview=False, show_output=False)
         self.state = state
         self.preview_points = None
         self.preview_support_points = None
@@ -4383,10 +4446,12 @@ class ModelTab(CommandTab):
         self.preview_segment_frames: list[tuple[str, np.ndarray, np.ndarray]] = []
         self.preview_metadata: dict[str, object] = {}
         self._updating_dof_controls = False
+        self._auto_frame_range: tuple[str, str] | None = None
+        self._syncing_frame_defaults = False
         self.set_run_button_text("Generate model")
 
         form = ttk.LabelFrame(self.main, text="Construction du modèle")
-        form.pack(fill=tk.X, pady=(0, 8), before=self.output)
+        form.pack(fill=tk.X, pady=(0, 8))
 
         row = ttk.Frame(form)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -4520,23 +4585,21 @@ class ModelTab(CommandTab):
         self.frame_start.var.trace_add("write", lambda *_args: self.update_details())
         self.frame_end.var.trace_add("write", lambda *_args: self.update_details())
         self.subject_mass.var.trace_add("write", lambda *_args: self.update_details())
-        self.output.configure(height=8)
 
-        # Layout: commandes/logs et liste des modeles a gauche, preview a droite.
-        self.buttons_frame.pack_forget()
-        self.progress_row.pack_forget()
-        self.command_preview_label.pack_forget()
-        self.output.pack_forget()
+        # Layout: controls and model list on the left, preview on the right.
+        self.hide_preview_copy_buttons()
 
         form.pack_forget()
         form.grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        self.buttons_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        self.progress_row.grid(row=2, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        self.command_preview_label.grid(row=3, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        self.output.grid(row=4, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        if self.buttons_frame is not None:
+            self.buttons_frame.pack_forget()
+            self.buttons_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
+        if self.progress_row is not None:
+            self.progress_row.pack_forget()
+            self.progress_row.grid(row=2, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
 
         existing_box = ttk.LabelFrame(self.main, text="Existing models")
-        existing_box.grid(row=5, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        existing_box.grid(row=3, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
         existing_controls = ttk.Frame(existing_box)
         existing_controls.pack(fill=tk.X, padx=8, pady=(8, 0))
         ttk.Button(existing_controls, text="Refresh models", command=self.refresh_existing_models).pack(side=tk.LEFT)
@@ -4553,7 +4616,7 @@ class ModelTab(CommandTab):
         )
 
         preview_box = ttk.LabelFrame(self.main, text="Première frame triangulée / modèle")
-        preview_box.grid(row=0, column=1, rowspan=6, sticky="nsew", pady=(0, 8))
+        preview_box.grid(row=0, column=1, rowspan=4, sticky="nsew", pady=(0, 8))
         preview_controls_top = ttk.Frame(preview_box)
         preview_controls_top.pack(fill=tk.X, padx=8, pady=(8, 2))
         self.show_triangulation_var = tk.BooleanVar(value=False)
@@ -4619,8 +4682,7 @@ class ModelTab(CommandTab):
 
         self.main.grid_columnconfigure(0, weight=1, uniform="modeltab")
         self.main.grid_columnconfigure(1, weight=2, uniform="modeltab")
-        self.main.grid_rowconfigure(4, weight=1)
-        self.main.grid_rowconfigure(5, weight=2)
+        self.main.grid_rowconfigure(3, weight=1)
 
         self.update_details()
         self.sync_paths_from_state()
@@ -4648,7 +4710,65 @@ class ModelTab(CommandTab):
         )
         self.sync_paths_from_state()
 
+    def _available_pose_frame_bounds(self) -> tuple[int, int] | None:
+        """Return the full frame range available in the current 2D source."""
+
+        keypoints_path = ROOT / self.state.keypoints_var.get()
+        calib_path = ROOT / self.state.calib_var.get()
+        if not keypoints_path.exists() or not calib_path.exists():
+            return None
+        _calibrations, pose_data = get_cached_pose_data(
+            self.state,
+            keypoints_path=keypoints_path,
+            calib_path=calib_path,
+            max_frames=None,
+            frame_start=None,
+            frame_end=None,
+            data_mode=self.pose_data_mode.get(),
+            smoothing_window=int(self.state.pose_filter_window_var.get()),
+            outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
+            lower_percentile=float(self.state.pose_p_low_var.get()),
+            upper_percentile=float(self.state.pose_p_high_var.get()),
+        )
+        if pose_data.frames.size == 0:
+            return None
+        return int(pose_data.frames[0]), int(pose_data.frames[-1])
+
+    def _sync_frame_range_defaults(self) -> None:
+        """Populate Start/End with the available 2D frame range without overwriting manual edits."""
+
+        if self._syncing_frame_defaults:
+            return
+        try:
+            bounds = self._available_pose_frame_bounds()
+        except Exception:
+            return
+        if bounds is None:
+            return
+        next_range = (str(bounds[0]), str(bounds[1]))
+        current_range = (self.frame_start.get().strip(), self.frame_end.get().strip())
+        previous_auto_range = self._auto_frame_range
+        should_update = (
+            not current_range[0]
+            or not current_range[1]
+            or previous_auto_range is None
+            or current_range == previous_auto_range
+        )
+        if not should_update:
+            return
+        if current_range == next_range:
+            self._auto_frame_range = next_range
+            return
+        self._syncing_frame_defaults = True
+        try:
+            self.frame_start.var.set(next_range[0])
+            self.frame_end.var.set(next_range[1])
+            self._auto_frame_range = next_range
+        finally:
+            self._syncing_frame_defaults = False
+
     def sync_paths_from_state(self) -> None:
+        self._sync_frame_range_defaults()
         try:
             subject_mass_kg = float(self.subject_mass.get())
             max_frames = int(self.max_frames.get()) if self.max_frames.get() else None
@@ -4695,6 +4815,11 @@ class ModelTab(CommandTab):
             pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
         )
         self.model_info_var.set(f"{model_dir.name} -> {display_path(biomod_path)}")
+        self.refresh_existing_models()
+
+    def on_command_success(self) -> None:
+        """Refresh the matching model list after a successful model generation."""
+
         self.refresh_existing_models()
 
     def refresh_existing_models(self) -> None:
@@ -5341,6 +5466,7 @@ class ProfilesTab(CommandTab):
         super().__init__(master, "Profiles")
         self.state = state
         self._updating_profile_name = False
+        self.flip_method_label_var = tk.StringVar(value=flip_method_display_name("epipolar"))
 
         form = ttk.LabelFrame(self.main, text="Profils de reconstruction")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -5441,14 +5567,22 @@ class ProfilesTab(CommandTab):
         flip_method_label = ttk.Label(self.flip_frame, text="Method", width=8)
         flip_method_label.pack(side=tk.LEFT)
         self.flip_method = tk.StringVar(value="epipolar")
-        flip_method_box = ttk.Combobox(
+        self.flip_method_button = ttk.Menubutton(
             self.flip_frame,
-            textvariable=self.flip_method,
-            values=list(SUPPORTED_FLIP_METHODS),
-            width=24,
-            state="readonly",
+            textvariable=self.flip_method_label_var,
+            width=28,
+            direction="below",
         )
-        flip_method_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.flip_method_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.flip_method_menu = tk.Menu(self.flip_method_button, tearoff=False)
+        for method in SUPPORTED_FLIP_METHODS:
+            self.flip_method_menu.add_radiobutton(
+                label=flip_method_display_name(method),
+                value=method,
+                variable=self.flip_method,
+                command=self.on_flip_method_changed,
+            )
+        self.flip_method_button.configure(menu=self.flip_method_menu)
         flip_hint = ttk.Label(
             self.flip_frame,
             text="epipolar stays local; *_viterbi adds temporal decoding; ekf_prediction_gate is EKF2D-only; triangulation_* is slower",
@@ -5584,7 +5718,7 @@ class ProfilesTab(CommandTab):
             "Technique de flip L/R. ekf_prediction_gate agit dans l'update EKF 2D; les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
         )
         attach_tooltip(
-            flip_method_box,
+            self.flip_method_button,
             "epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. ekf_prediction_gate: test raw vs swapped contre la projection prédite par l'EKF 2D. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
         )
         attach_tooltip(
@@ -5640,8 +5774,10 @@ class ProfilesTab(CommandTab):
 
         actions = ttk.Frame(form)
         actions.pack(fill=tk.X, padx=8, pady=6)
-        ttk.Button(actions, text="Add / replace current profile", command=self.add_current_profile).pack(side=tk.LEFT)
-        ttk.Button(actions, text="-", width=3, command=self.remove_selected_profiles).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Add profile", command=self.add_current_profile).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Delete profile", command=self.remove_selected_profiles).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
         ttk.Button(actions, text="Generate examples", command=self.generate_examples).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Generate all supported", command=self.generate_all_supported).pack(
             side=tk.LEFT, padx=(8, 0)
@@ -5696,9 +5832,15 @@ class ProfilesTab(CommandTab):
         self.state.register_profile_listener(self.refresh_profile_tree)
         self.refresh_profile_camera_choices()
         self.update_family_controls()
+        self.on_flip_method_changed()
         self.sync_profile_name()
         self.refresh_profile_tree()
         self.hide_command_controls()
+
+    def on_flip_method_changed(self) -> None:
+        """Sync the menu button label with the selected flip method."""
+
+        self.flip_method_label_var.set(flip_method_display_name(self.flip_method.get()))
 
     def update_family_controls(self) -> None:
         for frame in [
@@ -5941,12 +6083,12 @@ class ProfilesTab(CommandTab):
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
-        self.save_profiles_to_json()
+        runtime_config_path = write_runtime_profiles_config(self.state)
         cmd = [
             sys.executable,
             "run_reconstruction_profiles.py",
             "--config",
-            self.config_path.get(),
+            display_path(runtime_config_path),
             "--output-root",
             self.state.output_root_var.get(),
             "--dataset-name",
@@ -5964,7 +6106,7 @@ class ProfilesTab(CommandTab):
         if selected_cameras:
             cmd.extend(["--camera-names", ",".join(selected_cameras)])
         if self.state.pose2sim_trc_var.get().strip():
-            cmd.extend(["--pose2sim-trc", self.state.pose2sim_trc_var.get()])
+            cmd.extend(["--trc-file", self.state.pose2sim_trc_var.get()])
         for profile in self.selected_profiles():
             cmd.extend(["--profile", profile.name])
         return cmd
@@ -5989,12 +6131,6 @@ class ReconstructionsTab(CommandTab):
             text="Les options détaillées se règlent dans l'onglet Profiles. Ici on choisit simplement quoi lancer et on inspecte les caches du dataset courant.",
         )
         info.pack(fill=tk.X, padx=8, pady=(4, 6))
-
-        self.config_path = LabeledEntry(form, "Config JSON", browse=True)
-        self.config_path.var = state.profiles_config_var
-        self.config_path.entry_widget.configure(textvariable=self.config_path.var)
-        self.config_path.pack(fill=tk.X, padx=8, pady=4)
-        self.config_path.set_tooltip("Configuration JSON des profils de reconstruction.")
 
         controls = ttk.Frame(form)
         controls.pack(fill=tk.X, padx=8, pady=6)
@@ -6216,12 +6352,12 @@ class ReconstructionsTab(CommandTab):
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
-        save_profiles_json(ROOT / self.config_path.get(), self.state.profiles)
+        runtime_config_path = write_runtime_profiles_config(self.state)
         cmd = [
             sys.executable,
             "run_reconstruction_profiles.py",
             "--config",
-            self.config_path.get(),
+            display_path(runtime_config_path),
             "--output-root",
             self.state.output_root_var.get(),
             "--dataset-name",
@@ -6236,7 +6372,7 @@ class ReconstructionsTab(CommandTab):
             self.state.workers_var.get(),
         ]
         if self.state.pose2sim_trc_var.get().strip():
-            cmd.extend(["--pose2sim-trc", self.state.pose2sim_trc_var.get()])
+            cmd.extend(["--trc-file", self.state.pose2sim_trc_var.get()])
         for profile in self.selected_profiles():
             cmd.extend(["--profile", profile.name])
         return cmd
@@ -6342,7 +6478,7 @@ class RootKinematicsTab(ttk.Frame):
         )
         attach_tooltip(
             common_geometric_root_check,
-            "Pour les reconstructions basées sur q, reconstruit d'abord les marqueurs du modèle puis ré-extrait la racine géométrique avec la même méthode que triangulation/Pose2Sim.",
+            "Pour les reconstructions basées sur q, reconstruit d'abord les marqueurs du modèle puis ré-extrait la racine géométrique avec la même méthode que triangulation/TRC file.",
         )
 
         plot_box = ttk.LabelFrame(self, text="Comparaison racine")
@@ -8835,7 +8971,7 @@ class DDTab(ttk.Frame):
         attach_tooltip(prominence_entry, "Prominence minimale du pic de hauteur pour conserver un saut.")
         attach_tooltip(contact_label, "Fenetre de recherche des minima de contact avant et apres la phase aerienne.")
         attach_tooltip(contact_entry, "Fenetre de recherche des minima de contact avant et apres la phase aerienne.")
-        attach_tooltip(angle_mode_label, "Choisit la methode utilisee pour calculer salto, vrille et tilt.")
+        attach_tooltip(angle_mode_label, "Choisit la methode utilisee pour calculer salto, vrille et angles du corps.")
         attach_tooltip(
             angle_mode_box,
             "euler: ré-extrait simplement RotX/RotY/RotZ. body_axes: calcule des angles fonctionnels à partir des axes du corps.",
@@ -8915,6 +9051,7 @@ class DDTab(ttk.Frame):
         self.state.fps_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.state.initial_rotation_correction_var.trace_add("write", lambda *_args: self.refresh_analysis())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+        self.after_idle(self.sync_dataset_dir)
 
     def _on_reconstruction_selected(self, _event=None) -> None:
         if self._suspend_refresh:
@@ -9415,12 +9552,32 @@ class DDTab(ttk.Frame):
 
             axes[2].plot(
                 plot_data.local_t,
-                np.rad2deg(selected_jump.tilt_curve_rad),
+                np.rad2deg(selected_jump.hip_flex_curve_rad),
                 color="#55a868",
                 linewidth=1.8,
-                label="tilt",
+                label="hip flex",
             )
-            axes[2].set_title(f"S{jump_idx + 1} tilt ({selected_jump.angle_mode})")
+            axes[2].plot(
+                plot_data.local_t,
+                np.rad2deg(selected_jump.knee_flex_curve_rad),
+                color="#8172b3",
+                linewidth=1.8,
+                label="knee flex",
+            )
+            for phase_name, mask, color_fill in (
+                ("grouped", selected_jump.grouped_mask, "#dd8452"),
+                ("piked", selected_jump.piked_mask, "#4c72b0"),
+            ):
+                phase_regions = contiguous_true_regions(mask)
+                for region_idx, (start_idx, end_idx) in enumerate(phase_regions):
+                    axes[2].axvspan(
+                        plot_data.local_t[start_idx],
+                        plot_data.local_t[end_idx],
+                        color=color_fill,
+                        alpha=0.14,
+                        label=phase_name if region_idx == 0 else None,
+                    )
+            axes[2].set_title(f"S{jump_idx + 1} hip/knee flexion ({selected_jump.angle_mode})")
             axes[2].set_ylabel("deg")
             axes[2].set_xlabel("Time within jump (s)")
             axes[2].grid(alpha=0.25)
