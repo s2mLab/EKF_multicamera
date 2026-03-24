@@ -35,6 +35,11 @@ LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 os.environ.setdefault("XDG_CACHE_HOME", str(LOCAL_CACHE))
 
+DEFAULT_GUI_CALIB_PATH = "inputs/calibration/Calib.toml"
+DEFAULT_GUI_KEYPOINTS_PATH = "inputs/keypoints/1_partie_0429_keypoints.json"
+DEFAULT_GUI_TRC_PATH = "inputs/trc/1_partie_0429.trc"
+DEFAULT_GUI_PROFILES_CONFIG = "reconstruction_profiles.json"
+
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
@@ -4590,12 +4595,14 @@ class ModelTab(CommandTab):
         self.hide_preview_copy_buttons()
 
         form.pack_forget()
-        form.grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
         if self.buttons_frame is not None:
             self.buttons_frame.pack_forget()
-            self.buttons_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
         if self.progress_row is not None:
             self.progress_row.pack_forget()
+        form.grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
+        if self.buttons_frame is not None:
+            self.buttons_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
+        if self.progress_row is not None:
             self.progress_row.grid(row=2, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
 
         existing_box = ttk.LabelFrame(self.main, text="Existing models")
@@ -9599,9 +9606,9 @@ class LauncherApp(tk.Tk):
         self.geometry("1450x950")
 
         state = SharedAppState(
-            calib_var=tk.StringVar(value="inputs/calibration/Calib.toml"),
-            keypoints_var=tk.StringVar(value="inputs/keypoints/1_partie_0429_keypoints.json"),
-            pose2sim_trc_var=tk.StringVar(value="inputs/trc/1_partie_0429.trc"),
+            calib_var=tk.StringVar(value=DEFAULT_GUI_CALIB_PATH),
+            keypoints_var=tk.StringVar(value=DEFAULT_GUI_KEYPOINTS_PATH),
+            pose2sim_trc_var=tk.StringVar(value=DEFAULT_GUI_TRC_PATH),
             fps_var=tk.StringVar(value="120"),
             workers_var=tk.StringVar(value="6"),
             pose_data_mode_var=tk.StringVar(value="cleaned"),
@@ -9621,7 +9628,7 @@ class LauncherApp(tk.Tk):
             initial_rotation_correction_var=tk.BooleanVar(value=True),
             selected_camera_names_var=tk.StringVar(value=""),
             output_root_var=tk.StringVar(value="output"),
-            profiles_config_var=tk.StringVar(value="reconstruction_profiles.json"),
+            profiles_config_var=tk.StringVar(value=DEFAULT_GUI_PROFILES_CONFIG),
         )
         profiles_path = ROOT / state.profiles_config_var.get()
         if profiles_path.exists():
