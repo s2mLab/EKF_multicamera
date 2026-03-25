@@ -49,6 +49,8 @@ from animation.animate_dual_stick_comparison import (
     parse_trc,
     resample_points,
 )
+from camera_tools.camera_selection import parse_camera_names, subset_calibrations, subset_pose_data
+from judging.execution import infer_execution_images_root, resolve_execution_image_path
 from reconstruction.reconstruction_dataset import (
     dataset_source_paths,
     reconstruction_color,
@@ -113,6 +115,9 @@ def parse_args() -> argparse.Namespace:
         help="`full` utilise toute l'image, `pose` recadre chaque frame autour des keypoints 2D valides.",
     )
     parser.add_argument("--crop-margin", type=float, default=0.10, help="Marge relative appliquee au cadrage `pose`.")
+    parser.add_argument("--camera-names", type=str, default="", help="Sous-ensemble de caméras à afficher.")
+    parser.add_argument("--images-root", type=Path, default=None, help="Dossier d'images par caméra.")
+    parser.add_argument("--show-images", action="store_true", help="Affiche les images caméra en fond des subplots.")
     return parser.parse_args()
 
 
@@ -443,6 +448,9 @@ def create_animation(
     show: tuple[str, ...],
     airborne_mask: np.ndarray,
     confusion_mask: np.ndarray | None,
+    frame_numbers: np.ndarray,
+    images_root: Path | None,
+    show_images: bool,
 ) -> None:
     """Genere le GIF multi-vues."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -457,6 +465,7 @@ def create_animation(
     ]
     styles = {name: layer_style(name, marker_size) for name in display_names}
     crop_reference_points = compose_crop_reference_points(raw_2d, layer_2d, show)
+    image_artists = []
 
     artists: dict[str, list[dict[str, object]]] = {key: [] for key in display_names}
     line_artists: dict[str, list[list]] = {key: [] for key in display_names}
@@ -485,6 +494,7 @@ def create_animation(
         ax.set_aspect("equal")
         ax.set_title(cam_name)
         ax.grid(alpha=0.15)
+        image_artists.append(ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8), visible=False, zorder=0))
         for key in display_names:
             style = styles[key]
             markers = scatter_markers(key)
@@ -549,6 +559,15 @@ def create_animation(
         suspect_labels = []
         for cam_idx in range(n_cameras):
             label = camera_names[cam_idx]
+            if show_images:
+                image_path = resolve_execution_image_path(images_root, label, int(frame_numbers[frame_idx]))
+                if image_path is not None and image_path.exists():
+                    image_artists[cam_idx].set_data(plt.imread(str(image_path)))
+                    image_artists[cam_idx].set_visible(True)
+                else:
+                    image_artists[cam_idx].set_visible(False)
+            else:
+                image_artists[cam_idx].set_visible(False)
             if confusion_mask is not None and confusion_mask[cam_idx, frame_idx]:
                 axes[cam_idx].set_title(f"{label} | face/dos ?", color="#c44e52")
                 suspect_labels.append(label)
@@ -574,7 +593,7 @@ def create_animation(
                 set_lines(line_artists[name][cam_idx], layer_2d[name][cam_idx, frame_idx])
         phase = "AIR" if airborne_mask[frame_idx] else "TOILE"
         warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
-        title.set_text(f"Frame {frame_idx} | {phase}{warning}")
+        title.set_text(f"Frame {int(frame_numbers[frame_idx])} | {phase}{warning}")
         return (
             [
                 scatter
@@ -584,6 +603,7 @@ def create_animation(
                 if scatter is not None
             ]
             + [line for groups in line_artists.values() for group in groups for line in group]
+            + image_artists
             + [title]
         )
 
@@ -649,6 +669,9 @@ def render_frame(
     show: tuple[str, ...],
     airborne_mask: np.ndarray,
     confusion_mask: np.ndarray | None,
+    frame_numbers: np.ndarray,
+    images_root: Path | None,
+    show_images: bool,
     output_path: Path,
 ) -> Path:
     """Rend une frame PNG de l'animation 2D."""
@@ -674,6 +697,10 @@ def render_frame(
             continue
         cam_name = camera_names[ax_idx]
         width, height = calibrations[cam_name].image_size
+        if show_images:
+            image_path = resolve_execution_image_path(images_root, cam_name, int(frame_numbers[frame_idx]))
+            if image_path is not None and image_path.exists():
+                ax.imshow(plt.imread(str(image_path)))
         apply_2d_axis_limits(
             ax,
             crop_mode=crop_mode,
@@ -723,7 +750,7 @@ def render_frame(
         camera_names[i] for i in range(n_cameras) if confusion_mask is not None and confusion_mask[i, frame_idx]
     ]
     warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
-    fig.suptitle(f"Frame {frame_idx} | {phase}{warning}", fontsize=14)
+    fig.suptitle(f"Frame {int(frame_numbers[frame_idx])} | {phase}{warning}", fontsize=14)
     fig.tight_layout()
     fig.savefig(output_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
@@ -744,6 +771,9 @@ def create_animation_parallel(
     show: tuple[str, ...],
     airborne_mask: np.ndarray,
     confusion_mask: np.ndarray | None,
+    frame_numbers: np.ndarray,
+    images_root: Path | None,
+    show_images: bool,
 ) -> None:
     """Rend les frames en parallele puis assemble le GIF."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -766,6 +796,9 @@ def create_animation_parallel(
                     show,
                     airborne_mask,
                     confusion_mask,
+                    frame_numbers,
+                    images_root,
+                    show_images,
                     frame_paths[frame_idx],
                 )
         else:
@@ -784,6 +817,9 @@ def create_animation_parallel(
                         show,
                         airborne_mask,
                         confusion_mask,
+                        frame_numbers,
+                        images_root,
+                        show_images,
                         frame_paths[frame_idx],
                     )
                     for frame_idx in range(n_frames)
@@ -813,7 +849,6 @@ def main() -> None:
         keypoints_path = Path(sources["keypoints"])
         calibrations = load_calibrations(calib_path)
         pose_data = load_pose_data(keypoints_path, calibrations, max_frames=None)
-        camera_names = pose_data.camera_names
         recon_3d, frames, local_time, airborne_mask = load_dataset_reconstructions(args.dataset_dir)
     else:
         calib_path = args.calib if args.calib is not None else DEFAULT_CALIB
@@ -821,7 +856,6 @@ def main() -> None:
         pose2sim_trc = args.pose2sim_trc if args.pose2sim_trc is not None else Path("inputs/trc/1_partie_0429.trc")
         calibrations = load_calibrations(calib_path)
         pose_data = load_pose_data(keypoints_path, calibrations, max_frames=None)
-        camera_names = pose_data.camera_names
 
         triangulation_3d, frames = load_triangulation(args.triangulation)
         flight_threshold, flight_min_consecutive = load_flight_parameters(args.triangulation)
@@ -848,6 +882,12 @@ def main() -> None:
         pose2sim_3d, pose2sim_time, _ = parse_trc(pose2sim_trc)
         recon_3d["pose2sim"] = resample_points(pose2sim_3d, pose2sim_time, local_time)
 
+    selected_camera_names = parse_camera_names(args.camera_names)
+    if selected_camera_names:
+        calibrations = subset_calibrations(calibrations, selected_camera_names)
+        pose_data = subset_pose_data(pose_data, selected_camera_names)
+    camera_names = pose_data.camera_names
+
     frame_to_idx = {int(frame): idx for idx, frame in enumerate(np.asarray(pose_data.frames, dtype=int))}
     if not np.all(np.isin(frames, pose_data.frames)):
         missing = [int(frame) for frame in frames if int(frame) not in frame_to_idx]
@@ -858,6 +898,7 @@ def main() -> None:
     selected_raw_idx = np.array([frame_to_idx[int(frame)] for frame in frames], dtype=int)
     raw_2d = np.asarray(pose_data.keypoints[:, selected_raw_idx], dtype=float)
     raw_scores = np.asarray(pose_data.scores[:, selected_raw_idx], dtype=float)
+    frame_numbers = np.asarray(frames, dtype=int)
 
     projected_layers = {
         name: project_points(points_3d, calibrations, camera_names) for name, points_3d in recon_3d.items()
@@ -868,10 +909,12 @@ def main() -> None:
         stride=args.stride,
         max_frames=args.max_frames,
     )
+    frame_numbers = subsample_all([frame_numbers], stride=args.stride, max_frames=args.max_frames, frame_axis=0)[0]
     projected_layers = subsample_layer_dict(
         projected_layers, stride=args.stride, max_frames=args.max_frames, frame_axis=1
     )
     confusion_mask = detect_face_back_confusions(raw_2d, raw_scores, calibrations, camera_names)
+    images_root = args.images_root if args.images_root is not None else infer_execution_images_root(keypoints_path)
 
     include_raw = args.show is None or "raw" in args.show
     requested_reconstructions = None if args.show is None else [name for name in args.show if name != "raw"]
@@ -894,6 +937,9 @@ def main() -> None:
             show=tuple(show),
             airborne_mask=airborne_mask,
             confusion_mask=confusion_mask,
+            frame_numbers=frame_numbers,
+            images_root=images_root,
+            show_images=bool(args.show_images),
         )
     else:
         create_animation_parallel(
@@ -910,6 +956,9 @@ def main() -> None:
             show=tuple(show),
             airborne_mask=airborne_mask,
             confusion_mask=confusion_mask,
+            frame_numbers=frame_numbers,
+            images_root=images_root,
+            show_images=bool(args.show_images),
         )
     print(f"Animation 2D multi-vues exportee dans: {args.output}")
 

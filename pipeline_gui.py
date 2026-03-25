@@ -70,10 +70,12 @@ from judging.execution import (
     build_execution_overlay_frame,
     execution_focus_frame,
     infer_execution_images_root,
+    resolve_execution_image_path,
 )
 from judging.trampoline_displacement import (
     BED_X_MAX,
     BED_Y_MAX,
+    TRAMPOLINE_BED_HEIGHT_M,
     TRAMPOLINE_GEOMETRY,
     X_INNER,
     X_MAX,
@@ -172,7 +174,12 @@ from reconstruction.reconstruction_registry import (
     scan_model_dirs,
     scan_reconstruction_dirs,
 )
-from reconstruction.reconstruction_timings import format_reconstruction_timing_details, objective_total_seconds
+from reconstruction.reconstruction_timings import (
+    format_reconstruction_timing_details,
+    model_compute_seconds,
+    objective_total_seconds,
+    reconstruction_run_seconds,
+)
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_METHOD,
@@ -1156,6 +1163,25 @@ def compute_airborne_mask_from_points(
     return mask
 
 
+def jump_segmentation_height_series(points_3d: np.ndarray | None, root_q: np.ndarray) -> np.ndarray:
+    """Return the vertical series used to segment jumps.
+
+    Prefer foot-to-bed clearance when 3D markers are available. Fall back to the
+    lowest visible marker, then to the root vertical translation.
+    """
+
+    if points_3d is not None:
+        points_3d = np.asarray(points_3d, dtype=float)
+        if points_3d.ndim == 3 and points_3d.shape[2] >= 3:
+            ankles = np.asarray(points_3d[:, [KP_INDEX["left_ankle"], KP_INDEX["right_ankle"]], 2], dtype=float)
+            if np.any(np.isfinite(ankles)):
+                return np.nanmin(ankles, axis=1)
+            all_markers_z = np.asarray(points_3d[:, :, 2], dtype=float)
+            if np.any(np.isfinite(all_markers_z)):
+                return np.nanmin(all_markers_z, axis=1)
+    return np.asarray(root_q[:, 2], dtype=float)
+
+
 def camera_layout(n_cameras: int) -> tuple[int, int]:
     ncols = 4
     nrows = int(math.ceil(n_cameras / ncols))
@@ -1208,6 +1234,21 @@ def compute_pose_crop_limits_2d(
                 camera_limits[frame_idx] = camera_limits[last_valid]
         limits[cam_name] = camera_limits
     return limits
+
+
+def preview_pose_frame_indices(pose_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
+    """Map preview frame ids back to pose-data indices."""
+
+    pose_frames = np.asarray(pose_frames, dtype=int)
+    target_frames = np.asarray(target_frames, dtype=int)
+    frame_to_idx = {int(frame): idx for idx, frame in enumerate(pose_frames)}
+    missing = [int(frame) for frame in target_frames if int(frame) not in frame_to_idx]
+    if missing:
+        raise ValueError(
+            "The preview bundle frames and the 2D detections do not share the same frame ids. "
+            f"Missing raw frames for ids: {missing[:10]}"
+        )
+    return np.asarray([frame_to_idx[int(frame)] for frame in target_frames], dtype=int)
 
 
 def compose_multiview_crop_points(
@@ -3373,8 +3414,12 @@ class MultiViewTab(CommandTab):
         self.calibrations = None
         self.preview_bundle = None
         self.projected_layers: dict[str, np.ndarray] = {}
+        self.preview_frame_numbers = np.array([], dtype=int)
+        self.preview_raw_points = None
+        self.preview_pose_points = None
         self.crop_limits_cache: dict[str, np.ndarray] = {}
         self.crop_limits_key: tuple[object, ...] | None = None
+        self.images_root: Path | None = None
         self._dragging_frame_scale = False
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "extended"
@@ -3412,6 +3457,40 @@ class MultiViewTab(CommandTab):
         self.generate_button = ttk.Button(row4, text="GENERATE GIF", command=self.toggle_run_command)
         self.generate_button.pack(side=tk.RIGHT)
         self.attach_primary_action_button(self.generate_button, run_text="GENERATE GIF", stop_text="STOP")
+
+        lower_left = ttk.Frame(left)
+        lower_left.pack(fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        cameras_box = ttk.LabelFrame(lower_left, text="Cameras")
+        cameras_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        cameras_header = ttk.Frame(cameras_box)
+        cameras_header.pack(fill=tk.X, padx=8, pady=(6, 2))
+        self.multiview_cameras_summary = tk.StringVar(value="Cameras (n=0/0)")
+        ttk.Label(cameras_header, textvariable=self.multiview_cameras_summary, anchor="w").pack(side=tk.LEFT)
+        cameras_body = ttk.Frame(cameras_box, height=120)
+        cameras_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        cameras_body.pack_propagate(False)
+        self.multiview_cameras_list = tk.Listbox(
+            cameras_body,
+            selectmode=tk.EXTENDED,
+            exportselection=False,
+            height=5,
+        )
+        self.multiview_cameras_list.pack(fill=tk.BOTH, expand=True)
+        self.multiview_cameras_list.bind(
+            "<<ListboxSelect>>", lambda _event: self.on_multiview_camera_selection_changed()
+        )
+
+        images_box = ttk.LabelFrame(lower_left, text="Images")
+        images_box.pack(fill=tk.X, expand=False)
+        row_images_1 = ttk.Frame(images_box)
+        row_images_1.pack(fill=tk.X, padx=8, pady=4)
+        self.show_images_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row_images_1, text="Show images", variable=self.show_images_var, command=self.refresh_preview
+        ).pack(side=tk.LEFT)
+        self.images_root_entry = LabeledEntry(images_box, "Images root", "", browse=True, directory=True)
+        self.images_root_entry.pack(fill=tk.X, padx=8, pady=(0, 6))
 
         preview_box = ttk.LabelFrame(right, text="Preview 2D multivues")
         preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -3451,6 +3530,8 @@ class MultiViewTab(CommandTab):
         attach_tooltip(
             self.generate_button, "Genere le GIF 2D multivues, puis devient STOP tant que l'export est en cours."
         )
+        attach_tooltip(self.multiview_cameras_list, "Choisissez les caméras visibles dans le preview et le GIF.")
+        self.images_root_entry.set_tooltip("Dossier d'images utilisé comme fond des vues 2D, par caméra si disponible.")
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 2D.")
         attach_tooltip(self.frame_label, "Index de frame actuellement affiche dans le preview 2D.")
         self.extra.set_tooltip("Options CLI supplémentaires pour animation/animate_multiview_2d_comparison.py.")
@@ -3463,6 +3544,47 @@ class MultiViewTab(CommandTab):
         """Return the default GIF filename for the current dataset."""
 
         return f"{current_dataset_name(self.state)}_2d_multiview.gif"
+
+    def selected_multiview_camera_names(self) -> list[str]:
+        if self.pose_data is None:
+            return []
+        all_camera_names = [str(name) for name in self.pose_data.camera_names]
+        indices = [int(index) for index in self.multiview_cameras_list.curselection()]
+        if not indices:
+            return list(all_camera_names)
+        return [all_camera_names[index] for index in indices if 0 <= index < len(all_camera_names)]
+
+    def _set_multiview_camera_selection(self, camera_names: list[str] | None) -> None:
+        requested = set(camera_names or [])
+        self.multiview_cameras_list.selection_clear(0, tk.END)
+        for index in range(self.multiview_cameras_list.size()):
+            if self.multiview_cameras_list.get(index) in requested:
+                self.multiview_cameras_list.selection_set(index)
+
+    def update_multiview_camera_summary(self) -> None:
+        total_count = self.multiview_cameras_list.size()
+        selected_count = len(self.multiview_cameras_list.curselection()) if total_count else 0
+        if total_count and selected_count == 0:
+            selected_count = total_count
+        self.multiview_cameras_summary.set(f"Cameras (n={selected_count}/{total_count})")
+
+    def refresh_multiview_camera_choices(self) -> None:
+        selected_before = self.selected_multiview_camera_names()
+        self.multiview_cameras_list.delete(0, tk.END)
+        camera_names: list[str] = []
+        if self.pose_data is not None and getattr(self.pose_data, "camera_names", None) is not None:
+            camera_names = [str(name) for name in self.pose_data.camera_names]
+        elif self.calibrations:
+            camera_names = [str(name) for name in self.calibrations.keys()]
+        for camera_name in camera_names:
+            self.multiview_cameras_list.insert(tk.END, camera_name)
+        default_selection = selected_before if selected_before else camera_names
+        self._set_multiview_camera_selection(default_selection if camera_names else None)
+        self.update_multiview_camera_summary()
+
+    def on_multiview_camera_selection_changed(self) -> None:
+        self.update_multiview_camera_summary()
+        self.refresh_preview()
 
     def resolved_output_gif_path(self) -> Path:
         """Resolve the GIF output path inside the current dataset figures directory."""
@@ -3554,6 +3676,9 @@ class MultiViewTab(CommandTab):
 
     def sync_dataset_defaults(self) -> None:
         self.output_gif.var.set(self.default_gif_name())
+        inferred_images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+        self.images_root = inferred_images_root
+        self.images_root_entry.var.set("" if inferred_images_root is None else display_path(inferred_images_root))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -3607,6 +3732,14 @@ class MultiViewTab(CommandTab):
         selected = [name for name in self.selected_reconstruction_names() if name in available]
         if selected:
             cmd.extend(["--show", *selected])
+        selected_cameras = self.selected_multiview_camera_names()
+        if selected_cameras:
+            cmd.extend(["--camera-names", ",".join(selected_cameras)])
+        images_root = self.images_root_entry.get().strip()
+        if self.show_images_var.get():
+            cmd.append("--show-images")
+            if images_root:
+                cmd.extend(["--images-root", images_root])
         cmd.extend(self.parse_extra_args(self.extra.get()))
         return cmd
 
@@ -3647,19 +3780,48 @@ class MultiViewTab(CommandTab):
                 upper_percentile=float(self.state.pose_p_high_var.get()),
             )
             self.preview_bundle = preview_load.bundle
+            self.refresh_multiview_camera_choices()
+            inferred_images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+            if not self.images_root_entry.get().strip() or inferred_images_root is not None:
+                self.images_root = inferred_images_root
+                self.images_root_entry.var.set(
+                    "" if inferred_images_root is None else display_path(inferred_images_root)
+                )
             self._publish_reconstruction_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
+            bundle_frames = (
+                np.asarray(self.preview_bundle["frames"], dtype=int)
+                if self.preview_bundle is not None and "frames" in self.preview_bundle
+                else np.asarray(self.pose_data.frames, dtype=int)
+            )
+            pose_frame_indices = preview_pose_frame_indices(np.asarray(self.pose_data.frames, dtype=int), bundle_frames)
+            self.preview_frame_numbers = np.asarray(bundle_frames, dtype=int)
+            self.preview_pose_points = np.asarray(self.pose_data.keypoints[:, pose_frame_indices], dtype=float)
+            self.preview_raw_points = np.asarray(
+                (
+                    self.pose_data.raw_keypoints[:, pose_frame_indices]
+                    if self.pose_data.raw_keypoints is not None
+                    else self.pose_data.keypoints[:, pose_frame_indices]
+                ),
+                dtype=float,
+            )
             camera_names = list(self.pose_data.camera_names)
             self.projected_layers = {}
             for name, points_3d in self.preview_bundle["recon_3d"].items():
                 self.projected_layers[name] = project_points_all_cameras(points_3d, self.calibrations, camera_names)
             self.crop_limits_cache = {}
             self.crop_limits_key = None
-            bundle_frames = (
-                preview_load.preview_state.max_frame + 1
-                if self.preview_bundle is not None
-                else len(self.pose_data.frames)
+            n_frames = min(
+                (
+                    self.preview_pose_points.shape[1]
+                    if self.preview_pose_points is not None
+                    else len(self.pose_data.frames)
+                ),
+                (
+                    preview_load.preview_state.max_frame + 1
+                    if self.preview_bundle is not None
+                    else len(self.pose_data.frames)
+                ),
             )
-            n_frames = min(len(self.pose_data.frames), bundle_frames)
             self.frame_scale.configure(to=max(n_frames - 1, 0))
             self.frame_var.set(0)
             self.preview_canvas_widget.focus_set()
@@ -3668,11 +3830,14 @@ class MultiViewTab(CommandTab):
             messagebox.showerror("2D multiview", str(exc))
 
     def refresh_preview(self) -> None:
-        if self.pose_data is None or self.calibrations is None:
+        if (
+            self.pose_data is None
+            or self.calibrations is None
+            or self.preview_pose_points is None
+            or self.preview_raw_points is None
+        ):
             return
-        n_frames = len(self.pose_data.frames)
-        if self.preview_bundle is not None and len(self.preview_bundle["frames"]):
-            n_frames = min(n_frames, len(self.preview_bundle["frames"]))
+        n_frames = self.preview_pose_points.shape[1]
         if n_frames == 0:
             return
         frame_idx = clamp_frame_index(int(round(self.frame_var.get())), n_frames - 1)
@@ -3680,21 +3845,29 @@ class MultiViewTab(CommandTab):
         self.frame_label.configure(text=f"frame {frame_idx}")
 
         self.preview_figure.clear()
-        camera_names = list(self.pose_data.camera_names)
+        all_camera_names = [str(name) for name in self.pose_data.camera_names]
+        camera_names = self.selected_multiview_camera_names()
+        camera_indices = [all_camera_names.index(name) for name in camera_names if name in all_camera_names]
+        if not camera_indices:
+            camera_names = list(all_camera_names)
+            camera_indices = list(range(len(camera_names)))
         nrows, ncols = camera_layout(len(camera_names))
         axes = self.preview_figure.subplots(nrows, ncols)
         axes = np.atleast_1d(axes).ravel()
         selected = self.selected_reconstruction_names()
-        raw_points = np.asarray(
-            self.pose_data.raw_keypoints if self.pose_data.raw_keypoints is not None else self.pose_data.keypoints,
-            dtype=float,
-        )
-        crop_points = compose_multiview_crop_points(
-            np.asarray(self.pose_data.keypoints, dtype=float), self.projected_layers, selected
-        )
+        raw_points = np.asarray(self.preview_raw_points[camera_indices], dtype=float)
+        pose_points = np.asarray(self.preview_pose_points[camera_indices], dtype=float)
+        projected_layers = {
+            name: np.asarray(points[camera_indices], dtype=float) for name, points in self.projected_layers.items()
+        }
+        crop_points = compose_multiview_crop_points(pose_points, projected_layers, selected)
         crop_mode = "pose" if self.crop_var.get() else "full"
         crop_margin = 0.1
         crop_limits = self._ensure_crop_limits(crop_points, camera_names, crop_margin) if crop_mode == "pose" else {}
+        frame_number = int(self.preview_frame_numbers[frame_idx]) if self.preview_frame_numbers.size else int(frame_idx)
+        images_root = (
+            Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
+        )
 
         for ax_idx, ax in enumerate(axes):
             if ax_idx >= len(camera_names):
@@ -3702,6 +3875,10 @@ class MultiViewTab(CommandTab):
                 continue
             cam_name = camera_names[ax_idx]
             width, height = self.calibrations[cam_name].image_size
+            if self.show_images_var.get():
+                image_path = resolve_execution_image_path(images_root, cam_name, frame_number)
+                if image_path is not None and image_path.exists():
+                    ax.imshow(plt.imread(str(image_path)))
             apply_2d_axis_limits(
                 ax,
                 crop_mode=crop_mode,
@@ -3722,9 +3899,9 @@ class MultiViewTab(CommandTab):
                 mapped = "triangulation_adaptive" if raw_name == "triangulation" else mapped
                 if mapped == "biorbd_kalman":
                     mapped = "ekf_3d"
-                if mapped == "raw" or mapped not in self.projected_layers:
+                if mapped == "raw" or mapped not in projected_layers:
                     continue
-                points_2d = self.projected_layers[mapped][ax_idx, frame_idx]
+                points_2d = projected_layers[mapped][ax_idx, frame_idx]
                 draw_skeleton_2d(
                     ax,
                     points_2d,
@@ -6651,6 +6828,8 @@ class ReconstructionsTab(CommandTab):
             reproj = summary.get("reprojection_px", {})
             latest = summary.get("is_latest_family_version")
             compute_s = objective_total_seconds(summary)
+            model_s = model_compute_seconds(summary)
+            reconstruction_s = reconstruction_run_seconds(summary)
             recon_name = str(summary.get("name", recon_dir.name))
             self.status_summaries[recon_name] = summary
             rows.append(
@@ -6661,7 +6840,8 @@ class ReconstructionsTab(CommandTab):
                     "frames": summary.get("n_frames", "-"),
                     "reproj_mean": reproj.get("mean"),
                     "path": str(recon_dir),
-                    "compute_s": compute_s,
+                    "compute_s": reconstruction_s if reconstruction_s is not None else compute_s,
+                    "model_compute_s": model_s,
                     "reproj_std": reproj.get("std"),
                     "is_latest": latest,
                 }
@@ -8156,7 +8336,8 @@ class ExecutionTab(ttk.Frame):
             self.dd_analysis = analyze_dd_session(
                 np.asarray(root_q, dtype=float),
                 fps,
-                height_values=np.asarray(root_q[:, 2], dtype=float),
+                height_values=jump_segmentation_height_series(points_3d, np.asarray(root_q, dtype=float)),
+                height_threshold=TRAMPOLINE_BED_HEIGHT_M,
                 angle_mode="euler",
                 analysis_start_frame=ANALYSIS_START_FRAME,
                 require_complete_jumps=True,
@@ -9258,10 +9439,19 @@ class TrampolineTab(ttk.Frame):
             if root_q is None:
                 raise ValueError(f"Aucune cinématique racine disponible pour {self.current_reconstruction_name}.")
             fps = float(self.state.fps_var.get())
+            recon_3d = self.bundle.get("recon_3d", {}) if isinstance(self.bundle, dict) else {}
             self.analysis = analyze_dd_session(
                 np.asarray(root_q, dtype=float),
                 fps,
-                height_values=np.asarray(root_q[:, 2], dtype=float),
+                height_values=jump_segmentation_height_series(
+                    (
+                        np.asarray(recon_3d[self.current_reconstruction_name], dtype=float)
+                        if self.current_reconstruction_name in recon_3d
+                        else None
+                    ),
+                    np.asarray(root_q, dtype=float),
+                ),
+                height_threshold=TRAMPOLINE_BED_HEIGHT_M,
                 angle_mode="euler",
                 analysis_start_frame=ANALYSIS_START_FRAME,
                 require_complete_jumps=True,
@@ -9755,8 +9945,13 @@ class DDTab(ttk.Frame):
                     self.analysis_by_name[name] = analyze_dd_session(
                         np.asarray(name_root_q, dtype=float),
                         fps,
-                        height_values=self._height_series(name_root_q, name_full_q, name_q_name_list),
-                        height_threshold=None if not height_threshold_abs else float(height_threshold_abs),
+                        height_values=jump_segmentation_height_series(
+                            np.asarray(recon_3d[name], dtype=float) if name in recon_3d else None,
+                            np.asarray(name_root_q, dtype=float),
+                        ),
+                        height_threshold=(
+                            float(height_threshold_abs) if height_threshold_abs else TRAMPOLINE_BED_HEIGHT_M
+                        ),
                         height_threshold_range_ratio=float(self.height_threshold_ratio.get()),
                         smoothing_window_s=float(self.smoothing_window_s.get()),
                         min_airtime_s=float(self.min_airtime_s.get()),

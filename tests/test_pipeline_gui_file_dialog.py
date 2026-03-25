@@ -196,6 +196,15 @@ def test_compose_multiview_crop_points_includes_selected_reprojections():
     np.testing.assert_allclose(crop_points[:, :, 3:], reproj)
 
 
+def test_preview_pose_frame_indices_aligns_sparse_bundle_frames():
+    pose_frames = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=int)
+    target_frames = np.array([0, 3, 6], dtype=int)
+
+    indices = pipeline_gui.preview_pose_frame_indices(pose_frames, target_frames)
+
+    np.testing.assert_array_equal(indices, np.array([0, 3, 6], dtype=int))
+
+
 def test_infer_pose2sim_trc_from_keypoints_uses_inputs_trc_folder(tmp_path, monkeypatch):
     root = tmp_path / "workspace"
     (root / "inputs" / "keypoints").mkdir(parents=True)
@@ -332,6 +341,46 @@ def test_reconstructions_tab_build_command_uses_runtime_profiles_cache(monkeypat
     cmd = pipeline_gui.ReconstructionsTab.build_command(tab)
 
     assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
+
+
+def test_multiview_tab_build_command_uses_selected_cameras_and_images_root(monkeypatch):
+    tab = pipeline_gui.MultiViewTab.__new__(pipeline_gui.MultiViewTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        workers_var=SimpleNamespace(get=lambda: "6"),
+        pose2sim_trc_var=SimpleNamespace(get=lambda: ""),
+    )
+    tab.output_gif = _FakeEntryField("trial.gif")
+    tab.gif_fps = _FakeEntryField("10")
+    tab.stride = _FakeEntryField("5")
+    tab.marker_size = _FakeEntryField("18")
+    tab.images_root_entry = _FakeEntryField("inputs/images/trial")
+    tab.crop_var = SimpleNamespace(get=lambda: True)
+    tab.show_images_var = SimpleNamespace(get=lambda: True)
+    tab.extra = _FakeEntryField("")
+    tab.pose_data = SimpleNamespace(camera_names=["M11139", "M11140", "M11141"])
+    tab.multiview_cameras_list = _FakeListbox()
+    for name in tab.pose_data.camera_names:
+        tab.multiview_cameras_list.insert("end", name)
+    tab.multiview_cameras_list.selection_set(0)
+    tab.multiview_cameras_list.selection_set(2)
+    tab.selected_reconstruction_names = lambda: ["raw", "pose2sim"]
+    tab.parse_extra_args = lambda raw: raw.split() if raw else []
+    tab.resolved_output_gif_path = lambda: Path("output/trial/figures/trial.gif")
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "discover_reconstruction_catalog",
+        lambda *_args, **_kwargs: [{"name": "pose2sim", "cached": True}],
+    )
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/trial"))
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+
+    cmd = pipeline_gui.MultiViewTab.build_command(tab)
+
+    assert cmd[cmd.index("--camera-names") + 1] == "M11139,M11141"
+    assert "--show-images" in cmd
+    assert cmd[cmd.index("--images-root") + 1] == "inputs/images/trial"
 
 
 class _FakeEntryField:
