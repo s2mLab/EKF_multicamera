@@ -32,6 +32,8 @@ SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
     "epipolar_fast",
+    "epipolar_framewise",
+    "epipolar_fast_framewise",
     "triangulation",
     "triangulation_once",
     "triangulation_greedy",
@@ -232,6 +234,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
+            "epipolar_framewise",
+            "epipolar_fast_framewise",
         ):
             raise ValueError("ekf2d_3d_source=first_frame_only requires an epipolar coherence method.")
     elif profile.flip and profile.flip_method == "ekf_prediction_gate":
@@ -409,7 +413,11 @@ def generate_supported_profiles(
             (False, True) if enable_dof_locking else (False,),
             (False, True) if enable_initial_rotation_correction else (False,),
         ):
-            coherence_methods = ("epipolar",) if ekf2d_3d_source == "first_frame_only" else SUPPORTED_COHERENCE_METHODS
+            coherence_methods = (
+                ("epipolar", "epipolar_fast", "epipolar_framewise", "epipolar_fast_framewise")
+                if ekf2d_3d_source == "first_frame_only"
+                else SUPPORTED_COHERENCE_METHODS
+            )
             for coherence_method in coherence_methods:
                 profiles.append(
                     validate_profile(

@@ -27,12 +27,16 @@ from vitpose_ekf_pipeline import (
     compute_camera_epipolar_costs_vectorized,
     compute_camera_triangulation_cost,
     compute_epipolar_coherence,
+    compute_epipolar_fast_frame_coherence,
+    compute_epipolar_frame_coherence,
+    compute_framewise_epipolar_measurement_weights,
     load_pose_data,
     project_point_with_projection_matrices,
     q_names_from_model,
     sample_frames_uniformly,
     sampson_error_pixels_vectorized,
     smooth_camera_time_series,
+    support_coherence_method_for_runtime,
     symmetric_epipolar_distance_vectorized,
     triangulation_method_from_coherence_method,
     triangulation_reference_from_other_views,
@@ -136,7 +140,10 @@ def test_canonical_triangulation_and_coherence_methods_support_once():
     assert canonical_triangulation_method("raw") == "once"
     assert canonical_triangulation_method("once") == "once"
     assert canonical_coherence_method("triangulation", "greedy") == "triangulation_greedy"
+    assert canonical_coherence_method("epipolar_framewise") == "epipolar_framewise"
+    assert support_coherence_method_for_runtime("epipolar_fast_framewise") == "epipolar_fast"
     assert triangulation_method_from_coherence_method("triangulation_once", "exhaustive") == "once"
+    assert triangulation_method_from_coherence_method("epipolar_framewise", "exhaustive") == "exhaustive"
 
 
 def test_sequential_measurement_update_matches_batch_update():
@@ -285,6 +292,102 @@ def test_compute_epipolar_coherence_accepts_symmetric_distance_mode():
 
     assert coherence.shape == (1, 1, 2)
     np.testing.assert_allclose(coherence, 1.0, atol=1e-12)
+
+
+def test_compute_epipolar_frame_coherence_matches_one_frame_sequence_result():
+    point = np.array([0.15, 0.05, 2.5], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0)]
+    frame_keypoints = np.stack([[camera.project_point(point)] for camera in cameras], axis=0)
+    frame_scores = np.ones((2, 1), dtype=float)
+    pose_data = PoseData(
+        camera_names=[camera.name for camera in cameras],
+        frames=np.array([0], dtype=int),
+        keypoints=frame_keypoints[:, np.newaxis, :, :],
+        scores=frame_scores[:, np.newaxis, :],
+    )
+    fundamental_matrices = {
+        (i_cam, j_cam): vitpose_ekf_pipeline.fundamental_matrix(cameras[i_cam], cameras[j_cam])
+        for i_cam in range(len(cameras))
+        for j_cam in range(len(cameras))
+        if i_cam != j_cam
+    }
+
+    sequence_coherence = compute_epipolar_coherence(
+        pose_data,
+        fundamental_matrices,
+        threshold_px=10.0,
+        distance_mode="sampson",
+    )[0]
+    frame_coherence = compute_epipolar_frame_coherence(
+        frame_keypoints,
+        frame_scores,
+        fundamental_matrices,
+        threshold_px=10.0,
+    )
+
+    np.testing.assert_allclose(frame_coherence, sequence_coherence, atol=1e-12)
+
+
+def test_compute_epipolar_fast_frame_coherence_matches_one_frame_sequence_result():
+    point = np.array([0.15, 0.05, 2.5], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0)]
+    frame_keypoints = np.stack([[camera.project_point(point)] for camera in cameras], axis=0)
+    frame_scores = np.ones((2, 1), dtype=float)
+    pose_data = PoseData(
+        camera_names=[camera.name for camera in cameras],
+        frames=np.array([0], dtype=int),
+        keypoints=frame_keypoints[:, np.newaxis, :, :],
+        scores=frame_scores[:, np.newaxis, :],
+    )
+    fundamental_matrices = {
+        (i_cam, j_cam): vitpose_ekf_pipeline.fundamental_matrix(cameras[i_cam], cameras[j_cam])
+        for i_cam in range(len(cameras))
+        for j_cam in range(len(cameras))
+        if i_cam != j_cam
+    }
+
+    sequence_coherence = compute_epipolar_coherence(
+        pose_data,
+        fundamental_matrices,
+        threshold_px=10.0,
+        distance_mode="symmetric",
+    )[0]
+    frame_coherence = compute_epipolar_fast_frame_coherence(
+        frame_keypoints,
+        frame_scores,
+        fundamental_matrices,
+        threshold_px=10.0,
+    )
+
+    np.testing.assert_allclose(frame_coherence, sequence_coherence, atol=1e-12)
+
+
+def test_compute_framewise_epipolar_measurement_weights_matches_expected_variances():
+    point = np.array([0.15, 0.05, 2.5], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0)]
+    frame_keypoints = np.stack([[camera.project_point(point)] for camera in cameras], axis=0)
+    frame_scores = np.array([[0.9], [0.8]], dtype=float)
+    fundamental_matrices = {
+        (i_cam, j_cam): vitpose_ekf_pipeline.fundamental_matrix(cameras[i_cam], cameras[j_cam])
+        for i_cam in range(len(cameras))
+        for j_cam in range(len(cameras))
+        if i_cam != j_cam
+    }
+
+    frame_coherence, effective_confidences, measurement_variances = compute_framewise_epipolar_measurement_weights(
+        frame_keypoints,
+        frame_scores,
+        fundamental_matrices,
+        threshold_px=10.0,
+        distance_mode="sampson",
+        coherence_confidence_floor=0.35,
+        measurement_noise_scale=1.5,
+    )
+
+    np.testing.assert_allclose(frame_coherence, np.ones_like(frame_coherence), atol=1e-12)
+    np.testing.assert_allclose(effective_confidences, frame_scores, atol=1e-12)
+    expected_variances = 1.5 * (4.0 / frame_scores) ** 2
+    np.testing.assert_allclose(measurement_variances, expected_variances, atol=1e-12)
 
 
 def test_viterbi_flip_state_path_rejects_isolated_positive_frame():

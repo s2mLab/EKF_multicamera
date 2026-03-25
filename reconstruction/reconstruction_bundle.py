@@ -9,7 +9,7 @@ import math
 import shutil
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -89,6 +89,7 @@ from vitpose_ekf_pipeline import (
     save_reconstruction_cache,
     save_single_ekf_state,
     select_active_coherence,
+    support_coherence_method_for_runtime,
     triangulate_pose2sim_like,
     triangulation_method_from_coherence_method,
 )
@@ -188,7 +189,8 @@ def load_or_compute_epipolar_cache(
     pose_amplitude_upper_percentile: float,
 ) -> tuple[np.ndarray, float, Path, str]:
     coherence_method = canonical_coherence_method(coherence_method)
-    distance_mode = "symmetric" if coherence_method == "epipolar_fast" else "sampson"
+    support_method = support_coherence_method_for_runtime(coherence_method)
+    distance_mode = "symmetric" if support_method == "epipolar_fast" else "sampson"
     metadata = epipolar_cache_metadata(
         pose_data,
         epipolar_threshold_px,
@@ -835,8 +837,8 @@ def prepare_pose_data_for_reconstruction(
 
     active_flip_method = flip_method
     if active_flip_method is None:
-        if coherence_method in {"epipolar", "epipolar_fast"}:
-            active_flip_method = coherence_method
+        if coherence_method in {"epipolar", "epipolar_fast", "epipolar_framewise", "epipolar_fast_framewise"}:
+            active_flip_method = support_coherence_method_for_runtime(coherence_method)
         else:
             active_flip_method = "triangulation_exhaustive"
     if active_flip_method == "triangulation":
@@ -2094,6 +2096,7 @@ def build_ekf_2d_bundle(
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
+    support_coherence_method = support_coherence_method_for_runtime(coherence_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
     effective_fps = pose_effective_fps(pose_data, fps)
     use_runtime_flip_gate = bool(flip_left_right and flip_method == "ekf_prediction_gate")
@@ -2101,7 +2104,12 @@ def build_ekf_2d_bundle(
         raise ValueError(f"Unsupported ekf2d_3d_source: {ekf2d_3d_source}")
     if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"}:
         raise ValueError(f"Unsupported ekf2d_initial_state_method: {ekf2d_initial_state_method}")
-    if ekf2d_3d_source == "first_frame_only" and coherence_method not in {"epipolar", "epipolar_fast"}:
+    if ekf2d_3d_source == "first_frame_only" and coherence_method not in {
+        "epipolar",
+        "epipolar_fast",
+        "epipolar_framewise",
+        "epipolar_fast_framewise",
+    }:
         raise ValueError("ekf2d_3d_source=first_frame_only requires an epipolar coherence method.")
 
     pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
@@ -2109,7 +2117,7 @@ def build_ekf_2d_bundle(
             output_dir=output_dir,
             pose_data=pose_data,
             calibrations=calibrations,
-            coherence_method=coherence_method,
+            coherence_method=support_coherence_method,
             reprojection_threshold_px=reprojection_threshold_px,
             epipolar_threshold_px=epipolar_threshold_px,
             pose_data_mode=pose_data_mode,
@@ -2139,7 +2147,7 @@ def build_ekf_2d_bundle(
                 output_dir=output_dir,
                 pose_data=pose_data_used,
                 calibrations=calibrations,
-                coherence_method=coherence_method,
+                coherence_method=support_coherence_method,
                 triangulation_method=effective_triangulation_method,
                 reprojection_threshold_px=reprojection_threshold_px,
                 min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2152,6 +2160,8 @@ def build_ekf_2d_bundle(
                 pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
             )
         )
+        if reconstruction.coherence_method != coherence_method:
+            reconstruction = replace(reconstruction, coherence_method=coherence_method)
         save_legacy_triangulation(
             output_dir,
             reconstruction,
@@ -2172,7 +2182,7 @@ def build_ekf_2d_bundle(
             output_dir=output_dir,
             pose_data=pose_data_used,
             calibrations=calibrations,
-            coherence_method=coherence_method,
+            coherence_method=support_coherence_method,
             epipolar_threshold_px=epipolar_threshold_px,
             pose_data_mode=pose_data_mode,
             pose_filter_window=pose_filter_window,
@@ -2186,7 +2196,7 @@ def build_ekf_2d_bundle(
                 output_dir=output_dir,
                 pose_data=bootstrap_pose_data,
                 calibrations=calibrations,
-                coherence_method=coherence_method,
+                coherence_method=support_coherence_method,
                 triangulation_method=effective_triangulation_method,
                 reprojection_threshold_px=reprojection_threshold_px,
                 min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2252,6 +2262,7 @@ def build_ekf_2d_bundle(
         min_frame_coherence_for_update=min_frame_coherence_for_update,
         skip_low_coherence_updates=skip_low_coherence_updates,
         coherence_confidence_floor=coherence_confidence_floor,
+        epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
         method=ekf2d_initial_state_method,
         bootstrap_passes=ekf2d_bootstrap_passes,
@@ -2275,6 +2286,7 @@ def build_ekf_2d_bundle(
         min_frame_coherence_for_update=min_frame_coherence_for_update,
         skip_low_coherence_updates=skip_low_coherence_updates,
         coherence_confidence_floor=coherence_confidence_floor,
+        epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
         root_flight_dynamics=(predictor == "dyn"),
         flight_height_threshold_m=flight_height_threshold_m,

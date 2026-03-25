@@ -67,6 +67,8 @@ SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
     "epipolar_fast",
+    "epipolar_framewise",
+    "epipolar_fast_framewise",
     "triangulation",
     "triangulation_once",
     "triangulation_greedy",
@@ -380,7 +382,7 @@ def select_active_coherence(
 ) -> np.ndarray:
     """Selectionne le score de coherence actif selon la methode demandee."""
     coherence_method = canonical_coherence_method(coherence_method)
-    if coherence_method in {"epipolar", "epipolar_fast"}:
+    if coherence_method in {"epipolar", "epipolar_fast", "epipolar_framewise", "epipolar_fast_framewise"}:
         return np.array(epipolar_coherence, copy=True)
     if coherence_method in {"triangulation_once", "triangulation_greedy", "triangulation_exhaustive"}:
         return np.array(triangulation_coherence, copy=True)
@@ -416,9 +418,20 @@ def triangulation_method_from_coherence_method(
     """Return the triangulation variant required by the active coherence method."""
 
     normalized = canonical_coherence_method(coherence_method, triangulation_method)
-    if normalized in {"epipolar", "epipolar_fast"}:
+    if normalized in {"epipolar", "epipolar_fast", "epipolar_framewise", "epipolar_fast_framewise"}:
         return canonical_triangulation_method(triangulation_method)
     return normalized.replace("triangulation_", "", 1)
+
+
+def support_coherence_method_for_runtime(coherence_method: str) -> str:
+    """Map runtime framewise coherence methods to their sequence-wide support variant."""
+
+    normalized = canonical_coherence_method(coherence_method)
+    if normalized == "epipolar_framewise":
+        return "epipolar"
+    if normalized == "epipolar_fast_framewise":
+        return "epipolar_fast"
+    return normalized
 
 
 def smooth_valid_1d(values: np.ndarray, valid_mask: np.ndarray, window: int = 9) -> np.ndarray:
@@ -2354,6 +2367,88 @@ def compute_epipolar_coherence(
     return coherence
 
 
+def compute_epipolar_frame_coherence(
+    frame_keypoints: np.ndarray,
+    frame_scores: np.ndarray,
+    fundamental_matrices: dict[tuple[int, int], np.ndarray],
+    threshold_px: float,
+    *,
+    distance_mode: str = "sampson",
+) -> np.ndarray:
+    """Compute multiview epipolar coherence for a single frame.
+
+    This is the frame-local equivalent of :func:`compute_epipolar_coherence`.
+    It returns a `(n_keypoints, n_cams)` coherence array that can be used by
+    future runtime EKF logic without requiring a sequence-wide precompute.
+    """
+
+    frame_keypoints = np.asarray(frame_keypoints, dtype=float)
+    frame_scores = np.asarray(frame_scores, dtype=float)
+    if frame_keypoints.ndim != 3 or frame_keypoints.shape[-1] != 2:
+        raise ValueError("frame_keypoints must have shape (n_cams, n_keypoints, 2).")
+    if frame_scores.shape != frame_keypoints.shape[:2]:
+        raise ValueError("frame_scores must have shape (n_cams, n_keypoints).")
+
+    pose_data = PoseData(
+        camera_names=[str(index) for index in range(frame_keypoints.shape[0])],
+        frames=np.array([0], dtype=int),
+        keypoints=frame_keypoints[:, np.newaxis, :, :],
+        scores=frame_scores[:, np.newaxis, :],
+    )
+    coherence = compute_epipolar_coherence(
+        pose_data,
+        fundamental_matrices,
+        threshold_px,
+        distance_mode=distance_mode,
+    )
+    return coherence[0]
+
+
+def compute_epipolar_fast_frame_coherence(
+    frame_keypoints: np.ndarray,
+    frame_scores: np.ndarray,
+    fundamental_matrices: dict[tuple[int, int], np.ndarray],
+    threshold_px: float,
+) -> np.ndarray:
+    """Compute one-frame epipolar coherence with the symmetric distance."""
+
+    return compute_epipolar_frame_coherence(
+        frame_keypoints,
+        frame_scores,
+        fundamental_matrices,
+        threshold_px,
+        distance_mode="symmetric",
+    )
+
+
+def compute_framewise_epipolar_measurement_weights(
+    frame_keypoints: np.ndarray,
+    frame_scores: np.ndarray,
+    fundamental_matrices: dict[tuple[int, int], np.ndarray],
+    threshold_px: float,
+    *,
+    distance_mode: str = "sampson",
+    coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+    measurement_noise_scale: float = DEFAULT_MEASUREMENT_NOISE_SCALE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute frame-local coherence, effective confidences, and measurement variances."""
+
+    frame_coherence = compute_epipolar_frame_coherence(
+        frame_keypoints,
+        frame_scores,
+        fundamental_matrices,
+        threshold_px,
+        distance_mode=distance_mode,
+    )
+    frame_scores = np.asarray(frame_scores, dtype=float)
+    frame_coherence_cam_kp = np.transpose(frame_coherence, (1, 0))
+    blended_coherence = coherence_confidence_floor + (1.0 - coherence_confidence_floor) * frame_coherence_cam_kp
+    effective_confidences = frame_scores * blended_coherence
+    measurement_variances = measurement_noise_scale * (4.0 / np.maximum(effective_confidences, 1e-3)) ** 2
+    measurement_variances[effective_confidences <= 1e-3] = np.inf
+    return frame_coherence, effective_confidences, measurement_variances
+
+
 def triangulate_pose2sim_like(
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
@@ -3109,6 +3204,7 @@ class MultiViewKinematicEKF:
         min_frame_coherence_for_update: float = DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
         skip_low_coherence_updates: bool = False,
         coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+        epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
         enable_dof_locking: bool = False,
         root_flight_dynamics: bool = False,
         flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
@@ -3130,6 +3226,7 @@ class MultiViewKinematicEKF:
         self.min_frame_coherence_for_update = min_frame_coherence_for_update
         self.skip_low_coherence_updates = skip_low_coherence_updates
         self.coherence_confidence_floor = coherence_confidence_floor
+        self.epipolar_threshold_px = float(epipolar_threshold_px)
         self.enable_dof_locking = enable_dof_locking
         self.root_flight_dynamics = root_flight_dynamics
         self.flight_height_threshold_m = flight_height_threshold_m
@@ -3156,12 +3253,29 @@ class MultiViewKinematicEKF:
         self.marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in self.marker_pairs], dtype=int)
         self.camera_order = pose_data.camera_names
         self.camera_calibrations = [self.calibrations[cam_name] for cam_name in self.camera_order]
+        self.coherence_method = canonical_coherence_method(reconstruction.coherence_method)
+        self.use_framewise_coherence = self.coherence_method in {"epipolar_framewise", "epipolar_fast_framewise"}
+        self.framewise_epipolar_distance_mode = (
+            "symmetric" if self.coherence_method == "epipolar_fast_framewise" else "sampson"
+        )
+        self.framewise_fundamental_matrices = (
+            {
+                (i_cam, j_cam): fundamental_matrix(self.camera_calibrations[i_cam], self.camera_calibrations[j_cam])
+                for i_cam in range(len(self.camera_calibrations))
+                for j_cam in range(len(self.camera_calibrations))
+                if i_cam != j_cam
+            }
+            if self.use_framewise_coherence
+            else None
+        )
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
         self.locked_q_indices: set[int] = set()
         base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
         self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
-        self.multiview_coherence: np.ndarray | None = reconstruction.multiview_coherence
+        self.multiview_coherence: np.ndarray | None = (
+            None if self.use_framewise_coherence else reconstruction.multiview_coherence
+        )
         self.skip_correction_countdown = 0
         self.update_status = {
             "corrected": 0,
@@ -3197,6 +3311,11 @@ class MultiViewKinematicEKF:
     def _precompute_measurement_variances(self) -> tuple[np.ndarray, np.ndarray]:
         """Pre-calcule les poids et variances de mesure pour toute la sequence."""
         scores = np.asarray(self.pose_data.scores, dtype=float)
+        if self.use_framewise_coherence:
+            effective_confidences = scores
+            measurement_variances = self.measurement_noise_scale * (4.0 / np.maximum(effective_confidences, 1e-3)) ** 2
+            measurement_variances[effective_confidences <= 1e-3] = np.inf
+            return effective_confidences, measurement_variances
         if self.multiview_coherence is None:
             effective_confidences = scores
         else:
@@ -3209,6 +3328,25 @@ class MultiViewKinematicEKF:
         measurement_variances = self.measurement_noise_scale * (4.0 / np.maximum(effective_confidences, 1e-3)) ** 2
         measurement_variances[effective_confidences <= 1e-3] = np.inf
         return effective_confidences, measurement_variances
+
+    def _frame_measurement_inputs(self, frame_idx: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+        """Return frame-local coherence, effective confidences, and variances."""
+
+        if not self.use_framewise_coherence:
+            frame_coherence = None if self.multiview_coherence is None else self.multiview_coherence[frame_idx]
+            return frame_coherence, self.effective_confidences[:, frame_idx], self.measurement_variances[:, frame_idx]
+
+        assert self.framewise_fundamental_matrices is not None
+        frame_coherence, effective_confidences, measurement_variances = compute_framewise_epipolar_measurement_weights(
+            self.pose_data.keypoints[:, frame_idx],
+            self.pose_data.scores[:, frame_idx],
+            self.framewise_fundamental_matrices,
+            threshold_px=self.epipolar_threshold_px,
+            distance_mode=self.framewise_epipolar_distance_mode,
+            coherence_confidence_floor=self.coherence_confidence_floor,
+            measurement_noise_scale=self.measurement_noise_scale,
+        )
+        return frame_coherence, effective_confidences, measurement_variances
 
     def transition_matrix(self) -> np.ndarray:
         """Matrice d'etat du modele discret a acceleration constante."""
@@ -3375,8 +3513,11 @@ class MultiViewKinematicEKF:
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_cooldown"
 
-        if self.skip_low_coherence_updates and self.multiview_coherence is not None:
-            frame_coherence = self.multiview_coherence[frame_idx]
+        frame_coherence, _frame_effective_confidences, frame_measurement_variances = self._frame_measurement_inputs(
+            frame_idx
+        )
+
+        if self.skip_low_coherence_updates and frame_coherence is not None:
             valid_frame_coherence = frame_coherence[frame_coherence > 0]
             mean_frame_coherence = float(np.mean(valid_frame_coherence)) if valid_frame_coherence.size else 0.0
             if mean_frame_coherence < self.min_frame_coherence_for_update:
@@ -3414,7 +3555,7 @@ class MultiViewKinematicEKF:
 
         for cam_idx, calibration in enumerate(self.camera_calibrations):
             frame_keypoints = self.pose_data.keypoints[cam_idx, frame_idx]
-            frame_variances = self.measurement_variances[cam_idx, frame_idx]
+            frame_variances = frame_measurement_variances[cam_idx]
             valid_keypoints = (
                 np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_variances) & (frame_variances < np.inf)
             )
@@ -3800,6 +3941,7 @@ def initial_state_from_ekf_bootstrap(
     min_frame_coherence_for_update: float = DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     skip_low_coherence_updates: bool = False,
     coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+    epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
     enable_dof_locking: bool = False,
     passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     tolerance: float = 1e-6,
@@ -3850,6 +3992,7 @@ def initial_state_from_ekf_bootstrap(
         min_frame_coherence_for_update=min_frame_coherence_for_update,
         skip_low_coherence_updates=skip_low_coherence_updates,
         coherence_confidence_floor=coherence_confidence_floor,
+        epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
         root_flight_dynamics=False,
         flight_height_threshold_m=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
@@ -3906,6 +4049,7 @@ def initial_state_from_root_pose_bootstrap(
     min_frame_coherence_for_update: float = DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     skip_low_coherence_updates: bool = False,
     coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+    epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
     enable_dof_locking: bool = False,
     passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     flip_method: str | None = None,
@@ -3937,6 +4081,7 @@ def initial_state_from_root_pose_bootstrap(
             min_frame_coherence_for_update=min_frame_coherence_for_update,
             skip_low_coherence_updates=skip_low_coherence_updates,
             coherence_confidence_floor=coherence_confidence_floor,
+            epipolar_threshold_px=epipolar_threshold_px,
             enable_dof_locking=enable_dof_locking,
             passes=passes,
             flip_method=flip_method,
@@ -3958,6 +4103,7 @@ def initial_state_from_root_pose_bootstrap(
         min_frame_coherence_for_update=min_frame_coherence_for_update,
         skip_low_coherence_updates=skip_low_coherence_updates,
         coherence_confidence_floor=coherence_confidence_floor,
+        epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
         passes=passes,
         initial_state=root_seed_state,
@@ -3986,7 +4132,8 @@ def compute_ekf2d_initial_state(
     min_frame_coherence_for_update: float,
     skip_low_coherence_updates: bool,
     coherence_confidence_floor: float,
-    enable_dof_locking: bool,
+    epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    enable_dof_locking: bool = False,
     method: str = DEFAULT_EKF2D_INITIAL_STATE_METHOD,
     bootstrap_passes: int = DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     flip_method: str | None = None,
@@ -4021,6 +4168,7 @@ def compute_ekf2d_initial_state(
             min_frame_coherence_for_update=min_frame_coherence_for_update,
             skip_low_coherence_updates=skip_low_coherence_updates,
             coherence_confidence_floor=coherence_confidence_floor,
+            epipolar_threshold_px=epipolar_threshold_px,
             enable_dof_locking=enable_dof_locking,
             passes=bootstrap_passes,
             flip_method=flip_method,
@@ -4041,6 +4189,7 @@ def compute_ekf2d_initial_state(
             min_frame_coherence_for_update=min_frame_coherence_for_update,
             skip_low_coherence_updates=skip_low_coherence_updates,
             coherence_confidence_floor=coherence_confidence_floor,
+            epipolar_threshold_px=epipolar_threshold_px,
             enable_dof_locking=enable_dof_locking,
             passes=bootstrap_passes,
             flip_method=flip_method,
@@ -4063,6 +4212,7 @@ def run_ekf(
     min_frame_coherence_for_update: float = DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     skip_low_coherence_updates: bool = False,
     coherence_confidence_floor: float = DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
+    epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
     enable_dof_locking: bool = False,
     root_flight_dynamics: bool = False,
     flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
@@ -4102,6 +4252,7 @@ def run_ekf(
         min_frame_coherence_for_update=min_frame_coherence_for_update,
         skip_low_coherence_updates=skip_low_coherence_updates,
         coherence_confidence_floor=coherence_confidence_floor,
+        epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,

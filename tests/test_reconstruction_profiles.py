@@ -256,6 +256,21 @@ def test_validate_profile_accepts_epipolar_fast_coherence_and_flip_method():
     assert "flip_triangulation_greedy" in canonical_profile_name(profile)
 
 
+def test_validate_profile_accepts_framewise_epipolar_coherence_for_first_frame_only():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            ekf2d_3d_source="first_frame_only",
+            coherence_method="epipolar_fast_framewise",
+        )
+    )
+
+    assert profile.coherence_method == "epipolar_fast_framewise"
+    assert "coh_epipolar_fast_framewise" in canonical_profile_name(profile)
+
+
 def test_validate_profile_accepts_explicit_viterbi_flip_method():
     profile = validate_profile(
         ReconstructionProfile(
