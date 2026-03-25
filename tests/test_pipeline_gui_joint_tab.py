@@ -9,7 +9,11 @@ import pipeline_gui
 
 
 class _FakeAxis:
-    def plot(self, *_args, **_kwargs):
+    def __init__(self):
+        self.plots = []
+
+    def plot(self, *_args, **kwargs):
+        self.plots.append(kwargs)
         return None
 
     def set_title(self, *_args, **_kwargs):
@@ -123,3 +127,63 @@ def test_joint_kinematics_sync_dataset_dir_only_refreshes(monkeypatch):
     pipeline_gui.JointKinematicsTab.sync_dataset_dir(tab)
 
     assert calls == ["refresh"]
+
+
+def test_joint_kinematics_pair_selection_triggers_refresh():
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+    calls = []
+    tab.refresh_plot = lambda: calls.append("refresh")
+
+    pipeline_gui.JointKinematicsTab._on_pair_selection_changed(tab)
+
+    assert calls == ["refresh"]
+
+
+def test_joint_kinematics_uses_reconstruction_colors_and_side_styles(monkeypatch):
+    axis = _FakeAxis()
+    bundle = {
+        "q_names": np.asarray(["LEFT_KNEE:RotY", "RIGHT_KNEE:RotY"], dtype=object),
+        "recon_q": {"demo": np.column_stack((np.linspace(0.0, 1.0, 20), np.linspace(1.0, 0.0, 20)))},
+        "recon_qdot": {"demo": np.zeros((20, 2), dtype=float)},
+    }
+
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        shared_reconstruction_selection=["demo"],
+    )
+    tab.pair_list = _FakeListbox(["Knee"], [0])
+    tab.figure = _FakeFigure()
+    tab.figure.subplots = lambda *_args, **_kwargs: axis
+    tab.canvas = _FakeCanvas()
+    tab.quantity = SimpleNamespace(get=lambda: "q")
+    tab.fd_qdot_var = SimpleNamespace(get=lambda: False)
+    tab.bundle = None
+    tab.q_names = np.array([], dtype=object)
+    tab._show_empty_plot = lambda _message: (_ for _ in ()).throw(AssertionError("unexpected empty plot"))
+
+    monkeypatch.setattr(pipeline_gui, "get_cached_preview_bundle", lambda *_args, **_kwargs: bundle)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: "output/1_partie_0429")
+    monkeypatch.setattr(pipeline_gui, "bundle_available_reconstruction_names", lambda *_args, **_kwargs: ["demo"])
+    monkeypatch.setattr(
+        pipeline_gui, "pair_dof_names", lambda _q_names: [("Knee", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY")]
+    )
+    monkeypatch.setattr(pipeline_gui, "reconstruction_display_color", lambda _state, _name: "#123456")
+    monkeypatch.setattr(pipeline_gui, "reconstruction_legend_label", lambda _state, _name: "7")
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showerror",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected GUI error")),
+    )
+
+    pipeline_gui.JointKinematicsTab.refresh_plot(tab)
+
+    assert len(axis.plots) == 2
+    assert axis.plots[0]["color"] == "#123456"
+    assert axis.plots[0]["linestyle"] == "-"
+    assert axis.plots[0]["marker"] == "o"
+    assert axis.plots[0]["label"] == "7 | L"
+    assert axis.plots[1]["color"] == "#123456"
+    assert axis.plots[1]["linestyle"] == "--"
+    assert axis.plots[1]["marker"] == "s"
+    assert axis.plots[1]["label"] == "7 | R"

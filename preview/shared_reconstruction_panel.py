@@ -55,16 +55,18 @@ class SharedReconstructionPanel(ttk.Frame):
 
         self.tree = ttk.Treeview(
             self,
-            columns=("label", "family", "frames", "reproj", "path"),
+            columns=("index", "label", "family", "frames", "reproj", "path"),
             show="headings",
             height=5,
             selectmode="extended",
         )
+        self.tree.heading("index", text="#")
         self.tree.heading("label", text="Reconstruction")
         self.tree.heading("family", text="Family")
         self.tree.heading("frames", text="Frames")
         self.tree.heading("reproj", text="Reproj (px)")
         self.tree.heading("path", text="Path")
+        self.tree.column("index", width=42, anchor="center", stretch=False)
         self.tree.column("label", width=240, anchor="w")
         self.tree.column("family", width=90, anchor="w")
         self.tree.column("frames", width=70, anchor="w")
@@ -104,7 +106,7 @@ class SharedReconstructionPanel(ttk.Frame):
             for item in self.tree.get_children():
                 self.tree.delete(item)
             row_names = []
-            for row in rows:
+            for row_idx, row in enumerate(rows, start=1):
                 name = str(row.get("name", ""))
                 if not name:
                     continue
@@ -115,6 +117,7 @@ class SharedReconstructionPanel(ttk.Frame):
                     "end",
                     iid=name,
                     values=(
+                        str(row_idx),
                         str(row.get("label", name)),
                         str(row.get("family", "-")),
                         row.get("frames", "-"),
@@ -150,7 +153,7 @@ class SharedReconstructionPanel(ttk.Frame):
         try:
             for item in self.tree.get_children():
                 self.tree.delete(item)
-            self.tree.insert("", "end", iid="__placeholder__", values=(message, "-", "-", "-", "-"))
+            self.tree.insert("", "end", iid="__placeholder__", values=("", message, "-", "-", "-", "-"))
             self.tree.selection_remove(self.tree.selection())
         finally:
             self._suspend_selection_callback = False
