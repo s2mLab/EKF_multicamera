@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 
 outputs/
+output/
 
 Archive.zip
 *.mat
