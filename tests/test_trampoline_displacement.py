@@ -9,6 +9,7 @@ from judging.trampoline_displacement import (
     Y_MAX,
     analyze_trampoline_contacts,
     contact_segments_between_jumps,
+    judged_trampoline_zone_xy,
     total_trampoline_penalty,
     trampoline_geometry_from_reference,
     trampoline_penalty_refined,
@@ -40,6 +41,20 @@ def test_trampoline_penalty_refined_matches_expected_zones():
     assert trampoline_penalty_refined(0.5 * (X_INNER + X_MAX), 0.0) == 0.1
     assert trampoline_penalty_refined(0.0, 0.5 * (Y_INNER + Y_MAX)) == 0.1
     assert trampoline_penalty_refined(0.5 * (X_INNER + X_MAX), 0.5 * (Y_INNER + Y_MAX)) == 0.3
+
+
+def test_judged_trampoline_zone_xy_returns_zone_rectangle_for_each_penalty_region():
+    center_zone = judged_trampoline_zone_xy(0.0, 0.0)
+    side_zone = judged_trampoline_zone_xy(0.5 * (X_INNER + X_MAX), 0.0)
+    corner_zone = judged_trampoline_zone_xy(0.5 * (X_INNER + X_MAX), 0.5 * (Y_INNER + Y_MAX))
+
+    np.testing.assert_allclose(
+        center_zone, [[-X_INNER, -Y_INNER], [X_INNER, -Y_INNER], [X_INNER, Y_INNER], [-X_INNER, Y_INNER]]
+    )
+    np.testing.assert_allclose(
+        side_zone, [[X_INNER, -Y_INNER], [X_MAX, -Y_INNER], [X_MAX, Y_INNER], [X_INNER, Y_INNER]]
+    )
+    np.testing.assert_allclose(corner_zone, [[X_INNER, Y_INNER], [X_MAX, Y_INNER], [X_MAX, Y_MAX], [X_INNER, Y_MAX]])
 
 
 def test_trampoline_geometry_is_centered_and_contains_expected_markers():

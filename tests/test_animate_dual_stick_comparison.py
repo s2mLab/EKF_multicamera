@@ -1,14 +1,13 @@
 import numpy as np
 
 from animation.animate_dual_stick_comparison import (
-    BED_X_MAX,
-    BED_Y_MAX,
     KP_INDEX,
     compute_axis_limits,
     compute_frame_axis_limits,
     init_artists,
     trampoline_contact_zone_xy,
 )
+from judging.trampoline_displacement import X_INNER, X_MAX, Y_INNER
 
 
 def test_compute_frame_axis_limits_uses_only_current_frame():
@@ -36,19 +35,19 @@ def test_compute_frame_axis_limits_uses_only_current_frame():
     assert frame_limits == compute_axis_limits(recon_points["a"][0:1], recon_points["b"][0:1])
 
 
-def test_trampoline_contact_zone_xy_wraps_visible_ankles_and_clips_to_bed():
+def test_trampoline_contact_zone_xy_returns_the_strongest_judged_zone():
     frame_points = np.full((17, 3), np.nan, dtype=float)
-    frame_points[KP_INDEX["left_ankle"]] = [-BED_X_MAX - 1.0, -0.10, 1.2]
-    frame_points[KP_INDEX["right_ankle"]] = [0.25, BED_Y_MAX + 1.0, 1.2]
+    frame_points[KP_INDEX["left_ankle"]] = [0.0, 0.0, 1.2]
+    frame_points[KP_INDEX["right_ankle"]] = [0.5 * (X_INNER + X_MAX), 0.0, 1.2]
 
-    polygon_xy = trampoline_contact_zone_xy([frame_points], padding_m=0.05)
+    polygon_xy = trampoline_contact_zone_xy([frame_points])
 
     assert polygon_xy is not None
     assert polygon_xy.shape == (4, 2)
-    assert np.all(polygon_xy[:, 0] >= -BED_X_MAX)
-    assert np.all(polygon_xy[:, 0] <= BED_X_MAX)
-    assert np.all(polygon_xy[:, 1] >= -BED_Y_MAX)
-    assert np.all(polygon_xy[:, 1] <= BED_Y_MAX)
+    np.testing.assert_allclose(
+        polygon_xy,
+        [[X_INNER, -Y_INNER], [X_MAX, -Y_INNER], [X_MAX, Y_INNER], [X_INNER, Y_INNER]],
+    )
 
 
 class _FakeLine:

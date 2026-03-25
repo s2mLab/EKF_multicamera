@@ -115,6 +115,50 @@ def trampoline_penalty_refined(x: float, y: float) -> float:
     return 0.2
 
 
+def judged_trampoline_zone_xy(x: float, y: float) -> np.ndarray | None:
+    """Return the judged trampoline rectangle containing one contact point."""
+
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    x = float(x)
+    y = float(y)
+    if abs(x) > X_MAX or abs(y) > Y_MAX:
+        return None
+    if abs(x) <= X_INNER and abs(y) <= Y_INNER:
+        min_x, max_x = -X_INNER, X_INNER
+        min_y, max_y = -Y_INNER, Y_INNER
+    elif abs(x) <= X_INNER:
+        min_x, max_x = -X_INNER, X_INNER
+        if y >= 0.0:
+            min_y, max_y = Y_INNER, Y_MAX
+        else:
+            min_y, max_y = -Y_MAX, -Y_INNER
+    elif abs(y) <= Y_INNER:
+        min_y, max_y = -Y_INNER, Y_INNER
+        if x >= 0.0:
+            min_x, max_x = X_INNER, X_MAX
+        else:
+            min_x, max_x = -X_MAX, -X_INNER
+    else:
+        if x >= 0.0:
+            min_x, max_x = X_INNER, X_MAX
+        else:
+            min_x, max_x = -X_MAX, -X_INNER
+        if y >= 0.0:
+            min_y, max_y = Y_INNER, Y_MAX
+        else:
+            min_y, max_y = -Y_MAX, -Y_INNER
+    return np.array(
+        [
+            [min_x, min_y],
+            [max_x, min_y],
+            [max_x, max_y],
+            [min_x, max_y],
+        ],
+        dtype=float,
+    )
+
+
 def contact_segments_between_jumps(session: DDSessionAnalysis) -> list[tuple[int, int]]:
     """Return the contact intervals located between consecutive DD jumps."""
 

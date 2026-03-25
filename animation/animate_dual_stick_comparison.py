@@ -32,7 +32,17 @@ import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from judging.trampoline_displacement import BED_X_MAX, BED_Y_MAX, TRAMPOLINE_GEOMETRY, X_MAX, Y_MAX
+from judging.trampoline_displacement import (
+    BED_X_MAX,
+    BED_Y_MAX,
+    TRAMPOLINE_GEOMETRY,
+    X_INNER,
+    X_MAX,
+    Y_INNER,
+    Y_MAX,
+    judged_trampoline_zone_xy,
+    trampoline_penalty_refined,
+)
 from reconstruction.reconstruction_dataset import (
     align_array_to_frames,
     load_bundle_entries,
@@ -471,9 +481,20 @@ def draw_trampoline_bed(ax, z_level: float) -> None:
         ],
         dtype=float,
     )
+    inner_rect = np.array(
+        [
+            [-X_INNER, -Y_INNER, z_level],
+            [X_INNER, -Y_INNER, z_level],
+            [X_INNER, Y_INNER, z_level],
+            [-X_INNER, Y_INNER, z_level],
+            [-X_INNER, -Y_INNER, z_level],
+        ],
+        dtype=float,
+    )
     cross = TRAMPOLINE_GEOMETRY.cross
     ax.plot(outer[:, 0], outer[:, 1], outer[:, 2], color="#2b6cb0", linewidth=1.8, alpha=0.45)
     ax.plot(big_rect[:, 0], big_rect[:, 1], big_rect[:, 2], color="#b56576", linewidth=1.2, alpha=0.35)
+    ax.plot(inner_rect[:, 0], inner_rect[:, 1], inner_rect[:, 2], color="#b56576", linewidth=1.0, alpha=0.30)
     ax.plot(
         [cross["left"][0], cross["right"][0]],
         [cross["left"][1], cross["right"][1]],
@@ -492,35 +513,22 @@ def draw_trampoline_bed(ax, z_level: float) -> None:
     )
 
 
-def trampoline_contact_zone_xy(frame_points_list: list[np.ndarray], padding_m: float = 0.08) -> np.ndarray | None:
-    """Return a rectangular foot-contact zone projected onto the trampoline bed."""
+def trampoline_contact_zone_xy(frame_points_list: list[np.ndarray]) -> np.ndarray | None:
+    """Return the judged trampoline zone associated with the strongest visible foot contact."""
 
-    foot_xy_samples: list[np.ndarray] = []
+    best_penalty = -1.0
+    best_xy: tuple[float, float] | None = None
     for frame_points in frame_points_list:
         for kp_name in ("left_ankle", "right_ankle"):
             point = np.asarray(frame_points[KP_INDEX[kp_name]], dtype=float)
             if np.all(np.isfinite(point[:2])):
-                foot_xy_samples.append(point[:2])
-    if not foot_xy_samples:
+                penalty = trampoline_penalty_refined(float(point[0]), float(point[1]))
+                if np.isfinite(penalty) and penalty >= best_penalty:
+                    best_penalty = float(penalty)
+                    best_xy = (float(point[0]), float(point[1]))
+    if best_xy is None:
         return None
-    foot_xy = np.asarray(foot_xy_samples, dtype=float)
-    min_xy = np.nanmin(foot_xy, axis=0) - float(padding_m)
-    max_xy = np.nanmax(foot_xy, axis=0) + float(padding_m)
-    min_xy[0] = max(min_xy[0], -BED_X_MAX)
-    min_xy[1] = max(min_xy[1], -BED_Y_MAX)
-    max_xy[0] = min(max_xy[0], BED_X_MAX)
-    max_xy[1] = min(max_xy[1], BED_Y_MAX)
-    if np.any(max_xy <= min_xy):
-        return None
-    return np.array(
-        [
-            [min_xy[0], min_xy[1]],
-            [max_xy[0], min_xy[1]],
-            [max_xy[0], max_xy[1]],
-            [min_xy[0], max_xy[1]],
-        ],
-        dtype=float,
-    )
+    return judged_trampoline_zone_xy(*best_xy)
 
 
 def draw_trampoline_contact_zone(ax, polygon_xy: np.ndarray | None, z_level: float) -> Poly3DCollection | None:
