@@ -64,6 +64,55 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
     return compute_time_seconds(summary)
 
 
+def model_compute_seconds(summary: dict[str, object]) -> float | None:
+    """Return the wall time spent in the model-creation stage for this run."""
+
+    stage_timings = dict(parse_stage_timings(summary))
+    stage_time = _coerce_float(stage_timings.get("model_creation_s"))
+    if stage_time is not None:
+        return stage_time
+
+    pipeline = summary.get("pipeline_timing")
+    if isinstance(pipeline, dict):
+        stages = pipeline.get("stages")
+        if isinstance(stages, list):
+            total = 0.0
+            used = False
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                if str(stage.get("id", "")) != "model_creation":
+                    continue
+                value = stage_compute_time(stage)
+                if value is None:
+                    continue
+                total += value
+                used = True
+            if used:
+                return total
+    return None
+
+
+def reconstruction_run_seconds(summary: dict[str, object]) -> float | None:
+    """Return current-run reconstruction time excluding model creation."""
+
+    stage_timings = dict(parse_stage_timings(summary))
+    total_s = _coerce_float(stage_timings.get("total_s"))
+    model_s = _coerce_float(stage_timings.get("model_creation_s"))
+    if total_s is not None:
+        if model_s is None:
+            return total_s
+        return max(0.0, total_s - model_s)
+
+    total = objective_total_seconds(summary)
+    if total is None:
+        return None
+    model_s = model_compute_seconds(summary)
+    if model_s is None:
+        return total
+    return max(0.0, total - model_s)
+
+
 def current_run_seconds(summary: dict[str, object]) -> float | None:
     """Return the wall time spent by the current run, excluding prior cached work."""
 
@@ -176,6 +225,8 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
 
     pipeline_stages = parse_timing_trace(summary)
     objective_time = objective_total_seconds(summary)
+    model_time = model_compute_seconds(summary)
+    reconstruction_time = reconstruction_run_seconds(summary)
     current_time = current_run_seconds(summary)
     lines = [
         f"Name: {summary.get('name', '-')}",
@@ -185,6 +236,8 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
         f"Effective FPS: {summary.get('fps', '-')}",
         f"Sequence duration: {format_seconds_brief(_coerce_float(summary.get('duration_s')))}",
         f"Objective compute time: {format_seconds_brief(objective_time)}",
+        f"Reconstruction time (excl. model): {format_seconds_brief(reconstruction_time)}",
+        f"Model time: {format_seconds_brief(model_time)}",
     ]
     source_path = summary.get("source")
     if isinstance(source_path, str) and source_path.strip():
