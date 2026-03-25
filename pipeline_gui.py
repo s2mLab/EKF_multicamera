@@ -4339,6 +4339,7 @@ class DataExplorer2DTab(ttk.Frame):
 
     def clean_trial_outputs(self) -> None:
         dataset_dir = current_dataset_dir(self.state)
+        trial_name = current_dataset_name(self.state)
         if not dataset_dir.exists():
             messagebox.showinfo(
                 "Clean trial outputs", f"No outputs found for this dataset:\n{display_path(dataset_dir)}"
@@ -4346,9 +4347,10 @@ class DataExplorer2DTab(ttk.Frame):
             return
         confirmed = messagebox.askyesno(
             "Clean trial outputs",
-            "Delete all generated outputs for the current dataset?\n\n"
+            f"Delete all generated outputs for trial '{trial_name}'?\n\n"
             f"{display_path(dataset_dir)}\n\n"
-            "This will remove models, reconstructions, figures, caches, and generated files for this trial.",
+            "This will remove models, reconstructions, figures, caches, and generated files for this trial.\n\n"
+            "This action cannot be undone.",
             icon=messagebox.WARNING,
         )
         if not confirmed:
@@ -4359,6 +4361,10 @@ class DataExplorer2DTab(ttk.Frame):
             self.state.calibration_cache.clear()
             self.state.notify_reconstructions_updated()
             self.update_dataset_summary()
+            panel = getattr(self.state, "shared_reconstruction_panel", None)
+            refresh_callback = getattr(panel, "_refresh_callback", None)
+            if callable(refresh_callback):
+                self.after_idle(refresh_callback)
             messagebox.showinfo("Clean trial outputs", f"Deleted outputs for:\n{display_path(dataset_dir)}")
         except Exception as exc:
             messagebox.showerror("Clean trial outputs", str(exc))

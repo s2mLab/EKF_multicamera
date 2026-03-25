@@ -3,6 +3,31 @@ from types import SimpleNamespace
 
 import pipeline_gui
 from preview.dataset_preview_state import DatasetPreviewState
+from preview.shared_reconstruction_panel import SharedReconstructionPanel
+
+
+class _FakeTree:
+    def __init__(self):
+        self.rows = {}
+        self._selection = ()
+
+    def get_children(self, _root=""):
+        return tuple(self.rows.keys())
+
+    def delete(self, item):
+        self.rows.pop(item, None)
+
+    def insert(self, _parent, _where, iid, values):
+        self.rows[iid] = tuple(values)
+
+    def selection_set(self, selection):
+        self._selection = tuple(selection)
+
+    def selection(self):
+        return self._selection
+
+    def exists(self, name):
+        return name in self.rows
 
 
 def test_normalize_pose_correction_mode_accepts_epipolar_fast():
@@ -71,6 +96,58 @@ def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_sta
     assert output_dir == Path("outputs/demo")
     assert loaded_bundle is bundle
     assert loaded_preview_state is preview_state
+
+
+def test_reconstruction_legend_label_uses_shared_panel_order():
+    tree = SimpleNamespace(get_children=lambda _root="": ("recon_b", "recon_a", "__placeholder__"))
+    panel = SimpleNamespace(tree=tree)
+    state = SimpleNamespace(shared_reconstruction_panel=panel, shared_reconstruction_selection=[])
+
+    assert pipeline_gui.reconstruction_legend_label(state, "recon_b") == "1"
+    assert pipeline_gui.reconstruction_legend_label(state, "recon_a") == "2"
+
+
+def test_reconstruction_display_color_uses_shared_panel_order():
+    tree = SimpleNamespace(get_children=lambda _root="": ("recon_b", "recon_a"))
+    panel = SimpleNamespace(tree=tree)
+    state = SimpleNamespace(shared_reconstruction_panel=panel, shared_reconstruction_selection=[])
+
+    assert pipeline_gui.reconstruction_display_color(state, "recon_b") == "#4c72b0"
+    assert pipeline_gui.reconstruction_display_color(state, "recon_a") == "#dd8452"
+
+
+def test_reconstruction_legend_label_falls_back_to_reconstruction_name_without_panel_order():
+    state = SimpleNamespace(shared_reconstruction_panel=None, shared_reconstruction_selection=[])
+
+    assert pipeline_gui.reconstruction_legend_label(state, "pose2sim") == "Pose2Sim"
+
+
+def test_reconstruction_display_color_falls_back_without_panel_order():
+    state = SimpleNamespace(shared_reconstruction_panel=None, shared_reconstruction_selection=[])
+
+    assert pipeline_gui.reconstruction_display_color(state, "pose2sim") == pipeline_gui.reconstruction_color("pose2sim")
+
+
+def test_shared_reconstruction_panel_prepends_numeric_index_column():
+    panel = SharedReconstructionPanel.__new__(SharedReconstructionPanel)
+    panel.tree = _FakeTree()
+    panel._default_names = []
+    panel._selection_callback = None
+    panel._refresh_callback = None
+    panel._suspend_selection_callback = False
+    panel.state = SimpleNamespace(set_shared_reconstruction_selection=lambda _names: None)
+
+    SharedReconstructionPanel.set_rows(
+        panel,
+        rows=[
+            {"name": "recon_b", "label": "B", "family": "ekf_2d", "frames": 12, "reproj_mean": 1.2, "path": "/b"},
+            {"name": "recon_a", "label": "A", "family": "pose2sim", "frames": 8, "reproj_mean": 2.3, "path": "/a"},
+        ],
+        default_names=["recon_b"],
+    )
+
+    assert panel.tree.rows["recon_b"][0] == "1"
+    assert panel.tree.rows["recon_a"][0] == "2"
 
 
 def test_infer_pose2sim_trc_from_keypoints_uses_inputs_trc_folder(tmp_path, monkeypatch):
@@ -246,3 +323,70 @@ def test_model_tab_on_command_success_refreshes_existing_models():
     pipeline_gui.ModelTab.on_command_success(tab)
 
     assert calls == ["refresh"]
+
+
+def test_clean_trial_outputs_aborts_when_confirmation_is_declined(monkeypatch, tmp_path):
+    tab = pipeline_gui.DataExplorer2DTab.__new__(pipeline_gui.DataExplorer2DTab)
+    tab.state = SimpleNamespace(
+        pose_data_cache={("demo",): object()},
+        calibration_cache={"demo": object()},
+        notify_reconstructions_updated=lambda: None,
+    )
+    tab.update_dataset_summary = lambda: None
+    dataset_dir = tmp_path / "output" / "trial"
+    dataset_dir.mkdir(parents=True)
+    shown_messages = []
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: dataset_dir)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_name", lambda _state: "trial")
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "askyesno",
+        lambda title, message, icon=None: shown_messages.append((title, message, icon)) or False,
+    )
+
+    pipeline_gui.DataExplorer2DTab.clean_trial_outputs(tab)
+
+    assert dataset_dir.exists()
+    assert shown_messages
+    assert "trial 'trial'" in shown_messages[0][1]
+    assert "cannot be undone" in shown_messages[0][1]
+
+
+def test_clean_trial_outputs_deletes_dataset_after_confirmation(monkeypatch, tmp_path):
+    notifications = []
+    summaries = []
+    refreshes = []
+    tab = pipeline_gui.DataExplorer2DTab.__new__(pipeline_gui.DataExplorer2DTab)
+    tab.state = SimpleNamespace(
+        pose_data_cache={("demo",): object()},
+        calibration_cache={"demo": object()},
+        notify_reconstructions_updated=lambda: notifications.append("updated"),
+        shared_reconstruction_panel=SimpleNamespace(_refresh_callback=lambda: refreshes.append("refresh")),
+    )
+    tab.update_dataset_summary = lambda: summaries.append("summary")
+    tab.after_idle = lambda callback: callback()
+    dataset_dir = tmp_path / "output" / "trial"
+    dataset_dir.mkdir(parents=True)
+    info_messages = []
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: dataset_dir)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_name", lambda _state: "trial")
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui.messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showinfo",
+        lambda title, message: info_messages.append((title, message)),
+    )
+
+    pipeline_gui.DataExplorer2DTab.clean_trial_outputs(tab)
+
+    assert not dataset_dir.exists()
+    assert tab.state.pose_data_cache == {}
+    assert tab.state.calibration_cache == {}
+    assert notifications == ["updated"]
+    assert summaries == ["summary"]
+    assert refreshes == ["refresh"]
+    assert info_messages
