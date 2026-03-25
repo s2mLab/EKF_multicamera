@@ -93,6 +93,39 @@ def test_analyze_dd_session_ignores_first_frames_and_keeps_only_complete_jumps()
     assert analysis.jump_segments[0].end < len(height) - 1
 
 
+def test_analyze_dd_session_threshold_ignores_null_prefix_before_analysis_window():
+    fps = 10.0
+    root_q = np.zeros((80, 6), dtype=float)
+    height = np.ones(80, dtype=float) * 1.2
+    # Null prefix would collapse the relative threshold if we looked at the full sequence.
+    height[:10] = 0.0
+    # Two contact valleys and one final incomplete jump.
+    height[12:20] = 2.8
+    height[20:24] = 1.15
+    height[24:34] = 2.7
+    height[34:38] = 1.18
+    height[38:48] = 2.9
+    height[48:52] = 1.16
+    height[52:79] = 2.6
+    root_q[:, 2] = height
+
+    analysis = analyze_dd_session(
+        root_q,
+        fps,
+        height_values=height,
+        smoothing_window_s=0.0,
+        min_airtime_s=0.2,
+        min_gap_s=0.0,
+        min_peak_prominence_m=0.2,
+        contact_window_s=0.2,
+        analysis_start_frame=10,
+        require_complete_jumps=True,
+    )
+
+    assert analysis.height_threshold >= 1.5
+    assert len(analysis.jump_segments) == 2
+
+
 def test_body_shape_phase_masks_separate_grouped_and_piked_frames():
     hip_curve = np.deg2rad(np.array([30.0, 80.0, 85.0, 90.0]))
     knee_curve = np.deg2rad(np.array([10.0, 85.0, 15.0, 5.0]))
