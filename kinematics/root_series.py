@@ -9,12 +9,12 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from reconstruction.reconstruction_bundle import extract_root_from_points
 from kinematics.root_kinematics import (
     ROOT_Q_NAMES,
     ROOT_ROTATION_SLICE,
-    TRUNK_ROTATION_NAMES,
+    TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
+    TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
     build_root_rotation_matrices,
     centered_finite_difference,
@@ -23,6 +23,7 @@ from kinematics.root_kinematics import (
     rotation_unit_label,
     rotation_unit_scale,
 )
+from reconstruction.reconstruction_bundle import extract_root_from_points
 
 
 def quantity_unit_label(quantity: str, family_is_translation: bool, rotation_unit: str) -> str:
@@ -175,7 +176,7 @@ def root_rotation_matrices_from_series(
     for frame_idx, angles in enumerate(root_q[:, ROOT_ROTATION_SLICE]):
         if not np.all(np.isfinite(angles)):
             continue
-        matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, angles, degrees=False).as_matrix()
+        matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, angles, degrees=False).as_matrix()
         if initial_rotation_matrix is not None:
             matrix = initial_rotation_matrix @ matrix
         matrices[frame_idx] = matrix

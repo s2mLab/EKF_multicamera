@@ -2,7 +2,8 @@ from pathlib import Path
 
 import numpy as np
 
-from reconstruction.reconstruction_bundle import parse_trc_points
+from reconstruction.reconstruction_bundle import parse_trc_points, root_kinematics_from_trc
+from reconstruction.reconstruction_dataset import write_trc_root_kinematics_sidecar
 
 
 def _write_trc(path: Path, marker_row: str, data_row: str) -> Path:
@@ -52,3 +53,30 @@ def test_parse_trc_points_accepts_exported_marker_names_with_underscores(tmp_pat
     assert data_rate == 120.0
     np.testing.assert_allclose(points_3d[0, 11], np.array([0.4, 0.5, 0.6], dtype=float))
     np.testing.assert_allclose(points_3d[0, 6], np.array([1.3, 1.4, 1.5], dtype=float))
+
+
+def test_root_kinematics_from_trc_prefers_exported_sidecar(tmp_path: Path):
+    trc_path = _write_trc(
+        tmp_path / "export_style.trc",
+        "Frame#\tTime\tleft_hip\tright_hip\tleft_shoulder\tright_shoulder",
+        "0\t0.0\t0.4\t0.5\t0.6\t0.7\t0.8\t0.9\t1.0\t1.1\t1.2\t1.3\t1.4\t1.5",
+    )
+    frames, time_s, points_3d, _ = parse_trc_points(trc_path)
+    q_root = np.array([[1.0, 2.0, 3.0, 0.1, 0.2, 0.3]], dtype=float)
+    qdot_root = np.array([[4.0, 5.0, 6.0, 0.4, 0.5, 0.6]], dtype=float)
+    write_trc_root_kinematics_sidecar(trc_path, q_root, qdot_root, frames, time_s)
+
+    resolved_q_root, resolved_qdot_root, correction_applied, source = root_kinematics_from_trc(
+        trc_path,
+        frames=frames,
+        time_s=time_s,
+        points_3d=points_3d,
+        fps=120.0,
+        initial_rotation_correction=True,
+        unwrap_root=False,
+    )
+
+    np.testing.assert_allclose(resolved_q_root, q_root)
+    np.testing.assert_allclose(resolved_qdot_root, qdot_root)
+    assert correction_applied is True
+    assert source == "trc_root_kinematics_sidecar"

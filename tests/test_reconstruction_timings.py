@@ -101,3 +101,20 @@ def test_format_reconstruction_timing_details_uses_pipeline_trace_when_present()
     assert "Current run wall time: 0.40 s" in details
     assert "2D cleaning [cache] -> Triangulation -> EKF 2D" in details
     assert "cache: /tmp/p" in details
+
+
+def test_format_reconstruction_timing_details_shows_trc_source_details():
+    source_path = "output/1_partie_0429/reconstructions/pose2sim_rotfix/markers_from_q.trc"
+    summary = {
+        "name": "pose2sim_rotfix",
+        "family": "pose2sim",
+        "source": source_path,
+        "trc_rate_hz": 120.0,
+        "n_frames": 1746,
+        "fps": 120.0,
+        "duration_s": 14.55,
+        "stage_timings_s": {"total_s": 0.75},
+    }
+    details = format_reconstruction_timing_details(summary)
+    assert f"Source file: {source_path}" in details
+    assert "TRC rate: 120.00 Hz" in details

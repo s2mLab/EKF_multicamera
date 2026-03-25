@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from kinematics.root_kinematics import TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE
 from kinematics.root_series import (
     quantity_unit_label,
     root_axis_labels,
@@ -11,7 +12,6 @@ from kinematics.root_series import (
     root_series_from_q,
     scale_root_series_rotations,
 )
-from kinematics.root_kinematics import TRUNK_ROOT_ROTATION_SEQUENCE
 
 
 def test_root_series_from_q_uses_precomputed_qdot_when_requested():
@@ -80,7 +80,7 @@ def test_root_rotation_matrices_from_series_can_apply_initial_trunk_rotation():
     expected = (
         Rotation.from_euler("z", alpha, degrees=False).as_matrix()
         @ Rotation.from_euler(
-            TRUNK_ROOT_ROTATION_SEQUENCE,
+            TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
             q_equiv[0, 3:6],
             degrees=False,
         ).as_matrix()
@@ -99,7 +99,7 @@ def test_root_rotation_matrices_from_points_can_keep_or_remove_alpha_correction(
     total_rotation = (
         Rotation.from_euler("z", alpha, degrees=False).as_matrix()
         @ Rotation.from_euler(
-            TRUNK_ROOT_ROTATION_SEQUENCE,
+            TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
             q_equiv,
             degrees=False,
         ).as_matrix()
@@ -114,7 +114,7 @@ def test_root_rotation_matrices_from_points_can_keep_or_remove_alpha_correction(
     np.testing.assert_allclose(raw_matrices[0], total_rotation, atol=1e-12)
     np.testing.assert_allclose(
         corrected_matrices[0],
-        Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, q_equiv, degrees=False).as_matrix(),
+        Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, q_equiv, degrees=False).as_matrix(),
         atol=1e-12,
     )
 

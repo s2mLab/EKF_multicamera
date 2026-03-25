@@ -338,3 +338,67 @@ def write_trc_file(
         lines.append("\t".join(row))
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path
+
+
+def trc_root_kinematics_sidecar_path(trc_path: Path) -> Path:
+    """Return the sidecar path used to persist root kinematics alongside one TRC."""
+
+    trc_path = Path(trc_path)
+    return trc_path.with_name(f"{trc_path.stem}_root_kinematics.npz")
+
+
+def write_trc_root_kinematics_sidecar(
+    trc_path: Path,
+    q_root: np.ndarray,
+    qdot_root: np.ndarray,
+    frames: np.ndarray,
+    time_s: np.ndarray,
+) -> Path:
+    """Persist exported root kinematics next to one TRC file.
+
+    The sidecar is used when a TRC generated from model coordinates is later
+    re-imported as a ``TRC file`` reconstruction. In that case, reusing the
+    original root DoFs yields an exact round-trip, whereas re-extracting the
+    root geometrically from markers only gives an approximation.
+    """
+
+    q_root = np.asarray(q_root, dtype=float)
+    qdot_root = np.asarray(qdot_root, dtype=float)
+    frames = np.asarray(frames, dtype=int)
+    time_s = np.asarray(time_s, dtype=float)
+    if q_root.ndim != 2 or q_root.shape[1] != 6:
+        raise ValueError("q_root must have shape (n_frames, 6).")
+    if qdot_root.shape != q_root.shape:
+        raise ValueError("qdot_root must match q_root shape.")
+    if q_root.shape[0] != len(frames) or q_root.shape[0] != len(time_s):
+        raise ValueError("frames/time_s length must match q_root length.")
+
+    output_path = trc_root_kinematics_sidecar_path(trc_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, q_root=q_root, qdot_root=qdot_root, frames=frames, time_s=time_s)
+    return output_path
+
+
+def load_trc_root_kinematics_sidecar(trc_path: Path) -> dict[str, np.ndarray] | None:
+    """Load the optional root-kinematics sidecar written next to one TRC export."""
+
+    sidecar_path = trc_root_kinematics_sidecar_path(trc_path)
+    if not sidecar_path.exists():
+        return None
+    data = np.load(sidecar_path, allow_pickle=False)
+    q_root = np.asarray(data["q_root"], dtype=float)
+    qdot_root = np.asarray(data["qdot_root"], dtype=float)
+    frames = np.asarray(data["frames"], dtype=int)
+    time_s = np.asarray(data["time_s"], dtype=float)
+    if q_root.ndim != 2 or q_root.shape[1] != 6:
+        return None
+    if qdot_root.shape != q_root.shape:
+        return None
+    if q_root.shape[0] != len(frames) or q_root.shape[0] != len(time_s):
+        return None
+    return {
+        "q_root": q_root,
+        "qdot_root": qdot_root,
+        "frames": frames,
+        "time_s": time_s,
+    }

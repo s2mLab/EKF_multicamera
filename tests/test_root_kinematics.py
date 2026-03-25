@@ -5,6 +5,7 @@ from scipy.spatial.transform import Rotation
 
 from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
+    TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
     centered_finite_difference,
@@ -41,8 +42,8 @@ def test_reextract_euler_with_gaps_preserves_rotation_and_nans():
     assert np.all(np.isnan(result[2]))
     valid = np.where(np.all(np.isfinite(rotations), axis=1))[0]
     for frame_idx in valid:
-        original_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, rotations[frame_idx]).as_matrix()
-        result_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, result[frame_idx]).as_matrix()
+        original_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, rotations[frame_idx]).as_matrix()
+        result_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, result[frame_idx]).as_matrix()
         np.testing.assert_allclose(result_matrix, original_matrix, atol=1e-12)
 
 
@@ -131,7 +132,7 @@ def test_compute_trunk_dofs_from_points_uses_yxz_sequence():
     base_points[0, 12] = [0.0, -1.0, 0.0]
     base_points[0, 5] = [0.0, 1.0, 1.0]
     base_points[0, 6] = [0.0, -1.0, 1.0]
-    matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SEQUENCE, [0.25, 0.0, 0.0]).as_matrix()
+    matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, [0.25, 0.0, 0.0]).as_matrix()
     rotated_points = np.array(base_points, copy=True)
     for kp_idx in (11, 12, 5, 6):
         rotated_points[0, kp_idx] = matrix @ base_points[0, kp_idx]
@@ -166,16 +167,39 @@ def test_extract_root_from_points_removes_model_rotfix_before_euler_extraction()
     base_points[0, 6] = [0.0, -1.0, 1.0]
     q_equiv = np.array([0.2, -0.1, 0.3], dtype=float)
     alpha = math.pi
-    total_rotation = Rotation.from_euler("z", alpha, degrees=False).as_matrix() @ Rotation.from_euler(
-        TRUNK_ROOT_ROTATION_SEQUENCE,
-        q_equiv,
-        degrees=False,
-    ).as_matrix()
+    total_rotation = (
+        Rotation.from_euler("z", alpha, degrees=False).as_matrix()
+        @ Rotation.from_euler(
+            TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
+            q_equiv,
+            degrees=False,
+        ).as_matrix()
+    )
     rotated_points = np.array(base_points, copy=True)
     for kp_idx in (11, 12, 5, 6):
         rotated_points[0, kp_idx] = total_rotation @ base_points[0, kp_idx]
     root_q, correction_applied = extract_root_from_points(rotated_points, True, False)
     assert correction_applied is True
+    np.testing.assert_allclose(root_q[0, ROOT_ROTATION_SLICE], q_equiv, atol=1e-12)
+
+
+def test_extract_root_from_points_matches_intrinsic_trunk_q_convention():
+    base_points = np.full((1, 17, 3), np.nan, dtype=float)
+    base_points[0, 11] = [0.0, 1.0, 0.0]
+    base_points[0, 12] = [0.0, -1.0, 0.0]
+    base_points[0, 5] = [0.0, 1.0, 1.0]
+    base_points[0, 6] = [0.0, -1.0, 1.0]
+    root_translation = np.array([0.8, -0.2, 2.3], dtype=float)
+    q_equiv = np.array([-1.1, 0.2, -3.05], dtype=float)
+    rotation_matrix = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, q_equiv, degrees=False).as_matrix()
+    rotated_points = np.array(base_points, copy=True)
+    for kp_idx in (11, 12, 5, 6):
+        rotated_points[0, kp_idx] = rotation_matrix @ base_points[0, kp_idx] + root_translation
+
+    root_q, correction_applied = extract_root_from_points(rotated_points, False, False)
+
+    assert correction_applied is False
+    np.testing.assert_allclose(root_q[0, :3], root_translation, atol=1e-12)
     np.testing.assert_allclose(root_q[0, ROOT_ROTATION_SLICE], q_equiv, atol=1e-12)
 
 

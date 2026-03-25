@@ -2,7 +2,11 @@ from pathlib import Path
 
 import numpy as np
 
-from reconstruction.reconstruction_dataset import write_trc_file
+from reconstruction.reconstruction_dataset import (
+    load_trc_root_kinematics_sidecar,
+    write_trc_file,
+    write_trc_root_kinematics_sidecar,
+)
 
 
 def test_write_trc_file_outputs_expected_marker_layout(tmp_path: Path):
@@ -34,3 +38,21 @@ def test_write_trc_file_outputs_expected_marker_layout(tmp_path: Path):
     assert lines[5].startswith("10\t0.00000000")
     assert "0.10000000" in lines[5]
     assert lines[6].startswith("11\t0.00833333")
+
+
+def test_trc_root_kinematics_sidecar_roundtrip(tmp_path: Path):
+    trc_path = tmp_path / "markers_from_q.trc"
+    q_root = np.arange(12, dtype=float).reshape(2, 6)
+    qdot_root = q_root + 0.5
+    frames = np.array([3, 4], dtype=int)
+    time_s = np.array([0.0, 1.0 / 120.0], dtype=float)
+
+    output_path = write_trc_root_kinematics_sidecar(trc_path, q_root, qdot_root, frames, time_s)
+    loaded = load_trc_root_kinematics_sidecar(trc_path)
+
+    assert output_path.exists()
+    assert loaded is not None
+    np.testing.assert_allclose(loaded["q_root"], q_root)
+    np.testing.assert_allclose(loaded["qdot_root"], qdot_root)
+    np.testing.assert_array_equal(loaded["frames"], frames)
+    np.testing.assert_allclose(loaded["time_s"], time_s)

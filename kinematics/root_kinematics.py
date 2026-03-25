@@ -8,10 +8,10 @@ import math
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-
 TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
 TRUNK_ROTATION_NAMES = ["TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ"]
 TRUNK_ROOT_ROTATION_SEQUENCE = "yxz"
+TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE = TRUNK_ROOT_ROTATION_SEQUENCE.upper()
 ROOT_Q_NAMES = np.asarray(TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES, dtype=object)
 # Shared slices avoid hard-coded root DoF indexing across the codebase.
 ROOT_TRANSLATION_SLICE = slice(0, len(TRUNK_TRANSLATION_NAMES))
@@ -48,10 +48,17 @@ def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
     return unwrapped[:, 0] if squeeze else unwrapped
 
 
+def scipy_intrinsic_sequence(sequence: str) -> str:
+    """Map one bioMod Euler sequence to SciPy's intrinsic-sequence notation."""
+
+    return str(sequence).upper()
+
+
 def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str = TRUNK_ROOT_ROTATION_SEQUENCE) -> np.ndarray:
     """Re-extract Euler angles frame by frame without bridging missing segments."""
 
     array = np.asarray(rotations, dtype=float)
+    scipy_sequence = scipy_intrinsic_sequence(sequence)
     reextracted = np.full_like(array, np.nan, dtype=float)
     valid_idx = np.flatnonzero(np.all(np.isfinite(array), axis=1))
     if valid_idx.size == 0:
@@ -59,8 +66,8 @@ def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str = TRUNK_ROOT_
     split_points = np.where(np.diff(valid_idx) > 1)[0] + 1
     for segment in np.split(valid_idx, split_points):
         for frame_idx in segment:
-            rotation_matrix = Rotation.from_euler(sequence, array[frame_idx], degrees=False).as_matrix()
-            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(sequence, degrees=False)
+            rotation_matrix = Rotation.from_euler(scipy_sequence, array[frame_idx], degrees=False).as_matrix()
+            reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(scipy_sequence, degrees=False)
     return reextracted
 
 
@@ -93,7 +100,9 @@ def build_root_rotation_matrices(
         shoulder_center = 0.5 * (left_shoulder[frame_idx] + right_shoulder[frame_idx])
         # The trunk frame uses z = longitudinal, y = medio-lateral, x = antero-posterior.
         z_axis = normalize(shoulder_center - hip_center)
-        y_seed = 0.5 * ((left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx]))
+        y_seed = 0.5 * (
+            (left_hip[frame_idx] - right_hip[frame_idx]) + (left_shoulder[frame_idx] - right_shoulder[frame_idx])
+        )
         y_axis_seed = normalize(y_seed)
         x_axis = normalize(np.cross(y_axis_seed, z_axis))
         y_axis = normalize(np.cross(z_axis, x_axis))
@@ -157,7 +166,10 @@ def compute_trunk_dofs_from_points(points_3d: np.ndarray, unwrap_rotations: bool
     for frame_idx in range(points_3d.shape[0]):
         matrix = rotation_matrices[frame_idx]
         if np.all(np.isfinite(matrix)):
-            rotations_xyz[frame_idx] = Rotation.from_matrix(matrix).as_euler(TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False)
+            rotations_xyz[frame_idx] = Rotation.from_matrix(matrix).as_euler(
+                TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
+                degrees=False,
+            )
     if unwrap_rotations:
         rotations_xyz = unwrap_with_gaps(rotations_xyz)
     return np.hstack((translations, rotations_xyz))
@@ -177,7 +189,9 @@ def extract_root_from_q(
         if str(dof_name) in name_to_index:
             root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
     if renormalize_rotations:
-        root_q[:, ROOT_ROTATION_SLICE] = reextract_euler_with_gaps(root_q[:, ROOT_ROTATION_SLICE], TRUNK_ROOT_ROTATION_SEQUENCE)
+        root_q[:, ROOT_ROTATION_SLICE] = reextract_euler_with_gaps(
+            root_q[:, ROOT_ROTATION_SLICE], TRUNK_ROOT_ROTATION_SEQUENCE
+        )
     if unwrap_rotations:
         root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
     return root_q

@@ -186,6 +186,12 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
         f"Sequence duration: {format_seconds_brief(_coerce_float(summary.get('duration_s')))}",
         f"Objective compute time: {format_seconds_brief(objective_time)}",
     ]
+    source_path = summary.get("source")
+    if isinstance(source_path, str) and source_path.strip():
+        lines.append(f"Source file: {source_path}")
+    trc_rate_hz = _coerce_float(summary.get("trc_rate_hz"))
+    if trc_rate_hz is not None:
+        lines.append(f"TRC rate: {trc_rate_hz:.2f} Hz")
     if current_time is not None:
         lines.append(f"Current run wall time: {format_seconds_brief(current_time)}")
 
@@ -204,9 +210,8 @@ def format_reconstruction_timing_details(summary: dict[str, object]) -> str:
             source = str(stage.get("source", "computed_now"))
             cache_path = stage.get("cache_path")
             suffix = " [cache]" if source == "cache" else ""
-            lines.append(
-                f"  - {stage.get('label', humanize_stage_name(str(stage.get('id', ''))))}: {format_seconds_brief(value)}{suffix}"
-            )
+            label = stage.get("label", humanize_stage_name(str(stage.get("id", ""))))
+            lines.append(f"  - {label}: {format_seconds_brief(value)}{suffix}")
             if cache_path:
                 lines.append(f"      cache: {cache_path}")
     else:

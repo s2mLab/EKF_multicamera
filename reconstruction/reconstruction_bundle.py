@@ -18,6 +18,7 @@ from scipy.spatial.transform import Rotation
 from kinematics.root_kinematics import (
     ROOT_Q_NAMES,
     ROOT_ROTATION_SLICE,
+    TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     build_root_rotation_matrices,
     centered_finite_difference,
@@ -26,6 +27,7 @@ from kinematics.root_kinematics import (
     root_z_correction_angle_from_points,
     unwrap_with_gaps,
 )
+from reconstruction.reconstruction_dataset import load_trc_root_kinematics_sidecar
 from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
 from reconstruction.reconstruction_timings import make_timing_stage
 from vitpose_ekf_pipeline import (
@@ -1014,12 +1016,52 @@ def extract_root_from_points(
         if correction_applied:
             matrix = Rotation.from_euler("z", -correction_angle, degrees=False).as_matrix() @ matrix
         root_q[frame_idx, ROOT_ROTATION_SLICE] = Rotation.from_matrix(matrix).as_euler(
-            TRUNK_ROOT_ROTATION_SEQUENCE, degrees=False
+            TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE,
+            degrees=False,
         )
 
     if unwrap_rotations:
         root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
     return root_q, correction_applied
+
+
+def root_kinematics_from_trc(
+    trc_path: Path,
+    *,
+    frames: np.ndarray,
+    time_s: np.ndarray,
+    points_3d: np.ndarray,
+    fps: float,
+    initial_rotation_correction: bool,
+    unwrap_root: bool,
+) -> tuple[np.ndarray, np.ndarray, bool, str]:
+    """Resolve root kinematics for one imported TRC file.
+
+    When the TRC comes from the local ``Export TRC from q`` workflow, an
+    optional sidecar stores the exact root trajectory. Reusing it keeps the
+    round-trip consistent with the original EKF reconstruction. Generic TRC
+    files still fall back to geometric root extraction from the marker cloud.
+    """
+
+    sidecar = load_trc_root_kinematics_sidecar(trc_path)
+    if sidecar is not None:
+        sidecar_frames = np.asarray(sidecar["frames"], dtype=int)
+        sidecar_time_s = np.asarray(sidecar["time_s"], dtype=float)
+        if np.array_equal(sidecar_frames, np.asarray(frames, dtype=int)) and np.allclose(
+            sidecar_time_s,
+            np.asarray(time_s, dtype=float),
+            equal_nan=True,
+        ):
+            return (
+                np.asarray(sidecar["q_root"], dtype=float),
+                np.asarray(sidecar["qdot_root"], dtype=float),
+                bool(initial_rotation_correction),
+                "trc_root_kinematics_sidecar",
+            )
+
+    q_root, correction_applied = extract_root_from_points(points_3d, initial_rotation_correction, unwrap_root)
+    qdot_root = centered_finite_difference(q_root, 1.0 / fps)
+    return q_root, qdot_root, correction_applied, "geometric_trc_markers"
 
 
 def align_points_to_frames(points_3d: np.ndarray, point_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
@@ -1372,8 +1414,15 @@ def build_pose2sim_bundle(
     print_step(2, 2, "TRC file import + export bundle")
     t0 = time.perf_counter()
     frames, time_s, points_3d, trc_rate = parse_trc_points(pose2sim_trc)
-    q_root, correction_applied = extract_root_from_points(points_3d, initial_rotation_correction, unwrap_root)
-    qdot_root = centered_finite_difference(q_root, 1.0 / fps)
+    q_root, qdot_root, correction_applied, root_kinematics_source = root_kinematics_from_trc(
+        pose2sim_trc,
+        frames=frames,
+        time_s=time_s,
+        points_3d=points_3d,
+        fps=fps,
+        initial_rotation_correction=initial_rotation_correction,
+        unwrap_root=unwrap_root,
+    )
     reprojection_errors = compute_points_reprojection_error_per_view(points_3d, frames, calibrations, pose_data)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
     correction_angle = root_z_correction_angle_from_points(
@@ -1400,6 +1449,7 @@ def build_pose2sim_bundle(
         "source": str(pose2sim_trc),
         "fps": float(fps),
         "trc_rate_hz": float(trc_rate),
+        "root_kinematics_source": root_kinematics_source,
         "n_frames": int(len(frames)),
         "duration_s": duration_from_time(time_s),
         "initial_rotation_correction_requested": bool(initial_rotation_correction),
