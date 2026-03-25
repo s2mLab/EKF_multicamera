@@ -143,6 +143,47 @@ def dd_reference_status_color(comparison: DDReferenceComparison) -> str:
     }.get(comparison.status, "neutral")
 
 
+def format_detected_dd_code_with_inline_errors(expected_code: str | None, detected_code: str | None) -> str:
+    """Format one detected DD code with inline mismatch markers.
+
+    Treeview cells cannot color individual characters. We therefore keep the
+    compact detected code and wrap mismatching characters in square brackets so
+    the table still points to the faulty parts without duplicating the
+    reference code.
+    """
+
+    if not expected_code:
+        return str(detected_code or "-")
+    comparisons = compare_dd_code_characters(expected_code, detected_code)
+    if not comparisons:
+        return str(detected_code or "-")
+    parts: list[str] = []
+    for item in comparisons:
+        if item.detected_char == "_":
+            parts.append("[_]")
+        elif item.matches:
+            parts.append(item.detected_char)
+        else:
+            parts.append(f"[{item.detected_char}]")
+    return "".join(parts)
+
+
+def format_detected_dd_codes_with_inline_errors(comparison: DDReferenceComparison) -> str:
+    """Format the per-jump detected DD codes with compact inline mismatch markers."""
+
+    if not comparison.detected_codes:
+        return "-"
+    if not comparison.expected_codes:
+        return " | ".join(comparison.detected_codes)
+    count = max(len(comparison.expected_codes), len(comparison.detected_codes))
+    formatted_codes = []
+    for jump_idx in range(count):
+        expected_code = comparison.expected_codes[jump_idx] if jump_idx < len(comparison.expected_codes) else None
+        detected_code = comparison.detected_codes[jump_idx] if jump_idx < len(comparison.detected_codes) else None
+        formatted_codes.append(format_detected_dd_code_with_inline_errors(expected_code, detected_code))
+    return " | ".join(formatted_codes)
+
+
 def jump_list_label(index: int, jump: DDJumpAnalysis) -> str:
     """Build the compact label shown in the DD jump list."""
 

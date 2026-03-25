@@ -8,6 +8,8 @@ from judging.dd_presenter import (
     dd_reference_status_color,
     dd_reference_status_text,
     format_dd_summary,
+    format_detected_dd_code_with_inline_errors,
+    format_detected_dd_codes_with_inline_errors,
     jump_list_label,
     jump_list_label_with_reference,
     split_dd_code,
@@ -147,3 +149,30 @@ def test_compare_dd_code_characters_marks_only_the_wrong_role_characters():
         ("twist", "1", "2", False),
         ("body", "o", "/", False),
     ]
+
+
+def test_format_detected_dd_code_with_inline_errors_marks_only_detected_mismatches():
+    assert format_detected_dd_code_with_inline_errors("821o", "812/") == "8[1][2][/]"
+
+
+def test_format_detected_dd_codes_with_inline_errors_joins_jump_codes_without_expected_column():
+    comparison = compare_dd_to_reference(
+        DDSessionAnalysis(
+            root_q=np.zeros((80, 6)),
+            height=np.linspace(1.0, 2.0, 80),
+            smoothed_height=np.linspace(1.0, 2.0, 80),
+            height_threshold=1.4,
+            airborne_regions=[(12, 25), (42, 55)],
+            jump_segments=[JumpSegment(start=10, end=30, peak_index=20), JumpSegment(start=40, end=60, peak_index=50)],
+            jumps=[
+                DDJumpAnalysis(
+                    **{**make_jump().__dict__, "code": "821o", "segment": JumpSegment(start=10, end=30, peak_index=20)}
+                ),
+                DDJumpAnalysis(
+                    **{**make_jump().__dict__, "code": "42/", "segment": JumpSegment(start=40, end=60, peak_index=50)}
+                ),
+            ],
+        ),
+        {1: "821o", 2: "43/"},
+    )
+    assert format_detected_dd_codes_with_inline_errors(comparison) == "821o | 4[2]/"
