@@ -55,7 +55,7 @@ class SharedReconstructionPanel(ttk.Frame):
 
         self.tree = ttk.Treeview(
             self,
-            columns=("index", "label", "family", "frames", "reproj", "path"),
+            columns=("index", "label", "family", "frames", "recon_time", "model_time", "reproj", "path"),
             show="headings",
             height=5,
             selectmode="extended",
@@ -64,14 +64,18 @@ class SharedReconstructionPanel(ttk.Frame):
         self.tree.heading("label", text="Reconstruction")
         self.tree.heading("family", text="Family")
         self.tree.heading("frames", text="Frames")
+        self.tree.heading("recon_time", text="Recon (s)")
+        self.tree.heading("model_time", text="Model (s)")
         self.tree.heading("reproj", text="Reproj (px)")
         self.tree.heading("path", text="Path")
         self.tree.column("index", width=42, anchor="center", stretch=False)
         self.tree.column("label", width=240, anchor="w")
         self.tree.column("family", width=90, anchor="w")
         self.tree.column("frames", width=70, anchor="w")
+        self.tree.column("recon_time", width=80, anchor="w", stretch=False)
+        self.tree.column("model_time", width=80, anchor="w", stretch=False)
         self.tree.column("reproj", width=95, anchor="w")
-        self.tree.column("path", width=540, anchor="w")
+        self.tree.column("path", width=380, anchor="w")
         self.tree.pack(fill=tk.X, expand=False, padx=8, pady=(0, 6))
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
         if tooltip_fn is not None:
@@ -112,6 +116,8 @@ class SharedReconstructionPanel(ttk.Frame):
                     continue
                 row_names.append(name)
                 reproj_mean = row.get("reproj_mean")
+                recon_compute_s = row.get("compute_s")
+                model_compute_s = row.get("model_compute_s")
                 row_family = str(row.get("family", "-"))
                 row_index = "" if name == "raw" or row_family == "2d" else str(row_idx)
                 self.tree.insert(
@@ -123,6 +129,8 @@ class SharedReconstructionPanel(ttk.Frame):
                         str(row.get("label", name)),
                         row_family,
                         row.get("frames", "-"),
+                        "-" if recon_compute_s is None else f"{float(recon_compute_s):.2f}",
+                        "-" if model_compute_s is None else f"{float(model_compute_s):.2f}",
                         "-" if reproj_mean is None else f"{float(reproj_mean):.2f}",
                         str(row.get("path", "")),
                     ),
@@ -155,7 +163,7 @@ class SharedReconstructionPanel(ttk.Frame):
         try:
             for item in self.tree.get_children():
                 self.tree.delete(item)
-            self.tree.insert("", "end", iid="__placeholder__", values=("", message, "-", "-", "-", "-"))
+            self.tree.insert("", "end", iid="__placeholder__", values=("", message, "-", "-", "-", "-", "-", "-"))
             self.tree.selection_remove(self.tree.selection())
         finally:
             self._suspend_selection_callback = False

@@ -6150,9 +6150,21 @@ class ProfilesTab(CommandTab):
             state="readonly",
         )
         ekf3d_init_box.pack(side=tk.LEFT, padx=(0, 8))
-        self.biorbd_noise = LabeledEntry(self.ekf3d_frame, "EKF3D noise", "1e-8")
+        self.biorbd_noise = LabeledEntry(
+            self.ekf3d_frame,
+            "EKF3D noise",
+            "1e-8",
+            label_width=10,
+            entry_width=6,
+        )
         self.biorbd_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.biorbd_error = LabeledEntry(self.ekf3d_frame, "EKF3D error", "1e-4")
+        self.biorbd_error = LabeledEntry(
+            self.ekf3d_frame,
+            "EKF3D error",
+            "1e-4",
+            label_width=10,
+            entry_width=6,
+        )
         self.biorbd_error.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf_model_frame = ttk.Frame(self.profile_source_row)
@@ -6785,12 +6797,6 @@ class ReconstructionsTab(CommandTab):
 
         form = ttk.LabelFrame(self.main, text="Lancer les reconstructions depuis les profils")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
-
-        info = ttk.Label(
-            form,
-            text="Les options détaillées se règlent dans l'onglet Profiles. Ici on choisit simplement quoi lancer et on inspecte les caches du dataset courant.",
-        )
-        info.pack(fill=tk.X, padx=8, pady=(4, 6))
 
         controls = ttk.Frame(form)
         controls.pack(fill=tk.X, padx=8, pady=6)
