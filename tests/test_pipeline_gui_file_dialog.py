@@ -283,6 +283,15 @@ class _FakeEntryField:
         self._value = str(value)
 
 
+class _FakeCombobox:
+    def __init__(self):
+        self.values = ()
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self.values = tuple(kwargs["values"])
+
+
 def test_model_tab_sync_frame_range_defaults_uses_available_2d_bounds(monkeypatch):
     tab = pipeline_gui.ModelTab.__new__(pipeline_gui.ModelTab)
     tab.frame_start = _FakeEntryField("")
@@ -323,6 +332,32 @@ def test_model_tab_on_command_success_refreshes_existing_models():
     pipeline_gui.ModelTab.on_command_success(tab)
 
     assert calls == ["refresh"]
+
+
+def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(monkeypatch):
+    model_dir = Path("output/1_partie_0429/models/model_demo")
+    biomod_path = model_dir / "model_demo.bioMod"
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.state = SimpleNamespace()
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.ekf_model_var = SimpleNamespace(get=lambda: "auto", set=lambda value: setattr(tab, "_selected_model", value))
+    tab.ekf_model_box = _FakeCombobox()
+    tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
+    tab._profile_model_choices = {"auto": None}
+    tab.sync_profile_name = lambda: None
+    tab._selected_model = "auto"
+    tab._model_info = ""
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/1_partie_0429"))
+    monkeypatch.setattr(pipeline_gui, "scan_model_dirs", lambda _dataset_dir: [model_dir])
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [biomod_path] if self == model_dir else [])
+
+    pipeline_gui.ProfilesTab.refresh_profile_model_choices(tab)
+
+    assert tab.ekf_model_box.values == ("auto", str(biomod_path))
+    assert tab._profile_model_choices[str(biomod_path)] == str(biomod_path)
+    assert tab._model_info == "auto-build model from current 2D data (slower)"
 
 
 def test_clean_trial_outputs_aborts_when_confirmation_is_declined(monkeypatch, tmp_path):

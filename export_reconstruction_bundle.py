@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
     parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
+    parser.add_argument("--biomod", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
         "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
@@ -252,6 +253,7 @@ def main() -> None:
             biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
             biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
+            biomod_path=args.biomod,
         )
     else:
         build_ekf_2d_bundle(
@@ -298,6 +300,7 @@ def main() -> None:
             skip_low_coherence_updates=args.skip_low_coherence_updates,
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
+            biomod_path=args.biomod,
         )
 
     print(f"Bundle ecrit dans {args.output_dir}", flush=True)

@@ -79,6 +79,19 @@ def test_canonical_profile_name_includes_ekf3d_root_pose_flag():
     assert canonical_profile_name(profile) == "ekf_3d_rootq0"
 
 
+def test_canonical_profile_name_includes_selected_model_stem_for_ekf_profiles():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+        )
+    )
+
+    assert canonical_profile_name(profile).startswith("ekf_2d_mdl_model_demo_acc")
+
+
 def test_build_pipeline_command_includes_ekf3d_init_method():
     profile = validate_profile(
         ReconstructionProfile(
@@ -97,6 +110,29 @@ def test_build_pipeline_command_includes_ekf3d_init_method():
     )
     assert "--biorbd-kalman-init-method" in cmd
     assert cmd[cmd.index("--biorbd-kalman-init-method") + 1] == "root_pose_zero_rest"
+
+
+def test_build_pipeline_command_includes_selected_biomod_for_ekf_profiles():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_existing_model",
+            family="ekf_2d",
+            predictor="acc",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--biomod" in cmd
+    assert cmd[cmd.index("--biomod") + 1] == "output/1_partie_0429/models/model_demo/model_demo.bioMod"
 
 
 def test_build_pipeline_command_includes_frame_stride():

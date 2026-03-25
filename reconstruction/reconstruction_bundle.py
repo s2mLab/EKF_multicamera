@@ -1763,6 +1763,7 @@ def build_ekf_3d_bundle(
     biorbd_kalman_noise_factor: float,
     biorbd_kalman_error_factor: float,
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
+    biomod_path: Path | None = None,
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -1834,22 +1835,33 @@ def build_ekf_3d_bundle(
     )
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
-    lengths, biomod_cache_path, model_cache_path, _, model_compute_time_s, model_source = load_or_build_model_cache(
-        output_dir=output_dir,
-        reconstruction=reconstruction,
-        reconstruction_cache_path=reconstruction_cache_path,
-        fps=effective_fps,
-        subject_mass_kg=subject_mass_kg,
-        initial_rotation_correction=initial_rotation_correction,
-        lengths_mode="full_triangulation",
-    )
-    biomod_path = output_dir / "vitpose_chain.bioMod"
-    shutil.copy2(biomod_cache_path, biomod_path)
+    selected_biomod_path = None if biomod_path is None else Path(biomod_path)
+    output_biomod_path = output_dir / "vitpose_chain.bioMod"
+    if selected_biomod_path is not None:
+        if not selected_biomod_path.exists():
+            raise FileNotFoundError(f"Selected bioMod not found: {selected_biomod_path}")
+        shutil.copy2(selected_biomod_path, output_biomod_path)
+        model_cache_path = selected_biomod_path
+        model_compute_time_s = 0.0
+        model_source = "provided"
+    else:
+        _lengths, biomod_cache_path, model_cache_path, _, model_compute_time_s, model_source = (
+            load_or_build_model_cache(
+                output_dir=output_dir,
+                reconstruction=reconstruction,
+                reconstruction_cache_path=reconstruction_cache_path,
+                fps=effective_fps,
+                subject_mass_kg=subject_mass_kg,
+                initial_rotation_correction=initial_rotation_correction,
+                lengths_mode="full_triangulation",
+            )
+        )
+        shutil.copy2(biomod_cache_path, output_biomod_path)
     model_s = time.perf_counter() - model_start
 
     import biorbd
 
-    model = biorbd.Model(str(biomod_path))
+    model = biorbd.Model(str(output_biomod_path))
     print_step(4, 5, "EKF 3D")
     ekf3d_start = time.perf_counter()
     result = run_biorbd_marker_kalman_with_parameters(
@@ -1964,6 +1976,7 @@ def build_ekf_3d_bundle(
             "model": str(model_cache_path),
             **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
+        "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
             "error_factor": float(biorbd_kalman_error_factor),
@@ -2065,6 +2078,7 @@ def build_ekf_2d_bundle(
     skip_low_coherence_updates: bool,
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
+    biomod_path: Path | None = None,
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2185,24 +2199,34 @@ def build_ekf_2d_bundle(
 
     print_step(3, 5, "Model creation")
     model_start = time.perf_counter()
-    lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx, model_compute_time_s, model_source = (
-        load_or_build_model_cache(
-            output_dir=output_dir,
-            reconstruction=reconstruction,
-            reconstruction_cache_path=reconstruction_cache_path,
-            fps=effective_fps,
-            subject_mass_kg=subject_mass_kg,
-            initial_rotation_correction=initial_rotation_correction,
-            lengths_mode=ekf2d_3d_source,
+    selected_biomod_path = None if biomod_path is None else Path(biomod_path)
+    output_biomod_path = output_dir / "vitpose_chain.bioMod"
+    if selected_biomod_path is not None:
+        if not selected_biomod_path.exists():
+            raise FileNotFoundError(f"Selected bioMod not found: {selected_biomod_path}")
+        shutil.copy2(selected_biomod_path, output_biomod_path)
+        model_cache_path = selected_biomod_path
+        model_bootstrap_frame_idx = 0
+        model_compute_time_s = 0.0
+        model_source = "provided"
+    else:
+        _lengths, biomod_cache_path, model_cache_path, model_bootstrap_frame_idx, model_compute_time_s, model_source = (
+            load_or_build_model_cache(
+                output_dir=output_dir,
+                reconstruction=reconstruction,
+                reconstruction_cache_path=reconstruction_cache_path,
+                fps=effective_fps,
+                subject_mass_kg=subject_mass_kg,
+                initial_rotation_correction=initial_rotation_correction,
+                lengths_mode=ekf2d_3d_source,
+            )
         )
-    )
-    biomod_path = output_dir / "vitpose_chain.bioMod"
-    shutil.copy2(biomod_cache_path, biomod_path)
+        shutil.copy2(biomod_cache_path, output_biomod_path)
     model_s = time.perf_counter() - model_start
 
     import biorbd
 
-    model = biorbd.Model(str(biomod_path))
+    model = biorbd.Model(str(output_biomod_path))
     initial_state_start = time.perf_counter()
     initial_state, initial_state_diagnostics = compute_ekf2d_initial_state(
         model=model,
@@ -2455,6 +2479,7 @@ def build_ekf_2d_bundle(
             "model": str(model_cache_path),
             **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
+        "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),

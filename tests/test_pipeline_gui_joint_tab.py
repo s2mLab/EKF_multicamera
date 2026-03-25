@@ -11,9 +11,10 @@ import pipeline_gui
 class _FakeAxis:
     def __init__(self):
         self.plots = []
+        self.ylabel = None
 
-    def plot(self, *_args, **kwargs):
-        self.plots.append(kwargs)
+    def plot(self, *args, **kwargs):
+        self.plots.append({"args": args, "kwargs": kwargs})
         return None
 
     def set_title(self, *_args, **_kwargs):
@@ -22,7 +23,8 @@ class _FakeAxis:
     def grid(self, *_args, **_kwargs):
         return None
 
-    def set_ylabel(self, *_args, **_kwargs):
+    def set_ylabel(self, value, **_kwargs):
+        self.ylabel = value
         return None
 
     def set_xlabel(self, *_args, **_kwargs):
@@ -95,6 +97,7 @@ def test_joint_kinematics_refresh_plot_does_not_repopulate_rows(monkeypatch):
     tab.figure = _FakeFigure()
     tab.canvas = _FakeCanvas()
     tab.quantity = SimpleNamespace(get=lambda: "q")
+    tab.rotation_unit = SimpleNamespace(get=lambda: "rad")
     tab.fd_qdot_var = SimpleNamespace(get=lambda: False)
     tab.bundle = None
     tab.q_names = np.array([], dtype=object)
@@ -157,6 +160,7 @@ def test_joint_kinematics_uses_reconstruction_colors_and_side_styles(monkeypatch
     tab.figure.subplots = lambda *_args, **_kwargs: axis
     tab.canvas = _FakeCanvas()
     tab.quantity = SimpleNamespace(get=lambda: "q")
+    tab.rotation_unit = SimpleNamespace(get=lambda: "rad")
     tab.fd_qdot_var = SimpleNamespace(get=lambda: False)
     tab.bundle = None
     tab.q_names = np.array([], dtype=object)
@@ -179,11 +183,56 @@ def test_joint_kinematics_uses_reconstruction_colors_and_side_styles(monkeypatch
     pipeline_gui.JointKinematicsTab.refresh_plot(tab)
 
     assert len(axis.plots) == 2
-    assert axis.plots[0]["color"] == "#123456"
-    assert axis.plots[0]["linestyle"] == "-"
-    assert axis.plots[0]["marker"] == "o"
-    assert axis.plots[0]["label"] == "7 | L"
-    assert axis.plots[1]["color"] == "#123456"
-    assert axis.plots[1]["linestyle"] == "--"
-    assert axis.plots[1]["marker"] == "s"
-    assert axis.plots[1]["label"] == "7 | R"
+    assert axis.plots[0]["kwargs"]["color"] == "#123456"
+    assert axis.plots[0]["kwargs"]["linestyle"] == "-"
+    assert axis.plots[0]["kwargs"]["marker"] == "o"
+    assert axis.plots[0]["kwargs"]["label"] == "7 | L"
+    assert axis.plots[1]["kwargs"]["color"] == "#123456"
+    assert axis.plots[1]["kwargs"]["linestyle"] == "--"
+    assert axis.plots[1]["kwargs"]["marker"] == "s"
+    assert axis.plots[1]["kwargs"]["label"] == "7 | R"
+
+
+def test_joint_kinematics_rotation_unit_popup_converts_rotational_dofs(monkeypatch):
+    axis = _FakeAxis()
+    bundle = {
+        "q_names": np.asarray(["LEFT_KNEE:RotY", "RIGHT_KNEE:RotY"], dtype=object),
+        "recon_q": {"demo": np.column_stack((np.linspace(0.0, np.pi, 20), np.linspace(np.pi, 0.0, 20)))},
+        "recon_qdot": {"demo": np.zeros((20, 2), dtype=float)},
+    }
+
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        shared_reconstruction_selection=["demo"],
+    )
+    tab.pair_list = _FakeListbox(["Knee"], [0])
+    tab.figure = _FakeFigure()
+    tab.figure.subplots = lambda *_args, **_kwargs: axis
+    tab.canvas = _FakeCanvas()
+    tab.quantity = SimpleNamespace(get=lambda: "q")
+    tab.rotation_unit = SimpleNamespace(get=lambda: "deg")
+    tab.fd_qdot_var = SimpleNamespace(get=lambda: False)
+    tab.bundle = None
+    tab.q_names = np.array([], dtype=object)
+    tab._show_empty_plot = lambda _message: (_ for _ in ()).throw(AssertionError("unexpected empty plot"))
+
+    monkeypatch.setattr(pipeline_gui, "get_cached_preview_bundle", lambda *_args, **_kwargs: bundle)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: "output/1_partie_0429")
+    monkeypatch.setattr(pipeline_gui, "bundle_available_reconstruction_names", lambda *_args, **_kwargs: ["demo"])
+    monkeypatch.setattr(
+        pipeline_gui, "pair_dof_names", lambda _q_names: [("Knee", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY")]
+    )
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showerror",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unexpected GUI error")),
+    )
+
+    pipeline_gui.JointKinematicsTab.refresh_plot(tab)
+
+    expected_left = np.linspace(0.0, np.pi, 20)[10:] * 180.0 / np.pi
+    expected_right = np.linspace(np.pi, 0.0, 20)[10:] * 180.0 / np.pi
+    np.testing.assert_allclose(axis.plots[0]["args"][1], expected_left)
+    np.testing.assert_allclose(axis.plots[1]["args"][1], expected_right)
+    assert axis.ylabel == "deg"

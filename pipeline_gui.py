@@ -98,6 +98,8 @@ from kinematics.root_kinematics import (
     compute_trunk_dofs_from_points,
     extract_root_from_q,
     normalize,
+    rotation_unit_label,
+    rotation_unit_scale,
 )
 from kinematics.root_series import (
     quantity_unit_label,
@@ -5621,6 +5623,7 @@ class ProfilesTab(CommandTab):
         super().__init__(master, "Profiles")
         self.state = state
         self._updating_profile_name = False
+        self._profile_model_choices: dict[str, str | None] = {"auto": None}
         self.flip_method_label_var = tk.StringVar(value=flip_method_display_name("epipolar"))
 
         form = ttk.LabelFrame(self.main, text="Profils de reconstruction")
@@ -5791,7 +5794,13 @@ class ProfilesTab(CommandTab):
             state="readonly",
         )
         q0_method_box.pack(side=tk.LEFT, padx=(0, 8))
-        self.ekf2d_bootstrap_passes = LabeledEntry(self.ekf2d_params_frame, "Boot passes", "5")
+        self.ekf2d_bootstrap_passes = LabeledEntry(
+            self.ekf2d_params_frame,
+            "Boot passes",
+            "5",
+            label_width=9,
+            entry_width=4,
+        )
         self.ekf2d_bootstrap_passes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.measurement_noise = LabeledEntry(self.ekf2d_params_frame, "EKF2D meas", "1.5")
         self.measurement_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
@@ -5823,8 +5832,27 @@ class ProfilesTab(CommandTab):
         self.biorbd_error = LabeledEntry(self.ekf3d_frame, "EKF3D error", "1e-4")
         self.biorbd_error.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
+        self.ekf_model_frame = ttk.Frame(form)
+        ekf_model_label = ttk.Label(self.ekf_model_frame, text="Model", width=10)
+        ekf_model_label.pack(side=tk.LEFT)
+        self.ekf_model_var = tk.StringVar(value="auto")
+        self.ekf_model_box = ttk.Combobox(
+            self.ekf_model_frame,
+            textvariable=self.ekf_model_var,
+            values=["auto"],
+            width=44,
+            state="readonly",
+        )
+        self.ekf_model_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.ekf_model_info_var = tk.StringVar(value="auto-build model from current 2D data")
+        ttk.Label(self.ekf_model_frame, textvariable=self.ekf_model_info_var, foreground="#4f5b66").pack(
+            side=tk.LEFT,
+            fill=tk.X,
+            expand=True,
+        )
+
         self.clean_frame = ttk.Frame(form)
-        self.pose_filter_window = LabeledEntry(self.clean_frame, "Filter window", "9")
+        self.pose_filter_window = LabeledEntry(self.clean_frame, "Filter window", "9", label_width=9, entry_width=4)
         self.pose_filter_window.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.pose_outlier_ratio = LabeledEntry(self.clean_frame, "Outlier ratio", "0.10")
         self.pose_outlier_ratio.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
@@ -5922,6 +5950,14 @@ class ProfilesTab(CommandTab):
         )
         self.biorbd_noise.set_tooltip("Bruit des marqueurs 3D pour l'EKF 3D.")
         self.biorbd_error.set_tooltip("Erreur d'état initiale du Kalman 3D.")
+        attach_tooltip(
+            ekf_model_label,
+            "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
+        )
+        attach_tooltip(
+            self.ekf_model_box,
+            "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
+        )
         self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour la référence filtrée 2D.")
         self.pose_outlier_ratio.set_tooltip("Ratio de rejet des points 2D trop éloignés de la référence filtrée.")
         self.pose_p_low.set_tooltip("Percentile bas pour l'amplitude robuste du mouvement 2D.")
@@ -5960,6 +5996,7 @@ class ProfilesTab(CommandTab):
 
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
         self.family.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ekf_model_var.trace_add("write", lambda *_args: self.on_profile_model_changed())
         self.pose_data_mode.trace_add("write", lambda *_args: self.sync_profile_name())
         self.frame_stride.trace_add("write", lambda *_args: self.sync_profile_name())
         self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -5982,10 +6019,13 @@ class ProfilesTab(CommandTab):
         self.state.flip_temporal_weight_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.flip_temporal_tau_px_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.calib_var.trace_add("write", lambda *_args: self.refresh_profile_camera_choices())
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_profile_camera_summary())
         self.profile_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_camera_selection_changed())
         self.state.register_profile_listener(self.refresh_profile_tree)
         self.refresh_profile_camera_choices()
+        self.refresh_profile_model_choices()
         self.update_family_controls()
         self.on_flip_method_changed()
         self.sync_profile_name()
@@ -6006,6 +6046,7 @@ class ProfilesTab(CommandTab):
             self.ekf2d_frame,
             self.ekf2d_params_frame,
             self.ekf3d_frame,
+            self.ekf_model_frame,
             self.clean_frame,
         ]:
             frame.pack_forget()
@@ -6021,8 +6062,10 @@ class ProfilesTab(CommandTab):
         if family == "ekf_2d":
             self.ekf2d_frame.pack(fill=tk.X, padx=8, pady=4)
             self.ekf2d_params_frame.pack(fill=tk.X, padx=8, pady=4)
+            self.ekf_model_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
+            self.ekf_model_frame.pack(fill=tk.X, padx=8, pady=4)
 
     def selected_profile_camera_names(self) -> list[str] | None:
         indices = [int(index) for index in self.profile_cameras_list.curselection()]
@@ -6054,6 +6097,43 @@ class ProfilesTab(CommandTab):
         self._set_profile_camera_selection(selected_before if camera_names else None)
         self.sync_profile_name()
 
+    def on_tab_activated(self) -> None:
+        self.refresh_profile_model_choices()
+
+    def refresh_profile_model_choices(self) -> None:
+        selected_value = self.ekf_model_var.get().strip() or "auto"
+        dataset_dir = current_dataset_dir(self.state)
+        choices = [("auto", None)]
+        for model_dir in scan_model_dirs(dataset_dir):
+            for biomod_path in sorted(model_dir.glob("*.bioMod")):
+                display = display_path(biomod_path)
+                choices.append((display, display))
+        self._profile_model_choices = dict(choices)
+        self.ekf_model_box.configure(values=[label for label, _value in choices])
+        if selected_value not in self._profile_model_choices:
+            selected_value = "auto"
+        self.ekf_model_var.set(selected_value)
+        self.update_profile_model_info()
+        self.sync_profile_name()
+
+    def selected_profile_model_path(self) -> str | None:
+        value = self.ekf_model_var.get().strip()
+        return self._profile_model_choices.get(value)
+
+    def update_profile_model_info(self) -> None:
+        if self.family.get() not in ("ekf_2d", "ekf_3d"):
+            self.ekf_model_info_var.set("")
+            return
+        selected_model = self.selected_profile_model_path()
+        if selected_model:
+            self.ekf_model_info_var.set("reuse existing model (faster)")
+        else:
+            self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
+
+    def on_profile_model_changed(self) -> None:
+        self.update_profile_model_info()
+        self.sync_profile_name()
+
     def update_profile_camera_summary(self) -> None:
         selected = self.selected_profile_camera_names()
         self.profile_cameras_summary.set(
@@ -6078,6 +6158,7 @@ class ProfilesTab(CommandTab):
             name=self.profile_name.get() if include_name else "",
             family=family,
             camera_names=self.selected_profile_camera_names(),
+            ekf_model_path=self.selected_profile_model_path() if family in ("ekf_2d", "ekf_3d") else None,
             predictor=self.predictor.get() if family == "ekf_2d" else None,
             ekf2d_3d_source=self.ekf2d_3d_source.get() if family == "ekf_2d" else "full_triangulation",
             ekf2d_initial_state_method=self.ekf2d_initial_state_method.get() if family == "ekf_2d" else "ekf_bootstrap",
@@ -6152,6 +6233,8 @@ class ProfilesTab(CommandTab):
                     flags.append("roottransq0")
                 elif init_method == "root_pose_zero_rest":
                     flags.append("rootq0")
+            if getattr(profile, "ekf_model_path", None):
+                flags.append(f"mdl:{Path(str(profile.ekf_model_path)).stem}")
             if profile.initial_rotation_correction:
                 flags.append("rotfix")
             if profile.flip:
@@ -6967,6 +7050,13 @@ class JointKinematicsTab(ttk.Frame):
         self.quantity = tk.StringVar(value="q")
         quantity_box = ttk.Combobox(row, textvariable=self.quantity, values=["q", "qdot"], width=10, state="readonly")
         quantity_box.pack(side=tk.LEFT, padx=(0, 6))
+        rot_unit_label = ttk.Label(row, text="Angle unit", width=10)
+        rot_unit_label.pack(side=tk.LEFT)
+        self.rotation_unit = tk.StringVar(value="rad")
+        rotation_unit_box = ttk.Combobox(
+            row, textvariable=self.rotation_unit, values=["rad", "deg"], width=8, state="readonly"
+        )
+        rotation_unit_box.pack(side=tk.LEFT, padx=(0, 6))
         self.fd_qdot_var = tk.BooleanVar(value=False)
         fd_qdot_check = ttk.Checkbutton(row, text="qdot par différence finie", variable=self.fd_qdot_var)
         fd_qdot_check.pack(side=tk.LEFT)
@@ -6976,9 +7066,12 @@ class JointKinematicsTab(ttk.Frame):
         self.pair_list.pack(fill=tk.X, padx=8, pady=4)
         attach_tooltip(quantity_label, "Choisit entre positions q et vitesses qdot pour les autres DoF.")
         attach_tooltip(quantity_box, "Choisit entre positions q et vitesses qdot pour les autres DoF.")
+        attach_tooltip(rot_unit_label, "Choisit l'unité d'affichage des DoF de rotation.")
+        attach_tooltip(rotation_unit_box, "Choisit l'unité d'affichage des DoF de rotation.")
         attach_tooltip(fd_qdot_check, "Recalcule qdot par difference finie sur q.")
         attach_tooltip(self.pair_list, "Choisissez les paires gauche/droite de DoF a comparer sur les graphes.")
         self.quantity.trace_add("write", lambda *_args: self.refresh_plot())
+        self.rotation_unit.trace_add("write", lambda *_args: self.refresh_plot())
         self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.pair_list.bind("<<ListboxSelect>>", self._on_pair_selection_changed)
 
@@ -7021,6 +7114,26 @@ class JointKinematicsTab(ttk.Frame):
         """Render a placeholder when no joint-kinematics plot can be produced."""
 
         show_placeholder_figure(self.figure, self.canvas, message)
+
+    @staticmethod
+    def _is_rotational_dof(dof_name: str) -> bool:
+        """Return whether the given DoF represents a rotation."""
+
+        return ":Rot" in str(dof_name)
+
+    def _scale_joint_dof_series(self, values: np.ndarray, dof_name: str) -> np.ndarray:
+        """Convert rotational DoF series to the requested display unit."""
+
+        if not self._is_rotational_dof(dof_name):
+            return np.asarray(values, dtype=float)
+        return np.asarray(values, dtype=float) * rotation_unit_scale(self.rotation_unit.get())
+
+    def _joint_dof_unit_label(self, dof_name: str) -> str:
+        """Return the display unit for one joint DoF curve."""
+
+        if self._is_rotational_dof(dof_name):
+            return rotation_unit_label(self.rotation_unit.get(), self.quantity.get())
+        return "m" if self.quantity.get() == "q" else "m/s"
 
     def sync_dataset_dir(self) -> None:
         self.refresh_available_reconstructions()
@@ -7123,9 +7236,11 @@ class JointKinematicsTab(ttk.Frame):
                     legend_label = reconstruction_legend_label(self.state, recon_name)
                     left_style = side_styles["left"]
                     right_style = side_styles["right"]
+                    left_values = self._scale_joint_dof_series(series[:, left_idx], left_name)
+                    right_values = self._scale_joint_dof_series(series[:, right_idx], right_name)
                     ax.plot(
                         time_s,
-                        series[:, left_idx],
+                        left_values,
                         color=color,
                         linewidth=1.7,
                         linestyle=left_style["linestyle"],
@@ -7136,7 +7251,7 @@ class JointKinematicsTab(ttk.Frame):
                     )
                     ax.plot(
                         time_s,
-                        series[:, right_idx],
+                        right_values,
                         color=color,
                         linewidth=1.7,
                         linestyle=right_style["linestyle"],
@@ -7148,7 +7263,7 @@ class JointKinematicsTab(ttk.Frame):
                     plotted_series = True
                 ax.set_title(pair_label)
                 ax.grid(alpha=0.25)
-                ax.set_ylabel(self.quantity.get())
+                ax.set_ylabel(self._joint_dof_unit_label(left_name))
             if not plotted_series:
                 self._show_empty_plot(f"No analysis frames are available after frame {ANALYSIS_START_FRAME - 1}.")
                 return
@@ -9858,6 +9973,8 @@ class LauncherApp(tk.Tk):
         current_tab_id = self.notebook.select()
         current_tab = self.nametowidget(current_tab_id) if current_tab_id else None
         self.state.active_reconstruction_consumer = current_tab
+        if current_tab is not None and hasattr(current_tab, "on_tab_activated"):
+            current_tab.on_tab_activated()
         if current_tab is not None and getattr(current_tab, "uses_shared_reconstruction_panel", False):
             current_tab.configure_shared_reconstruction_panel(self.shared_reconstruction_panel)
         else:

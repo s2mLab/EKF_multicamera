@@ -63,6 +63,7 @@ class ReconstructionProfile:
     name: str
     family: str
     camera_names: list[str] | None = None
+    ekf_model_path: str | None = None
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
@@ -103,6 +104,8 @@ class ReconstructionProfile:
 
 def canonical_profile_name(profile: ReconstructionProfile) -> str:
     parts = [profile.family]
+    if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
+        parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
         if profile.initial_rotation_correction:
             parts.append("rotfix")
@@ -200,6 +203,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             seen_camera_names.add(name)
             normalized_camera_names.append(name)
         profile.camera_names = normalized_camera_names or None
+    if profile.ekf_model_path is not None:
+        normalized_model_path = str(profile.ekf_model_path).strip()
+        profile.ekf_model_path = normalized_model_path or None
     profile.pose_filter_window = max(3, int(profile.pose_filter_window))
     if profile.pose_filter_window % 2 == 0:
         profile.pose_filter_window += 1
@@ -238,6 +244,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.dof_locking = False
     if profile.family != "ekf_3d":
         profile.biorbd_kalman_init_method = "triangulation_ik_root_translation"
+    if profile.family not in ("ekf_2d", "ekf_3d"):
+        profile.ekf_model_path = None
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -507,6 +515,8 @@ def build_pipeline_command(
     if profile.no_root_unwrap:
         cmd.append("--no-root-unwrap")
     if profile.family == "ekf_2d":
+        if profile.ekf_model_path:
+            cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
@@ -521,6 +531,8 @@ def build_pipeline_command(
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])
     elif profile.family == "ekf_3d":
+        if profile.ekf_model_path:
+            cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")
