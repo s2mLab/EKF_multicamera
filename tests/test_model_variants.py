@@ -6,15 +6,16 @@ from vitpose_ekf_pipeline import SegmentLengths, build_biomod
 
 def test_default_model_stem_distinguishes_back_variant():
     stem_default = default_model_stem("cleaned", "exhaustive")
+    stem_back_flex = default_model_stem("cleaned", "exhaustive", model_variant="back_flexion_1d")
     stem_back = default_model_stem("cleaned", "exhaustive", model_variant="back_3dof")
 
     assert stem_default == "model_2d_cleaned_exhaustive"
+    assert stem_back_flex == "model_2d_cleaned_exhaustive_back_flexion_1d"
     assert stem_back == "model_2d_cleaned_exhaustive_back_3dof"
 
 
-def test_build_biomod_back_3dof_creates_upper_back_segment(tmp_path: Path):
-    output_path = tmp_path / "back_3dof.bioMod"
-    lengths = SegmentLengths(
+def _lengths() -> SegmentLengths:
+    return SegmentLengths(
         trunk_height=0.6,
         head_length=0.2,
         shoulder_half_width=0.18,
@@ -28,7 +29,27 @@ def test_build_biomod_back_3dof_creates_upper_back_segment(tmp_path: Path):
         ear_offset_y=0.06,
     )
 
-    build_biomod(lengths, output_path, model_variant="back_3dof")
+
+def test_build_biomod_back_flexion_1d_creates_upper_back_segment(tmp_path: Path):
+    output_path = tmp_path / "back_flexion_1d.bioMod"
+
+    build_biomod(_lengths(), output_path, model_variant="back_flexion_1d")
+
+    text = output_path.read_text()
+    assert "segment\tUPPER_BACK" in text
+    upper_back_start = text.index("segment\tUPPER_BACK")
+    upper_back_end = text.index("endsegment", upper_back_start)
+    upper_back_block = text[upper_back_start:upper_back_end]
+    assert "rotations\tx" in upper_back_block.lower()
+    assert "parent\tTRUNK" in text
+    assert "marker\tleft_shoulder" in text
+    assert "parent\tUPPER_BACK" in text
+
+
+def test_build_biomod_back_3dof_creates_upper_back_segment(tmp_path: Path):
+    output_path = tmp_path / "back_3dof.bioMod"
+
+    build_biomod(_lengths(), output_path, model_variant="back_3dof")
 
     text = output_path.read_text()
     assert "segment\tUPPER_BACK" in text

@@ -940,3 +940,23 @@ def test_choose_ekf_prediction_gate_measurements_skips_when_error_delta_is_too_s
     np.testing.assert_allclose(selected_points, frame_keypoints[[left_idx, right_idx]])
     assert diagnostics["used_swapped"] is False
     assert diagnostics["decision"] == "raw_below_error_delta"
+
+
+def test_upper_back_pseudo_measurement_block_tracks_mean_hip_flexion():
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.nq = 6
+    ekf.upper_back_rotx_idx = 1
+    ekf.hip_flexion_indices = (3, 4)
+    ekf.upper_back_sagittal_gain = 0.2
+    ekf.upper_back_pseudo_std_rad = np.deg2rad(10.0)
+
+    reference_q = np.array([0.0, 0.05, 0.0, 1.0, 0.5, 0.0], dtype=float)
+
+    pseudo_block = ekf._upper_back_pseudo_measurement_block(reference_q)
+
+    assert pseudo_block is not None
+    z, h, h_q, variance = pseudo_block
+    np.testing.assert_allclose(z, np.array([0.15], dtype=float))
+    np.testing.assert_allclose(h, np.array([0.05], dtype=float))
+    np.testing.assert_allclose(h_q, np.array([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=float))
+    np.testing.assert_allclose(variance, np.array([np.deg2rad(10.0) ** 2], dtype=float))

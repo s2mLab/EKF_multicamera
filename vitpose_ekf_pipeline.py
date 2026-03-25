@@ -64,7 +64,7 @@ DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
 DEFAULT_TRIANGULATION_WORKERS = 6
 DEFAULT_MODEL_VARIANT = "single_trunk"
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_3dof")
+SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -92,6 +92,8 @@ DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
 DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES = 1
 DEFAULT_EKF2D_INITIAL_STATE_METHOD = "ekf_bootstrap"
 DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
+DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
+DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
 DEFAULT_FLIP_IMPROVEMENT_RATIO = 0.7
 DEFAULT_FLIP_MIN_GAIN_PX = 3.0
 DEFAULT_FLIP_MIN_OTHER_CAMERAS = 2
@@ -2856,7 +2858,7 @@ def build_biomod(
     upper_back_height = 0.0
     trunk_inertia = inertia["TRUNK"]
     upper_back_inertia = None
-    if model_variant == "back_3dof":
+    if model_variant in {"back_flexion_1d", "back_3dof"}:
         lower_back_height = 0.5 * lengths.trunk_height
         upper_back_height = lengths.trunk_height - lower_back_height
         trunk_inertia = scaled_inertia(
@@ -2893,7 +2895,7 @@ def build_biomod(
 
     shoulder_parent_name = "TRUNK"
     shoulder_parent_local_z = lower_back_height
-    if model_variant == "back_3dof":
+    if model_variant in {"back_flexion_1d", "back_3dof"}:
         model.add_segment(
             SegmentReal(
                 name="UPPER_BACK",
@@ -2901,7 +2903,7 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
                 ),
-                rotations=Rotations.YXZ,
+                rotations=(Rotations.X if model_variant == "back_flexion_1d" else Rotations.YXZ),
                 inertia_parameters=upper_back_inertia,
                 mesh=mesh_with_axes(
                     [(0.0, 0.0, 0.0), (0.0, 0.0, upper_back_height)],
@@ -3289,6 +3291,8 @@ class MultiViewKinematicEKF:
         flip_min_valid_keypoints: int = DEFAULT_EKF_PREDICTION_GATE_MIN_VALID_KEYPOINTS,
         flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
         flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+        upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+        upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ):
         self.model = model
         self.calibrations = calibrations
@@ -3311,6 +3315,8 @@ class MultiViewKinematicEKF:
         self.flip_min_valid_keypoints = max(1, int(flip_min_valid_keypoints))
         self.flip_error_threshold_px = float(flip_error_threshold_px)
         self.flip_error_delta_threshold_px = float(flip_error_delta_threshold_px)
+        self.upper_back_sagittal_gain = float(upper_back_sagittal_gain)
+        self.upper_back_pseudo_std_rad = float(upper_back_pseudo_std_rad)
         self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
         self.nq = model.nbQ()
         self.nx = 3 * self.nq
@@ -3344,6 +3350,7 @@ class MultiViewKinematicEKF:
         )
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
+        self.upper_back_rotx_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
         self.locked_q_indices: set[int] = set()
         base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
         self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
@@ -3421,6 +3428,36 @@ class MultiViewKinematicEKF:
             measurement_noise_scale=self.measurement_noise_scale,
         )
         return frame_coherence, effective_confidences, measurement_variances
+
+    def _resolve_upper_back_pseudo_observation_indices(self) -> tuple[int | None, tuple[int, ...]]:
+        upper_back_rotx_idx = self.lock_map.get("UPPER_BACK:RotX")
+        hip_candidates = (
+            "LEFT_THIGH:RotY",
+            "RIGHT_THIGH:RotY",
+            "LEFT_THIGH:RotX",
+            "RIGHT_THIGH:RotX",
+        )
+        hip_indices = tuple(self.lock_map[name] for name in hip_candidates if name in self.lock_map)
+        if upper_back_rotx_idx is None or len(hip_indices) < 2:
+            return None, tuple()
+        return int(upper_back_rotx_idx), hip_indices
+
+    def _upper_back_pseudo_measurement_block(
+        self,
+        reference_q: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        if self.upper_back_rotx_idx is None or len(self.hip_flexion_indices) < 2:
+            return None
+        hip_flexion = np.asarray(reference_q[list(self.hip_flexion_indices)], dtype=float)
+        if not np.all(np.isfinite(hip_flexion)):
+            return None
+        target_value = self.upper_back_sagittal_gain * float(np.mean(hip_flexion))
+        H_q = np.zeros((1, self.nq), dtype=float)
+        H_q[0, self.upper_back_rotx_idx] = 1.0
+        h = np.array([float(reference_q[self.upper_back_rotx_idx])], dtype=float)
+        z = np.array([target_value], dtype=float)
+        variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
+        return z, h, H_q, variance
 
     def transition_matrix(self) -> np.ndarray:
         """Matrice d'etat du modele discret a acceleration constante."""
@@ -3712,6 +3749,10 @@ class MultiViewKinematicEKF:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
+
+        pseudo_block = self._upper_back_pseudo_measurement_block(q)
+        if pseudo_block is not None:
+            measurement_blocks.append(pseudo_block)
 
         t_solve = time.perf_counter()
         update_result = apply_measurement_update_sequential(
