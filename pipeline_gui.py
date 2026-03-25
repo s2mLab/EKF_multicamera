@@ -1948,6 +1948,8 @@ def flip_method_display_name(method: str) -> str:
 COHERENCE_METHOD_DISPLAY_NAMES = {
     "epipolar": "Epipolar (precomputed)",
     "epipolar_fast": "Epipolar fast (precomputed)",
+    "epipolar_framewise": "Epipolar (framewise)",
+    "epipolar_fast_framewise": "Epipolar fast (framewise)",
 }
 
 
@@ -5738,19 +5740,19 @@ class ProfilesTab(CommandTab):
         cameras_header = ttk.Frame(self.cameras_frame)
         cameras_header.pack(fill=tk.X)
         self.profile_cameras_summary = tk.StringVar(value="Cameras (n=0/0)")
-        cameras_label = ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, width=20)
+        cameras_label = ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, width=22, anchor="w")
         cameras_label.pack(side=tk.LEFT)
         self.profile_source_row = ttk.Frame(self.cameras_frame)
         self.profile_source_row.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        cameras_body = ttk.Frame(self.profile_source_row, width=470, height=250)
+        cameras_body = ttk.Frame(self.profile_source_row, width=470, height=62)
         cameras_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         cameras_body.pack_propagate(False)
         self.profile_cameras_list = tk.Listbox(
             cameras_body,
             selectmode="extended",
             exportselection=False,
-            height=14,
+            height=5,
             width=40,
         )
         self.profile_cameras_list.pack(fill=tk.BOTH, expand=True)
@@ -5867,7 +5869,12 @@ class ProfilesTab(CommandTab):
         self.coherence_box = ttk.Combobox(
             self.ekf2d_observation_frame,
             textvariable=self.coherence_method,
-            values=[coherence_method_display_name("epipolar"), coherence_method_display_name("epipolar_fast")],
+            values=[
+                coherence_method_display_name("epipolar"),
+                coherence_method_display_name("epipolar_fast"),
+                coherence_method_display_name("epipolar_framewise"),
+                coherence_method_display_name("epipolar_fast_framewise"),
+            ],
             width=26,
             state="readonly",
         )
@@ -5937,17 +5944,17 @@ class ProfilesTab(CommandTab):
         self.ekf_model_frame = ttk.Frame(self.profile_source_row)
         model_header = ttk.Frame(self.ekf_model_frame)
         model_header.pack(fill=tk.X)
-        ekf_model_label = ttk.Label(model_header, text="Existing bioMod", width=14)
+        ekf_model_label = ttk.Label(model_header, text="Existing bioMod", width=22, anchor="w")
         ekf_model_label.pack(side=tk.LEFT)
         self.profile_models_summary = tk.StringVar(value="")
-        ttk.Label(model_header, textvariable=self.profile_models_summary, foreground="#4f5b66").pack(
+        ttk.Label(model_header, textvariable=self.profile_models_summary, foreground="#4f5b66", anchor="w").pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        models_body = ttk.Frame(self.ekf_model_frame, width=470, height=250)
+        models_body = ttk.Frame(self.ekf_model_frame, width=470, height=62)
         models_body.pack(fill=tk.BOTH, pady=(4, 0), expand=True)
         models_body.pack_propagate(False)
         self.profile_models_list = tk.Listbox(
-            models_body, selectmode="browse", exportselection=False, height=14, width=40
+            models_body, selectmode="browse", exportselection=False, height=5, width=40
         )
         self.profile_models_list.pack(fill=tk.BOTH, expand=True)
         self.ekf_model_info_var = tk.StringVar(value="used by EKF profiles only")
@@ -6004,11 +6011,11 @@ class ProfilesTab(CommandTab):
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(
             coherence_label,
-            "Pondération multivue de l'EKF 2D pendant la boucle du filtre. Les modes affichés ici sont aujourd'hui précalculés sur toute la séquence, puis relus pendant l'EKF.",
+            "Pondération multivue de l'EKF 2D pendant la boucle du filtre. Les modes precomputed sont calculés sur toute la séquence; les modes framewise recalculent la cohérence à chaque frame.",
         )
         attach_tooltip(
             self.coherence_box,
-            "Epipolar (precomputed): cohérence Sampson précalculée sur la séquence. Epipolar fast (precomputed): distance symétrique précalculée, plus légère.",
+            "Epipolar (precomputed): cohérence Sampson précalculée sur la séquence. Epipolar fast (precomputed): distance symétrique précalculée. Epipolar (framewise): Sampson recalculé à chaque frame. Epipolar fast (framewise): distance symétrique recalculée à chaque frame.",
         )
         attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
         attach_tooltip(
@@ -6047,7 +6054,8 @@ class ProfilesTab(CommandTab):
         )
         actions = ttk.Frame(form)
         actions.pack(fill=tk.X, padx=8, pady=6)
-        ttk.Button(actions, text="Add profile", command=self.add_current_profile).pack(side=tk.LEFT)
+        self.add_profile_button = ttk.Button(actions, text="Add profile", command=self.add_current_profile)
+        self.add_profile_button.pack(side=tk.LEFT)
         ttk.Button(actions, text="Delete profile", command=self.remove_selected_profiles).pack(
             side=tk.LEFT, padx=(8, 0)
         )
@@ -6110,6 +6118,7 @@ class ProfilesTab(CommandTab):
         self.on_flip_method_changed()
         self.sync_profile_name()
         self.refresh_profile_tree()
+        self.update_add_profile_button_state()
         self.hide_command_controls()
 
     def on_flip_method_changed(self) -> None:
@@ -6150,6 +6159,7 @@ class ProfilesTab(CommandTab):
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
         self.update_profile_model_info()
+        self.update_add_profile_button_state()
 
     def selected_profile_camera_names(self) -> list[str] | None:
         indices = [int(index) for index in self.profile_cameras_list.curselection()]
@@ -6180,6 +6190,7 @@ class ProfilesTab(CommandTab):
             self.profile_cameras_list.insert(tk.END, camera_name)
         default_selection = selected_before if selected_before else camera_names
         self._set_profile_camera_selection(default_selection if camera_names else None)
+        self.update_add_profile_button_state()
         self.sync_profile_name()
 
     def on_tab_activated(self) -> None:
@@ -6212,11 +6223,15 @@ class ProfilesTab(CommandTab):
         self.profile_models_list.delete(0, tk.END)
         for label, _value in choices:
             self.profile_models_list.insert(tk.END, label)
-        fallback_value = None if self.family.get() == "ekf_2d" else "auto"
+        if self.family.get() == "ekf_2d":
+            fallback_value = next((label for label, value in choices if value is not None), None)
+        else:
+            fallback_value = "auto"
         target_value = selected_value if selected_value in self._profile_model_choices else fallback_value
         self._set_profile_model_selection_by_label(target_value)
         self.update_profile_model_summary()
         self.update_profile_model_info()
+        self.update_add_profile_button_state()
         self.sync_profile_name()
 
     def selected_profile_model_label(self) -> str | None:
@@ -6244,16 +6259,16 @@ class ProfilesTab(CommandTab):
     def update_profile_model_summary(self) -> None:
         selected_label = self.selected_profile_model_label()
         if selected_label is None:
-            self.profile_models_summary.set("select one model")
+            self.profile_models_summary.set("")
             return
         if selected_label == "auto":
             self.profile_models_summary.set("auto-build")
             return
         selected_path = self.selected_profile_model_path()
         if selected_path:
-            self.profile_models_summary.set(f"selected: {Path(selected_path).stem}")
+            self.profile_models_summary.set(Path(selected_path).stem)
             return
-        self.profile_models_summary.set(f"selected: {selected_label}")
+        self.profile_models_summary.set(str(selected_label))
 
     def update_profile_model_info(self) -> None:
         family = self.family.get()
@@ -6263,14 +6278,13 @@ class ProfilesTab(CommandTab):
         selected_model = self.selected_profile_model_path()
         if selected_model:
             self.ekf_model_info_var.set("reuse existing model (faster)")
-        elif family == "ekf_2d":
-            self.ekf_model_info_var.set("select an existing bioMod (required for EKF 2D)")
         else:
             self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
 
     def on_profile_model_changed(self) -> None:
         self.update_profile_model_summary()
         self.update_profile_model_info()
+        self.update_add_profile_button_state()
         self.sync_profile_name()
 
     def update_profile_camera_summary(self) -> None:
@@ -6289,7 +6303,22 @@ class ProfilesTab(CommandTab):
 
     def on_profile_camera_selection_changed(self) -> None:
         self.update_profile_camera_summary()
+        self.update_add_profile_button_state()
         self.sync_profile_name()
+
+    def update_add_profile_button_state(self) -> None:
+        if not hasattr(self, "add_profile_button") or not hasattr(self, "profile_cameras_list"):
+            return
+        camera_count = len(self.selected_profile_camera_names() or [])
+        has_enough_cameras = camera_count >= 2
+        has_required_model = True
+        if self.family.get() == "ekf_2d":
+            has_required_model = self.selected_profile_model_path() is not None
+        button_state = "normal" if has_enough_cameras and has_required_model else "disabled"
+        try:
+            self.add_profile_button.configure(state=button_state)
+        except Exception:
+            pass
 
     def current_profile(self, *, include_name: bool = True) -> ReconstructionProfile:
         family = self.family.get()

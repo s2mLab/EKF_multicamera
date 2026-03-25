@@ -272,7 +272,10 @@ def test_flip_method_display_name_uses_user_friendly_labels():
 def test_coherence_method_display_name_uses_precomputed_labels():
     assert pipeline_gui.coherence_method_display_name("epipolar") == "Epipolar (precomputed)"
     assert pipeline_gui.coherence_method_display_name("epipolar_fast") == "Epipolar fast (precomputed)"
+    assert pipeline_gui.coherence_method_display_name("epipolar_framewise") == "Epipolar (framewise)"
+    assert pipeline_gui.coherence_method_display_name("epipolar_fast_framewise") == "Epipolar fast (framewise)"
     assert pipeline_gui.coherence_method_from_display_name("Epipolar fast (precomputed)") == "epipolar_fast"
+    assert pipeline_gui.coherence_method_from_display_name("Epipolar fast (framewise)") == "epipolar_fast_framewise"
 
 
 def test_profiles_tab_selected_profile_flip_method_disables_flip_for_none():
@@ -388,6 +391,15 @@ class _FakePackFrame:
         self.pack_forget_calls += 1
 
 
+class _FakeButton:
+    def __init__(self):
+        self.state = None
+
+    def configure(self, **kwargs):
+        if "state" in kwargs:
+            self.state = kwargs["state"]
+
+
 def test_model_tab_sync_frame_range_defaults_uses_available_2d_bounds(monkeypatch):
     tab = pipeline_gui.ModelTab.__new__(pipeline_gui.ModelTab)
     tab.frame_start = _FakeEntryField("")
@@ -441,7 +453,7 @@ def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(mo
     tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
     tab._profile_model_choices = {"auto": None}
     tab.sync_profile_name = lambda: None
-    tab.selected_profile_model_label = lambda: None
+    tab.update_add_profile_button_state = lambda: None
     tab._model_info = ""
     tab._model_summary = ""
 
@@ -464,8 +476,9 @@ def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(mo
 
     assert tuple(tab.profile_models_list.items) == ("model_demo",)
     assert tab._profile_model_choices["model_demo"] == str(biomod_path)
-    assert tab._model_info == "select an existing bioMod (required for EKF 2D)"
-    assert tab._model_summary == "select one model"
+    assert tab._model_info == "reuse existing model (faster)"
+    assert tab.profile_models_list.curselection() == (0,)
+    assert tab._model_summary == Path(str(biomod_path)).stem
 
 
 def test_profiles_tab_refresh_profile_camera_choices_selects_all_by_default(monkeypatch):
@@ -474,6 +487,7 @@ def test_profiles_tab_refresh_profile_camera_choices_selects_all_by_default(monk
     tab.profile_cameras_list = _FakeListbox()
     tab.profile_cameras_summary = SimpleNamespace(set=lambda value: setattr(tab, "_camera_summary", value))
     tab.sync_profile_name = lambda: None
+    tab.update_add_profile_button_state = lambda: None
     tab._camera_summary = ""
 
     monkeypatch.setattr(
@@ -557,7 +571,25 @@ def test_profiles_tab_update_profile_model_info_requires_existing_biomod_for_ekf
 
     pipeline_gui.ProfilesTab.update_profile_model_info(tab)
 
-    assert tab._model_info == "select an existing bioMod (required for EKF 2D)"
+    assert tab._model_info == "auto-build model from current 2D data (slower)"
+
+
+def test_profiles_tab_update_add_profile_button_state_requires_two_cameras_and_model_for_ekf2d():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.add_profile_button = _FakeButton()
+    tab.profile_cameras_list = _FakeListbox()
+    tab.selected_profile_camera_names = lambda: ["cam_a"]
+    tab.selected_profile_model_path = lambda: None
+
+    pipeline_gui.ProfilesTab.update_add_profile_button_state(tab)
+    assert tab.add_profile_button.state == "disabled"
+
+    tab.selected_profile_camera_names = lambda: ["cam_a", "cam_b"]
+    tab.selected_profile_model_path = lambda: "output/demo/models/model.bioMod"
+
+    pipeline_gui.ProfilesTab.update_add_profile_button_state(tab)
+    assert tab.add_profile_button.state == "normal"
 
 
 def test_profiles_tab_update_family_controls_hides_triangulation_for_ekf2d():
