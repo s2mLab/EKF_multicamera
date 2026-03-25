@@ -610,8 +610,16 @@ def load_pose_data(
     for camera_label, content in raw.items():
         calib_name = camera_label.split("_")[-1]
         if calib_name not in calibrations:
-            raise ValueError(f"Camera {camera_label} is absent from calibration file")
+            continue
         ordered_items.append((calib_name, content))
+
+    if not ordered_items:
+        available_camera_labels = ", ".join(str(label) for label in raw.keys())
+        selected_calibrations = ", ".join(str(name) for name in calibrations.keys())
+        raise ValueError(
+            "No cameras from the 2D keypoints JSON match the selected calibration subset. "
+            f"JSON cameras: {available_camera_labels}. Calibration cameras: {selected_calibrations}."
+        )
 
     # Keep every frame seen by at least one camera. Missing camera observations
     # are represented as NaN/0 so downstream stages can keep the full timeline.

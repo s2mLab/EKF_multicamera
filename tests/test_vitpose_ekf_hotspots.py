@@ -533,6 +533,37 @@ def test_load_pose_data_applies_frame_stride(tmp_path: Path):
     assert pose_data.frame_stride == 3
 
 
+def test_load_pose_data_ignores_unselected_json_cameras(tmp_path: Path):
+    keypoints_path = tmp_path / "keypoints.json"
+    payload = {
+        "Camera1_M11139": {
+            "frames": [0, 1],
+            "keypoints": np.zeros((2, 17, 2), dtype=float).tolist(),
+            "scores": np.ones((2, 17), dtype=float).tolist(),
+        },
+        "Camera2_M11140": {
+            "frames": [0, 1],
+            "keypoints": np.ones((2, 17, 2), dtype=float).tolist(),
+            "scores": np.ones((2, 17), dtype=float).tolist(),
+        },
+        "Camera5_M11459": {
+            "frames": [0, 1],
+            "keypoints": (2.0 * np.ones((2, 17, 2), dtype=float)).tolist(),
+            "scores": np.ones((2, 17), dtype=float).tolist(),
+        },
+    }
+    keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+    calibrations = {
+        "M11139": _make_camera("M11139", 0.0),
+        "M11140": _make_camera("M11140", 1.0),
+    }
+
+    pose_data = load_pose_data(keypoints_path, calibrations, data_mode="raw")
+
+    assert pose_data.camera_names == ["M11139", "M11140"]
+    assert pose_data.keypoints.shape[0] == 2
+
+
 def test_vectorized_epipolar_cost_matches_scalar_versions():
     cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
     point = np.array([0.2, -0.1, 2.5], dtype=float)
