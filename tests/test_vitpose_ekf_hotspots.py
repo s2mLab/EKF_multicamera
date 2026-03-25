@@ -26,6 +26,7 @@ from vitpose_ekf_pipeline import (
     compute_camera_epipolar_cost_legacy,
     compute_camera_epipolar_costs_vectorized,
     compute_camera_triangulation_cost,
+    compute_epipolar_coherence,
     load_pose_data,
     project_point_with_projection_matrices,
     q_names_from_model,
@@ -255,6 +256,35 @@ def test_symmetric_epipolar_distance_vectorized_is_zero_on_perfect_matches():
 
     distances = symmetric_epipolar_distance_vectorized(points, other_points, f_matrix)
     np.testing.assert_allclose(distances, np.zeros_like(distances), atol=1e-12)
+
+
+def test_compute_epipolar_coherence_accepts_symmetric_distance_mode():
+    point = np.array([0.15, 0.05, 2.5], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0)]
+    keypoints = np.stack([[camera.project_point(point)] for camera in cameras], axis=0)[:, np.newaxis, :, :]
+    scores = np.ones((2, 1, 1), dtype=float)
+    pose_data = PoseData(
+        camera_names=[camera.name for camera in cameras],
+        frames=np.array([0], dtype=int),
+        keypoints=keypoints,
+        scores=scores,
+    )
+    fundamental_matrices = {
+        (i_cam, j_cam): vitpose_ekf_pipeline.fundamental_matrix(cameras[i_cam], cameras[j_cam])
+        for i_cam in range(len(cameras))
+        for j_cam in range(len(cameras))
+        if i_cam != j_cam
+    }
+
+    coherence = compute_epipolar_coherence(
+        pose_data,
+        fundamental_matrices,
+        threshold_px=10.0,
+        distance_mode="symmetric",
+    )
+
+    assert coherence.shape == (1, 1, 2)
+    np.testing.assert_allclose(coherence, 1.0, atol=1e-12)
 
 
 def test_viterbi_flip_state_path_rejects_isolated_positive_frame():

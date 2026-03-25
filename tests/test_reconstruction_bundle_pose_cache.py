@@ -78,6 +78,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
     epipolar_metadata = epipolar_cache_metadata(
         pose_data,
         epipolar_threshold_px=15.0,
+        distance_mode="sampson",
         pose_data_mode="cleaned",
         pose_filter_window=9,
         pose_outlier_threshold_ratio=0.1,
@@ -87,6 +88,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
     corrected_epipolar_metadata = epipolar_cache_metadata(
         corrected,
         epipolar_threshold_px=15.0,
+        distance_mode="sampson",
         pose_data_mode="cleaned",
         pose_filter_window=9,
         pose_outlier_threshold_ratio=0.1,
@@ -94,6 +96,34 @@ def test_cache_metadata_changes_after_pose_data_flip():
         pose_amplitude_upper_percentile=95.0,
     )
     assert epipolar_metadata["pose_data_signature"] != corrected_epipolar_metadata["pose_data_signature"]
+
+
+def test_epipolar_cache_metadata_distinguishes_fast_distance_mode():
+    pose_data = _make_pose_data()
+
+    sampson_metadata = epipolar_cache_metadata(
+        pose_data,
+        epipolar_threshold_px=15.0,
+        distance_mode="sampson",
+        pose_data_mode="cleaned",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+    )
+    fast_metadata = epipolar_cache_metadata(
+        pose_data,
+        epipolar_threshold_px=15.0,
+        distance_mode="symmetric",
+        pose_data_mode="cleaned",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+    )
+
+    assert sampson_metadata["distance_mode"] == "sampson"
+    assert fast_metadata["distance_mode"] == "symmetric"
 
 
 def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeypatch):

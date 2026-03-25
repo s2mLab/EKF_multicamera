@@ -133,6 +133,7 @@ def cache_entry_dir(output_dir: Path, category: str, metadata: dict[str, object]
 def epipolar_cache_metadata(
     pose_data: PoseData,
     epipolar_threshold_px: float,
+    distance_mode: str,
     pose_data_mode: str,
     pose_filter_window: int,
     pose_outlier_threshold_ratio: float,
@@ -145,6 +146,7 @@ def epipolar_cache_metadata(
         "frame_signature": frame_signature(pose_data.frames),
         "pose_data_signature": pose_data_signature(pose_data),
         "epipolar_threshold_px": float(epipolar_threshold_px),
+        "distance_mode": str(distance_mode),
         "pose_data_mode": pose_data_mode,
         "pose_filter_window": int(pose_filter_window),
         "pose_outlier_threshold_ratio": float(pose_outlier_threshold_ratio),
@@ -177,6 +179,7 @@ def load_or_compute_epipolar_cache(
     output_dir: Path,
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
+    coherence_method: str,
     epipolar_threshold_px: float,
     pose_data_mode: str,
     pose_filter_window: int,
@@ -184,9 +187,12 @@ def load_or_compute_epipolar_cache(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> tuple[np.ndarray, float, Path, str]:
+    coherence_method = canonical_coherence_method(coherence_method)
+    distance_mode = "symmetric" if coherence_method == "epipolar_fast" else "sampson"
     metadata = epipolar_cache_metadata(
         pose_data,
         epipolar_threshold_px,
+        distance_mode,
         pose_data_mode,
         pose_filter_window,
         pose_outlier_threshold_ratio,
@@ -207,7 +213,12 @@ def load_or_compute_epipolar_cache(
         if i_cam != j_cam
     }
     t0 = time.perf_counter()
-    coherence = compute_epipolar_coherence(pose_data, fundamental_matrices, threshold_px=epipolar_threshold_px)
+    coherence = compute_epipolar_coherence(
+        pose_data,
+        fundamental_matrices,
+        threshold_px=epipolar_threshold_px,
+        distance_mode=distance_mode,
+    )
     compute_time_s = time.perf_counter() - t0
     save_epipolar_cache(cache_path, coherence, metadata, compute_time_s)
     return coherence, compute_time_s, cache_path, "computed_now"
@@ -717,6 +728,7 @@ def load_or_compute_triangulation_cache(
         output_dir=output_dir,
         pose_data=pose_data,
         calibrations=calibrations,
+        coherence_method=coherence_method,
         epipolar_threshold_px=epipolar_threshold_px,
         pose_data_mode=pose_data_mode,
         pose_filter_window=pose_filter_window,
@@ -2089,8 +2101,8 @@ def build_ekf_2d_bundle(
         raise ValueError(f"Unsupported ekf2d_3d_source: {ekf2d_3d_source}")
     if ekf2d_initial_state_method not in {"triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"}:
         raise ValueError(f"Unsupported ekf2d_initial_state_method: {ekf2d_initial_state_method}")
-    if ekf2d_3d_source == "first_frame_only" and coherence_method != "epipolar":
-        raise ValueError("ekf2d_3d_source=first_frame_only requires coherence_method=epipolar.")
+    if ekf2d_3d_source == "first_frame_only" and coherence_method not in {"epipolar", "epipolar_fast"}:
+        raise ValueError("ekf2d_3d_source=first_frame_only requires an epipolar coherence method.")
 
     pose_data_used, flip_diagnostics, pose_variant_cache_path, pose_variant_source = (
         prepare_pose_data_for_reconstruction(
@@ -2160,6 +2172,7 @@ def build_ekf_2d_bundle(
             output_dir=output_dir,
             pose_data=pose_data_used,
             calibrations=calibrations,
+            coherence_method=coherence_method,
             epipolar_threshold_px=epipolar_threshold_px,
             pose_data_mode=pose_data_mode,
             pose_filter_window=pose_filter_window,
@@ -2173,7 +2186,7 @@ def build_ekf_2d_bundle(
                 output_dir=output_dir,
                 pose_data=bootstrap_pose_data,
                 calibrations=calibrations,
-                coherence_method="epipolar",
+                coherence_method=coherence_method,
                 triangulation_method=effective_triangulation_method,
                 reprojection_threshold_px=reprojection_threshold_px,
                 min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2192,7 +2205,7 @@ def build_ekf_2d_bundle(
             bootstrap_reconstruction,
             epipolar_coherence,
             epipolar_time_s,
-            coherence_method="epipolar",
+            coherence_method=coherence_method,
             bootstrap_frame_global_idx=bootstrap_frame_idx,
         )
     triangulation_s = time.perf_counter() - tri_start

@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
+
 import pipeline_gui
 from preview.dataset_preview_state import DatasetPreviewState
 from preview.shared_reconstruction_panel import SharedReconstructionPanel
@@ -150,6 +152,50 @@ def test_shared_reconstruction_panel_prepends_numeric_index_column():
     assert panel.tree.rows["recon_a"][0] == "2"
 
 
+def test_shared_reconstruction_panel_does_not_number_raw_2d_rows():
+    panel = SharedReconstructionPanel.__new__(SharedReconstructionPanel)
+    panel.tree = _FakeTree()
+    panel._default_names = []
+    panel._selection_callback = None
+    panel._refresh_callback = None
+    panel._suspend_selection_callback = False
+    panel.state = SimpleNamespace(set_shared_reconstruction_selection=lambda _names: None)
+
+    SharedReconstructionPanel.set_rows(
+        panel,
+        rows=[
+            {"name": "raw", "label": "Raw 2D", "family": "2d", "frames": "-", "reproj_mean": None, "path": "-"},
+            {
+                "name": "pose2sim",
+                "label": "TRC file",
+                "family": "pose2sim",
+                "frames": 8,
+                "reproj_mean": 2.3,
+                "path": "/a",
+            },
+        ],
+        default_names=["raw"],
+    )
+
+    assert panel.tree.rows["raw"][0] == ""
+    assert panel.tree.rows["pose2sim"][0] == "2"
+
+
+def test_compose_multiview_crop_points_includes_selected_reprojections():
+    base = np.zeros((1, 2, 3, 2), dtype=float)
+    reproj = np.ones((1, 2, 3, 2), dtype=float)
+
+    crop_points = pipeline_gui.compose_multiview_crop_points(
+        base,
+        {"ekf_demo": reproj},
+        ["raw", "ekf_demo"],
+    )
+
+    assert crop_points.shape == (1, 2, 6, 2)
+    np.testing.assert_allclose(crop_points[:, :, :3], base)
+    np.testing.assert_allclose(crop_points[:, :, 3:], reproj)
+
+
 def test_infer_pose2sim_trc_from_keypoints_uses_inputs_trc_folder(tmp_path, monkeypatch):
     root = tmp_path / "workspace"
     (root / "inputs" / "keypoints").mkdir(parents=True)
@@ -218,8 +264,16 @@ def test_sanitize_filetypes_simplifies_macos_basename_wildcards(monkeypatch):
 
 
 def test_flip_method_display_name_uses_user_friendly_labels():
+    assert pipeline_gui.flip_method_display_name("none") == "None"
     assert pipeline_gui.flip_method_display_name("epipolar_fast_viterbi") == "Epipolar fast (Viterbi)"
     assert pipeline_gui.flip_method_display_name("triangulation_once") == "Triangulation once"
+
+
+def test_profiles_tab_selected_profile_flip_method_disables_flip_for_none():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.flip_method = SimpleNamespace(get=lambda: "none")
+
+    assert pipeline_gui.ProfilesTab.selected_profile_flip_method(tab) is None
 
 
 def test_profiles_tab_build_command_uses_runtime_profiles_cache(monkeypatch):
@@ -283,13 +337,47 @@ class _FakeEntryField:
         self._value = str(value)
 
 
-class _FakeCombobox:
+class _FakeListbox:
     def __init__(self):
-        self.values = ()
+        self.items = []
+        self._selection = ()
 
-    def configure(self, **kwargs):
-        if "values" in kwargs:
-            self.values = tuple(kwargs["values"])
+    def delete(self, _start, _end=None):
+        self.items = []
+        self._selection = ()
+
+    def insert(self, _index, value):
+        self.items.append(str(value))
+
+    def selection_clear(self, _start, _end=None):
+        self._selection = ()
+
+    def selection_set(self, index):
+        self._selection = (int(index),)
+
+    def curselection(self):
+        return self._selection
+
+    def size(self):
+        return len(self.items)
+
+    def get(self, index):
+        return self.items[int(index)]
+
+    def see(self, _index):
+        return None
+
+
+class _FakePackFrame:
+    def __init__(self):
+        self.pack_calls = []
+        self.pack_forget_calls = 0
+
+    def pack(self, *args, **kwargs):
+        self.pack_calls.append((args, kwargs))
+
+    def pack_forget(self):
+        self.pack_forget_calls += 1
 
 
 def test_model_tab_sync_frame_range_defaults_uses_available_2d_bounds(monkeypatch):
@@ -340,13 +428,14 @@ def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(mo
     tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
     tab.state = SimpleNamespace()
     tab.family = SimpleNamespace(get=lambda: "ekf_2d")
-    tab.ekf_model_var = SimpleNamespace(get=lambda: "auto", set=lambda value: setattr(tab, "_selected_model", value))
-    tab.ekf_model_box = _FakeCombobox()
+    tab.profile_models_list = _FakeListbox()
+    tab.profile_models_summary = SimpleNamespace(set=lambda value: setattr(tab, "_model_summary", value))
     tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
     tab._profile_model_choices = {"auto": None}
     tab.sync_profile_name = lambda: None
-    tab._selected_model = "auto"
+    tab.selected_profile_model_label = lambda: None
     tab._model_info = ""
+    tab._model_summary = ""
 
     monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/1_partie_0429"))
     monkeypatch.setattr(pipeline_gui, "scan_model_dirs", lambda _dataset_dir: [model_dir])
@@ -355,9 +444,100 @@ def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(mo
 
     pipeline_gui.ProfilesTab.refresh_profile_model_choices(tab)
 
-    assert tab.ekf_model_box.values == ("auto", str(biomod_path))
+    assert tuple(tab.profile_models_list.items) == (str(biomod_path),)
     assert tab._profile_model_choices[str(biomod_path)] == str(biomod_path)
-    assert tab._model_info == "auto-build model from current 2D data (slower)"
+    assert tab._model_info == "select an existing bioMod (required for EKF 2D)"
+    assert tab._model_summary == "select one model"
+
+
+def test_profiles_tab_update_profile_model_info_marks_existing_biomod_as_faster():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
+    tab.selected_profile_model_path = lambda: "output/demo/models/model.bioMod"
+    tab._model_info = ""
+
+    pipeline_gui.ProfilesTab.update_profile_model_info(tab)
+
+    assert tab._model_info == "reuse existing model (faster)"
+
+
+def test_profiles_tab_update_profile_model_info_requires_existing_biomod_for_ekf2d():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
+    tab.selected_profile_model_path = lambda: None
+    tab._model_info = ""
+
+    pipeline_gui.ProfilesTab.update_profile_model_info(tab)
+
+    assert tab._model_info == "select an existing bioMod (required for EKF 2D)"
+
+
+def test_profiles_tab_update_family_controls_hides_triangulation_for_ekf2d():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.cameras_frame = _FakePackFrame()
+    tab.pose_mode_frame = _FakePackFrame()
+    tab.triang_frame = _FakePackFrame()
+    tab.flip_frame = _FakePackFrame()
+    tab.ekf2d_frame = _FakePackFrame()
+    tab.ekf2d_params_frame = _FakePackFrame()
+    tab.ekf3d_frame = _FakePackFrame()
+    tab.clean_frame = _FakePackFrame()
+    tab.ekf_model_frame = _FakePackFrame()
+    tab.update_profile_model_info = lambda: None
+
+    pipeline_gui.ProfilesTab.update_family_controls(tab)
+
+    assert tab.triang_frame.pack_calls == []
+    assert tab.ekf2d_frame.pack_calls
+
+
+def test_model_tab_metadata_path_resolves_workspace_relative_paths(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    root.mkdir(parents=True)
+    cache_path = root / "output" / "trial" / "models" / "demo" / "triangulation_pose2sim_like.npz"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_text("dummy", encoding="utf-8")
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", root)
+
+    resolved = pipeline_gui.ModelTab._metadata_path(
+        cache_path.parent, "output/trial/models/demo/triangulation_pose2sim_like.npz"
+    )
+
+    assert resolved == cache_path
+
+
+def test_model_tab_refresh_existing_models_keeps_detected_models_with_match_status(monkeypatch):
+    model_dir = Path("output/1_partie_0429/models/model_demo")
+    biomod_path = model_dir / "model_demo.bioMod"
+    tab = pipeline_gui.ModelTab.__new__(pipeline_gui.ModelTab)
+    tab.model_tree = _FakeTree()
+    tab.state = SimpleNamespace(
+        pose_filter_window_var=SimpleNamespace(get=lambda: "9"),
+        pose_outlier_ratio_var=SimpleNamespace(get=lambda: "0.1"),
+        pose_p_low_var=SimpleNamespace(get=lambda: "5.0"),
+        pose_p_high_var=SimpleNamespace(get=lambda: "95.0"),
+    )
+    tab.pose_data_mode = SimpleNamespace(get=lambda: "cleaned")
+    tab.current_pose_correction_mode = lambda: "flip_epipolar_fast"
+    tab.current_pose_source_label = lambda: "cleaned + flip_epipolar_fast"
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/1_partie_0429"))
+    monkeypatch.setattr(pipeline_gui, "scan_model_dirs", lambda _dataset_dir: [model_dir])
+    monkeypatch.setattr(Path, "glob", lambda self, pattern: [biomod_path] if self == model_dir else [])
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui.ModelTab, "_model_matches_selected_2d_data", lambda *_args, **_kwargs: False)
+
+    pipeline_gui.ModelTab.refresh_existing_models(tab)
+
+    assert tab.model_tree.rows
+    row = next(iter(tab.model_tree.rows.values()))
+    assert row[0] == "model_demo"
+    assert row[1] == "no"
+    assert row[2] == str(biomod_path)
 
 
 def test_clean_trial_outputs_aborts_when_confirmation_is_declined(monkeypatch, tmp_path):

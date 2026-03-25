@@ -2278,10 +2278,12 @@ def compute_epipolar_coherence(
     pose_data: PoseData,
     fundamental_matrices: dict[tuple[int, int], np.ndarray],
     threshold_px: float,
+    *,
+    distance_mode: str = "sampson",
 ) -> np.ndarray:
     """Calcule un score de coherence epipolaire par frame, keypoint et vue.
 
-    Le score d'une vue est obtenu a partir des erreurs de Sampson avec toutes
+    Le score d'une vue est obtenu a partir des erreurs epipolaires avec toutes
     les autres vues valides. Cela donne un indicateur geometrique de
     compatibilite multivue sans utiliser la triangulation comme critere.
     """
@@ -2312,11 +2314,28 @@ def compute_epipolar_coherence(
             Fij = fundamental_matrices[(i_cam, j_cam)]
             Fxi = xi @ Fij.T
             Ftxj = xj @ Fij
-            numer = np.sum(xj * Fxi, axis=-1)
-            denom = Fxi[..., 0] ** 2 + Fxi[..., 1] ** 2 + Ftxj[..., 0] ** 2 + Ftxj[..., 1] ** 2
+            numer = np.abs(np.sum(xj * Fxi, axis=-1))
             pair_error = np.full((n_frames, n_keypoints), np.nan, dtype=float)
-            valid_denom = valid_ij & (denom > 1e-12) & np.isfinite(numer) & np.isfinite(denom)
-            pair_error[valid_denom] = np.abs(numer[valid_denom]) / np.sqrt(denom[valid_denom])
+            if distance_mode == "sampson":
+                denom = Fxi[..., 0] ** 2 + Fxi[..., 1] ** 2 + Ftxj[..., 0] ** 2 + Ftxj[..., 1] ** 2
+                valid_denom = valid_ij & (denom > 1e-12) & np.isfinite(numer) & np.isfinite(denom)
+                pair_error[valid_denom] = numer[valid_denom] / np.sqrt(denom[valid_denom])
+            elif distance_mode == "symmetric":
+                denom1 = np.sqrt(Fxi[..., 0] ** 2 + Fxi[..., 1] ** 2)
+                denom2 = np.sqrt(Ftxj[..., 0] ** 2 + Ftxj[..., 1] ** 2)
+                valid_denom = (
+                    valid_ij
+                    & (denom1 > 1e-12)
+                    & (denom2 > 1e-12)
+                    & np.isfinite(numer)
+                    & np.isfinite(denom1)
+                    & np.isfinite(denom2)
+                )
+                pair_error[valid_denom] = (
+                    numer[valid_denom] / denom1[valid_denom] + numer[valid_denom] / denom2[valid_denom]
+                )
+            else:
+                raise ValueError(f"Unknown epipolar distance mode: {distance_mode}")
             pair_errors_by_camera[i_cam].append(pair_error)
 
     for i_cam in range(n_cams):
@@ -2437,10 +2456,12 @@ def triangulate_pose2sim_like(
 
     if precomputed_epipolar_coherence is None:
         t_epipolar = time.perf_counter()
+        epipolar_distance_mode = "symmetric" if coherence_method == "epipolar_fast" else "sampson"
         epipolar_coherence = compute_epipolar_coherence(
             pose_data,
             fundamental_matrices,
             threshold_px=epipolar_threshold_px,
+            distance_mode=epipolar_distance_mode,
         )
         epipolar_time_s = time.perf_counter() - t_epipolar
     else:

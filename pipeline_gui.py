@@ -1210,6 +1210,26 @@ def compute_pose_crop_limits_2d(
     return limits
 
 
+def compose_multiview_crop_points(
+    base_points_2d: np.ndarray,
+    projected_layers: dict[str, np.ndarray],
+    selected_names: list[str],
+) -> np.ndarray:
+    """Build the 2D crop reference from detections and selected reprojections."""
+
+    stacked = [np.asarray(base_points_2d, dtype=float)]
+    for name in selected_names:
+        if name == "raw":
+            continue
+        points_2d = projected_layers.get(str(name))
+        if points_2d is None:
+            continue
+        stacked.append(np.asarray(points_2d, dtype=float))
+    if len(stacked) == 1:
+        return stacked[0]
+    return np.concatenate(stacked, axis=2)
+
+
 def apply_2d_axis_limits(
     ax,
     *,
@@ -1906,6 +1926,7 @@ def append_default_pose2sim_profile(
 
 
 FLIP_METHOD_DISPLAY_NAMES = {
+    "none": "None",
     "epipolar": "Epipolar (local)",
     "epipolar_fast": "Epipolar fast (local)",
     "epipolar_viterbi": "Epipolar (Viterbi)",
@@ -3638,11 +3659,14 @@ class MultiViewTab(CommandTab):
         nrows, ncols = camera_layout(len(camera_names))
         axes = self.preview_figure.subplots(nrows, ncols)
         axes = np.atleast_1d(axes).ravel()
+        selected = self.selected_reconstruction_names()
         raw_points = np.asarray(
             self.pose_data.raw_keypoints if self.pose_data.raw_keypoints is not None else self.pose_data.keypoints,
             dtype=float,
         )
-        crop_points = np.asarray(self.pose_data.keypoints, dtype=float)
+        crop_points = compose_multiview_crop_points(
+            np.asarray(self.pose_data.keypoints, dtype=float), self.projected_layers, selected
+        )
         crop_mode = "pose" if self.crop_var.get() else "full"
         crop_margin = 0.1
         crop_limits = self._ensure_crop_limits(crop_points, camera_names, crop_margin) if crop_mode == "pose" else {}
@@ -3664,7 +3688,6 @@ class MultiViewTab(CommandTab):
             )
             ax.set_title(cam_name.replace("Camera", ""))
             ax.grid(alpha=0.15)
-            selected = self.selected_reconstruction_names()
             if "raw" in selected:
                 draw_skeleton_2d(
                     ax, raw_points[ax_idx, frame_idx], "#444444", "Raw", marker_size=float(self.marker_size.get())
@@ -4761,15 +4784,18 @@ class ModelTab(CommandTab):
         existing_controls.pack(fill=tk.X, padx=8, pady=(8, 0))
         ttk.Button(existing_controls, text="Refresh models", command=self.refresh_existing_models).pack(side=tk.LEFT)
         ttk.Button(existing_controls, text="Clear models", command=self.clear_models).pack(side=tk.LEFT, padx=(8, 0))
-        self.model_tree = ttk.Treeview(existing_box, columns=("name", "path"), show="headings", height=12)
+        self.model_tree = ttk.Treeview(existing_box, columns=("name", "match", "path"), show="headings", height=12)
         self.model_tree.heading("name", text="Model")
+        self.model_tree.heading("match", text="Match")
         self.model_tree.heading("path", text="bioMod path")
         self.model_tree.column("name", width=160, anchor="w")
+        self.model_tree.column("match", width=80, anchor="center")
         self.model_tree.column("path", width=360, anchor="w")
         self.model_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.model_tree.bind("<<TreeviewSelect>>", lambda _event: self.load_preview(use_selected_model=True))
         attach_tooltip(
-            self.model_tree, "Liste des modeles compatibles avec les options 2D et de construction courantes."
+            self.model_tree,
+            "Liste des modeles detectes pour le trial courant. La colonne Match indique s'ils correspondent aux options 2D courantes.",
         )
 
         preview_box = ttk.LabelFrame(self.main, text="Première frame triangulée / modèle")
@@ -4993,12 +5019,12 @@ class ModelTab(CommandTab):
         expected_p_low = float(self.state.pose_p_low_var.get())
         expected_p_high = float(self.state.pose_p_high_var.get())
         seen: set[Path] = set()
-        matched = 0
+        found = 0
         for biomod_path in biomod_paths:
             if biomod_path in seen:
                 continue
             seen.add(biomod_path)
-            if not self._model_matches_selected_2d_data(
+            matches = self._model_matches_selected_2d_data(
                 biomod_path.parent,
                 expected_mode,
                 expected_correction,
@@ -5006,17 +5032,23 @@ class ModelTab(CommandTab):
                 expected_ratio,
                 expected_p_low,
                 expected_p_high,
-            ):
-                continue
+            )
             parent_name = biomod_path.parent.name
             biomod_display_path = display_path(biomod_path)
-            self.model_tree.insert("", "end", values=(parent_name, biomod_display_path))
-            matched += 1
-        if matched == 0:
             self.model_tree.insert(
                 "",
                 "end",
+                iid=str(biomod_path),
+                values=(parent_name, "yes" if matches else "no", biomod_display_path),
+            )
+            found += 1
+        if found == 0:
+            self.model_tree.insert(
+                "",
+                "end",
+                iid="__no_model__",
                 values=(
+                    "-",
                     "-",
                     f"No existing bioMod matches current 2D data settings ({self.current_pose_source_label()})",
                 ),
@@ -5093,11 +5125,7 @@ class ModelTab(CommandTab):
     ) -> bool:
         model_stage_path = model_dir / "model_stage.npz"
         stage_metadata = self._cache_metadata(model_stage_path)
-        reconstruction_cache_path = (
-            Path(stage_metadata.get("reconstruction_cache_path", ""))
-            if stage_metadata.get("reconstruction_cache_path")
-            else None
-        )
+        reconstruction_cache_path = self._metadata_path(model_dir, stage_metadata.get("reconstruction_cache_path"))
         if reconstruction_cache_path is None or not reconstruction_cache_path.exists():
             return False
         reconstruction_metadata = self._cache_metadata(reconstruction_cache_path)
@@ -5126,6 +5154,30 @@ class ModelTab(CommandTab):
                 abs_tol=1e-9,
             )
         )
+
+    @staticmethod
+    def _metadata_path(base_dir: Path, raw_path: object) -> Path | None:
+        """Resolve a cache path stored in metadata.
+
+        Older metadata may store a path relative to the workspace root, while
+        some local tools may emit paths relative to the model directory.
+        """
+
+        if raw_path is None:
+            return None
+        text = str(raw_path).strip()
+        if not text:
+            return None
+        path = Path(text)
+        if path.is_absolute():
+            return path
+        root_relative = ROOT / path
+        if root_relative.exists():
+            return root_relative
+        model_relative = base_dir / path
+        if model_relative.exists():
+            return model_relative
+        return root_relative
 
     def build_command(self) -> list[str]:
         cmd = [
@@ -5222,9 +5274,9 @@ class ModelTab(CommandTab):
         if not selected:
             return None
         values = self.model_tree.item(selected[0], "values")
-        if len(values) < 2 or not values[1] or str(values[1]).startswith("No existing"):
+        if len(values) < 3 or not values[2] or str(values[2]).startswith("No existing"):
             return None
-        path = Path(str(values[1]))
+        path = Path(str(values[2]))
         return path if path.is_absolute() else ROOT / path
 
     def _preview_model_path(self, use_selected_model: bool = False) -> Path:
@@ -5624,7 +5676,7 @@ class ProfilesTab(CommandTab):
         self.state = state
         self._updating_profile_name = False
         self._profile_model_choices: dict[str, str | None] = {"auto": None}
-        self.flip_method_label_var = tk.StringVar(value=flip_method_display_name("epipolar"))
+        self.flip_method_label_var = tk.StringVar(value=flip_method_display_name("none"))
 
         form = ttk.LabelFrame(self.main, text="Profils de reconstruction")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
@@ -5670,10 +5722,20 @@ class ProfilesTab(CommandTab):
         ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, foreground="#4f5b66").pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        cameras_body = ttk.Frame(self.cameras_frame)
-        cameras_body.pack(fill=tk.X, pady=(4, 0))
-        self.profile_cameras_list = tk.Listbox(cameras_body, selectmode="extended", exportselection=False, height=4)
-        self.profile_cameras_list.pack(fill=tk.X, expand=True)
+        self.profile_source_row = ttk.Frame(self.cameras_frame)
+        self.profile_source_row.pack(fill=tk.X, pady=(4, 0))
+
+        cameras_body = ttk.Frame(self.profile_source_row, width=260)
+        cameras_body.pack(side=tk.LEFT, fill=tk.Y)
+        cameras_body.pack_propagate(False)
+        self.profile_cameras_list = tk.Listbox(
+            cameras_body,
+            selectmode="extended",
+            exportselection=False,
+            height=4,
+            width=24,
+        )
+        self.profile_cameras_list.pack(fill=tk.BOTH, expand=True)
 
         self.pose_mode_frame = ttk.Frame(form)
         mode_label = ttk.Label(self.pose_mode_frame, text="2D mode", width=10)
@@ -5719,12 +5781,9 @@ class ProfilesTab(CommandTab):
         triang_box.pack(side=tk.LEFT, padx=(0, 8))
 
         self.flip_frame = ttk.Frame(form)
-        self.flip_var = tk.BooleanVar(value=False)
-        flip_check = ttk.Checkbutton(self.flip_frame, text="flip left/right", variable=self.flip_var)
-        flip_check.pack(side=tk.LEFT, padx=(0, 12))
-        flip_method_label = ttk.Label(self.flip_frame, text="Method", width=8)
+        flip_method_label = ttk.Label(self.flip_frame, text="Flip left/right method", width=20)
         flip_method_label.pack(side=tk.LEFT)
-        self.flip_method = tk.StringVar(value="epipolar")
+        self.flip_method = tk.StringVar(value="none")
         self.flip_method_button = ttk.Menubutton(
             self.flip_frame,
             textvariable=self.flip_method_label_var,
@@ -5733,7 +5792,7 @@ class ProfilesTab(CommandTab):
         )
         self.flip_method_button.pack(side=tk.LEFT, padx=(0, 8))
         self.flip_method_menu = tk.Menu(self.flip_method_button, tearoff=False)
-        for method in SUPPORTED_FLIP_METHODS:
+        for method in ("none", *SUPPORTED_FLIP_METHODS):
             self.flip_method_menu.add_radiobutton(
                 label=flip_method_display_name(method),
                 value=method,
@@ -5741,12 +5800,6 @@ class ProfilesTab(CommandTab):
                 command=self.on_flip_method_changed,
             )
         self.flip_method_button.configure(menu=self.flip_method_menu)
-        flip_hint = ttk.Label(
-            self.flip_frame,
-            text="epipolar stays local; *_viterbi adds temporal decoding; ekf_prediction_gate is EKF2D-only; triangulation_* is slower",
-            foreground="#5a6570",
-        )
-        flip_hint.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf2d_frame = ttk.Frame(form)
         predictor_label = ttk.Label(self.ekf2d_frame, text="Predictor", width=10)
@@ -5756,28 +5809,17 @@ class ProfilesTab(CommandTab):
             self.ekf2d_frame, textvariable=self.predictor, values=["acc", "dyn"], width=8, state="readonly"
         )
         predictor_box.pack(side=tk.LEFT, padx=(0, 8))
-        ekf2d_source_label = ttk.Label(self.ekf2d_frame, text="3D source", width=10)
-        ekf2d_source_label.pack(side=tk.LEFT)
-        self.ekf2d_3d_source = tk.StringVar(value="full_triangulation")
-        ekf2d_source_box = ttk.Combobox(
-            self.ekf2d_frame,
-            textvariable=self.ekf2d_3d_source,
-            values=["full_triangulation", "first_frame_only"],
-            width=18,
-            state="readonly",
-        )
-        ekf2d_source_box.pack(side=tk.LEFT, padx=(0, 8))
         coherence_label = ttk.Label(self.ekf2d_frame, text="Coherence", width=10)
         coherence_label.pack(side=tk.LEFT)
         self.coherence_method = tk.StringVar(value="epipolar")
-        coherence_box = ttk.Combobox(
+        self.coherence_box = ttk.Combobox(
             self.ekf2d_frame,
             textvariable=self.coherence_method,
-            values=list(SUPPORTED_COHERENCE_METHODS),
-            width=24,
+            values=["epipolar", "epipolar_fast"],
+            width=18,
             state="readonly",
         )
-        coherence_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.coherence_box.pack(side=tk.LEFT, padx=(0, 8))
         self.lock_var = tk.BooleanVar(value=False)
         lock_check = ttk.Checkbutton(self.ekf2d_frame, text="dof_locking", variable=self.lock_var)
         lock_check.pack(side=tk.LEFT)
@@ -5802,12 +5844,36 @@ class ProfilesTab(CommandTab):
             entry_width=4,
         )
         self.ekf2d_bootstrap_passes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.measurement_noise = LabeledEntry(self.ekf2d_params_frame, "EKF2D meas", "1.5")
+        self.measurement_noise = LabeledEntry(
+            self.ekf2d_params_frame,
+            "EKF2D meas",
+            "1.5",
+            label_width=10,
+            entry_width=5,
+        )
         self.measurement_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.process_noise = LabeledEntry(self.ekf2d_params_frame, "EKF2D proc", "1.0")
+        self.process_noise = LabeledEntry(
+            self.ekf2d_params_frame,
+            "EKF2D proc",
+            "1.0",
+            label_width=10,
+            entry_width=5,
+        )
         self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.coherence_floor = LabeledEntry(self.ekf2d_params_frame, "Conf floor", "0.35")
+        self.coherence_floor = LabeledEntry(
+            self.ekf2d_params_frame,
+            "Conf floor",
+            "0.35",
+            label_width=9,
+            entry_width=5,
+        )
         self.coherence_floor.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.ekf2d_initial_frame_info = ttk.Label(
+            self.ekf2d_params_frame,
+            text="q0 support: first valid frame only",
+            foreground="#5a6570",
+        )
+        self.ekf2d_initial_frame_info.pack(side=tk.LEFT, padx=(10, 0))
 
         self.ekf3d_frame = ttk.Frame(form)
         ekf3d_init_label = ttk.Label(self.ekf3d_frame, text="q0 init", width=10)
@@ -5832,29 +5898,39 @@ class ProfilesTab(CommandTab):
         self.biorbd_error = LabeledEntry(self.ekf3d_frame, "EKF3D error", "1e-4")
         self.biorbd_error.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.ekf_model_frame = ttk.Frame(form)
-        ekf_model_label = ttk.Label(self.ekf_model_frame, text="Model", width=10)
+        self.ekf_model_frame = ttk.Frame(self.profile_source_row)
+        model_header = ttk.Frame(self.ekf_model_frame)
+        model_header.pack(fill=tk.X)
+        ekf_model_label = ttk.Label(model_header, text="Existing bioMod", width=14)
         ekf_model_label.pack(side=tk.LEFT)
-        self.ekf_model_var = tk.StringVar(value="auto")
-        self.ekf_model_box = ttk.Combobox(
-            self.ekf_model_frame,
-            textvariable=self.ekf_model_var,
-            values=["auto"],
-            width=44,
-            state="readonly",
+        self.profile_models_summary = tk.StringVar(value="")
+        ttk.Label(model_header, textvariable=self.profile_models_summary, foreground="#4f5b66").pack(
+            side=tk.LEFT, padx=(8, 0)
         )
-        self.ekf_model_box.pack(side=tk.LEFT, padx=(0, 8))
+        models_body = ttk.Frame(self.ekf_model_frame, width=520)
+        models_body.pack(fill=tk.X, pady=(4, 0))
+        models_body.pack_propagate(False)
+        self.profile_models_list = tk.Listbox(models_body, selectmode="browse", exportselection=False, height=4)
+        self.profile_models_list.pack(fill=tk.BOTH, expand=True)
         self.ekf_model_info_var = tk.StringVar(value="auto-build model from current 2D data")
         ttk.Label(self.ekf_model_frame, textvariable=self.ekf_model_info_var, foreground="#4f5b66").pack(
-            side=tk.LEFT,
+            side=tk.TOP,
             fill=tk.X,
             expand=True,
+            anchor="w",
+            pady=(4, 0),
         )
 
         self.clean_frame = ttk.Frame(form)
         self.pose_filter_window = LabeledEntry(self.clean_frame, "Filter window", "9", label_width=9, entry_width=4)
         self.pose_filter_window.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.pose_outlier_ratio = LabeledEntry(self.clean_frame, "Outlier ratio", "0.10")
+        self.pose_outlier_ratio = LabeledEntry(
+            self.clean_frame,
+            "Outlier ratio",
+            "0.10",
+            label_width=10,
+            entry_width=5,
+        )
         self.pose_outlier_ratio.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.pose_p_low = LabeledEntry(self.clean_frame, "P low", "5")
         self.pose_p_low.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
@@ -5894,34 +5970,22 @@ class ProfilesTab(CommandTab):
             "once: une seule DLT pondérée. greedy: suppression gloutonne. exhaustive: la plus robuste mais plus coûteuse.",
         )
         attach_tooltip(
-            flip_check, "Autorise une correction globale gauche/droite des keypoints 2D avant reconstruction."
-        )
-        attach_tooltip(
             flip_method_label,
-            "Technique de flip L/R. ekf_prediction_gate agit dans l'update EKF 2D; les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
+            "Technique de flip L/R. Choisissez 'None' pour désactiver la correction. ekf_prediction_gate agit dans l'update EKF 2D; les variantes triangulation_* coûtent nettement plus cher que les variantes épipolaires.",
         )
         attach_tooltip(
             self.flip_method_button,
-            "epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. ekf_prediction_gate: test raw vs swapped contre la projection prédite par l'EKF 2D. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
-        )
-        attach_tooltip(
-            flip_hint,
-            "Raccourci pratique: epipolar_fast est le moins coûteux; ekf_prediction_gate exploite la prediction EKF 2D; *_viterbi ajoute de la stabilité temporelle; exhaustive est le plus coûteux.",
+            "none: pas de correction. epipolar: Sampson local frame-by-frame. epipolar_fast: distance symétrique locale. *_viterbi: mêmes coûts, mais avec décodage temporel explicite. ekf_prediction_gate: test raw vs swapped contre la projection prédite par l'EKF 2D. triangulation_once/greedy/exhaustive: validation 3D croissante en coût.",
         )
         attach_tooltip(predictor_label, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")
-        attach_tooltip(ekf2d_source_label, "Choisit comment obtenir l'information 3D de support pour EKF 2D.")
-        attach_tooltip(
-            ekf2d_source_box,
-            "Source 3D utilisee par EKF 2D pour le modele et q0: triangulation complete ou bootstrap sur la premiere frame seulement.",
-        )
         attach_tooltip(
             coherence_label,
-            "Pondération multivue de l'EKF 2D: épipolaire classique, épipolaire rapide, ou basée sur une triangulation once, greedy, ou exhaustive.",
+            "Pondération multivue de l'EKF 2D pendant la boucle du filtre. En mode simplifié EKF2D, on garde des options épipolaires compatibles avec une initialisation sur la première frame valide.",
         )
         attach_tooltip(
-            coherence_box,
-            "Chaque variante triangulation_* choisit explicitement la cohérence issue de cette variante de triangulation. epipolar_fast garde une cohérence épipolaire mais simplifie le score rapide.",
+            self.coherence_box,
+            "epipolar: Sampson local. epipolar_fast: distance symétrique plus légère. Ces scores sont utilisés pendant tout l'EKF 2D, alors que q0 est initialisé sur la première frame valide.",
         )
         attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
         attach_tooltip(
@@ -5933,7 +5997,7 @@ class ProfilesTab(CommandTab):
             "Methode pour trouver q0: IK 3D sur la triangulation ou corrections EKF 2D repetees en remettant qdot/qddot a zero.",
         )
         self.ekf2d_bootstrap_passes.set_tooltip(
-            "Nombre de passes EKF 2D utilisees pour affiner q0 quand le bootstrap est actif."
+            "Nombre de passes EKF 2D utilisées pour affiner q0 sur la première frame valide quand le bootstrap est actif."
         )
         self.measurement_noise.set_tooltip(
             "Bruit de mesure de l'EKF 2D. Plus grand = moins de confiance dans les keypoints 2D."
@@ -5955,7 +6019,7 @@ class ProfilesTab(CommandTab):
             "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
         )
         attach_tooltip(
-            self.ekf_model_box,
+            self.profile_models_list,
             "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
         )
         self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour la référence filtrée 2D.")
@@ -5996,17 +6060,15 @@ class ProfilesTab(CommandTab):
 
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
         self.family.trace_add("write", lambda *_args: self.sync_profile_name())
-        self.ekf_model_var.trace_add("write", lambda *_args: self.on_profile_model_changed())
+        self.family.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
         self.pose_data_mode.trace_add("write", lambda *_args: self.sync_profile_name())
         self.frame_stride.trace_add("write", lambda *_args: self.sync_profile_name())
         self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.coherence_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
-        self.ekf2d_3d_source.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
-        self.flip_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.flip_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6023,6 +6085,7 @@ class ProfilesTab(CommandTab):
         self.state.output_root_var.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_profile_camera_summary())
         self.profile_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_camera_selection_changed())
+        self.profile_models_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_model_changed())
         self.state.register_profile_listener(self.refresh_profile_tree)
         self.refresh_profile_camera_choices()
         self.refresh_profile_model_choices()
@@ -6037,6 +6100,12 @@ class ProfilesTab(CommandTab):
 
         self.flip_method_label_var.set(flip_method_display_name(self.flip_method.get()))
 
+    def selected_profile_flip_method(self) -> str | None:
+        """Return the selected flip method or ``None`` when flip correction is disabled."""
+
+        method = self.flip_method.get().strip()
+        return None if method == "none" else method
+
     def update_family_controls(self) -> None:
         for frame in [
             self.cameras_frame,
@@ -6046,26 +6115,27 @@ class ProfilesTab(CommandTab):
             self.ekf2d_frame,
             self.ekf2d_params_frame,
             self.ekf3d_frame,
-            self.ekf_model_frame,
             self.clean_frame,
         ]:
             frame.pack_forget()
         family = self.family.get()
         self.cameras_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.ekf_model_frame.pack_forget()
+        if family in ("ekf_2d", "ekf_3d"):
+            self.ekf_model_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
         if family in ("triangulation", "ekf_3d", "ekf_2d"):
             self.pose_mode_frame.pack(fill=tk.X, padx=8, pady=4)
             self.clean_frame.pack(fill=tk.X, padx=8, pady=4)
-        if family in ("triangulation", "ekf_3d", "ekf_2d"):
+        if family in ("triangulation", "ekf_3d"):
             self.triang_frame.pack(fill=tk.X, padx=8, pady=4)
         if family in ("triangulation", "ekf_3d", "ekf_2d"):
             self.flip_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_2d":
             self.ekf2d_frame.pack(fill=tk.X, padx=8, pady=4)
             self.ekf2d_params_frame.pack(fill=tk.X, padx=8, pady=4)
-            self.ekf_model_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
-            self.ekf_model_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.update_profile_model_info()
 
     def selected_profile_camera_names(self) -> list[str] | None:
         indices = [int(index) for index in self.profile_cameras_list.curselection()]
@@ -6101,36 +6171,74 @@ class ProfilesTab(CommandTab):
         self.refresh_profile_model_choices()
 
     def refresh_profile_model_choices(self) -> None:
-        selected_value = self.ekf_model_var.get().strip() or "auto"
+        selected_value = self.selected_profile_model_label()
         dataset_dir = current_dataset_dir(self.state)
-        choices = [("auto", None)]
+        if self.family.get() == "ekf_2d":
+            choices: list[tuple[str, str | None]] = []
+        else:
+            choices = [("auto", None)]
         for model_dir in scan_model_dirs(dataset_dir):
             for biomod_path in sorted(model_dir.glob("*.bioMod")):
                 display = display_path(biomod_path)
                 choices.append((display, display))
         self._profile_model_choices = dict(choices)
-        self.ekf_model_box.configure(values=[label for label, _value in choices])
-        if selected_value not in self._profile_model_choices:
-            selected_value = "auto"
-        self.ekf_model_var.set(selected_value)
+        self.profile_models_list.delete(0, tk.END)
+        for label, _value in choices:
+            self.profile_models_list.insert(tk.END, label)
+        fallback_value = None if self.family.get() == "ekf_2d" else "auto"
+        target_value = selected_value if selected_value in self._profile_model_choices else fallback_value
+        self._set_profile_model_selection_by_label(target_value)
+        self.update_profile_model_summary()
         self.update_profile_model_info()
         self.sync_profile_name()
 
+    def selected_profile_model_label(self) -> str | None:
+        selection = self.profile_models_list.curselection()
+        if not selection:
+            return None
+        return str(self.profile_models_list.get(selection[0]))
+
     def selected_profile_model_path(self) -> str | None:
-        value = self.ekf_model_var.get().strip()
+        value = self.selected_profile_model_label()
+        if value is None:
+            return None
         return self._profile_model_choices.get(value)
 
+    def _set_profile_model_selection_by_label(self, label: str | None) -> None:
+        self.profile_models_list.selection_clear(0, tk.END)
+        if label is None:
+            return
+        for index in range(self.profile_models_list.size()):
+            if str(self.profile_models_list.get(index)) == label:
+                self.profile_models_list.selection_set(index)
+                self.profile_models_list.see(index)
+                break
+
+    def update_profile_model_summary(self) -> None:
+        selected_label = self.selected_profile_model_label()
+        if selected_label is None:
+            self.profile_models_summary.set("select one model")
+            return
+        if selected_label == "auto":
+            self.profile_models_summary.set("auto-build")
+            return
+        self.profile_models_summary.set(f"selected: {Path(selected_label).stem}")
+
     def update_profile_model_info(self) -> None:
-        if self.family.get() not in ("ekf_2d", "ekf_3d"):
+        family = self.family.get()
+        if family not in ("ekf_2d", "ekf_3d"):
             self.ekf_model_info_var.set("")
             return
         selected_model = self.selected_profile_model_path()
         if selected_model:
             self.ekf_model_info_var.set("reuse existing model (faster)")
+        elif family == "ekf_2d":
+            self.ekf_model_info_var.set("select an existing bioMod (required for EKF 2D)")
         else:
             self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
 
     def on_profile_model_changed(self) -> None:
+        self.update_profile_model_summary()
         self.update_profile_model_info()
         self.sync_profile_name()
 
@@ -6154,17 +6262,26 @@ class ProfilesTab(CommandTab):
 
     def current_profile(self, *, include_name: bool = True) -> ReconstructionProfile:
         family = self.family.get()
+        selected_model_path = self.selected_profile_model_path() if family in ("ekf_2d", "ekf_3d") else None
+        if family == "ekf_2d" and not selected_model_path:
+            raise ValueError("EKF 2D requires selecting an existing bioMod.")
         profile = ReconstructionProfile(
             name=self.profile_name.get() if include_name else "",
             family=family,
             camera_names=self.selected_profile_camera_names(),
-            ekf_model_path=self.selected_profile_model_path() if family in ("ekf_2d", "ekf_3d") else None,
+            ekf_model_path=selected_model_path,
             predictor=self.predictor.get() if family == "ekf_2d" else None,
-            ekf2d_3d_source=self.ekf2d_3d_source.get() if family == "ekf_2d" else "full_triangulation",
+            ekf2d_3d_source="first_frame_only" if family == "ekf_2d" else "full_triangulation",
             ekf2d_initial_state_method=self.ekf2d_initial_state_method.get() if family == "ekf_2d" else "ekf_bootstrap",
             ekf2d_bootstrap_passes=int(self.ekf2d_bootstrap_passes.get()) if family == "ekf_2d" else 5,
-            flip=self.flip_var.get() if family in ("triangulation", "ekf_2d", "ekf_3d") else False,
-            flip_method=self.flip_method.get() if family in ("triangulation", "ekf_2d", "ekf_3d") else "epipolar",
+            flip=(
+                bool(self.selected_profile_flip_method()) if family in ("triangulation", "ekf_2d", "ekf_3d") else False
+            ),
+            flip_method=(
+                self.selected_profile_flip_method() or "epipolar"
+                if family in ("triangulation", "ekf_2d", "ekf_3d")
+                else "epipolar"
+            ),
             flip_improvement_ratio=float(self.state.flip_improvement_ratio_var.get()),
             flip_min_gain_px=float(self.state.flip_min_gain_px_var.get()),
             flip_min_other_cameras=int(self.state.flip_min_other_cameras_var.get()),
