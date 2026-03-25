@@ -31,10 +31,10 @@ from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from analysis.plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
 from vitpose_ekf_pipeline import load_calibrations
 
-DEFAULT_TRIANGULATION = Path("outputs/vitpose_full/triangulation_pose2sim_like.npz")
+DEFAULT_TRIANGULATION = Path("output/vitpose_full/triangulation_pose2sim_like.npz")
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
-DEFAULT_OUTPUT = Path("outputs/vitpose_full/posture_snapshots_3d.png")
-DEFAULT_FIRST_FRAME_OUTPUT = Path("outputs/vitpose_full/first_frame_root_coordinate_system.png")
+DEFAULT_OUTPUT = Path("output/vitpose_full/posture_snapshots_3d.png")
+DEFAULT_FIRST_FRAME_OUTPUT = Path("output/vitpose_full/first_frame_root_coordinate_system.png")
 DEFAULT_FPS = 120.0
 
 

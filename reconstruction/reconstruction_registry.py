@@ -6,7 +6,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 BUNDLE_SCHEMA_VERSION = 1
 ALGORITHM_VERSIONS = {
     "pose2sim": 3,
@@ -18,10 +17,20 @@ ALGORITHM_VERSIONS = {
 }
 
 DEFAULT_MODEL_SUBJECT_MASS_KG = 55.0
+DEFAULT_MODEL_VARIANT = "single_trunk"
 DEFAULT_POSE_FILTER_WINDOW = 9
 DEFAULT_POSE_OUTLIER_THRESHOLD_RATIO = 0.10
 DEFAULT_POSE_AMPLITUDE_LOWER_PERCENTILE = 5.0
 DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE = 95.0
+
+
+def normalize_output_root(output_root: Path | str) -> Path:
+    path = Path(output_root)
+    parts = list(path.parts)
+    if parts and parts[-1] == "outputs":
+        parts[-1] = "output"
+        return Path(*parts)
+    return path
 
 
 def slugify(value: str) -> str:
@@ -40,7 +49,9 @@ def canonical_dataset_name(path_or_name: str | Path) -> str:
     return slugify(name)
 
 
-def infer_dataset_name(keypoints_path: Path | None = None, pose2sim_trc: Path | None = None, dataset_name: str | None = None) -> str:
+def infer_dataset_name(
+    keypoints_path: Path | None = None, pose2sim_trc: Path | None = None, dataset_name: str | None = None
+) -> str:
     if dataset_name:
         return canonical_dataset_name(dataset_name)
     if keypoints_path is not None:
@@ -51,7 +62,7 @@ def infer_dataset_name(keypoints_path: Path | None = None, pose2sim_trc: Path | 
 
 
 def dataset_output_dir(output_root: Path, dataset_name: str) -> Path:
-    return output_root / canonical_dataset_name(dataset_name)
+    return normalize_output_root(output_root) / canonical_dataset_name(dataset_name)
 
 
 def dataset_models_dir(output_root: Path, dataset_name: str) -> Path:
@@ -82,6 +93,7 @@ def default_model_stem(
     pose_data_mode: str,
     triangulation_method: str,
     *,
+    model_variant: str = DEFAULT_MODEL_VARIANT,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -94,6 +106,8 @@ def default_model_stem(
     pose_amplitude_upper_percentile: float = DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE,
 ) -> str:
     tokens = ["model", "2d", slugify(pose_data_mode), slugify(triangulation_method)]
+    if str(model_variant).strip() and str(model_variant).strip() != DEFAULT_MODEL_VARIANT:
+        tokens.append(slugify(str(model_variant)))
     if str(pose_correction_mode).strip() not in ("", "none"):
         tokens.append(slugify(str(pose_correction_mode)))
     if initial_rotation_correction:
@@ -128,6 +142,7 @@ def model_output_dir(
     *,
     pose_data_mode: str,
     triangulation_method: str,
+    model_variant: str = DEFAULT_MODEL_VARIANT,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -142,6 +157,7 @@ def model_output_dir(
     stem = default_model_stem(
         pose_data_mode,
         triangulation_method,
+        model_variant=model_variant,
         pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,
@@ -162,6 +178,7 @@ def model_biomod_path(
     *,
     pose_data_mode: str,
     triangulation_method: str,
+    model_variant: str = DEFAULT_MODEL_VARIANT,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -178,6 +195,7 @@ def model_biomod_path(
         dataset_name,
         pose_data_mode=pose_data_mode,
         triangulation_method=triangulation_method,
+        model_variant=model_variant,
         pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,
@@ -203,7 +221,9 @@ def scan_dataset_dirs(output_root: Path) -> list[Path]:
         has_reconstructions = recon_dir.exists() and any(
             (grandchild / "bundle_summary.json").exists() for grandchild in recon_dir.iterdir() if grandchild.is_dir()
         )
-        legacy_reconstructions = any((grandchild / "bundle_summary.json").exists() for grandchild in child.iterdir() if grandchild.is_dir())
+        legacy_reconstructions = any(
+            (grandchild / "bundle_summary.json").exists() for grandchild in child.iterdir() if grandchild.is_dir()
+        )
         if (child / "manifest.json").exists() or has_reconstructions or legacy_reconstructions:
             dataset_dirs.append(child)
     return dataset_dirs

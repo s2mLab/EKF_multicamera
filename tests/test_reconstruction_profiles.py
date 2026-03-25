@@ -92,6 +92,18 @@ def test_canonical_profile_name_includes_selected_model_stem_for_ekf_profiles():
     assert canonical_profile_name(profile).startswith("ekf_2d_mdl_model_demo_acc")
 
 
+def test_canonical_profile_name_includes_model_variant_for_auto_built_ekf_model():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_3d",
+            model_variant="back_3dof",
+        )
+    )
+
+    assert canonical_profile_name(profile).startswith("ekf_3d_back_3dof")
+
+
 def test_build_pipeline_command_includes_ekf3d_init_method():
     profile = validate_profile(
         ReconstructionProfile(
@@ -133,6 +145,28 @@ def test_build_pipeline_command_includes_selected_biomod_for_ekf_profiles():
 
     assert "--biomod" in cmd
     assert cmd[cmd.index("--biomod") + 1] == "output/1_partie_0429/models/model_demo/model_demo.bioMod"
+
+
+def test_build_pipeline_command_includes_model_variant_for_auto_built_ekf_profiles():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf3d_back",
+            family="ekf_3d",
+            model_variant="back_3dof",
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--model-variant" in cmd
+    assert cmd[cmd.index("--model-variant") + 1] == "back_3dof"
 
 
 def test_build_pipeline_command_includes_frame_stride():

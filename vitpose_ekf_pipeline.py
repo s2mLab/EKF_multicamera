@@ -63,6 +63,8 @@ DEFAULT_BIORBD_KALMAN_INIT_METHOD = "triangulation_ik_root_translation"
 DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
 DEFAULT_TRIANGULATION_WORKERS = 6
+DEFAULT_MODEL_VARIANT = "single_trunk"
+SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_3dof")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -2790,6 +2792,7 @@ def build_biomod(
     subject_mass_kg: float = DEFAULT_SUBJECT_MASS_KG,
     reconstruction: ReconstructionResult | None = None,
     apply_initial_root_rotation_correction: bool = True,
+    model_variant: str = DEFAULT_MODEL_VARIANT,
 ) -> Path:
     """Construit un modele `.bioMod` minimal compatible avec les keypoints COCO17.
 
@@ -2800,6 +2803,7 @@ def build_biomod(
     ensure_local_imports()
     from biobuddy import (
         BiomechanicalModelReal,
+        InertiaParametersReal,
         MarkerReal,
         MeshReal,
         Rotations,
@@ -2807,6 +2811,9 @@ def build_biomod(
         SegmentReal,
         Translations,
     )
+
+    if model_variant not in SUPPORTED_MODEL_VARIANTS:
+        raise ValueError(f"Unsupported model_variant: {model_variant}")
 
     inertia = female_deleva_inertia_parameters(lengths, total_mass_kg=subject_mass_kg)
     model = BiomechanicalModelReal()
@@ -2831,43 +2838,102 @@ def build_biomod(
         ]
         return MeshReal(list(base_points) + axis_points)
 
+    def scaled_inertia(
+        source: InertiaParametersReal,
+        *,
+        mass_scale: float,
+        local_com: tuple[float, float, float],
+    ) -> InertiaParametersReal:
+        center_of_mass = np.asarray(local_com, dtype=float).reshape((3, 1))
+        inertia = np.asarray(source.inertia, dtype=float)[:3, :3] * float(mass_scale)
+        return InertiaParametersReal(
+            mass=float(source.mass) * float(mass_scale),
+            center_of_mass=center_of_mass,
+            inertia=inertia,
+        )
+
+    lower_back_height = lengths.trunk_height
+    upper_back_height = 0.0
+    trunk_inertia = inertia["TRUNK"]
+    upper_back_inertia = None
+    if model_variant == "back_3dof":
+        lower_back_height = 0.5 * lengths.trunk_height
+        upper_back_height = lengths.trunk_height - lower_back_height
+        trunk_inertia = scaled_inertia(
+            inertia["TRUNK"],
+            mass_scale=0.55,
+            local_com=(0.0, 0.0, 0.5 * lower_back_height),
+        )
+        upper_back_inertia = scaled_inertia(
+            inertia["TRUNK"],
+            mass_scale=0.45,
+            local_com=(0.0, 0.0, 0.5 * upper_back_height),
+        )
+
     model.add_segment(
         SegmentReal(
             name="TRUNK",
             translations=Translations.XYZ,
             rotations=Rotations.YXZ,
-            inertia_parameters=inertia["TRUNK"],
+            inertia_parameters=trunk_inertia,
             mesh=mesh_with_axes(
                 [
                     (0.0, -lengths.hip_half_width, 0.0),
                     (0.0, lengths.hip_half_width, 0.0),
                     (0.0, 0.0, 0.0),
-                    (0.0, 0.0, lengths.trunk_height),
+                    (0.0, 0.0, lower_back_height),
                 ],
-                axis_scale=0.25 * lengths.trunk_height,
+                axis_scale=0.25 * max(lower_back_height, 1e-3),
             ),
         )
     )
     trunk = model.segments["TRUNK"]
     trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
     trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
-    trunk.add_marker(
+
+    shoulder_parent_name = "TRUNK"
+    shoulder_parent_local_z = lower_back_height
+    if model_variant == "back_3dof":
+        model.add_segment(
+            SegmentReal(
+                name="UPPER_BACK",
+                parent_name="TRUNK",
+                segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
+                    np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
+                ),
+                rotations=Rotations.YXZ,
+                inertia_parameters=upper_back_inertia,
+                mesh=mesh_with_axes(
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, upper_back_height)],
+                    axis_scale=0.2 * max(upper_back_height, 1e-3),
+                ),
+            )
+        )
+        shoulder_parent_name = "UPPER_BACK"
+        shoulder_parent_local_z = upper_back_height
+
+    shoulder_parent = model.segments[shoulder_parent_name]
+    shoulder_parent.add_marker(
         MarkerReal(
-            name="left_shoulder", parent_name="TRUNK", position=[0, lengths.shoulder_half_width, lengths.trunk_height]
+            name="left_shoulder",
+            parent_name=shoulder_parent_name,
+            position=[0, lengths.shoulder_half_width, shoulder_parent_local_z],
         )
     )
-    trunk.add_marker(
+    shoulder_parent.add_marker(
         MarkerReal(
-            name="right_shoulder", parent_name="TRUNK", position=[0, -lengths.shoulder_half_width, lengths.trunk_height]
+            name="right_shoulder",
+            parent_name=shoulder_parent_name,
+            position=[0, -lengths.shoulder_half_width, shoulder_parent_local_z],
         )
     )
 
     model.add_segment(
         SegmentReal(
             name="HEAD",
-            parent_name="TRUNK",
+            parent_name=shoulder_parent_name,
             segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                np.zeros(3), "xyz", np.array([0, 0, lengths.trunk_height]), is_scs_local=True
+                np.zeros(3), "xyz", np.array([0, 0, shoulder_parent_local_z]), is_scs_local=True
             ),
             rotations=Rotations.XYZ,
             inertia_parameters=inertia["HEAD"],
@@ -2901,7 +2967,7 @@ def build_biomod(
     )
 
     for side, sign in (("left", 1.0), ("right", -1.0)):
-        shoulder_offset = (0, sign * lengths.shoulder_half_width, lengths.trunk_height)
+        shoulder_offset = (0, sign * lengths.shoulder_half_width, shoulder_parent_local_z)
         hip_offset = (0, sign * lengths.hip_half_width, 0)
 
         upper_name = f"{side.upper()}_UPPER_ARM"
@@ -2912,7 +2978,7 @@ def build_biomod(
         model.add_segment(
             SegmentReal(
                 name=upper_name,
-                parent_name="TRUNK",
+                parent_name=shoulder_parent_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.asarray(shoulder_offset, dtype=float), is_scs_local=True
                 ),
@@ -4582,6 +4648,7 @@ def model_stage_metadata(
     fps: float,
     subject_mass_kg: float,
     initial_rotation_correction: bool,
+    model_variant: str = DEFAULT_MODEL_VARIANT,
 ) -> dict[str, object]:
     """Metadonnees de validite du stage modele."""
     return {
@@ -4592,6 +4659,7 @@ def model_stage_metadata(
         "fps": float(fps),
         "subject_mass_kg": float(subject_mass_kg),
         "initial_rotation_correction": bool(initial_rotation_correction),
+        "model_variant": str(model_variant),
     }
 
 
@@ -5169,8 +5237,9 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_SUBJECT_MASS_KG,
         help="Masse du sujet utilisee pour les parametres inertiels de de Leva (femme).",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs") / "vitpose_ekf")
-    parser.add_argument("--biomod", type=Path, default=Path("outputs") / "vitpose_ekf" / "vitpose_chain.bioMod")
+    parser.add_argument("--output-dir", type=Path, default=Path("output") / "vitpose_ekf")
+    parser.add_argument("--biomod", type=Path, default=Path("output") / "vitpose_ekf" / "vitpose_chain.bioMod")
+    parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
     parser.add_argument("--model-cache", type=Path, default=None, help="Cache NPZ du stage modele.")
     parser.add_argument("--biorbd-kalman-cache", type=Path, default=None, help="Cache NPZ du Kalman marqueurs biorbd.")
     parser.add_argument(
@@ -5616,6 +5685,7 @@ def main() -> None:
         args.fps,
         args.subject_mass_kg,
         args.initial_rotation_correction,
+        model_variant=args.model_variant,
     )
     if metadata_cache_matches(model_cache_path, model_metadata) and args.biomod.exists():
         t0 = time.perf_counter()
@@ -5631,6 +5701,7 @@ def main() -> None:
             subject_mass_kg=args.subject_mass_kg,
             reconstruction=reconstruction,
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
+            model_variant=args.model_variant,
         )
         model_compute_time_s = time.perf_counter() - t0
         save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=model_compute_time_s)

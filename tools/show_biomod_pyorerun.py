@@ -26,13 +26,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--biomod",
         type=Path,
-        default=Path("outputs/vitpose_full/vitpose_chain.bioMod"),
+        default=Path("output/vitpose_full/vitpose_chain.bioMod"),
         help="Modele .bioMod a visualiser.",
     )
     parser.add_argument(
         "--states",
         type=Path,
-        default=Path("outputs/vitpose_full/ekf_states.npz"),
+        default=Path("output/vitpose_full/ekf_states.npz"),
         help="NPZ contenant `q`. Si absent, une pose neutre est affichee.",
     )
     parser.add_argument("--fps", type=float, default=120.0, help="Frequence d'echantillonnage des etats.")

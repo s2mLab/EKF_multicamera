@@ -36,11 +36,10 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-DEFAULT_TRIANGULATION = Path("outputs/vitpose_full/triangulation_pose2sim_like.npz")
-DEFAULT_OUTPUT = Path("outputs/vitpose_full/triangulated_marker_trajectories.png")
+DEFAULT_TRIANGULATION = Path("output/vitpose_full/triangulation_pose2sim_like.npz")
+DEFAULT_OUTPUT = Path("output/vitpose_full/triangulated_marker_trajectories.png")
 DEFAULT_FPS = 120.0
-DEFAULT_SUMMARY = Path("outputs/vitpose_full/summary.json")
+DEFAULT_SUMMARY = Path("output/vitpose_full/summary.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,10 +48,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--triangulation", type=Path, default=DEFAULT_TRIANGULATION, help="NPZ de triangulation.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Figure PNG de sortie.")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Frequence pour l'axe temporel.")
-    parser.add_argument("--summary", type=Path, default=DEFAULT_SUMMARY, help="Summary JSON pour recuperer les parametres de phase aerienne.")
-    parser.add_argument("--flight-height-threshold-m", type=float, default=None, help="Seuil vertical pour le critere AIR/TOILE. Si absent, on lit summary.json puis fallback a 0.")
-    parser.add_argument("--flight-min-consecutive-frames", type=int, default=None, help="Nombre minimal de frames consecutives au-dessus du seuil. Si absent, on lit summary.json puis fallback a 1.")
-    parser.add_argument("--interactive", action="store_true", help="Ouvre une fenetre interactive avec legende cliquable au lieu de seulement sauver un PNG.")
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        default=DEFAULT_SUMMARY,
+        help="Summary JSON pour recuperer les parametres de phase aerienne.",
+    )
+    parser.add_argument(
+        "--flight-height-threshold-m",
+        type=float,
+        default=None,
+        help="Seuil vertical pour le critere AIR/TOILE. Si absent, on lit summary.json puis fallback a 0.",
+    )
+    parser.add_argument(
+        "--flight-min-consecutive-frames",
+        type=int,
+        default=None,
+        help="Nombre minimal de frames consecutives au-dessus du seuil. Si absent, on lit summary.json puis fallback a 1.",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Ouvre une fenetre interactive avec legende cliquable au lieu de seulement sauver un PNG.",
+    )
     return parser.parse_args()
 
 
@@ -72,7 +90,9 @@ def load_flight_parameters(summary_path: Path) -> tuple[float, int]:
     return float(summary.get("flight_height_threshold_m", 0.0)), int(summary.get("flight_min_consecutive_frames", 1))
 
 
-def compute_airborne_mask(points_3d: np.ndarray, threshold_m: float, min_consecutive_frames: int) -> tuple[np.ndarray, np.ndarray]:
+def compute_airborne_mask(
+    points_3d: np.ndarray, threshold_m: float, min_consecutive_frames: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Reconstruit le masque AIR/TOILE et la trajectoire min_z associee.
 
     Le critere est le meme que dans le pipeline:
@@ -144,7 +164,9 @@ def register_clickable_legend(
         labels.append(name)
         grouped_lines[name] = lines
 
-    legend = legend_ax.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=True, fontsize=8, ncol=1)
+    legend = legend_ax.legend(
+        handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=True, fontsize=8, ncol=1
+    )
     legend_ax._clickable_legend = legend  # type: ignore[attr-defined]
 
     proxy_to_label: dict[Any, str] = {}
@@ -178,13 +200,23 @@ def main() -> None:
     keypoint_names = np.asarray(data["keypoint_names"], dtype=object)
     t = frames / args.fps
     default_threshold, default_min_consecutive = load_flight_parameters(args.summary)
-    flight_threshold = default_threshold if args.flight_height_threshold_m is None else float(args.flight_height_threshold_m)
-    flight_min_consecutive = default_min_consecutive if args.flight_min_consecutive_frames is None else int(args.flight_min_consecutive_frames)
+    flight_threshold = (
+        default_threshold if args.flight_height_threshold_m is None else float(args.flight_height_threshold_m)
+    )
+    flight_min_consecutive = (
+        default_min_consecutive
+        if args.flight_min_consecutive_frames is None
+        else int(args.flight_min_consecutive_frames)
+    )
     airborne_mask, min_z = compute_airborne_mask(points_3d, flight_threshold, flight_min_consecutive)
 
     fig, axes = plt.subplots(3, 1, figsize=(16, 11), sharex=True)
     axis_labels = ["X (m)", "Y (m)", "Z (m)"]
-    axis_titles = ["Trajectoires 3D triangulees - axe X", "Trajectoires 3D triangulees - axe Y", "Trajectoires 3D triangulees - axe Z"]
+    axis_titles = [
+        "Trajectoires 3D triangulees - axe X",
+        "Trajectoires 3D triangulees - axe Y",
+        "Trajectoires 3D triangulees - axe Z",
+    ]
 
     colors = plt.cm.tab20(np.linspace(0, 1, len(keypoint_names)))
     for ax in axes:
@@ -193,7 +225,9 @@ def main() -> None:
     for kp_idx, (kp_name, color) in enumerate(zip(keypoint_names, colors)):
         kp_lines: list[Any] = []
         for axis_idx, ax in enumerate(axes):
-            (line,) = ax.plot(t, points_3d[:, kp_idx, axis_idx], label=str(kp_name), linewidth=1.3, color=color, alpha=0.9)
+            (line,) = ax.plot(
+                t, points_3d[:, kp_idx, axis_idx], label=str(kp_name), linewidth=1.3, color=color, alpha=0.9
+            )
             kp_lines.append(line)
             ax.set_ylabel(axis_labels[axis_idx])
             ax.set_title(axis_titles[axis_idx])
@@ -203,7 +237,14 @@ def main() -> None:
     # Sur l'axe Z, on montre explicitement le critere utilise par le pipeline:
     # le minimum vertical parmi tous les marqueurs, compare au seuil.
     (min_z_line,) = axes[2].plot(t, min_z, color="black", linewidth=2.2, label="min_z marqueurs")
-    threshold_line = axes[2].axhline(flight_threshold, color="black", linewidth=1.2, linestyle="--", alpha=0.8, label=f"seuil AIR/TOILE = {flight_threshold:.3f} m")
+    threshold_line = axes[2].axhline(
+        flight_threshold,
+        color="black",
+        linewidth=1.2,
+        linestyle="--",
+        alpha=0.8,
+        label=f"seuil AIR/TOILE = {flight_threshold:.3f} m",
+    )
     axes[2].text(
         0.995,
         0.02,

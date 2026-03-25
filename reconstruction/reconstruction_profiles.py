@@ -27,6 +27,7 @@ from reconstruction.reconstruction_registry import (
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
+SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_3dof")
 SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
@@ -66,6 +67,7 @@ class ReconstructionProfile:
     family: str
     camera_names: list[str] | None = None
     ekf_model_path: str | None = None
+    model_variant: str = "single_trunk"
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
@@ -106,6 +108,8 @@ class ReconstructionProfile:
 
 def canonical_profile_name(profile: ReconstructionProfile) -> str:
     parts = [profile.family]
+    if profile.model_variant != "single_trunk":
+        parts.append(profile.model_variant)
     if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
         parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
@@ -190,6 +194,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
     if profile.flip_method not in SUPPORTED_FLIP_METHODS:
         raise ValueError(f"Unsupported flip_method: {profile.flip_method}")
+    if profile.model_variant not in SUPPORTED_MODEL_VARIANTS:
+        raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
     profile.frame_stride = int(profile.frame_stride)
@@ -250,6 +256,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.biorbd_kalman_init_method = "triangulation_ik_root_translation"
     if profile.family not in ("ekf_2d", "ekf_3d"):
         profile.ekf_model_path = None
+        profile.model_variant = "single_trunk"
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -525,6 +532,7 @@ def build_pipeline_command(
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
+        cmd.extend(["--model-variant", profile.model_variant])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
@@ -541,6 +549,7 @@ def build_pipeline_command(
     elif profile.family == "ekf_3d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
+        cmd.extend(["--model-variant", profile.model_variant])
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")

@@ -770,6 +770,7 @@ def load_or_build_model_cache(
     subject_mass_kg: float,
     initial_rotation_correction: bool,
     lengths_mode: str,
+    model_variant: str = "single_trunk",
 ) -> tuple[SegmentLengths, Path, Path, int, float, str]:
     if lengths_mode == "first_frame_only":
         lengths, bootstrap_frame_idx = estimate_segment_lengths_first_frame(reconstruction)
@@ -783,6 +784,7 @@ def load_or_build_model_cache(
         fps,
         subject_mass_kg,
         initial_rotation_correction,
+        model_variant=model_variant,
     )
     metadata["lengths_mode"] = lengths_mode
     metadata["bootstrap_frame_idx"] = int(bootstrap_frame_idx)
@@ -800,6 +802,7 @@ def load_or_build_model_cache(
         subject_mass_kg=subject_mass_kg,
         reconstruction=reconstruction,
         apply_initial_root_rotation_correction=initial_rotation_correction,
+        model_variant=model_variant,
     )
     compute_time_s = time.perf_counter() - build_start
     save_model_stage(cache_path, lengths, biomod_cache_path, metadata, compute_time_s=compute_time_s)
@@ -1778,6 +1781,7 @@ def build_ekf_3d_bundle(
     biorbd_kalman_error_factor: float,
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     biomod_path: Path | None = None,
+    model_variant: str = "single_trunk",
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -1868,6 +1872,7 @@ def build_ekf_3d_bundle(
                 subject_mass_kg=subject_mass_kg,
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode="full_triangulation",
+                model_variant=model_variant,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -1991,6 +1996,7 @@ def build_ekf_3d_bundle(
             **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
+        "model_variant": str(model_variant),
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
             "error_factor": float(biorbd_kalman_error_factor),
@@ -2093,6 +2099,7 @@ def build_ekf_2d_bundle(
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
     biomod_path: Path | None = None,
+    model_variant: str = "single_trunk",
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2242,6 +2249,7 @@ def build_ekf_2d_bundle(
                 subject_mass_kg=subject_mass_kg,
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode=ekf2d_3d_source,
+                model_variant=model_variant,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -2505,6 +2513,7 @@ def build_ekf_2d_bundle(
             **({"pose_2d": str(pose_variant_cache_path)} if pose_variant_cache_path is not None else {}),
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
+        "model_variant": str(model_variant),
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),

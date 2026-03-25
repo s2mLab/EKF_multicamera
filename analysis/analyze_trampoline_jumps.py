@@ -42,9 +42,8 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 import matplotlib.pyplot as plt
 
-
 DEFAULT_FPS = 120.0
-DEFAULT_STATES = Path("outputs") / "vitpose_full" / "ekf_states.npz"
+DEFAULT_STATES = Path("output") / "vitpose_full" / "ekf_states.npz"
 
 
 @dataclass
@@ -64,7 +63,9 @@ class JumpAnalysis:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyse des sauts de trampoline a partir des coordonnees generalisees.")
+    parser = argparse.ArgumentParser(
+        description="Analyse des sauts de trampoline a partir des coordonnees generalisees."
+    )
     parser.add_argument("--states", type=Path, default=DEFAULT_STATES, help="Fichier ekf_states.npz")
     parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Frequence d'echantillonnage")
     parser.add_argument("--figure", type=Path, default=None, help="PNG optionnel montrant le decoupage des sauts")
@@ -74,16 +75,43 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="PNG optionnel montrant saltos et vrilles en tours avec la separation des sauts",
     )
-    parser.add_argument("--height-threshold", type=float, default=None, help="Seuil absolu de hauteur racine. Si absent, utilise un seuil relatif.")
-    parser.add_argument("--height-threshold-range-ratio", type=float, default=0.20, help="Seuil relatif exprime en fraction du range de hauteur.")
-    parser.add_argument("--smoothing-window-s", type=float, default=0.15, help="Fenetre de lissage de la hauteur pour la segmentation.")
-    parser.add_argument("--min-airtime-s", type=float, default=0.25, help="Duree minimale au-dessus du seuil pour conserver un saut")
-    parser.add_argument("--min-gap-s", type=float, default=0.08, help="Ecart minimal entre deux phases aeriennes avant fusion")
-    parser.add_argument("--min-peak-prominence-m", type=float, default=0.35, help="Proeminence minimale du pic de hauteur par rapport aux points bas")
-    parser.add_argument("--contact-window-s", type=float, default=0.35, help="Fenetre de recherche locale pour les minima de contact")
+    parser.add_argument(
+        "--height-threshold",
+        type=float,
+        default=None,
+        help="Seuil absolu de hauteur racine. Si absent, utilise un seuil relatif.",
+    )
+    parser.add_argument(
+        "--height-threshold-range-ratio",
+        type=float,
+        default=0.20,
+        help="Seuil relatif exprime en fraction du range de hauteur.",
+    )
+    parser.add_argument(
+        "--smoothing-window-s", type=float, default=0.15, help="Fenetre de lissage de la hauteur pour la segmentation."
+    )
+    parser.add_argument(
+        "--min-airtime-s", type=float, default=0.25, help="Duree minimale au-dessus du seuil pour conserver un saut"
+    )
+    parser.add_argument(
+        "--min-gap-s", type=float, default=0.08, help="Ecart minimal entre deux phases aeriennes avant fusion"
+    )
+    parser.add_argument(
+        "--min-peak-prominence-m",
+        type=float,
+        default=0.35,
+        help="Proeminence minimale du pic de hauteur par rapport aux points bas",
+    )
+    parser.add_argument(
+        "--contact-window-s", type=float, default=0.35, help="Fenetre de recherche locale pour les minima de contact"
+    )
     parser.add_argument("--height-dof", type=str, default="TRUNK:TransZ", help="DoF de hauteur de la racine")
-    parser.add_argument("--salto-dof", type=str, default="TRUNK:RotY", help="DoF racine utilise pour compter les saltos")
-    parser.add_argument("--twist-dof", type=str, default="TRUNK:RotZ", help="DoF racine utilise pour compter les vrilles")
+    parser.add_argument(
+        "--salto-dof", type=str, default="TRUNK:RotY", help="DoF racine utilise pour compter les saltos"
+    )
+    parser.add_argument(
+        "--twist-dof", type=str, default="TRUNK:RotZ", help="DoF racine utilise pour compter les vrilles"
+    )
     parser.add_argument(
         "--hip-dofs",
         nargs="+",
@@ -168,14 +196,18 @@ def local_minimum_index(height: np.ndarray, center: int, left_limit: int, right_
     return start + int(np.argmin(height[start : end + 1]))
 
 
-def refine_jump_boundaries(height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int) -> list[JumpSegment]:
+def refine_jump_boundaries(
+    height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int
+) -> list[JumpSegment]:
     segments: list[JumpSegment] = []
     if not airborne_regions:
         return segments
 
     previous_end = 0
     for region_idx, (start, end) in enumerate(airborne_regions):
-        next_region_start = airborne_regions[region_idx + 1][0] if region_idx + 1 < len(airborne_regions) else len(height) - 1
+        next_region_start = (
+            airborne_regions[region_idx + 1][0] if region_idx + 1 < len(airborne_regions) else len(height) - 1
+        )
         jump_start = local_minimum_index(
             height,
             center=start,
@@ -262,9 +294,22 @@ def plot_jump_segmentation(
         ax.axvspan(t[start], t[end], color="#dd8452", alpha=0.12, label="Phase aerienne" if idx == 0 else None)
 
     for idx, segment in enumerate(jump_segments):
-        ax.axvline(t[segment.start], color="#55a868", linestyle="-", linewidth=1.8, label="Debut/fin saut" if idx == 0 else None)
+        ax.axvline(
+            t[segment.start],
+            color="#55a868",
+            linestyle="-",
+            linewidth=1.8,
+            label="Debut/fin saut" if idx == 0 else None,
+        )
         ax.axvline(t[segment.end], color="#55a868", linestyle="-", linewidth=1.8)
-        ax.scatter(t[segment.peak_index], height[segment.peak_index], color="#8172b3", s=35, zorder=3, label="Pic saut" if idx == 0 else None)
+        ax.scatter(
+            t[segment.peak_index],
+            height[segment.peak_index],
+            color="#8172b3",
+            s=35,
+            zorder=3,
+            label="Pic saut" if idx == 0 else None,
+        )
         ax.text(
             0.5 * (t[segment.start] + t[segment.end]),
             smoothed_height[segment.peak_index] + 0.05,
@@ -319,9 +364,21 @@ def plot_jump_rotations(
 
     for idx, segment in enumerate(jump_segments):
         for ax in axes:
-            ax.axvline(t[segment.start], color="#55a868", linestyle="-", linewidth=1.6, label="Debut/fin saut" if idx == 0 else None)
+            ax.axvline(
+                t[segment.start],
+                color="#55a868",
+                linestyle="-",
+                linewidth=1.6,
+                label="Debut/fin saut" if idx == 0 else None,
+            )
             ax.axvline(t[segment.end], color="#55a868", linestyle="-", linewidth=1.6)
-            ax.axvspan(t[segment.start], t[segment.end], color="#55a868", alpha=0.08, label="Intervalle saut" if idx == 0 else None)
+            ax.axvspan(
+                t[segment.start],
+                t[segment.end],
+                color="#55a868",
+                alpha=0.08,
+                label="Intervalle saut" if idx == 0 else None,
+            )
 
     axes[0].legend(loc="best")
     axes[1].legend(loc="best")
@@ -436,13 +493,19 @@ def main() -> None:
 
     height = q[:, height_idx]
     smoothed_height = smooth_signal(height, window_frames=max(1, int(round(args.smoothing_window_s * args.fps))))
-    height_threshold = args.height_threshold if args.height_threshold is not None else relative_height_threshold(
-        smoothed_height,
-        ratio=args.height_threshold_range_ratio,
+    height_threshold = (
+        args.height_threshold
+        if args.height_threshold is not None
+        else relative_height_threshold(
+            smoothed_height,
+            ratio=args.height_threshold_range_ratio,
+        )
     )
     airborne_mask = smoothed_height > height_threshold
     airborne_regions = contiguous_true_regions(airborne_mask)
-    airborne_regions = merge_close_regions(airborne_regions, max_gap_frames=max(0, int(round(args.min_gap_s * args.fps))))
+    airborne_regions = merge_close_regions(
+        airborne_regions, max_gap_frames=max(0, int(round(args.min_gap_s * args.fps)))
+    )
     jump_segments = refine_jump_boundaries(
         smoothed_height,
         airborne_regions,
@@ -497,7 +560,9 @@ def main() -> None:
         start_t = analysis.segment.start / args.fps
         end_t = analysis.segment.end / args.fps
         peak_h = float(np.nanmax(height[analysis.segment.start : analysis.segment.end + 1]))
-        twists_str = ", ".join(f"{value:.1f}" for value in analysis.twists_per_salto) if analysis.twists_per_salto else "none"
+        twists_str = (
+            ", ".join(f"{value:.1f}" for value in analysis.twists_per_salto) if analysis.twists_per_salto else "none"
+        )
 
         print(
             f"Saut {jump_idx}: frames {analysis.segment.start}-{analysis.segment.end} "

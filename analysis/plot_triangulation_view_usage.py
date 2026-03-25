@@ -10,6 +10,7 @@ contribue a la reconstruction:
 2. une heatmap detaillee (camera, keypoint) x frame pour voir plus finement
    quelles detections sont exclues.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,17 +35,19 @@ DEFAULT_CAMERA_FPS = 120.0
 
 def parse_args() -> argparse.Namespace:
     """Construit l'interface CLI du script."""
-    parser = argparse.ArgumentParser(description="Genere une figure montrant les vues utilisees pour la triangulation a chaque image.")
+    parser = argparse.ArgumentParser(
+        description="Genere une figure montrant les vues utilisees pour la triangulation a chaque image."
+    )
     parser.add_argument(
         "--triangulation",
         type=Path,
-        default=Path("outputs/vitpose_full/triangulation_pose2sim_like.npz"),
+        default=Path("output/vitpose_full/triangulation_pose2sim_like.npz"),
         help="Cache NPZ de triangulation robuste.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("outputs/vitpose_full/triangulation_view_usage.png"),
+        default=Path("output/vitpose_full/triangulation_view_usage.png"),
         help="Figure de sortie.",
     )
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence pour l'axe temporel.")

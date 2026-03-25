@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triangulation",
         type=Path,
-        default=Path("outputs/vitpose_full/triangulation_pose2sim_like.npz"),
+        default=Path("output/vitpose_full/triangulation_pose2sim_like.npz"),
         help="NPZ de triangulation pour lire les stats d'utilisation des vues.",
     )
     parser.add_argument(

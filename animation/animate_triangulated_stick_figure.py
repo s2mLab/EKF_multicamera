@@ -81,13 +81,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triangulation",
         type=Path,
-        default=Path("outputs") / "vitpose_biobuddy_check" / "triangulation_pose2sim_like.npz",
+        default=Path("output") / "vitpose_biobuddy_check" / "triangulation_pose2sim_like.npz",
         help="Fichier NPZ contenant `points_3d`",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("outputs") / "vitpose_biobuddy_check" / "triangulated_stick_figure.gif",
+        default=Path("output") / "vitpose_biobuddy_check" / "triangulated_stick_figure.gif",
         help="Chemin du GIF de sortie",
     )
     parser.add_argument("--fps", type=float, default=20.0, help="Frequence d'affichage du GIF")
@@ -203,7 +203,9 @@ def create_animation(points: np.ndarray, time_s: np.ndarray, output_path: Path, 
 def main() -> None:
     """Point d'entree CLI."""
     args = parse_args()
-    points, time_s = load_points(args.triangulation, stride=max(args.stride, 1), triangulation_fps=args.triangulation_fps)
+    points, time_s = load_points(
+        args.triangulation, stride=max(args.stride, 1), triangulation_fps=args.triangulation_fps
+    )
     create_animation(points, time_s, args.output, fps=args.fps)
     print(f"Animation exportee dans: {args.output}")
 

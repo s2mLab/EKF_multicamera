@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("outputs") / "vitpose_biobuddy_check",
+        default=Path("output") / "vitpose_biobuddy_check",
         help="Dossier contenant ekf_states.npz, kalman_comparison.npz et summary.json",
     )
     parser.add_argument(

@@ -40,11 +40,13 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
+    DEFAULT_MODEL_VARIANT,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
     SUPPORTED_COHERENCE_METHODS,
+    SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_TRIANGULATION_METHODS,
     load_calibrations,
 )
@@ -59,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
     parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--biomod", type=Path, default=None)
+    parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
         "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
@@ -254,6 +257,7 @@ def main() -> None:
             biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
             biomod_path=args.biomod,
+            model_variant=args.model_variant,
         )
     else:
         build_ekf_2d_bundle(
@@ -301,6 +305,7 @@ def main() -> None:
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             biomod_path=args.biomod,
+            model_variant=args.model_variant,
         )
 
     print(f"Bundle ecrit dans {args.output_dir}", flush=True)

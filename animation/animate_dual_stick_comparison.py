@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triangulation",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "triangulation_pose2sim_like.npz",
+        default=Path("output") / "vitpose_full" / "triangulation_pose2sim_like.npz",
         help="NPZ de reconstruction 3D issue du pipeline local",
     )
     parser.add_argument(
@@ -173,25 +173,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "multi_stick_comparison.gif",
+        default=Path("output") / "vitpose_full" / "multi_stick_comparison.gif",
         help="GIF de sortie",
     )
     parser.add_argument(
         "--ekf-states",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "ekf_states.npz",
+        default=Path("output") / "vitpose_full" / "ekf_states.npz",
         help="Etats du nouvel EKF multi-vues",
     )
     parser.add_argument(
         "--kalman-comparison",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "kalman_comparison.npz",
+        default=Path("output") / "vitpose_full" / "kalman_comparison.npz",
         help="Fichier de comparaison contenant `q_ekf_3d`",
     )
     parser.add_argument(
         "--biomod",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "vitpose_chain.bioMod",
+        default=Path("output") / "vitpose_full" / "vitpose_chain.bioMod",
         help="Modele biorbd utilise pour convertir les `q` en positions de keypoints",
     )
     parser.add_argument(

@@ -151,6 +151,7 @@ from reconstruction.reconstruction_presenter import (
 from reconstruction.reconstruction_profiles import (
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_FLIP_METHODS,
+    SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_TRIANGULATION_METHODS,
     ReconstructionProfile,
     build_pipeline_command,
@@ -171,6 +172,7 @@ from reconstruction.reconstruction_registry import (
     latest_version_for_family,
     model_biomod_path,
     model_output_dir,
+    normalize_output_root,
     scan_model_dirs,
     scan_reconstruction_dirs,
 )
@@ -193,6 +195,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
+    DEFAULT_MODEL_VARIANT,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     ReconstructionResult,
     apply_left_right_flip_to_points,
@@ -1735,7 +1738,7 @@ def current_dataset_name(state: SharedAppState) -> str:
 
 
 def current_dataset_dir(state: SharedAppState) -> Path:
-    return ROOT / state.output_root_var.get() / current_dataset_name(state)
+    return normalize_output_root(ROOT / state.output_root_var.get()) / current_dataset_name(state)
 
 
 def current_selected_camera_names(state: SharedAppState) -> list[str]:
@@ -1787,15 +1790,17 @@ def shared_pose_data_kwargs(state: SharedAppState, *, data_mode: str | None = No
 
 
 def current_models_dir(state: SharedAppState) -> Path:
-    return dataset_models_dir(ROOT / state.output_root_var.get(), current_dataset_name(state))
+    return dataset_models_dir(normalize_output_root(ROOT / state.output_root_var.get()), current_dataset_name(state))
 
 
 def current_reconstructions_dir(state: SharedAppState) -> Path:
-    return dataset_reconstructions_dir(ROOT / state.output_root_var.get(), current_dataset_name(state))
+    return dataset_reconstructions_dir(
+        normalize_output_root(ROOT / state.output_root_var.get()), current_dataset_name(state)
+    )
 
 
 def current_figures_dir(state: SharedAppState) -> Path:
-    return dataset_figures_dir(ROOT / state.output_root_var.get(), current_dataset_name(state))
+    return dataset_figures_dir(normalize_output_root(ROOT / state.output_root_var.get()), current_dataset_name(state))
 
 
 def current_dataset_preview_state(
@@ -2638,9 +2643,9 @@ class PipelineTab(CommandTab):
             filetypes=(("2D keypoints JSON", "*_keypoints.json"), ("JSON files", "*.json"), ("All files", "*.*")),
         )
         self.keypoints.pack(fill=tk.X, padx=8, pady=4)
-        self.output_dir = LabeledEntry(form, "Output dir", "outputs/vitpose_full", browse=True, directory=True)
+        self.output_dir = LabeledEntry(form, "Output dir", "output/vitpose_full", browse=True, directory=True)
         self.output_dir.pack(fill=tk.X, padx=8, pady=4)
-        self.biomod = LabeledEntry(form, "bioMod", "outputs/vitpose_full/vitpose_chain.bioMod", browse=True)
+        self.biomod = LabeledEntry(form, "bioMod", "output/vitpose_full/vitpose_chain.bioMod", browse=True)
         self.biomod.pack(fill=tk.X, padx=8, pady=4)
         self.reconstruction_cache = LabeledEntry(form, "Recon cache", "", browse=True)
         self.reconstruction_cache.pack(fill=tk.X, padx=8, pady=4)
@@ -3952,9 +3957,9 @@ class FiguresTab(CommandTab):
         form = ttk.LabelFrame(self.main, text="analysis/plot_kinematic_comparison.py")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
-        self.input_dir = LabeledEntry(form, "Input dir", "outputs/vitpose_full", browse=True, directory=True)
+        self.input_dir = LabeledEntry(form, "Input dir", "output/vitpose_full", browse=True, directory=True)
         self.input_dir.pack(fill=tk.X, padx=8, pady=4)
-        self.output_dir = LabeledEntry(form, "Output dir", "outputs/vitpose_full/figures", browse=True, directory=True)
+        self.output_dir = LabeledEntry(form, "Output dir", "output/vitpose_full/figures", browse=True, directory=True)
         self.output_dir.pack(fill=tk.X, padx=8, pady=4)
 
         row = ttk.Frame(form)
@@ -4065,33 +4070,33 @@ class AnalysisTab(CommandTab):
         script = self.script.get()
         self.interactive_var.set(False)
         if script == "analysis/analyze_trampoline_jumps.py":
-            self.entry_a.var.set("outputs/vitpose_full/ekf_states.npz")
-            self.entry_b.var.set("outputs/vitpose_full/jump_segmentation.png")
-            self.entry_c.var.set("outputs/vitpose_full/jump_rotations.png")
+            self.entry_a.var.set("output/vitpose_full/ekf_states.npz")
+            self.entry_b.var.set("output/vitpose_full/jump_segmentation.png")
+            self.entry_c.var.set("output/vitpose_full/jump_rotations.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("0.20")
             self.opt_3.var.set("0.15")
         elif script == "analysis/plot_triangulation_view_usage.py":
-            self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
+            self.entry_a.var.set("output/vitpose_full/triangulation_pose2sim_like.npz")
             self.entry_b.var.set("")
-            self.entry_c.var.set("outputs/vitpose_full/triangulation_view_usage.png")
+            self.entry_c.var.set("output/vitpose_full/triangulation_view_usage.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("used")
             self.opt_3.var.set("")
         elif script == "analysis/plot_triangulated_marker_trajectories.py":
-            self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
-            self.entry_b.var.set("outputs/vitpose_full/summary.json")
-            self.entry_c.var.set("outputs/vitpose_full/triangulated_marker_trajectories.png")
+            self.entry_a.var.set("output/vitpose_full/triangulation_pose2sim_like.npz")
+            self.entry_b.var.set("output/vitpose_full/summary.json")
+            self.entry_c.var.set("output/vitpose_full/triangulated_marker_trajectories.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("1.5")
             self.opt_3.var.set("2")
         else:
-            self.entry_a.var.set("outputs/vitpose_full/triangulation_pose2sim_like.npz")
+            self.entry_a.var.set("output/vitpose_full/triangulation_pose2sim_like.npz")
             self.entry_b.var.set("inputs/calibration/Calib.toml")
-            self.entry_c.var.set("outputs/vitpose_full/posture_snapshots_3d.png")
+            self.entry_c.var.set("output/vitpose_full/posture_snapshots_3d.png")
             self.opt_1.var.set("120")
             self.opt_2.var.set("7")
-            self.opt_3.var.set("outputs/vitpose_full/first_frame_root_coordinate_system.png")
+            self.opt_3.var.set("output/vitpose_full/first_frame_root_coordinate_system.png")
 
     def build_command(self) -> list[str]:
         script = self.script.get()
@@ -4839,6 +4844,17 @@ class ModelTab(CommandTab):
         row.pack(fill=tk.X, padx=8, pady=4)
         self.subject_mass = LabeledEntry(row, "Subject mass", "55", label_width=10, entry_width=6)
         self.subject_mass.pack(side=tk.LEFT, padx=(0, 8))
+        self.model_variant = tk.StringVar(value=DEFAULT_MODEL_VARIANT)
+        structure_label = ttk.Label(row, text="Structure", width=10)
+        structure_label.pack(side=tk.LEFT)
+        structure_box = ttk.Combobox(
+            row,
+            textvariable=self.model_variant,
+            values=list(SUPPORTED_MODEL_VARIANTS),
+            width=14,
+            state="readonly",
+        )
+        structure_box.pack(side=tk.LEFT, padx=(0, 8))
         self.triang_method = tk.StringVar(value="exhaustive")
         triang_label = ttk.Label(row, text="Triangulation", width=12)
         triang_label.pack(side=tk.LEFT)
@@ -4916,6 +4932,14 @@ class ModelTab(CommandTab):
 
         self.subject_mass.set_tooltip("Masse du sujet utilisée pour les paramètres inertiels du modèle.")
         attach_tooltip(
+            structure_label,
+            "Topologie du bioMod: single_trunk garde le modèle actuel; back_3dof ajoute un segment de dos à 3 DoF au milieu du tronc.",
+        )
+        attach_tooltip(
+            structure_box,
+            "single_trunk: modèle actuel. back_3dof: segment UPPER_BACK rotatif inséré entre le bassin et les épaules/tête/bras.",
+        )
+        attach_tooltip(
             triang_label, "Méthode de triangulation utilisée pour construire le modèle: once, greedy, ou exhaustive."
         )
         attach_tooltip(
@@ -4951,6 +4975,8 @@ class ModelTab(CommandTab):
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.register_reconstruction_listener(self.refresh_existing_models)
+        self.model_variant.trace_add("write", lambda *_args: self.update_details())
+        self.model_variant.trace_add("write", lambda *_args: self.refresh_existing_models())
         self.triang_method.trace_add("write", lambda *_args: self.update_details())
         self.pose_data_mode.trace_add("write", lambda *_args: self.update_details())
         self.pose_correction_mode.trace_add("write", lambda *_args: self.update_details())
@@ -5091,6 +5117,7 @@ class ModelTab(CommandTab):
         self.details_var.set(
             f"Model creation will use: {self.current_pose_source_label()} 2D data, "
             f"frames {frame_start} -> {frame_end}, nb {max_frames}, "
+            f"structure {self.model_variant.get()}, "
             f"triangulation {self.triang_method.get()}, "
             f"root rot-fix {'on' if self.initial_rot_var.get() else 'off'}, "
             f"subject mass {self.subject_mass.get()} kg."
@@ -5168,12 +5195,13 @@ class ModelTab(CommandTab):
         except ValueError:
             return
         dataset_name = current_dataset_name(self.state)
-        output_root = ROOT / self.state.output_root_var.get()
+        output_root = normalize_output_root(ROOT / self.state.output_root_var.get())
         model_dir = model_output_dir(
             output_root,
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            model_variant=self.model_variant.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
@@ -5190,6 +5218,7 @@ class ModelTab(CommandTab):
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            model_variant=self.model_variant.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
@@ -5218,6 +5247,7 @@ class ModelTab(CommandTab):
             biomod_paths.extend(sorted(model_dir.glob("*.bioMod")))
         expected_mode = self.pose_data_mode.get()
         expected_correction = self.current_pose_correction_mode()
+        expected_model_variant = self.model_variant.get() if hasattr(self, "model_variant") else DEFAULT_MODEL_VARIANT
         expected_window = int(self.state.pose_filter_window_var.get())
         expected_ratio = float(self.state.pose_outlier_ratio_var.get())
         expected_p_low = float(self.state.pose_p_low_var.get())
@@ -5232,6 +5262,7 @@ class ModelTab(CommandTab):
                 biomod_path.parent,
                 expected_mode,
                 expected_correction,
+                expected_model_variant,
                 expected_window,
                 expected_ratio,
                 expected_p_low,
@@ -5322,6 +5353,7 @@ class ModelTab(CommandTab):
         model_dir: Path,
         expected_mode: str,
         expected_correction: str,
+        expected_model_variant: str,
         expected_window: int,
         expected_ratio: float,
         expected_p_low: float,
@@ -5338,6 +5370,7 @@ class ModelTab(CommandTab):
         return (
             reconstruction_metadata.get("pose_data_mode") == expected_mode
             and str(reconstruction_metadata.get("pose_correction_mode", "none")) == expected_correction
+            and str(stage_metadata.get("model_variant", DEFAULT_MODEL_VARIANT)) == expected_model_variant
             and int(reconstruction_metadata.get("pose_filter_window", -1)) == expected_window
             and math.isclose(
                 float(reconstruction_metadata.get("pose_outlier_threshold_ratio", math.nan)),
@@ -5412,6 +5445,8 @@ class ModelTab(CommandTab):
             self.subject_mass.get(),
             "--triangulation-method",
             self.triang_method.get(),
+            "--model-variant",
+            self.model_variant.get(),
             "--output-dir",
             display_path(self.derived_model_dir()),
             "--biomod",
@@ -5433,12 +5468,13 @@ class ModelTab(CommandTab):
 
     def derived_model_dir(self) -> Path:
         dataset_name = current_dataset_name(self.state)
-        output_root = ROOT / self.state.output_root_var.get()
+        output_root = normalize_output_root(ROOT / self.state.output_root_var.get())
         return model_output_dir(
             output_root,
             dataset_name,
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
+            model_variant=self.model_variant.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
@@ -5453,13 +5489,14 @@ class ModelTab(CommandTab):
 
     def derived_biomod_path(self) -> str:
         dataset_name = current_dataset_name(self.state)
-        output_root = ROOT / self.state.output_root_var.get()
+        output_root = normalize_output_root(ROOT / self.state.output_root_var.get())
         return display_path(
             model_biomod_path(
                 output_root,
                 dataset_name,
                 pose_data_mode=self.pose_data_mode.get(),
                 triangulation_method=self.triang_method.get(),
+                model_variant=self.model_variant.get(),
                 pose_correction_mode=self.current_pose_correction_mode(),
                 initial_rotation_correction=self.initial_rot_var.get(),
                 max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
@@ -6134,6 +6171,18 @@ class ProfilesTab(CommandTab):
             models_body, selectmode="browse", exportselection=False, height=5, width=40
         )
         self.profile_models_list.pack(fill=tk.BOTH, expand=True)
+        model_variant_row = ttk.Frame(self.ekf_model_frame)
+        model_variant_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(model_variant_row, text="Model variant", width=16).pack(side=tk.LEFT)
+        self.profile_model_variant = tk.StringVar(value=DEFAULT_MODEL_VARIANT)
+        self.profile_model_variant_box = ttk.Combobox(
+            model_variant_row,
+            textvariable=self.profile_model_variant,
+            values=list(SUPPORTED_MODEL_VARIANTS),
+            width=18,
+            state="readonly",
+        )
+        self.profile_model_variant_box.pack(side=tk.LEFT, padx=(0, 8))
         self.ekf_model_info_var = tk.StringVar(value="used by EKF profiles only")
         ttk.Label(self.ekf_model_frame, textvariable=self.ekf_model_info_var, foreground="#4f5b66").pack(
             side=tk.TOP,
@@ -6229,6 +6278,10 @@ class ProfilesTab(CommandTab):
             self.profile_models_list,
             "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
         )
+        attach_tooltip(
+            self.profile_model_variant_box,
+            "Variante du modèle utilisée seulement si le profil reconstruit son bioMod au lieu d'en réutiliser un existant.",
+        )
         actions = ttk.Frame(form)
         actions.pack(fill=tk.X, padx=8, pady=6)
         self.add_profile_button = ttk.Button(actions, text="Add profile", command=self.add_current_profile)
@@ -6269,6 +6322,7 @@ class ProfilesTab(CommandTab):
         self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.coherence_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.profile_model_variant.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6456,7 +6510,13 @@ class ProfilesTab(CommandTab):
         if selected_model:
             self.ekf_model_info_var.set("reuse existing model (faster)")
         else:
-            self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
+            model_variant = (
+                self.profile_model_variant.get() if hasattr(self, "profile_model_variant") else DEFAULT_MODEL_VARIANT
+            )
+            if model_variant == DEFAULT_MODEL_VARIANT:
+                self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
+            else:
+                self.ekf_model_info_var.set(f"auto-build {model_variant} model from current 2D data")
 
     def on_profile_model_changed(self) -> None:
         self.update_profile_model_summary()
@@ -6502,11 +6562,15 @@ class ProfilesTab(CommandTab):
         selected_model_path = self.selected_profile_model_path() if family in ("ekf_2d", "ekf_3d") else None
         if family == "ekf_2d" and not selected_model_path:
             raise ValueError("EKF 2D requires selecting an existing bioMod.")
+        model_variant = (
+            self.profile_model_variant.get() if hasattr(self, "profile_model_variant") else DEFAULT_MODEL_VARIANT
+        )
         profile = ReconstructionProfile(
             name=self.profile_name.get() if include_name else "",
             family=family,
             camera_names=self.selected_profile_camera_names(),
             ekf_model_path=selected_model_path,
+            model_variant=model_variant if family in ("ekf_2d", "ekf_3d") else DEFAULT_MODEL_VARIANT,
             predictor=self.predictor.get() if family == "ekf_2d" else None,
             ekf2d_3d_source="first_frame_only" if family == "ekf_2d" else "full_triangulation",
             ekf2d_initial_state_method=self.ekf2d_initial_state_method.get() if family == "ekf_2d" else "ekf_bootstrap",
@@ -6591,6 +6655,8 @@ class ProfilesTab(CommandTab):
                     flags.append("rootq0")
             if getattr(profile, "ekf_model_path", None):
                 flags.append(f"mdl:{Path(str(profile.ekf_model_path)).stem}")
+            elif getattr(profile, "model_variant", DEFAULT_MODEL_VARIANT) != DEFAULT_MODEL_VARIANT:
+                flags.append(f"mdl:{getattr(profile, 'model_variant', DEFAULT_MODEL_VARIANT)}")
             if profile.initial_rotation_correction:
                 flags.append("rotfix")
             if profile.flip:
@@ -6684,7 +6750,7 @@ class ProfilesTab(CommandTab):
             "--config",
             display_path(runtime_config_path),
             "--output-root",
-            self.state.output_root_var.get(),
+            display_path(normalize_output_root(self.state.output_root_var.get())),
             "--dataset-name",
             current_dataset_name(self.state),
             "--calib",
@@ -10304,6 +10370,7 @@ class LauncherApp(tk.Tk):
             output_root_var=tk.StringVar(value="output"),
             profiles_config_var=tk.StringVar(value=DEFAULT_GUI_PROFILES_CONFIG),
         )
+        state.output_root_var.set(display_path(normalize_output_root(state.output_root_var.get())))
         profiles_path = ROOT / state.profiles_config_var.get()
         if profiles_path.exists():
             try:

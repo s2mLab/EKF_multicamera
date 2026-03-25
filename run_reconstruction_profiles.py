@@ -25,7 +25,7 @@ from reconstruction.reconstruction_profiles import (
     validate_profile,
     variant_output_dir,
 )
-from reconstruction.reconstruction_registry import infer_dataset_name, latest_version_for_family
+from reconstruction.reconstruction_registry import infer_dataset_name, latest_version_for_family, normalize_output_root
 
 DEFAULT_CONFIG = Path("reconstruction_profiles.json")
 DEFAULT_OUTPUT_ROOT = Path("output")
@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    args.output_root = normalize_output_root(args.output_root)
     if args.write_example_config:
         save_profiles_json(args.config, example_profiles())
         print(f"Configuration d'exemple ecrite dans {args.config}")

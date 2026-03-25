@@ -84,19 +84,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--triangulation",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "triangulation_pose2sim_like.npz",
+        default=Path("output") / "vitpose_full" / "triangulation_pose2sim_like.npz",
         help="NPZ triangulation locale",
     )
     parser.add_argument("--pose2sim-trc", type=Path, default=None)
-    parser.add_argument("--ekf-states", type=Path, default=Path("outputs") / "vitpose_full" / "ekf_states.npz")
+    parser.add_argument("--ekf-states", type=Path, default=Path("output") / "vitpose_full" / "ekf_states.npz")
     parser.add_argument(
-        "--kalman-comparison", type=Path, default=Path("outputs") / "vitpose_full" / "kalman_comparison.npz"
+        "--kalman-comparison", type=Path, default=Path("output") / "vitpose_full" / "kalman_comparison.npz"
     )
-    parser.add_argument("--biomod", type=Path, default=Path("outputs") / "vitpose_full" / "vitpose_chain.bioMod")
+    parser.add_argument("--biomod", type=Path, default=Path("output") / "vitpose_full" / "vitpose_chain.bioMod")
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("outputs") / "vitpose_full" / "multiview_2d_comparison.gif",
+        default=Path("output") / "vitpose_full" / "multiview_2d_comparison.gif",
         help="GIF de sortie",
     )
     parser.add_argument("--data-fps", type=float, default=DEFAULT_CAMERA_FPS, help="Frequence des donnees source")

@@ -30,7 +30,7 @@ from vitpose_ekf_pipeline import load_calibrations, load_pose_data
 
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
-DEFAULT_OUTPUT = Path("outputs/vitpose_full/camera_2d_temporal_exploration.png")
+DEFAULT_OUTPUT = Path("output/vitpose_full/camera_2d_temporal_exploration.png")
 DEFAULT_FPS = 120.0
 
 
