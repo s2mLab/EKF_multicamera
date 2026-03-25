@@ -1,4 +1,7 @@
 import math
+from pathlib import Path
+
+import numpy as np
 
 from reconstruction.reconstruction_timings import (
     build_pipeline_diagram,
@@ -109,7 +112,36 @@ def test_model_and_reconstruction_seconds_prefer_stage_wall_times():
     }
     assert math.isclose(objective_total_seconds(summary), 3.3)
     assert math.isclose(model_compute_seconds(summary), 0.7)
-    assert math.isclose(reconstruction_run_seconds(summary), 3.3)
+    assert math.isclose(reconstruction_run_seconds(summary), 2.6)
+
+
+def test_objective_model_time_can_be_recovered_from_selected_biomod_cache(tmp_path: Path):
+    model_dir = tmp_path / "model_demo"
+    model_dir.mkdir()
+    biomod_path = model_dir / "model_demo.bioMod"
+    biomod_path.write_text("version 4", encoding="utf-8")
+    np.savez(
+        model_dir / "model_stage.npz",
+        lengths=np.asarray("{}", dtype=object),
+        biomod_path=np.asarray(str(biomod_path), dtype=object),
+        compute_time_s=np.asarray(1.25, dtype=float),
+        metadata=np.asarray("{}", dtype=object),
+    )
+
+    summary = {
+        "selected_model": str(biomod_path),
+        "pipeline_timing": {
+            "stages": [
+                make_timing_stage("triangulation", "Triangulation", compute_time_s=2.0),
+                make_timing_stage("model_creation", "Model creation", compute_time_s=0.0, source="provided"),
+                make_timing_stage("ekf_3d", "EKF 3D", compute_time_s=0.5),
+            ]
+        },
+    }
+
+    assert math.isclose(model_compute_seconds(summary), 1.25)
+    assert math.isclose(objective_total_seconds(summary), 3.75)
+    assert math.isclose(reconstruction_run_seconds(summary), 2.5)
 
 
 def test_build_pipeline_diagram_marks_cached_stages():

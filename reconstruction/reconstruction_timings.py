@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Iterable
+
+import numpy as np
 
 
 def make_timing_stage(
@@ -39,6 +42,77 @@ def stage_compute_time(stage: dict[str, object]) -> float | None:
     return _coerce_float(stage.get("compute_time_s"))
 
 
+def _load_model_stage_compute_time(model_stage_path: Path) -> float | None:
+    """Read the cached model generation time from one `model_stage.npz`."""
+
+    if not model_stage_path.exists():
+        return None
+    try:
+        with np.load(model_stage_path, allow_pickle=True) as data:
+            if "compute_time_s" not in data:
+                return None
+            return _coerce_float(np.asarray(data["compute_time_s"]).item())
+    except Exception:
+        return None
+
+
+def _candidate_model_stage_paths(summary: dict[str, object]) -> list[Path]:
+    """Enumerate candidate `model_stage.npz` paths associated with this summary."""
+
+    candidates: list[Path] = []
+    selected_model = summary.get("selected_model")
+    if isinstance(selected_model, str) and selected_model.strip():
+        biomod_path = Path(selected_model)
+        candidates.append(biomod_path.parent / "model_stage.npz")
+
+    cache_paths = summary.get("cache_paths")
+    if isinstance(cache_paths, dict):
+        raw_model_cache = cache_paths.get("model")
+        if isinstance(raw_model_cache, str) and raw_model_cache.strip():
+            model_cache_path = Path(raw_model_cache)
+            if model_cache_path.name == "model_stage.npz":
+                candidates.append(model_cache_path)
+            elif model_cache_path.suffix == ".bioMod":
+                candidates.append(model_cache_path.parent / "model_stage.npz")
+
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(candidate)
+    return result
+
+
+def fallback_model_objective_seconds(summary: dict[str, object]) -> float | None:
+    """Recover the model-generation cost when the bundle reuses an existing bioMod."""
+
+    for candidate in _candidate_model_stage_paths(summary):
+        value = _load_model_stage_compute_time(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def stage_objective_seconds(stage: dict[str, object], summary: dict[str, object]) -> float | None:
+    """Return the objective cost of one stage, replacing cache-read times when possible."""
+
+    value = stage_compute_time(stage)
+    if str(stage.get("id", "")) != "model_creation":
+        return value
+    if value is not None and value > 0.0:
+        return value
+    fallback = fallback_model_objective_seconds(summary)
+    if fallback is not None:
+        return fallback
+    return value
+
+
 def objective_total_seconds(summary: dict[str, object]) -> float | None:
     """Return the total objective compute time, including reused cached stages."""
 
@@ -54,7 +128,7 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
             for stage in stages:
                 if not isinstance(stage, dict) or not bool(stage.get("include_in_total", True)):
                     continue
-                value = stage_compute_time(stage)
+                value = stage_objective_seconds(stage, summary)
                 if value is None:
                     continue
                 total += value
@@ -65,12 +139,7 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
 
 
 def model_compute_seconds(summary: dict[str, object]) -> float | None:
-    """Return the wall time spent in the model-creation stage for this run."""
-
-    stage_timings = dict(parse_stage_timings(summary))
-    stage_time = _coerce_float(stage_timings.get("model_creation_s"))
-    if stage_time is not None:
-        return stage_time
+    """Return the objective time attributable to the model-creation stage."""
 
     pipeline = summary.get("pipeline_timing")
     if isinstance(pipeline, dict):
@@ -83,26 +152,22 @@ def model_compute_seconds(summary: dict[str, object]) -> float | None:
                     continue
                 if str(stage.get("id", "")) != "model_creation":
                     continue
-                value = stage_compute_time(stage)
+                value = stage_objective_seconds(stage, summary)
                 if value is None:
                     continue
                 total += value
                 used = True
-            if used:
+            if used and total > 0.0:
                 return total
-    return None
+    stage_timings = dict(parse_stage_timings(summary))
+    stage_time = _coerce_float(stage_timings.get("model_creation_s"))
+    if stage_time is not None:
+        return stage_time
+    return fallback_model_objective_seconds(summary)
 
 
 def reconstruction_run_seconds(summary: dict[str, object]) -> float | None:
-    """Return current-run reconstruction time excluding model creation."""
-
-    stage_timings = dict(parse_stage_timings(summary))
-    total_s = _coerce_float(stage_timings.get("total_s"))
-    model_s = _coerce_float(stage_timings.get("model_creation_s"))
-    if total_s is not None:
-        if model_s is None:
-            return total_s
-        return max(0.0, total_s - model_s)
+    """Return the objective reconstruction time excluding model creation."""
 
     total = objective_total_seconds(summary)
     if total is None:
