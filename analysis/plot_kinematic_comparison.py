@@ -12,9 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from math import ceil
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

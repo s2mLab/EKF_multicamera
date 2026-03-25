@@ -13,18 +13,17 @@ python biorbd_fd_to_c3d.py \
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Iterable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np
-
 import biorbd
 import ezc3d
+import numpy as np
 
 
 def _try_loadmat(path: Path):

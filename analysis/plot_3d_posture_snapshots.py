@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -27,8 +27,8 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 
-from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from analysis.plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
+from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from vitpose_ekf_pipeline import load_calibrations
 
 DEFAULT_TRIANGULATION = Path("output/vitpose_full/triangulation_pose2sim_like.npz")
