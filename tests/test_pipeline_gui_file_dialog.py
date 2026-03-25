@@ -269,6 +269,12 @@ def test_flip_method_display_name_uses_user_friendly_labels():
     assert pipeline_gui.flip_method_display_name("triangulation_once") == "Triangulation once"
 
 
+def test_coherence_method_display_name_uses_precomputed_labels():
+    assert pipeline_gui.coherence_method_display_name("epipolar") == "Epipolar (precomputed)"
+    assert pipeline_gui.coherence_method_display_name("epipolar_fast") == "Epipolar fast (precomputed)"
+    assert pipeline_gui.coherence_method_from_display_name("Epipolar fast (precomputed)") == "epipolar_fast"
+
+
 def test_profiles_tab_selected_profile_flip_method_disables_flip_for_none():
     tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
     tab.flip_method = SimpleNamespace(get=lambda: "none")
@@ -340,23 +346,25 @@ class _FakeEntryField:
 class _FakeListbox:
     def __init__(self):
         self.items = []
-        self._selection = ()
+        self._selection = []
 
     def delete(self, _start, _end=None):
         self.items = []
-        self._selection = ()
+        self._selection = []
 
     def insert(self, _index, value):
         self.items.append(str(value))
 
     def selection_clear(self, _start, _end=None):
-        self._selection = ()
+        self._selection = []
 
     def selection_set(self, index):
-        self._selection = (int(index),)
+        value = int(index)
+        if value not in self._selection:
+            self._selection.append(value)
 
     def curselection(self):
-        return self._selection
+        return tuple(self._selection)
 
     def size(self):
         return len(self.items)
@@ -438,16 +446,94 @@ def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(mo
     tab._model_summary = ""
 
     monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/1_partie_0429"))
+    monkeypatch.setattr(pipeline_gui, "current_models_dir", lambda _state: Path("output/1_partie_0429/models"))
     monkeypatch.setattr(pipeline_gui, "scan_model_dirs", lambda _dataset_dir: [model_dir])
     monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
-    monkeypatch.setattr(Path, "glob", lambda self, pattern: [biomod_path] if self == model_dir else [])
+    monkeypatch.setattr(
+        Path,
+        "glob",
+        lambda self, pattern: (
+            [biomod_path]
+            if (self == Path("output/1_partie_0429/models") and pattern == "**/*.bioMod")
+            or (self == model_dir and pattern == "*.bioMod")
+            else []
+        ),
+    )
 
     pipeline_gui.ProfilesTab.refresh_profile_model_choices(tab)
 
-    assert tuple(tab.profile_models_list.items) == (str(biomod_path),)
-    assert tab._profile_model_choices[str(biomod_path)] == str(biomod_path)
+    assert tuple(tab.profile_models_list.items) == ("model_demo",)
+    assert tab._profile_model_choices["model_demo"] == str(biomod_path)
     assert tab._model_info == "select an existing bioMod (required for EKF 2D)"
     assert tab._model_summary == "select one model"
+
+
+def test_profiles_tab_refresh_profile_camera_choices_selects_all_by_default(monkeypatch):
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.state = SimpleNamespace(calib_var=SimpleNamespace(get=lambda: "inputs/calibration/Calib.toml"))
+    tab.profile_cameras_list = _FakeListbox()
+    tab.profile_cameras_summary = SimpleNamespace(set=lambda value: setattr(tab, "_camera_summary", value))
+    tab.sync_profile_name = lambda: None
+    tab._camera_summary = ""
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "load_calibrations",
+        lambda _path: {"cam_a": object(), "cam_b": object(), "cam_c": object()},
+    )
+
+    pipeline_gui.ProfilesTab.refresh_profile_camera_choices(tab)
+
+    assert tuple(tab.profile_cameras_list.items) == ("cam_a", "cam_b", "cam_c")
+    assert tab.profile_cameras_list.curselection() == (0, 1, 2)
+    assert tab._camera_summary == "Cameras (n=3/3)"
+
+
+def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.state = SimpleNamespace(
+        pose_filter_window_var=SimpleNamespace(get=lambda: "11"),
+        pose_outlier_ratio_var=SimpleNamespace(get=lambda: "0.2"),
+        pose_p_low_var=SimpleNamespace(get=lambda: "7"),
+        pose_p_high_var=SimpleNamespace(get=lambda: "93"),
+        flip_improvement_ratio_var=SimpleNamespace(get=lambda: "0.7"),
+        flip_min_gain_px_var=SimpleNamespace(get=lambda: "3.0"),
+        flip_min_other_cameras_var=SimpleNamespace(get=lambda: "2"),
+        flip_restrict_to_outliers_var=SimpleNamespace(get=lambda: True),
+        flip_outlier_percentile_var=SimpleNamespace(get=lambda: "85.0"),
+        flip_outlier_floor_px_var=SimpleNamespace(get=lambda: "5.0"),
+        flip_temporal_weight_var=SimpleNamespace(get=lambda: "0.35"),
+        flip_temporal_tau_px_var=SimpleNamespace(get=lambda: "20.0"),
+    )
+    tab.family = SimpleNamespace(get=lambda: "ekf_2d")
+    tab.profile_name = SimpleNamespace(get=lambda: "demo")
+    tab.selected_profile_camera_names = lambda: ["cam_a"]
+    tab.selected_profile_model_path = lambda: "output/demo/models/model.bioMod"
+    tab.predictor = SimpleNamespace(get=lambda: "acc")
+    tab.ekf2d_initial_state_method = SimpleNamespace(get=lambda: "ekf_bootstrap")
+    tab.ekf2d_bootstrap_passes = SimpleNamespace(get=lambda: "5")
+    tab.selected_profile_flip_method = lambda: None
+    tab.lock_var = SimpleNamespace(get=lambda: False)
+    tab.initial_rot_var = SimpleNamespace(get=lambda: False)
+    tab.pose_data_mode = SimpleNamespace(get=lambda: "cleaned")
+    tab.frame_stride = SimpleNamespace(get=lambda: "1")
+    tab.triang_method = SimpleNamespace(get=lambda: "exhaustive")
+    tab.coherence_method = SimpleNamespace(get=lambda: "Epipolar (precomputed)")
+    tab.unwrap_var = SimpleNamespace(get=lambda: False)
+    tab.biorbd_noise = SimpleNamespace(get=lambda: "1e-8")
+    tab.biorbd_error = SimpleNamespace(get=lambda: "1e-4")
+    tab.biorbd_kalman_init_method = SimpleNamespace(get=lambda: "triangulation_ik_root_translation")
+    tab.measurement_noise = SimpleNamespace(get=lambda: "1.5")
+    tab.process_noise = SimpleNamespace(get=lambda: "1.0")
+    tab.coherence_floor = SimpleNamespace(get=lambda: "0.35")
+
+    profile = pipeline_gui.ProfilesTab.current_profile(tab)
+
+    assert profile.pose_filter_window == 11
+    assert profile.pose_outlier_threshold_ratio == 0.2
+    assert profile.pose_amplitude_lower_percentile == 7.0
+    assert profile.pose_amplitude_upper_percentile == 93.0
+    assert profile.coherence_method == "epipolar"
 
 
 def test_profiles_tab_update_profile_model_info_marks_existing_biomod_as_faster():
@@ -482,6 +568,7 @@ def test_profiles_tab_update_family_controls_hides_triangulation_for_ekf2d():
     tab.triang_frame = _FakePackFrame()
     tab.flip_frame = _FakePackFrame()
     tab.ekf2d_frame = _FakePackFrame()
+    tab.ekf2d_observation_frame = _FakePackFrame()
     tab.ekf2d_params_frame = _FakePackFrame()
     tab.ekf3d_frame = _FakePackFrame()
     tab.clean_frame = _FakePackFrame()

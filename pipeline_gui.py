@@ -1440,6 +1440,7 @@ class LabeledEntry(ttk.Frame):
         *,
         label_width: int = 18,
         entry_width: int = 70,
+        label_padx: tuple[int, int] = (0, 6),
         filetypes: tuple[tuple[str, str], ...] | None = None,
         browse_initialdir: str | None = None,
     ):
@@ -1448,7 +1449,7 @@ class LabeledEntry(ttk.Frame):
         self.filetypes = filetypes
         self.browse_initialdir = browse_initialdir
         self.label_widget = ttk.Label(self, text=label, width=label_width)
-        self.label_widget.pack(side=tk.LEFT, padx=(0, 6))
+        self.label_widget.pack(side=tk.LEFT, padx=label_padx)
         self.var = tk.StringVar(value=default)
         self.entry_widget = ttk.Entry(self, textvariable=self.var, width=entry_width)
         self.entry_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -1942,6 +1943,28 @@ def flip_method_display_name(method: str) -> str:
     """Return a user-facing label for a profile flip method."""
 
     return FLIP_METHOD_DISPLAY_NAMES.get(str(method).strip(), str(method).strip() or "Epipolar (local)")
+
+
+COHERENCE_METHOD_DISPLAY_NAMES = {
+    "epipolar": "Epipolar (precomputed)",
+    "epipolar_fast": "Epipolar fast (precomputed)",
+}
+
+
+def coherence_method_display_name(method: str) -> str:
+    """Return a user-facing label for an EKF2D coherence method."""
+
+    return COHERENCE_METHOD_DISPLAY_NAMES.get(str(method).strip(), str(method).strip() or "Epipolar (precomputed)")
+
+
+def coherence_method_from_display_name(label: str) -> str:
+    """Map a UI label back to its internal coherence identifier."""
+
+    normalized = str(label).strip()
+    for method, display_name in COHERENCE_METHOD_DISPLAY_NAMES.items():
+        if normalized == display_name:
+            return method
+    return normalized or "epipolar"
 
 
 def write_runtime_profiles_config(state: SharedAppState) -> Path:
@@ -2591,7 +2614,7 @@ class PipelineTab(CommandTab):
         mode_label.pack(side=tk.LEFT)
         self.pose_data_mode = tk.StringVar(value="cleaned")
         pose_mode_box = ttk.Combobox(
-            row0, textvariable=self.pose_data_mode, values=["raw", "filtered", "cleaned"], width=12, state="readonly"
+            row0, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=12, state="readonly"
         )
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 6))
         self.subject_mass = LabeledEntry(form, "Subject mass", "55")
@@ -2610,11 +2633,11 @@ class PipelineTab(CommandTab):
         )
         attach_tooltip(
             mode_label,
-            "Version des detections 2D utilisee par le pipeline: brute, lissee, ou nettoyee apres rejet des points aberrants.",
+            "Version des detections 2D utilisee par le pipeline: brute ou nettoyee apres rejet des points aberrants.",
         )
         attach_tooltip(
             pose_mode_box,
-            "Version des detections 2D utilisee par le pipeline: brute, lissee, ou nettoyee apres rejet des points aberrants.",
+            "Version des detections 2D utilisee par le pipeline: brute ou nettoyee apres rejet des points aberrants.",
         )
         self.subject_mass.set_tooltip("Masse utilisee pour les proprietes inertielles du sujet dans le modele.")
 
@@ -4063,26 +4086,25 @@ class DataExplorer2DTab(ttk.Frame):
         )
 
         row_display = ttk.Frame(controls)
-        row_display.pack(fill=tk.X, padx=8, pady=4)
-        component_label = ttk.Label(row_display, text="Composante", width=10)
+        component_label = ttk.Label(row_display, text="Composante", width=12)
         component_label.pack(side=tk.LEFT)
         self.component = tk.StringVar(value="y")
         component_box = ttk.Combobox(
             row_display, textvariable=self.component, values=["x", "y"], width=6, state="readonly"
         )
         component_box.pack(side=tk.LEFT, padx=(0, 8))
-        view_mode_label = ttk.Label(row_display, text="Traitement", width=10)
+        view_mode_label = ttk.Label(row_display, text="2D mode", width=10)
         view_mode_label.pack(side=tk.LEFT)
         self.view_mode = state.pose_data_mode_var
         self.view_mode_menu = ttk.Combobox(
             row_display,
             textvariable=self.view_mode,
-            values=["raw", "filtered", "cleaned"],
+            values=["raw", "cleaned"],
             width=10,
             state="readonly",
         )
         self.view_mode_menu.pack(side=tk.LEFT, padx=(0, 8))
-        flip_mode_label = ttk.Label(row_display, text="Correction L/R", width=12)
+        flip_mode_label = ttk.Label(row_display, text="Correction L/R", width=14)
         flip_mode_label.pack(side=tk.LEFT)
         self.flip_mode = tk.StringVar(value="none")
         self.flip_mode_menu = ttk.Combobox(
@@ -4093,29 +4115,27 @@ class DataExplorer2DTab(ttk.Frame):
             state="readonly",
         )
         self.flip_mode_menu.pack(side=tk.LEFT, padx=(0, 8))
-        self.pose_filter_window = LabeledEntry(row_display, "Filter window", "9", label_width=10, entry_width=4)
-        self.pose_filter_window.var = state.pose_filter_window_var
-        self.pose_filter_window.entry_widget.configure(textvariable=self.pose_filter_window.var)
-        self.pose_filter_window.pack(side=tk.LEFT, padx=(0, 6))
-        self.pose_outlier_ratio = LabeledEntry(row_display, "Outlier ratio", "0.10", label_width=10, entry_width=5)
-        self.pose_outlier_ratio.var = state.pose_outlier_ratio_var
-        self.pose_outlier_ratio.entry_widget.configure(textvariable=self.pose_outlier_ratio.var)
-        self.pose_outlier_ratio.pack(side=tk.LEFT)
 
         row_clean = ttk.Frame(controls)
         row_clean.pack(fill=tk.X, padx=8, pady=4)
-        self.pose_p_low = LabeledEntry(row_clean, "P low", "5", label_width=6, entry_width=4)
+        self.pose_filter_window = LabeledEntry(row_clean, "Filter window", "9", label_width=10, entry_width=4)
+        self.pose_filter_window.var = state.pose_filter_window_var
+        self.pose_filter_window.entry_widget.configure(textvariable=self.pose_filter_window.var)
+        self.pose_filter_window.pack(side=tk.LEFT, padx=(0, 6))
+        self.pose_outlier_ratio = LabeledEntry(row_clean, "Outlier ratio", "0.10", label_width=10, entry_width=5)
+        self.pose_outlier_ratio.var = state.pose_outlier_ratio_var
+        self.pose_outlier_ratio.entry_widget.configure(textvariable=self.pose_outlier_ratio.var)
+        self.pose_outlier_ratio.pack(side=tk.LEFT, padx=(0, 6))
+        self.pose_p_low = LabeledEntry(row_clean, "P_low", "5", label_width=5, entry_width=4, label_padx=(0, 2))
         self.pose_p_low.var = state.pose_p_low_var
         self.pose_p_low.entry_widget.configure(textvariable=self.pose_p_low.var)
         self.pose_p_low.pack(side=tk.LEFT, padx=(0, 6))
-        self.pose_p_high = LabeledEntry(row_clean, "P high", "95", label_width=6, entry_width=4)
+        self.pose_p_high = LabeledEntry(row_clean, "P_high", "95", label_width=6, entry_width=4, label_padx=(0, 2))
         self.pose_p_high.var = state.pose_p_high_var
         self.pose_p_high.entry_widget.configure(textvariable=self.pose_p_high.var)
         self.pose_p_high.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(row_clean, text="Load 2D data", command=self.load_data).pack(side=tk.LEFT)
         ttk.Button(row_clean, text="Refresh", command=self.reload_data).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(row_clean, text="Choix des keypoints:").pack(side=tk.LEFT, padx=(14, 6))
-
         row_flip = ttk.Frame(controls)
         row_flip.pack(fill=tk.X, padx=8, pady=4)
         self.flip_restrict_var = state.flip_restrict_to_outliers_var
@@ -4147,17 +4167,20 @@ class DataExplorer2DTab(ttk.Frame):
         self.flip_min_gain.var = state.flip_min_gain_px_var
         self.flip_min_gain.entry_widget.configure(textvariable=self.flip_min_gain.var)
         self.flip_min_gain.pack(side=tk.LEFT, padx=(0, 6))
+
+        row_flip_timing = ttk.Frame(controls)
+        row_flip_timing.pack(fill=tk.X, padx=8, pady=4)
         self.flip_min_cameras = LabeledEntry(
-            row_flip, "Min cams", str(DEFAULT_FLIP_MIN_OTHER_CAMERAS), label_width=8, entry_width=4
+            row_flip_timing, "Min cams", str(DEFAULT_FLIP_MIN_OTHER_CAMERAS), label_width=8, entry_width=4
         )
         self.flip_min_cameras.var = state.flip_min_other_cameras_var
         self.flip_min_cameras.entry_widget.configure(textvariable=self.flip_min_cameras.var)
         self.flip_min_cameras.pack(side=tk.LEFT, padx=(0, 10))
-        triang_flip_label = ttk.Label(row_flip, text="Triang flip", width=9)
+        triang_flip_label = ttk.Label(row_flip_timing, text="Triang flip", width=9)
         triang_flip_label.pack(side=tk.LEFT)
         self.triang_flip_method = tk.StringVar(value="once")
         self.triang_flip_method_box = ttk.Combobox(
-            row_flip,
+            row_flip_timing,
             textvariable=self.triang_flip_method,
             values=["once", "greedy", "exhaustive"],
             width=10,
@@ -4165,20 +4188,22 @@ class DataExplorer2DTab(ttk.Frame):
         )
         self.triang_flip_method_box.pack(side=tk.LEFT, padx=(0, 10))
         self.flip_temporal_weight = LabeledEntry(
-            row_flip, "Temp w", str(DEFAULT_FLIP_TEMPORAL_WEIGHT), label_width=7, entry_width=4
+            row_flip_timing, "Temp w", str(DEFAULT_FLIP_TEMPORAL_WEIGHT), label_width=7, entry_width=4
         )
         self.flip_temporal_weight.var = state.flip_temporal_weight_var
         self.flip_temporal_weight.entry_widget.configure(textvariable=self.flip_temporal_weight.var)
         self.flip_temporal_weight.pack(side=tk.LEFT, padx=(0, 6))
         self.flip_temporal_tau = LabeledEntry(
-            row_flip, "Temp tau", str(DEFAULT_FLIP_TEMPORAL_TAU_PX), label_width=8, entry_width=4
+            row_flip_timing, "Temp tau", str(DEFAULT_FLIP_TEMPORAL_TAU_PX), label_width=8, entry_width=4
         )
         self.flip_temporal_tau.var = state.flip_temporal_tau_px_var
         self.flip_temporal_tau.entry_widget.configure(textvariable=self.flip_temporal_tau.var)
         self.flip_temporal_tau.pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Label(row_flip, textvariable=self.flip_status_var, foreground="#4f5b66", justify=tk.LEFT).pack(
+        ttk.Label(row_flip_timing, textvariable=self.flip_status_var, foreground="#4f5b66", justify=tk.LEFT).pack(
             side=tk.LEFT, fill=tk.X, expand=True
         )
+
+        row_display.pack(fill=tk.X, padx=8, pady=4)
 
         content = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -4228,8 +4253,8 @@ class DataExplorer2DTab(ttk.Frame):
         )
         attach_tooltip(component_label, "Composante 2D affichée sur les courbes temporelles.")
         attach_tooltip(component_box, "Composante 2D affichée sur les courbes temporelles.")
-        attach_tooltip(view_mode_label, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
-        attach_tooltip(self.view_mode_menu, "Traitement affiché: brut, filtré, ou nettoyé après rejet des outliers.")
+        attach_tooltip(view_mode_label, "Traitement affiché: brut ou nettoyé après rejet des outliers.")
+        attach_tooltip(self.view_mode_menu, "Traitement affiché: brut ou nettoyé après rejet des outliers.")
         attach_tooltip(
             flip_mode_label,
             "Applique visuellement une correction gauche/droite basée sur le diagnostic choisi. Les variantes sans suffixe utilisent une décision locale frame par frame; les variantes *_viterbi appliquent un lissage explicite par Viterbi.",
@@ -4656,13 +4681,13 @@ class ModelTab(CommandTab):
         row2b = ttk.Frame(form)
         row2b.pack(fill=tk.X, padx=8, pady=4)
         default_model_pose_mode = state.pose_data_mode_var.get().strip()
-        if default_model_pose_mode not in ("raw", "filtered", "cleaned"):
+        if default_model_pose_mode not in ("raw", "cleaned"):
             default_model_pose_mode = "cleaned"
         self.pose_data_mode = tk.StringVar(value=default_model_pose_mode)
         pose_mode_label = ttk.Label(row2b, text="2D source", width=10)
         pose_mode_label.pack(side=tk.LEFT)
         pose_mode_box = ttk.Combobox(
-            row2b, textvariable=self.pose_data_mode, values=["raw", "filtered", "cleaned"], width=10, state="readonly"
+            row2b, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=10, state="readonly"
         )
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
         default_pose_correction_mode = current_calibration_correction_mode(state)
@@ -4720,7 +4745,7 @@ class ModelTab(CommandTab):
         )
         attach_tooltip(
             pose_mode_label,
-            "Choix de la version de base des 2D utilisées pour construire le modèle: raw, filtered ou cleaned.",
+            "Choix de la version de base des 2D utilisées pour construire le modèle: raw ou cleaned.",
         )
         attach_tooltip(
             pose_mode_box,
@@ -5712,28 +5737,21 @@ class ProfilesTab(CommandTab):
         self.cameras_frame = ttk.Frame(form)
         cameras_header = ttk.Frame(self.cameras_frame)
         cameras_header.pack(fill=tk.X)
-        cameras_label = ttk.Label(cameras_header, text="Cameras", width=10)
+        self.profile_cameras_summary = tk.StringVar(value="Cameras (n=0/0)")
+        cameras_label = ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, width=20)
         cameras_label.pack(side=tk.LEFT)
-        ttk.Button(cameras_header, text="Use current selection", command=self.use_current_camera_selection).pack(
-            side=tk.LEFT, padx=(0, 6)
-        )
-        ttk.Button(cameras_header, text="All cameras", command=self.clear_profile_camera_selection).pack(side=tk.LEFT)
-        self.profile_cameras_summary = tk.StringVar(value="all cameras")
-        ttk.Label(cameras_header, textvariable=self.profile_cameras_summary, foreground="#4f5b66").pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
         self.profile_source_row = ttk.Frame(self.cameras_frame)
-        self.profile_source_row.pack(fill=tk.X, pady=(4, 0))
+        self.profile_source_row.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        cameras_body = ttk.Frame(self.profile_source_row, width=260)
-        cameras_body.pack(side=tk.LEFT, fill=tk.Y)
+        cameras_body = ttk.Frame(self.profile_source_row, width=470, height=250)
+        cameras_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         cameras_body.pack_propagate(False)
         self.profile_cameras_list = tk.Listbox(
             cameras_body,
             selectmode="extended",
             exportselection=False,
-            height=4,
-            width=24,
+            height=14,
+            width=40,
         )
         self.profile_cameras_list.pack(fill=tk.BOTH, expand=True)
 
@@ -5744,12 +5762,18 @@ class ProfilesTab(CommandTab):
         pose_mode_box = ttk.Combobox(
             self.pose_mode_frame,
             textvariable=self.pose_data_mode,
-            values=["raw", "filtered", "cleaned"],
+            values=["raw", "cleaned"],
             width=12,
             state="readonly",
         )
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
-        stride_label = ttk.Label(self.pose_mode_frame, text="1/N", width=4)
+        self.pose_mode_info = ttk.Label(
+            self.pose_mode_frame,
+            text="clean settings follow 2D explorer",
+            foreground="#5a6570",
+        )
+        self.pose_mode_info.pack(side=tk.LEFT, padx=(0, 12))
+        stride_label = ttk.Label(self.pose_mode_frame, text="Downsampling", width=12)
         stride_label.pack(side=tk.LEFT)
         self.frame_stride = tk.StringVar(value="1")
         stride_box = ttk.Combobox(
@@ -5809,20 +5833,53 @@ class ProfilesTab(CommandTab):
             self.ekf2d_frame, textvariable=self.predictor, values=["acc", "dyn"], width=8, state="readonly"
         )
         predictor_box.pack(side=tk.LEFT, padx=(0, 8))
-        coherence_label = ttk.Label(self.ekf2d_frame, text="Coherence", width=10)
-        coherence_label.pack(side=tk.LEFT)
-        self.coherence_method = tk.StringVar(value="epipolar")
-        self.coherence_box = ttk.Combobox(
+        self.measurement_noise = LabeledEntry(
             self.ekf2d_frame,
+            "EKF2D meas",
+            "1.5",
+            label_width=10,
+            entry_width=4,
+        )
+        self.measurement_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.process_noise = LabeledEntry(
+            self.ekf2d_frame,
+            "EKF2D proc",
+            "1.0",
+            label_width=10,
+            entry_width=4,
+        )
+        self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.ekf2d_observation_frame = ttk.Frame(form)
+        ekf2d_flip_method_label = ttk.Label(self.ekf2d_observation_frame, text="Flip left/right method", width=20)
+        ekf2d_flip_method_label.pack(side=tk.LEFT)
+        self.ekf2d_flip_method_button = ttk.Menubutton(
+            self.ekf2d_observation_frame,
+            textvariable=self.flip_method_label_var,
+            width=28,
+            direction="below",
+        )
+        self.ekf2d_flip_method_button.pack(side=tk.LEFT, padx=(0, 8))
+        self.ekf2d_flip_method_button.configure(menu=self.flip_method_menu)
+        coherence_label = ttk.Label(self.ekf2d_observation_frame, text="Coherence", width=10)
+        coherence_label.pack(side=tk.LEFT)
+        self.coherence_method = tk.StringVar(value=coherence_method_display_name("epipolar"))
+        self.coherence_box = ttk.Combobox(
+            self.ekf2d_observation_frame,
             textvariable=self.coherence_method,
-            values=["epipolar", "epipolar_fast"],
-            width=18,
+            values=[coherence_method_display_name("epipolar"), coherence_method_display_name("epipolar_fast")],
+            width=26,
             state="readonly",
         )
         self.coherence_box.pack(side=tk.LEFT, padx=(0, 8))
-        self.lock_var = tk.BooleanVar(value=False)
-        lock_check = ttk.Checkbutton(self.ekf2d_frame, text="dof_locking", variable=self.lock_var)
-        lock_check.pack(side=tk.LEFT)
+        self.coherence_floor = LabeledEntry(
+            self.ekf2d_observation_frame,
+            "Conf floor",
+            "0.35",
+            label_width=9,
+            entry_width=4,
+        )
+        self.coherence_floor.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf2d_params_frame = ttk.Frame(form)
         q0_method_label = ttk.Label(self.ekf2d_params_frame, text="q0 init", width=10)
@@ -5844,30 +5901,9 @@ class ProfilesTab(CommandTab):
             entry_width=4,
         )
         self.ekf2d_bootstrap_passes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.measurement_noise = LabeledEntry(
-            self.ekf2d_params_frame,
-            "EKF2D meas",
-            "1.5",
-            label_width=10,
-            entry_width=5,
-        )
-        self.measurement_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.process_noise = LabeledEntry(
-            self.ekf2d_params_frame,
-            "EKF2D proc",
-            "1.0",
-            label_width=10,
-            entry_width=5,
-        )
-        self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.coherence_floor = LabeledEntry(
-            self.ekf2d_params_frame,
-            "Conf floor",
-            "0.35",
-            label_width=9,
-            entry_width=5,
-        )
-        self.coherence_floor.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.lock_var = tk.BooleanVar(value=False)
+        lock_check = ttk.Checkbutton(self.ekf2d_params_frame, text="dof_locking", variable=self.lock_var)
+        lock_check.pack(side=tk.LEFT, padx=(0, 8))
         self.ekf2d_initial_frame_info = ttk.Label(
             self.ekf2d_params_frame,
             text="q0 support: first valid frame only",
@@ -5907,12 +5943,14 @@ class ProfilesTab(CommandTab):
         ttk.Label(model_header, textvariable=self.profile_models_summary, foreground="#4f5b66").pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        models_body = ttk.Frame(self.ekf_model_frame, width=520)
-        models_body.pack(fill=tk.X, pady=(4, 0))
+        models_body = ttk.Frame(self.ekf_model_frame, width=470, height=250)
+        models_body.pack(fill=tk.BOTH, pady=(4, 0), expand=True)
         models_body.pack_propagate(False)
-        self.profile_models_list = tk.Listbox(models_body, selectmode="browse", exportselection=False, height=4)
+        self.profile_models_list = tk.Listbox(
+            models_body, selectmode="browse", exportselection=False, height=14, width=40
+        )
         self.profile_models_list.pack(fill=tk.BOTH, expand=True)
-        self.ekf_model_info_var = tk.StringVar(value="auto-build model from current 2D data")
+        self.ekf_model_info_var = tk.StringVar(value="used by EKF profiles only")
         ttk.Label(self.ekf_model_frame, textvariable=self.ekf_model_info_var, foreground="#4f5b66").pack(
             side=tk.TOP,
             fill=tk.X,
@@ -5920,22 +5958,7 @@ class ProfilesTab(CommandTab):
             anchor="w",
             pady=(4, 0),
         )
-
-        self.clean_frame = ttk.Frame(form)
-        self.pose_filter_window = LabeledEntry(self.clean_frame, "Filter window", "9", label_width=9, entry_width=4)
-        self.pose_filter_window.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.pose_outlier_ratio = LabeledEntry(
-            self.clean_frame,
-            "Outlier ratio",
-            "0.10",
-            label_width=10,
-            entry_width=5,
-        )
-        self.pose_outlier_ratio.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.pose_p_low = LabeledEntry(self.clean_frame, "P low", "5")
-        self.pose_p_low.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.pose_p_high = LabeledEntry(self.clean_frame, "P high", "95")
-        self.pose_p_high.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.ekf_model_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
 
         self.config_path.set_tooltip("Fichier JSON contenant les profils de reconstruction sauvegardes.")
         self.profile_name.set_tooltip("Nom lisible du profil de reconstruction.")
@@ -5981,11 +6004,11 @@ class ProfilesTab(CommandTab):
         attach_tooltip(predictor_box, "Choisit le predicteur dynamique de l'EKF 2D.")
         attach_tooltip(
             coherence_label,
-            "Pondération multivue de l'EKF 2D pendant la boucle du filtre. En mode simplifié EKF2D, on garde des options épipolaires compatibles avec une initialisation sur la première frame valide.",
+            "Pondération multivue de l'EKF 2D pendant la boucle du filtre. Les modes affichés ici sont aujourd'hui précalculés sur toute la séquence, puis relus pendant l'EKF.",
         )
         attach_tooltip(
             self.coherence_box,
-            "epipolar: Sampson local. epipolar_fast: distance symétrique plus légère. Ces scores sont utilisés pendant tout l'EKF 2D, alors que q0 est initialisé sur la première frame valide.",
+            "Epipolar (precomputed): cohérence Sampson précalculée sur la séquence. Epipolar fast (precomputed): distance symétrique précalculée, plus légère.",
         )
         attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
         attach_tooltip(
@@ -6022,11 +6045,6 @@ class ProfilesTab(CommandTab):
             self.profile_models_list,
             "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
         )
-        self.pose_filter_window.set_tooltip("Fenêtre du lissage utilisé pour la référence filtrée 2D.")
-        self.pose_outlier_ratio.set_tooltip("Ratio de rejet des points 2D trop éloignés de la référence filtrée.")
-        self.pose_p_low.set_tooltip("Percentile bas pour l'amplitude robuste du mouvement 2D.")
-        self.pose_p_high.set_tooltip("Percentile haut pour l'amplitude robuste du mouvement 2D.")
-
         actions = ttk.Frame(form)
         actions.pack(fill=tk.X, padx=8, pady=6)
         ttk.Button(actions, text="Add profile", command=self.add_current_profile).pack(side=tk.LEFT)
@@ -6083,7 +6101,6 @@ class ProfilesTab(CommandTab):
         self.state.calib_var.trace_add("write", lambda *_args: self.refresh_profile_camera_choices())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
         self.state.output_root_var.trace_add("write", lambda *_args: self.refresh_profile_model_choices())
-        self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_profile_camera_summary())
         self.profile_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_camera_selection_changed())
         self.profile_models_list.bind("<<ListboxSelect>>", lambda _event: self.on_profile_model_changed())
         self.state.register_profile_listener(self.refresh_profile_tree)
@@ -6113,25 +6130,22 @@ class ProfilesTab(CommandTab):
             self.triang_frame,
             self.flip_frame,
             self.ekf2d_frame,
+            self.ekf2d_observation_frame,
             self.ekf2d_params_frame,
             self.ekf3d_frame,
-            self.clean_frame,
         ]:
             frame.pack_forget()
         family = self.family.get()
         self.cameras_frame.pack(fill=tk.X, padx=8, pady=4)
-        self.ekf_model_frame.pack_forget()
-        if family in ("ekf_2d", "ekf_3d"):
-            self.ekf_model_frame.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 0))
         if family in ("triangulation", "ekf_3d", "ekf_2d"):
             self.pose_mode_frame.pack(fill=tk.X, padx=8, pady=4)
-            self.clean_frame.pack(fill=tk.X, padx=8, pady=4)
         if family in ("triangulation", "ekf_3d"):
             self.triang_frame.pack(fill=tk.X, padx=8, pady=4)
-        if family in ("triangulation", "ekf_3d", "ekf_2d"):
+        if family in ("triangulation", "ekf_3d"):
             self.flip_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_2d":
             self.ekf2d_frame.pack(fill=tk.X, padx=8, pady=4)
+            self.ekf2d_observation_frame.pack(fill=tk.X, padx=8, pady=4)
             self.ekf2d_params_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
@@ -6153,7 +6167,7 @@ class ProfilesTab(CommandTab):
         self.update_profile_camera_summary()
 
     def refresh_profile_camera_choices(self) -> None:
-        selected_before = self.selected_profile_camera_names() or current_selected_camera_names(self.state)
+        selected_before = self.selected_profile_camera_names()
         camera_names: list[str] = []
         calib_raw = self.state.calib_var.get().strip()
         if calib_raw:
@@ -6164,7 +6178,8 @@ class ProfilesTab(CommandTab):
         self.profile_cameras_list.delete(0, tk.END)
         for camera_name in camera_names:
             self.profile_cameras_list.insert(tk.END, camera_name)
-        self._set_profile_camera_selection(selected_before if camera_names else None)
+        default_selection = selected_before if selected_before else camera_names
+        self._set_profile_camera_selection(default_selection if camera_names else None)
         self.sync_profile_name()
 
     def on_tab_activated(self) -> None:
@@ -6177,10 +6192,22 @@ class ProfilesTab(CommandTab):
             choices: list[tuple[str, str | None]] = []
         else:
             choices = [("auto", None)]
-        for model_dir in scan_model_dirs(dataset_dir):
-            for biomod_path in sorted(model_dir.glob("*.bioMod")):
-                display = display_path(biomod_path)
-                choices.append((display, display))
+        biomod_paths: list[Path] = []
+        models_root = current_models_dir(self.state)
+        if models_root.exists():
+            biomod_paths.extend(sorted(models_root.glob("**/*.bioMod")))
+        if not biomod_paths:
+            for model_dir in scan_model_dirs(dataset_dir):
+                biomod_paths.extend(sorted(model_dir.glob("*.bioMod")))
+        unique_biomods = sorted({path.resolve(): path for path in biomod_paths}.values(), key=lambda path: str(path))
+        label_counts: dict[str, int] = {}
+        for biomod_path in unique_biomods:
+            label_counts[biomod_path.parent.name] = label_counts.get(biomod_path.parent.name, 0) + 1
+        for biomod_path in unique_biomods:
+            display = display_path(biomod_path)
+            short_label = biomod_path.parent.name
+            label = display if label_counts.get(short_label, 0) > 1 else short_label
+            choices.append((label, display))
         self._profile_model_choices = dict(choices)
         self.profile_models_list.delete(0, tk.END)
         for label, _value in choices:
@@ -6222,12 +6249,16 @@ class ProfilesTab(CommandTab):
         if selected_label == "auto":
             self.profile_models_summary.set("auto-build")
             return
-        self.profile_models_summary.set(f"selected: {Path(selected_label).stem}")
+        selected_path = self.selected_profile_model_path()
+        if selected_path:
+            self.profile_models_summary.set(f"selected: {Path(selected_path).stem}")
+            return
+        self.profile_models_summary.set(f"selected: {selected_label}")
 
     def update_profile_model_info(self) -> None:
         family = self.family.get()
         if family not in ("ekf_2d", "ekf_3d"):
-            self.ekf_model_info_var.set("")
+            self.ekf_model_info_var.set("available models for EKF profiles")
             return
         selected_model = self.selected_profile_model_path()
         if selected_model:
@@ -6244,9 +6275,9 @@ class ProfilesTab(CommandTab):
 
     def update_profile_camera_summary(self) -> None:
         selected = self.selected_profile_camera_names()
-        self.profile_cameras_summary.set(
-            "all cameras" if not selected else f"profile cameras: {format_camera_names(selected)}"
-        )
+        total_count = self.profile_cameras_list.size()
+        selected_count = total_count if not selected and total_count else len(selected or [])
+        self.profile_cameras_summary.set(f"Cameras (n={selected_count}/{total_count})")
 
     def use_current_camera_selection(self) -> None:
         self._set_profile_camera_selection(current_selected_camera_names(self.state))
@@ -6297,7 +6328,9 @@ class ProfilesTab(CommandTab):
             triangulation_method=(
                 self.triang_method.get() if family in ("triangulation", "ekf_3d", "ekf_2d") else "exhaustive"
             ),
-            coherence_method=self.coherence_method.get() if family == "ekf_2d" else "epipolar",
+            coherence_method=(
+                coherence_method_from_display_name(self.coherence_method.get()) if family == "ekf_2d" else "epipolar"
+            ),
             no_root_unwrap=self.unwrap_var.get(),
             biorbd_kalman_noise_factor=float(self.biorbd_noise.get()),
             biorbd_kalman_error_factor=float(self.biorbd_error.get()),
@@ -6307,10 +6340,10 @@ class ProfilesTab(CommandTab):
             measurement_noise_scale=float(self.measurement_noise.get()),
             process_noise_scale=float(self.process_noise.get()),
             coherence_confidence_floor=float(self.coherence_floor.get()),
-            pose_filter_window=int(self.pose_filter_window.get()),
-            pose_outlier_threshold_ratio=float(self.pose_outlier_ratio.get()),
-            pose_amplitude_lower_percentile=float(self.pose_p_low.get()),
-            pose_amplitude_upper_percentile=float(self.pose_p_high.get()),
+            pose_filter_window=int(self.state.pose_filter_window_var.get()),
+            pose_outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
+            pose_amplitude_lower_percentile=float(self.state.pose_p_low_var.get()),
+            pose_amplitude_upper_percentile=float(self.state.pose_p_high_var.get()),
         )
         return validate_profile(profile)
 
@@ -10067,9 +10100,9 @@ class LauncherApp(tk.Tk):
 
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        self.notebook.add(DataExplorer2DTab(self.notebook, state), text="2D explorer")
+        self.notebook.add(DataExplorer2DTab(self.notebook, state), text="2D analysis")
         self.notebook.add(CameraToolsTab(self.notebook, state), text="Caméras")
-        self.notebook.add(ModelTab(self.notebook, state), text="Modèle")
+        self.notebook.add(ModelTab(self.notebook, state), text="Models")
         self.notebook.add(ProfilesTab(self.notebook, state), text="Profiles")
         self.notebook.add(ReconstructionsTab(self.notebook, state), text="Reconstructions")
         self.notebook.add(DualAnimationTab(self.notebook, state), text="3D animation")
