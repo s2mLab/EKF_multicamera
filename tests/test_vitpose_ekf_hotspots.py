@@ -960,3 +960,26 @@ def test_upper_back_pseudo_measurement_block_tracks_mean_hip_flexion():
     np.testing.assert_allclose(h, np.array([0.05], dtype=float))
     np.testing.assert_allclose(h_q, np.array([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=float))
     np.testing.assert_allclose(variance, np.array([np.deg2rad(10.0) ** 2], dtype=float))
+
+
+def test_upper_back_zero_prior_blocks_pull_lateral_and_axial_dofs_to_zero():
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.nq = 6
+    ekf.upper_back_zero_prior_indices = (2, 5)
+    ekf.upper_back_pseudo_std_rad = np.deg2rad(8.0)
+
+    reference_q = np.array([0.0, 0.0, 0.2, 0.0, 0.0, -0.15], dtype=float)
+
+    blocks = ekf._upper_back_zero_prior_blocks(reference_q)
+
+    assert len(blocks) == 2
+    first_z, first_h, first_h_q, first_variance = blocks[0]
+    second_z, second_h, second_h_q, second_variance = blocks[1]
+    np.testing.assert_allclose(first_z, np.array([0.0], dtype=float))
+    np.testing.assert_allclose(first_h, np.array([0.2], dtype=float))
+    np.testing.assert_allclose(first_h_q, np.array([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]], dtype=float))
+    np.testing.assert_allclose(first_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))
+    np.testing.assert_allclose(second_z, np.array([0.0], dtype=float))
+    np.testing.assert_allclose(second_h, np.array([-0.15], dtype=float))
+    np.testing.assert_allclose(second_h_q, np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=float))
+    np.testing.assert_allclose(second_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))

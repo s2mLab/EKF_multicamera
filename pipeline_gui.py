@@ -761,7 +761,7 @@ def single_frame_reconstruction(reconstruction: ReconstructionResult, frame_idx:
     )
 
 
-def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str]]:
+def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str | None]]:
     names = [str(name) for name in q_names]
     pairs = []
     for name in names:
@@ -771,6 +771,8 @@ def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str]]:
         if right_name in names:
             pair_label = name.replace("LEFT_", "", 1)
             pairs.append((pair_label, name, right_name))
+    if "UPPER_BACK:RotX" in names:
+        pairs.append(("UPPER_BACK:RotX", "UPPER_BACK:RotX", None))
     pairs.sort(key=lambda item: item[0])
     return pairs
 
@@ -4978,11 +4980,11 @@ class ModelTab(CommandTab):
         self.subject_mass.set_tooltip("Masse du sujet utilisée pour les paramètres inertiels du modèle.")
         attach_tooltip(
             structure_label,
-            "Topologie du bioMod: single_trunk garde le modèle actuel; back_3dof ajoute un segment de dos à 3 DoF au milieu du tronc.",
+            "Topologie du bioMod: single_trunk garde le modèle actuel; back_flexion_1d ajoute une flexion sagittale du dos; back_3dof ajoute un segment de dos à 3 DoF au milieu du tronc.",
         )
         attach_tooltip(
             structure_box,
-            "single_trunk: modèle actuel. back_3dof: segment UPPER_BACK rotatif inséré entre le bassin et les épaules/tête/bras.",
+            "single_trunk: modèle actuel. back_flexion_1d: UPPER_BACK avec 1 DoF sagittal. back_3dof: UPPER_BACK avec 3 DoF entre le bassin et les épaules/tête/bras.",
         )
         attach_tooltip(
             symmetrize_check,
@@ -6185,6 +6187,22 @@ class ProfilesTab(CommandTab):
             entry_width=4,
         )
         self.ekf2d_bootstrap_passes.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.upper_back_sagittal_gain = LabeledEntry(
+            self.ekf2d_params_frame,
+            "Back gain",
+            "0.2",
+            label_width=8,
+            entry_width=4,
+        )
+        self.upper_back_sagittal_gain.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.upper_back_pseudo_std_deg = LabeledEntry(
+            self.ekf2d_params_frame,
+            "Back std",
+            "10",
+            label_width=7,
+            entry_width=4,
+        )
+        self.upper_back_pseudo_std_deg.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.lock_var = tk.BooleanVar(value=False)
         lock_check = ttk.Checkbutton(self.ekf2d_params_frame, text="dof_locking", variable=self.lock_var)
         lock_check.pack(side=tk.LEFT, padx=(0, 8))
@@ -6330,6 +6348,12 @@ class ProfilesTab(CommandTab):
         self.ekf2d_bootstrap_passes.set_tooltip(
             "Nombre de passes EKF 2D utilisées pour affiner q0 sur la première frame valide quand le bootstrap est actif."
         )
+        self.upper_back_sagittal_gain.set_tooltip(
+            "Fraction de la flexion moyenne des hanches utilisée comme cible douce pour UPPER_BACK:RotX."
+        )
+        self.upper_back_pseudo_std_deg.set_tooltip(
+            "Ecart-type angulaire (en degrés) de la pseudo-observation du dos. Plus petit = contrainte plus forte."
+        )
         self.measurement_noise.set_tooltip(
             "Bruit de mesure de l'EKF 2D. Plus grand = moins de confiance dans les keypoints 2D."
         )
@@ -6401,6 +6425,8 @@ class ProfilesTab(CommandTab):
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.upper_back_sagittal_gain.var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.upper_back_pseudo_std_deg.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.flip_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6693,6 +6719,12 @@ class ProfilesTab(CommandTab):
             measurement_noise_scale=float(self.measurement_noise.get()),
             process_noise_scale=float(self.process_noise.get()),
             coherence_confidence_floor=float(self.coherence_floor.get()),
+            upper_back_sagittal_gain=(
+                float(self.upper_back_sagittal_gain.get()) if hasattr(self, "upper_back_sagittal_gain") else 0.2
+            ),
+            upper_back_pseudo_std_deg=(
+                float(self.upper_back_pseudo_std_deg.get()) if hasattr(self, "upper_back_pseudo_std_deg") else 10.0
+            ),
             pose_filter_window=int(self.state.pose_filter_window_var.get()),
             pose_outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
             pose_amplitude_lower_percentile=float(self.state.pose_p_low_var.get()),
@@ -6728,6 +6760,8 @@ class ProfilesTab(CommandTab):
                 flags.append("rootq0")
             elif int(getattr(profile, "ekf2d_bootstrap_passes", 5)) != 5:
                 flags.append(f"boot{int(getattr(profile, 'ekf2d_bootstrap_passes', 5))}")
+            if abs(float(getattr(profile, "upper_back_sagittal_gain", 0.2)) - 0.2) > 1e-9:
+                flags.append(f"ubg:{float(getattr(profile, 'upper_back_sagittal_gain', 0.2)):.2f}")
             if profile.family == "ekf_3d":
                 init_method = getattr(profile, "biorbd_kalman_init_method", "triangulation_ik_root_translation")
                 if init_method == "triangulation_ik":
@@ -7639,6 +7673,25 @@ class JointKinematicsTab(ttk.Frame):
             return rotation_unit_label(self.rotation_unit.get(), self.quantity.get())
         return "m" if self.quantity.get() == "q" else "m/s"
 
+    @staticmethod
+    def _upper_back_target_series(series: np.ndarray, name_to_index: dict[str, int]) -> np.ndarray | None:
+        """Return the default sagittal prior target for `UPPER_BACK:RotX` if available."""
+
+        hip_candidates = (
+            "LEFT_THIGH:RotY",
+            "RIGHT_THIGH:RotY",
+            "LEFT_THIGH:RotX",
+            "RIGHT_THIGH:RotX",
+        )
+        hip_indices = [name_to_index[name] for name in hip_candidates if name in name_to_index]
+        if len(hip_indices) < 2:
+            return None
+        hip_values = np.asarray(series[:, hip_indices], dtype=float)
+        if hip_values.ndim != 2 or hip_values.shape[1] < 2:
+            return None
+        with np.errstate(invalid="ignore"):
+            return 0.2 * np.nanmean(hip_values, axis=1)
+
     def sync_dataset_dir(self) -> None:
         self.refresh_available_reconstructions()
 
@@ -7735,13 +7788,10 @@ class JointKinematicsTab(ttk.Frame):
                     frame_indices = np.arange(frame_slice.start, frame_slice.stop, dtype=float)
                     time_s = frame_indices * dt
                     left_idx = name_to_index[left_name]
-                    right_idx = name_to_index[right_name]
                     color = reconstruction_display_color(self.state, recon_name)
                     legend_label = reconstruction_legend_label(self.state, recon_name)
                     left_style = side_styles["left"]
-                    right_style = side_styles["right"]
                     left_values = self._scale_joint_dof_series(series[:, left_idx], left_name)
-                    right_values = self._scale_joint_dof_series(series[:, right_idx], right_name)
                     ax.plot(
                         time_s,
                         left_values,
@@ -7751,19 +7801,34 @@ class JointKinematicsTab(ttk.Frame):
                         marker=left_style["marker"],
                         markevery=max(1, len(time_s) // 24) if len(time_s) else 1,
                         markersize=3.0,
-                        label=f"{legend_label} | L",
+                        label=f"{legend_label} | L" if right_name is not None else legend_label,
                     )
-                    ax.plot(
-                        time_s,
-                        right_values,
-                        color=color,
-                        linewidth=1.7,
-                        linestyle=right_style["linestyle"],
-                        marker=right_style["marker"],
-                        markevery=max(1, len(time_s) // 24) if len(time_s) else 1,
-                        markersize=3.0,
-                        label=f"{legend_label} | R",
-                    )
+                    if right_name is not None:
+                        right_idx = name_to_index[right_name]
+                        right_style = side_styles["right"]
+                        right_values = self._scale_joint_dof_series(series[:, right_idx], right_name)
+                        ax.plot(
+                            time_s,
+                            right_values,
+                            color=color,
+                            linewidth=1.7,
+                            linestyle=right_style["linestyle"],
+                            marker=right_style["marker"],
+                            markevery=max(1, len(time_s) // 24) if len(time_s) else 1,
+                            markersize=3.0,
+                            label=f"{legend_label} | R",
+                        )
+                    elif left_name == "UPPER_BACK:RotX":
+                        target_values = self._upper_back_target_series(series, name_to_index)
+                        if target_values is not None:
+                            ax.plot(
+                                time_s,
+                                self._scale_joint_dof_series(target_values, left_name),
+                                color="#202020",
+                                linewidth=1.2,
+                                linestyle=":",
+                                label=f"{legend_label} | target",
+                            )
                     plotted_series = True
                 ax.set_title(pair_label)
                 ax.grid(alpha=0.25)

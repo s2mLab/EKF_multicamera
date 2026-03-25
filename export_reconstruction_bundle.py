@@ -8,6 +8,8 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent
 LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
@@ -45,6 +47,8 @@ from vitpose_ekf_pipeline import (
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_TRIANGULATION_METHODS,
@@ -143,6 +147,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-noise-scale", type=float, default=DEFAULT_MEASUREMENT_NOISE_SCALE)
     parser.add_argument("--process-noise-scale", type=float, default=1.0)
     parser.add_argument("--coherence-confidence-floor", type=float, default=DEFAULT_COHERENCE_CONFIDENCE_FLOOR)
+    parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
+    parser.add_argument(
+        "--upper-back-pseudo-std-deg", type=float, default=np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD)
+    )
     parser.add_argument("--min-frame-coherence-for-update", type=float, default=DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE)
     parser.add_argument("--skip-low-coherence-updates", action="store_true")
     parser.add_argument("--flight-height-threshold-m", type=float, default=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M)
@@ -310,6 +318,8 @@ def main() -> None:
             skip_low_coherence_updates=args.skip_low_coherence_updates,
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
+            upper_back_sagittal_gain=args.upper_back_sagittal_gain,
+            upper_back_pseudo_std_deg=args.upper_back_pseudo_std_deg,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,

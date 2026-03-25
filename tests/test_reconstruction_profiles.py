@@ -203,6 +203,31 @@ def test_build_pipeline_command_includes_model_variant_for_auto_built_ekf_profil
     assert cmd[cmd.index("--model-variant") + 1] == "back_3dof"
 
 
+def test_build_pipeline_command_includes_upper_back_prior_parameters_for_ekf2d():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_back",
+            family="ekf_2d",
+            predictor="acc",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+            upper_back_sagittal_gain=0.35,
+            upper_back_pseudo_std_deg=8.0,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert cmd[cmd.index("--upper-back-sagittal-gain") + 1] == "0.35"
+    assert cmd[cmd.index("--upper-back-pseudo-std-deg") + 1] == "8.0"
+
+
 def test_canonical_profile_name_marks_asymmetric_auto_built_models():
     profile = validate_profile(
         ReconstructionProfile(

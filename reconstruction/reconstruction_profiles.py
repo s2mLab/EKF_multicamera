@@ -11,6 +11,7 @@ Ce module permet de:
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass
 from itertools import product
@@ -100,6 +101,8 @@ class ReconstructionProfile:
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
     coherence_confidence_floor: float = 0.35
+    upper_back_sagittal_gain: float = 0.2
+    upper_back_pseudo_std_deg: float = 10.0
     pose_filter_window: int = 9
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
@@ -131,6 +134,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
+        if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
+            parts.append(f"ubg{slugify(f'{profile.upper_back_sagittal_gain:.2f}')}")
         if profile.flip:
             if profile.flip_method != "epipolar":
                 parts.append(f"flip_{profile.flip_method}")
@@ -204,6 +209,10 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
+    if float(profile.upper_back_sagittal_gain) < 0.0:
+        raise ValueError("upper_back_sagittal_gain must be >= 0.")
+    if float(profile.upper_back_pseudo_std_deg) <= 0.0:
+        raise ValueError("upper_back_pseudo_std_deg must be > 0.")
     profile.frame_stride = int(profile.frame_stride)
     if profile.frame_stride not in SUPPORTED_FRAME_STRIDES:
         raise ValueError(f"Unsupported frame_stride: {profile.frame_stride}")
@@ -267,6 +276,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf_model_path = None
         profile.model_variant = "single_trunk"
         profile.symmetrize_limbs = True
+        profile.upper_back_sagittal_gain = 0.2
+        profile.upper_back_pseudo_std_deg = 10.0
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -545,6 +556,8 @@ def build_pipeline_command(
         cmd.extend(["--model-variant", profile.model_variant])
         if not profile.symmetrize_limbs:
             cmd.append("--no-symmetrize-limbs")
+        cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
+        cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])

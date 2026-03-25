@@ -3388,6 +3388,11 @@ class MultiViewKinematicEKF:
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
         self.upper_back_rotx_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
+        self.upper_back_zero_prior_indices = tuple(
+            idx
+            for idx in (self.lock_map.get("UPPER_BACK:RotY"), self.lock_map.get("UPPER_BACK:RotZ"))
+            if idx is not None
+        )
         self.locked_q_indices: set[int] = set()
         base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
         self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
@@ -3495,6 +3500,29 @@ class MultiViewKinematicEKF:
         z = np.array([target_value], dtype=float)
         variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
         return z, h, H_q, variance
+
+    def _upper_back_zero_prior_blocks(
+        self,
+        reference_q: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for q_idx in self.upper_back_zero_prior_indices:
+            if q_idx is None:
+                continue
+            current_value = float(reference_q[int(q_idx)])
+            if not np.isfinite(current_value):
+                continue
+            h_q = np.zeros((1, self.nq), dtype=float)
+            h_q[0, int(q_idx)] = 1.0
+            blocks.append(
+                (
+                    np.array([0.0], dtype=float),
+                    np.array([current_value], dtype=float),
+                    h_q,
+                    np.array([self.upper_back_pseudo_std_rad**2], dtype=float),
+                )
+            )
+        return blocks
 
     def transition_matrix(self) -> np.ndarray:
         """Matrice d'etat du modele discret a acceleration constante."""
@@ -3790,6 +3818,7 @@ class MultiViewKinematicEKF:
         pseudo_block = self._upper_back_pseudo_measurement_block(q)
         if pseudo_block is not None:
             measurement_blocks.append(pseudo_block)
+        measurement_blocks.extend(self._upper_back_zero_prior_blocks(q))
 
         t_solve = time.perf_counter()
         update_result = apply_measurement_update_sequential(
@@ -4103,6 +4132,8 @@ def initial_state_from_ekf_bootstrap(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -4154,6 +4185,8 @@ def initial_state_from_ekf_bootstrap(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -4209,6 +4242,8 @@ def initial_state_from_root_pose_bootstrap(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -4241,6 +4276,8 @@ def initial_state_from_root_pose_bootstrap(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -4264,6 +4301,8 @@ def initial_state_from_root_pose_bootstrap(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -4293,6 +4332,8 @@ def compute_ekf2d_initial_state(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -4328,6 +4369,8 @@ def compute_ekf2d_initial_state(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -4349,6 +4392,8 @@ def compute_ekf2d_initial_state(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -4379,6 +4424,8 @@ def run_ekf(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -4414,6 +4461,8 @@ def run_ekf(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
     )
     state = (
         np.array(initial_state, copy=True)

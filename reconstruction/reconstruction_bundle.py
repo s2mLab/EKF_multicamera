@@ -59,6 +59,8 @@ from vitpose_ekf_pipeline import (
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     KP_INDEX,
     CameraCalibration,
     PoseData,
@@ -2104,6 +2106,8 @@ def build_ekf_2d_bundle(
     skip_low_coherence_updates: bool,
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
@@ -2287,6 +2291,8 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2315,6 +2321,8 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
@@ -2527,6 +2535,8 @@ def build_ekf_2d_bundle(
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),
             "coherence_confidence_floor": float(coherence_confidence_floor),
+            "upper_back_sagittal_gain": float(upper_back_sagittal_gain),
+            "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
