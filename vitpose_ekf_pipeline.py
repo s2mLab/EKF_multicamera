@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations
 from kinematics.root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
@@ -3520,6 +3521,73 @@ def q_names_from_model(model) -> list[str]:
     ]
 
 
+def _segment_rotation_sequence_and_offsets(segment_dof_names: list[str]) -> tuple[str | None, np.ndarray]:
+    """Infer a contiguous Euler rotation block from one segment DoF list."""
+
+    rotation_offsets: list[int] = []
+    rotation_axes: list[str] = []
+    for dof_idx, dof_name in enumerate(segment_dof_names):
+        dof_name = str(dof_name)
+        if dof_name.startswith("Rot") and len(dof_name) == 4 and dof_name[-1] in {"X", "Y", "Z"}:
+            rotation_offsets.append(dof_idx)
+            rotation_axes.append(dof_name[-1].lower())
+    if not rotation_offsets:
+        return None, np.empty(0, dtype=int)
+    offsets_array = np.asarray(rotation_offsets, dtype=int)
+    expected_offsets = np.arange(offsets_array[0], offsets_array[0] + offsets_array.size, dtype=int)
+    if not np.array_equal(offsets_array, expected_offsets):
+        return None, np.empty(0, dtype=int)
+    return "".join(rotation_axes), offsets_array
+
+
+def canonicalize_model_q_rotation_branches(model, q_values: np.ndarray) -> np.ndarray:
+    """Re-extract segment Euler blocks on a canonical branch.
+
+    The EKF bootstrap can converge to numerically large Euler representations
+    that still encode the same joint orientation. We rebuild each segment
+    rotation matrix and re-extract the angles with the same sequence so the
+    warm start stays equivalent in 3D while returning to more physiological
+    numeric ranges.
+    """
+
+    q_array = np.asarray(q_values, dtype=float).reshape(-1)
+    canonical_q = np.array(q_array, copy=True)
+    q_cursor = 0
+    for segment_idx in range(model.nbSegment()):
+        segment = model.segment(segment_idx)
+        segment_dof_names = [segment.nameDof(dof_idx).to_string() for dof_idx in range(segment.nbDof())]
+        sequence, local_rotation_offsets = _segment_rotation_sequence_and_offsets(segment_dof_names)
+        if sequence is not None and local_rotation_offsets.size:
+            block_indices = q_cursor + local_rotation_offsets
+            block_values = canonical_q[block_indices]
+            if np.all(np.isfinite(block_values)):
+                if len(sequence) == 1:
+                    angle_value = float(block_values[0])
+                    canonical_q[block_indices[0]] = math.atan2(math.sin(angle_value), math.cos(angle_value))
+                else:
+                    scipy_sequence = sequence.upper()
+                    if len(sequence) == 2:
+                        extra_axis = next(axis for axis in "xyz" if axis not in set(sequence))
+                        extended_sequence = f"{sequence}{extra_axis}"
+                        scipy_extended_sequence = extended_sequence.upper()
+                        extended_values = np.concatenate((block_values, np.zeros(1, dtype=float)))
+                        rotation_matrix = Rotation.from_euler(
+                            scipy_extended_sequence, extended_values, degrees=False
+                        ).as_matrix()
+                        canonical_q[block_indices] = Rotation.from_matrix(rotation_matrix).as_euler(
+                            scipy_extended_sequence,
+                            degrees=False,
+                        )[:2]
+                    else:
+                        rotation_matrix = Rotation.from_euler(scipy_sequence, block_values, degrees=False).as_matrix()
+                        canonical_q[block_indices] = Rotation.from_matrix(rotation_matrix).as_euler(
+                            scipy_sequence,
+                            degrees=False,
+                        )
+        q_cursor += segment.nbDof()
+    return canonical_q
+
+
 def first_valid_root_translation_from_triangulation(
     reconstruction: ReconstructionResult,
 ) -> tuple[int | None, np.ndarray | None]:
@@ -3732,6 +3800,7 @@ def initial_state_from_ekf_bootstrap(
         if initial_state is not None
         else initial_state_from_triangulation(model, reconstruction)
     )
+    ik_state[: model.nbQ()] = canonicalize_model_q_rotation_branches(model, ik_state[: model.nbQ()])
     frame_idx, _marker_positions = first_valid_marker_tensor_from_reconstruction(model, reconstruction)
     diagnostics: dict[str, object] = {
         "method": "ekf_bootstrap",
@@ -3774,7 +3843,8 @@ def initial_state_from_ekf_bootstrap(
     base_covariance = np.eye(ekf.nx) * 1e-2
     passes = max(1, int(passes))
     for _pass_idx in range(passes):
-        seed_state = np.concatenate((np.asarray(state[: ekf.nq], dtype=float), np.zeros(ekf.nq), np.zeros(ekf.nq)))
+        seed_q = canonicalize_model_q_rotation_branches(model, state[: ekf.nq])
+        seed_state = np.concatenate((seed_q, np.zeros(ekf.nq), np.zeros(ekf.nq)))
         covariance = np.array(base_covariance, copy=True)
         ekf.skip_correction_countdown = 0
         predicted_state, predicted_covariance = ekf.predict(seed_state, covariance, frame_idx)
@@ -3792,9 +3862,10 @@ def initial_state_from_ekf_bootstrap(
             diagnostics["stopped_early"] = True
             diagnostics["final_q_norm"] = float(np.linalg.norm(state[: ekf.nq]))
             return state, diagnostics
-        q_delta_norm = float(np.linalg.norm(corrected_state[: ekf.nq] - seed_state[: ekf.nq]))
+        corrected_q = canonicalize_model_q_rotation_branches(model, corrected_state[: ekf.nq])
+        q_delta_norm = float(np.linalg.norm(corrected_q - seed_state[: ekf.nq]))
         diagnostics["q_delta_norms"].append(q_delta_norm)
-        state = np.concatenate((np.asarray(corrected_state[: ekf.nq], dtype=float), np.zeros(ekf.nq), np.zeros(ekf.nq)))
+        state = np.concatenate((corrected_q, np.zeros(ekf.nq), np.zeros(ekf.nq)))
         if q_delta_norm <= float(tolerance):
             diagnostics["converged"] = True
             break

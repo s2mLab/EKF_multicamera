@@ -1,7 +1,9 @@
 import json
+import math
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 import vitpose_ekf_pipeline
 from vitpose_ekf_pipeline import (
@@ -17,6 +19,7 @@ from vitpose_ekf_pipeline import (
     build_fundamental_matrix_array,
     canonical_coherence_method,
     canonical_triangulation_method,
+    canonicalize_model_q_rotation_branches,
     choose_ekf_prediction_gate_measurements,
     compute_biorbd_kalman_initial_state,
     compute_camera_epipolar_cost,
@@ -496,6 +499,7 @@ class _FakeModel:
     def __init__(self):
         self._segments = [
             _FakeSegment("TRUNK", ["TransX", "TransY", "TransZ", "RotY", "RotX", "RotZ"]),
+            _FakeSegment("LEFT_UPPER_ARM", ["RotY", "RotX"]),
             _FakeSegment("LEFT_THIGH", ["RotY"]),
         ]
 
@@ -528,6 +532,7 @@ def test_apply_root_pose_guess_to_state_sets_root_dofs_only():
     assert updated[q_names.index("TRUNK:RotY")] == 0.4
     assert updated[q_names.index("TRUNK:RotX")] == -0.2
     assert updated[q_names.index("TRUNK:RotZ")] == 1.1
+    assert updated[q_names.index("LEFT_UPPER_ARM:RotY")] == 0.0
     assert updated[q_names.index("LEFT_THIGH:RotY")] == 0.0
 
 
@@ -561,6 +566,7 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
     assert state[q_names.index("TRUNK:RotY")] == 0.4
     assert state[q_names.index("TRUNK:RotX")] == -0.2
     assert state[q_names.index("TRUNK:RotZ")] == 1.1
+    assert state[q_names.index("LEFT_UPPER_ARM:RotY")] == 0.0
     assert state[q_names.index("LEFT_THIGH:RotY")] == 0.0
 
 
@@ -595,6 +601,92 @@ def test_sample_frames_uniformly_spreads_indices_over_range():
     frames = np.arange(100, 110, dtype=int)
     sampled = sample_frames_uniformly(frames, 4)
     np.testing.assert_array_equal(sampled, np.array([100, 103, 106, 109], dtype=int))
+
+
+def test_canonicalize_model_q_rotation_branches_reextracts_multi_axis_blocks():
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    q = np.zeros(model.nbQ(), dtype=float)
+    root_input = np.array([math.pi + 0.4, -0.2, 2.0 * math.pi + 0.3], dtype=float)
+    upper_arm_input = np.array([2.0 * math.pi + 0.2, -2.0 * math.pi - 0.3], dtype=float)
+    thigh_input = 2.0 * math.pi + 0.1
+    q[q_names.index("TRUNK:RotY")] = root_input[0]
+    q[q_names.index("TRUNK:RotX")] = root_input[1]
+    q[q_names.index("TRUNK:RotZ")] = root_input[2]
+    q[q_names.index("LEFT_UPPER_ARM:RotY")] = upper_arm_input[0]
+    q[q_names.index("LEFT_UPPER_ARM:RotX")] = upper_arm_input[1]
+    q[q_names.index("LEFT_THIGH:RotY")] = thigh_input
+
+    canonical_q = canonicalize_model_q_rotation_branches(model, q)
+
+    np.testing.assert_allclose(
+        Rotation.from_euler("YXZ", canonical_q[[3, 4, 5]], degrees=False).as_matrix(),
+        Rotation.from_euler("YXZ", root_input, degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        Rotation.from_euler("YX", canonical_q[[6, 7]], degrees=False).as_matrix(),
+        Rotation.from_euler("YX", upper_arm_input, degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    assert abs(canonical_q[q_names.index("LEFT_THIGH:RotY")] - 0.1) < 1e-12
+    assert abs(canonical_q[q_names.index("TRUNK:RotZ")]) < abs(root_input[2])
+
+
+def test_initial_state_from_ekf_bootstrap_canonicalizes_rotation_branches(monkeypatch):
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    nq = model.nbQ()
+
+    class _FakeBootstrapEkf:
+        def __init__(self, *args, **kwargs):
+            self.nq = nq
+            self.nx = 3 * nq
+            self.skip_correction_countdown = 0
+
+        def predict(self, state, covariance, frame_idx):
+            return np.array(state, copy=True), np.array(covariance, copy=True)
+
+        def update(self, predicted_state, predicted_covariance, frame_idx):
+            corrected_state = np.array(predicted_state, copy=True)
+            corrected_state[q_names.index("TRUNK:RotY")] = math.pi + 0.25
+            corrected_state[q_names.index("TRUNK:RotX")] = -0.15
+            corrected_state[q_names.index("TRUNK:RotZ")] = 2.0 * math.pi + 0.35
+            corrected_state[q_names.index("LEFT_UPPER_ARM:RotY")] = 2.0 * math.pi + 0.1
+            corrected_state[q_names.index("LEFT_UPPER_ARM:RotX")] = -2.0 * math.pi - 0.2
+            corrected_state[q_names.index("LEFT_THIGH:RotY")] = 2.0 * math.pi + 0.4
+            return corrected_state, np.array(predicted_covariance, copy=True), "corrected"
+
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda *_args, **_kwargs: np.zeros(3 * nq)
+    )
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline, "first_valid_marker_tensor_from_reconstruction", lambda *_args, **_kwargs: (0, object())
+    )
+    monkeypatch.setattr(vitpose_ekf_pipeline, "MultiViewKinematicEKF", _FakeBootstrapEkf)
+
+    state, diagnostics = vitpose_ekf_pipeline.initial_state_from_ekf_bootstrap(
+        model=model,
+        calibrations={},
+        pose_data=object(),
+        reconstruction=object(),
+        fps=120.0,
+        passes=1,
+    )
+
+    assert diagnostics["used_fallback"] is False
+    assert abs(state[q_names.index("LEFT_THIGH:RotY")] - 0.4) < 1e-12
+    assert abs(state[q_names.index("LEFT_UPPER_ARM:RotY")] - 0.1) < 1e-12
+    assert abs(state[q_names.index("LEFT_UPPER_ARM:RotX")] + 0.2) < 1e-12
+    np.testing.assert_allclose(
+        Rotation.from_euler(
+            "YXZ",
+            state[[q_names.index("TRUNK:RotY"), q_names.index("TRUNK:RotX"), q_names.index("TRUNK:RotZ")]],
+            degrees=False,
+        ).as_matrix(),
+        Rotation.from_euler("YXZ", [math.pi + 0.25, -0.15, 2.0 * math.pi + 0.35], degrees=False).as_matrix(),
+        atol=1e-12,
+    )
 
 
 def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction_matches():
