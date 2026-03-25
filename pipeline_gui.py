@@ -44,6 +44,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.spatial.transform import Rotation
 
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
@@ -56,6 +57,7 @@ from judging.dd_presenter import (
     dd_reference_status_color,
     dd_reference_status_text,
     format_dd_summary,
+    format_detected_dd_codes_with_inline_errors,
     jump_list_label_with_reference,
 )
 from judging.dd_reference import default_dd_reference_path, load_dd_reference_codes
@@ -133,6 +135,7 @@ from reconstruction.reconstruction_dataset import (
     reconstruction_color,
     reconstruction_label,
     write_trc_file,
+    write_trc_root_kinematics_sidecar,
 )
 from reconstruction.reconstruction_presenter import (
     bundle_available_reconstruction_names,
@@ -288,6 +291,47 @@ ANALYSIS_START_FRAME = 10
 def gui_debug(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[GUI {timestamp}] {message}", flush=True)
+
+
+def shared_reconstruction_order(state: "SharedAppState") -> list[str]:
+    """Return the current shared reconstruction order used across analysis tabs."""
+
+    panel = getattr(state, "shared_reconstruction_panel", None)
+    if panel is not None:
+        names = [str(item) for item in panel.tree.get_children("") if str(item) != "__placeholder__"]
+        if names:
+            return names
+    return [str(name) for name in getattr(state, "shared_reconstruction_selection", [])]
+
+
+def reconstruction_legend_label(state: "SharedAppState", name: str) -> str:
+    """Return a compact numeric label for one reconstruction in plot legends."""
+
+    ordered_names = shared_reconstruction_order(state)
+    if name in ordered_names:
+        return str(ordered_names.index(name) + 1)
+    return reconstruction_label(name)
+
+
+def reconstruction_display_color(state: "SharedAppState", name: str) -> str:
+    """Return a color driven by the shared reconstruction order when available."""
+
+    ordered_names = shared_reconstruction_order(state)
+    if name in ordered_names:
+        palette = [
+            "#4c72b0",
+            "#dd8452",
+            "#55a868",
+            "#c44e52",
+            "#8172b3",
+            "#937860",
+            "#da8bc3",
+            "#8c8c8c",
+            "#64b5cd",
+            "#ccb974",
+        ]
+        return palette[ordered_names.index(name) % len(palette)]
+    return reconstruction_color(name)
 
 
 def load_json_if_exists(path: Path) -> dict:
@@ -761,39 +805,41 @@ def edge_linewidth(start_name: str, end_name: str, base: float, lower_scale: flo
     return base * lower_scale if (start_name, end_name) in LOWER_LIMB_EDGES else base
 
 
-def draw_skeleton_3d(ax, frame_points: np.ndarray, color: str, label: str) -> None:
+def draw_skeleton_3d(ax, frame_points: np.ndarray, color: str, label: str, marker_size: float = 22.0) -> None:
     grouped = keypoint_groups(frame_points)
-    if grouped["center"].size:
+    show_markers = float(marker_size) > 0.0
+    if show_markers and grouped["center"].size:
         ax.scatter(
             grouped["center"][:, 0],
             grouped["center"][:, 1],
             grouped["center"][:, 2],
-            s=22,
+            s=marker_size,
             c=color,
             marker="o",
             depthshade=False,
             label=label,
         )
-    if grouped["left"].size:
+    if show_markers and grouped["left"].size:
         ax.scatter(
             grouped["left"][:, 0],
             grouped["left"][:, 1],
             grouped["left"][:, 2],
-            s=34,
+            s=marker_size * 1.55,
             c=color,
             marker="^",
             depthshade=False,
         )
-    if grouped["right"].size:
+    if show_markers and grouped["right"].size:
         ax.scatter(
             grouped["right"][:, 0],
             grouped["right"][:, 1],
             grouped["right"][:, 2],
-            s=34,
+            s=marker_size * 1.55,
             c=color,
             marker="s",
             depthshade=False,
         )
+    label_drawn = bool(show_markers and grouped["center"].size)
     for start_name, end_name in SKELETON_EDGES:
         p0 = frame_points[KP_INDEX[start_name]]
         p1 = frame_points[KP_INDEX[end_name]]
@@ -805,7 +851,9 @@ def draw_skeleton_3d(ax, frame_points: np.ndarray, color: str, label: str) -> No
                 color=color,
                 linewidth=edge_linewidth(start_name, end_name, base=1.8),
                 alpha=0.9,
+                label=label if not label_drawn else None,
             )
+            label_drawn = True
 
 
 def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -1037,6 +1085,73 @@ def draw_trampoline_bed_3d(ax, z_level: float) -> None:
         linewidth=1.0,
         alpha=0.35,
     )
+
+
+def trampoline_contact_zone_xy(frame_points_list: list[np.ndarray], padding_m: float = 0.08) -> np.ndarray | None:
+    """Return a rectangular foot-contact zone projected onto the trampoline bed."""
+
+    foot_xy_samples: list[np.ndarray] = []
+    for frame_points in frame_points_list:
+        for kp_name in ("left_ankle", "right_ankle"):
+            point = np.asarray(frame_points[KP_INDEX[kp_name]], dtype=float)
+            if np.all(np.isfinite(point[:2])):
+                foot_xy_samples.append(point[:2])
+    if not foot_xy_samples:
+        return None
+    foot_xy = np.asarray(foot_xy_samples, dtype=float)
+    min_xy = np.nanmin(foot_xy, axis=0) - float(padding_m)
+    max_xy = np.nanmax(foot_xy, axis=0) + float(padding_m)
+    min_xy[0] = max(min_xy[0], -BED_X_MAX)
+    min_xy[1] = max(min_xy[1], -BED_Y_MAX)
+    max_xy[0] = min(max_xy[0], BED_X_MAX)
+    max_xy[1] = min(max_xy[1], BED_Y_MAX)
+    if np.any(max_xy <= min_xy):
+        return None
+    return np.array(
+        [
+            [min_xy[0], min_xy[1]],
+            [max_xy[0], min_xy[1]],
+            [max_xy[0], max_xy[1]],
+            [min_xy[0], max_xy[1]],
+        ],
+        dtype=float,
+    )
+
+
+def draw_trampoline_contact_zone_3d(
+    ax,
+    polygon_xy: np.ndarray | None,
+    z_level: float,
+    *,
+    color: str = "#ed8936",
+    alpha: float = 0.30,
+) -> None:
+    """Draw a semi-transparent contact zone on the trampoline bed."""
+
+    if polygon_xy is None or np.asarray(polygon_xy).shape != (4, 2):
+        return
+    vertices = np.column_stack((np.asarray(polygon_xy, dtype=float), np.full(4, float(z_level), dtype=float)))
+    patch = Poly3DCollection([vertices], facecolors=color, edgecolors=color, linewidths=1.2, alpha=float(alpha))
+    ax.add_collection3d(patch)
+
+
+def compute_airborne_mask_from_points(
+    points_3d: np.ndarray,
+    *,
+    threshold_m: float,
+    min_consecutive_frames: int,
+) -> np.ndarray:
+    """Infer airborne frames from 3D points using the bundle flight settings."""
+
+    above = np.all(points_3d[:, :, 2] > float(threshold_m), axis=1)
+    above &= np.all(np.isfinite(points_3d[:, :, 2]), axis=1)
+    mask = np.zeros(points_3d.shape[0], dtype=bool)
+    consecutive = 0
+    for frame_idx, is_above in enumerate(above):
+        consecutive = consecutive + 1 if is_above else 0
+        if consecutive >= max(1, int(min_consecutive_frames)):
+            mask[frame_idx] = True
+    return mask
 
 
 def camera_layout(n_cameras: int) -> tuple[int, int]:
@@ -2106,16 +2221,18 @@ class SelectionTable(ttk.Frame):
             ttk.Button(header, text=action_label, command=action_command).pack(side=tk.RIGHT)
         self.tree = ttk.Treeview(
             self,
-            columns=("label", "family", "frames", "reproj", "path"),
+            columns=("index", "label", "family", "frames", "reproj", "path"),
             show="headings",
             height=6,
             selectmode="extended",
         )
+        self.tree.heading("index", text="#")
         self.tree.heading("label", text="Reconstruction")
         self.tree.heading("family", text="Family")
         self.tree.heading("frames", text="Frames")
         self.tree.heading("reproj", text="Reproj (px)")
         self.tree.heading("path", text="Path")
+        self.tree.column("index", width=42, anchor="center", stretch=False)
         self.tree.column("label", width=220, anchor="w")
         self.tree.column("family", width=90, anchor="w")
         self.tree.column("frames", width=70, anchor="w")
@@ -2130,7 +2247,7 @@ class SelectionTable(ttk.Frame):
         for item in self.tree.get_children():
             self.tree.delete(item)
         row_names = []
-        for row in rows:
+        for row_idx, row in enumerate(rows, start=1):
             name = str(row.get("name", ""))
             if not name:
                 continue
@@ -2141,6 +2258,7 @@ class SelectionTable(ttk.Frame):
                 "end",
                 iid=name,
                 values=(
+                    str(row_idx),
                     str(row.get("label", name)),
                     str(row.get("family", "-")),
                     row.get("frames", "-"),
@@ -3133,9 +3251,34 @@ class DualAnimationTab(CommandTab):
         if self._view_state is not None:
             ax.view_init(elev=self._view_state[0], azim=self._view_state[1], roll=self._view_state[2])
         points_dict = {name: available[name] for name in show_names}
+        contact_zone_xy = None
+        trampoline_z = None
+        if self.show_trampoline_var.get():
+            stacked = np.concatenate([points.reshape(-1, 3) for points in points_dict.values()], axis=0)
+            valid_points = stacked[np.all(np.isfinite(stacked), axis=1)]
+            if valid_points.size:
+                trampoline_z = float(np.nanpercentile(valid_points[:, 2], 5))
+                reference_name = show_names[0]
+                reference_points = np.asarray(points_dict[reference_name], dtype=float)
+                summary = self.bundle.get("recon_summary", {}).get(reference_name, {})
+                airborne_mask = compute_airborne_mask_from_points(
+                    reference_points,
+                    threshold_m=float(summary.get("flight_height_threshold_m", trampoline_z + 0.12)),
+                    min_consecutive_frames=int(summary.get("flight_min_consecutive_frames", 1)),
+                )
+                if frame_idx < airborne_mask.shape[0] and not airborne_mask[frame_idx]:
+                    contact_zone_xy = trampoline_contact_zone_xy(
+                        [np.asarray(points_dict[name][frame_idx], dtype=float) for name in show_names]
+                    )
         for name in show_names:
             frame_points = available[name][frame_idx]
-            draw_skeleton_3d(ax, frame_points, reconstruction_color(name), reconstruction_label(name))
+            draw_skeleton_3d(
+                ax,
+                frame_points,
+                reconstruction_display_color(self.state, name),
+                reconstruction_legend_label(self.state, name),
+                marker_size=float(self.marker_size.get()),
+            )
             if self.show_trunk_frames_var.get():
                 origin, rotation = compute_root_frame_from_points(frame_points)
                 if origin is not None and rotation is not None:
@@ -3145,16 +3288,15 @@ class DualAnimationTab(CommandTab):
                         rotation,
                         scale=0.18,
                         alpha=0.95,
-                        prefix=f"{reconstruction_label(name)[:2]}_",
+                        prefix=f"{reconstruction_legend_label(self.state, name)}_",
                         show_labels=False,
                         line_width=2.2,
                     )
         set_equal_3d_limits(ax, points_dict, frame_idx if self.crop_var.get() else None)
         if self.show_trampoline_var.get():
-            stacked = np.concatenate([points.reshape(-1, 3) for points in points_dict.values()], axis=0)
-            valid_points = stacked[np.all(np.isfinite(stacked), axis=1)]
-            if valid_points.size:
-                draw_trampoline_bed_3d(ax, float(np.nanpercentile(valid_points[:, 2], 5)))
+            if trampoline_z is not None:
+                draw_trampoline_bed_3d(ax, trampoline_z)
+                draw_trampoline_contact_zone_3d(ax, contact_zone_xy, trampoline_z)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -3536,8 +3678,8 @@ class MultiViewTab(CommandTab):
                 draw_skeleton_2d(
                     ax,
                     points_2d,
-                    reconstruction_color(mapped),
-                    reconstruction_label(mapped),
+                    reconstruction_display_color(self.state, mapped),
+                    reconstruction_legend_label(self.state, mapped),
                     marker_size=float(self.marker_size.get()),
                 )
             if ax_idx >= (nrows - 1) * ncols:
@@ -6280,6 +6422,7 @@ class ReconstructionsTab(CommandTab):
             return
 
         q = np.asarray(data["q"], dtype=float)
+        q_names = np.asarray(data["q_names"], dtype=object) if "q_names" in data else np.empty(0, dtype=object)
         frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(q.shape[0], dtype=int)
         time_s = (
             np.asarray(data["time_s"], dtype=float)
@@ -6311,6 +6454,16 @@ class ReconstructionsTab(CommandTab):
 
         output_path = recon_dir / f"{recon_dir.name}_markers_from_q.trc"
         write_trc_file(output_path, marker_names, marker_points, frames, time_s, data_rate=data_rate, units="m")
+        q_root = (
+            np.asarray(data["q_root"], dtype=float)
+            if "q_root" in data and np.asarray(data["q_root"]).shape[0] == q.shape[0]
+            else extract_root_from_q(q_names, q, unwrap_rotations=False, renormalize_rotations=True)
+        )
+        if "qdot_root" in data and np.asarray(data["qdot_root"]).shape == q_root.shape:
+            qdot_root = np.asarray(data["qdot_root"], dtype=float)
+        else:
+            qdot_root = centered_finite_difference(q_root, 1.0 / max(float(data_rate), 1.0))
+        write_trc_root_kinematics_sidecar(output_path, q_root, qdot_root, frames, time_s)
         messagebox.showinfo("Export TRC from q", f"TRC written to:\n{output_path}")
 
     def refresh_timing_details(self) -> None:
@@ -6735,9 +6888,9 @@ class RootKinematicsTab(ttk.Frame):
                             ax.plot(
                                 t,
                                 matrices[:, row_idx, col_idx],
-                                color=reconstruction_color(name),
+                                color=reconstruction_display_color(self.state, name),
                                 linewidth=1.5,
-                                label=reconstruction_label(name),
+                                label=reconstruction_legend_label(self.state, name),
                             )
                             ax.set_title(component_labels[row_idx][col_idx], fontsize=9)
                             ax.grid(alpha=0.25)
@@ -6749,9 +6902,9 @@ class RootKinematicsTab(ttk.Frame):
                         ax.plot(
                             t,
                             series_to_plot[:, family_slice.start + axis_idx],
-                            color=reconstruction_color(name),
+                            color=reconstruction_display_color(self.state, name),
                             linewidth=1.7,
-                            label=reconstruction_label(name),
+                            label=reconstruction_legend_label(self.state, name),
                         )
                         ax.set_ylabel(f"{axis_display_labels[axis_idx]} ({unit_label})")
                         ax.grid(alpha=0.25)
@@ -6819,6 +6972,9 @@ class JointKinematicsTab(ttk.Frame):
         attach_tooltip(quantity_box, "Choisit entre positions q et vitesses qdot pour les autres DoF.")
         attach_tooltip(fd_qdot_check, "Recalcule qdot par difference finie sur q.")
         attach_tooltip(self.pair_list, "Choisissez les paires gauche/droite de DoF a comparer sur les graphes.")
+        self.quantity.trace_add("write", lambda *_args: self.refresh_plot())
+        self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.pair_list.bind("<<ListboxSelect>>", self._on_pair_selection_changed)
 
         plot_box = ttk.LabelFrame(self, text="Gauche / droite sur le même graphe")
         plot_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -6848,6 +7004,11 @@ class JointKinematicsTab(ttk.Frame):
             panel.set_rows(rows, defaults)
 
     def _on_reconstruction_selection_changed(self) -> None:
+        self.refresh_plot()
+
+    def _on_pair_selection_changed(self, _event=None) -> None:
+        """Refresh the joint-DoF plot when the selected DoF pairs change."""
+
         self.refresh_plot()
 
     def _show_empty_plot(self, message: str) -> None:
@@ -6926,6 +7087,10 @@ class JointKinematicsTab(ttk.Frame):
             dt = 1.0 / float(self.state.fps_var.get())
             name_to_index = {str(name): idx for idx, name in enumerate(self.q_names)}
             plotted_series = False
+            side_styles = {
+                "left": {"linestyle": "-", "marker": "o"},
+                "right": {"linestyle": "--", "marker": "s"},
+            }
 
             for ax, (pair_label, left_name, right_name) in zip(axes, selected_pairs):
                 for recon_name in selected_names:
@@ -6948,21 +7113,31 @@ class JointKinematicsTab(ttk.Frame):
                     time_s = frame_indices * dt
                     left_idx = name_to_index[left_name]
                     right_idx = name_to_index[right_name]
-                    color = RECONSTRUCTION_COLORS.get(recon_name, "#333333")
+                    color = reconstruction_display_color(self.state, recon_name)
+                    legend_label = reconstruction_legend_label(self.state, recon_name)
+                    left_style = side_styles["left"]
+                    right_style = side_styles["right"]
                     ax.plot(
                         time_s,
                         series[:, left_idx],
                         color=color,
                         linewidth=1.7,
-                        label=f"{RECONSTRUCTION_LABELS.get(recon_name, recon_name)} | L",
+                        linestyle=left_style["linestyle"],
+                        marker=left_style["marker"],
+                        markevery=max(1, len(time_s) // 24) if len(time_s) else 1,
+                        markersize=3.0,
+                        label=f"{legend_label} | L",
                     )
                     ax.plot(
                         time_s,
                         series[:, right_idx],
                         color=color,
                         linewidth=1.7,
-                        linestyle="--",
-                        label=f"{RECONSTRUCTION_LABELS.get(recon_name, recon_name)} | R",
+                        linestyle=right_style["linestyle"],
+                        marker=right_style["marker"],
+                        markevery=max(1, len(time_s) // 24) if len(time_s) else 1,
+                        markersize=3.0,
+                        label=f"{legend_label} | R",
                     )
                     plotted_series = True
                 ax.set_title(pair_label)
@@ -7330,7 +7505,7 @@ class Analysis3DTab(ttk.Frame):
                     continue
                 length_samples = valid_segment_length_samples(segment_length_series(points_3d))
                 box_data = [length_samples.get(label, np.array([np.nan], dtype=float)) for label in segment_labels]
-                color = reconstruction_color(recon_name)
+                color = reconstruction_display_color(self.state, recon_name)
                 boxplot = box_ax.boxplot(
                     box_data,
                     positions=base_positions + offset,
@@ -7346,7 +7521,14 @@ class Analysis3DTab(ttk.Frame):
                 for median in boxplot["medians"]:
                     median.set_color(color)
                     median.set_linewidth(1.4)
-                box_ax.plot([], [], color=color, linewidth=6, alpha=0.35, label=reconstruction_label(recon_name))
+                box_ax.plot(
+                    [],
+                    [],
+                    color=color,
+                    linewidth=6,
+                    alpha=0.35,
+                    label=reconstruction_legend_label(self.state, recon_name),
+                )
                 plotted_lengths += 1
                 summary_lines.append(f"{reconstruction_label(recon_name)} lengths:")
                 for label in segment_labels:
@@ -7410,8 +7592,8 @@ class Analysis3DTab(ttk.Frame):
 
                 model = biorbd.Model(str(biomod_path))
                 plot_data = angular_momentum_plot_data(model, q, qdot, time_s)
-                color = reconstruction_color(recon_name)
-                label = reconstruction_label(recon_name)
+                color = reconstruction_display_color(self.state, recon_name)
+                label = reconstruction_legend_label(self.state, recon_name)
                 component_styles = [("-", "Hx"), ("--", "Hy"), (":", "Hz")]
                 for component_idx, (linestyle, axis_label) in enumerate(component_styles):
                     comp_ax.plot(
@@ -7975,7 +8157,7 @@ class ExecutionTab(ttk.Frame):
             draw_skeleton_2d(
                 view_2d_ax,
                 projected_points,
-                reconstruction_color(self.current_reconstruction_name),
+                reconstruction_display_color(self.state, self.current_reconstruction_name),
                 "reprojection",
                 marker_size=12.0,
             )
@@ -8508,19 +8690,20 @@ class CameraToolsTab(ttk.Frame):
         reference_name = (self._selected_reconstruction() or "").strip()
         if not reference_name:
             return None, "none", "#444444"
+        reference_label = reconstruction_legend_label(self.state, reference_name)
         recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
         if recon_dir is None:
-            return None, reference_name, reconstruction_color(reference_name)
+            return None, reference_label, reconstruction_display_color(self.state, reference_name)
         payload = load_bundle_payload(recon_dir)
         points_3d = np.asarray(payload.get("points_3d"), dtype=float) if "points_3d" in payload else None
         if points_3d is None or points_3d.ndim != 3 or frame_local_idx >= points_3d.shape[0]:
-            return None, reconstruction_label(reference_name), reconstruction_color(reference_name)
+            return None, reference_label, reconstruction_display_color(self.state, reference_name)
         projected = np.full((points_3d.shape[1], 2), np.nan, dtype=float)
         calibration = self.calibrations[camera_name]
         for kp_idx, point_3d in enumerate(points_3d[frame_local_idx]):
             if np.all(np.isfinite(point_3d)):
                 projected[kp_idx] = calibration.project_point(point_3d)
-        return projected, reconstruction_label(reference_name), reconstruction_color(reference_name)
+        return projected, reference_label, reconstruction_display_color(self.state, reference_name)
 
     def render_flip_preview(self) -> None:
         self.flip_figure.clear()
@@ -8998,7 +9181,7 @@ class DDTab(ttk.Frame):
         comparison_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
         self.comparison_tree = ttk.Treeview(
             comparison_box,
-            columns=("reconstruction", "match", "status", "expected", "codes"),
+            columns=("reconstruction", "match", "status", "codes"),
             show="headings",
             height=6,
             selectmode="browse",
@@ -9006,13 +9189,11 @@ class DDTab(ttk.Frame):
         self.comparison_tree.heading("reconstruction", text="Reconstruction")
         self.comparison_tree.heading("match", text="Match")
         self.comparison_tree.heading("status", text="Status")
-        self.comparison_tree.heading("expected", text="Expected")
         self.comparison_tree.heading("codes", text="Detected codes")
         self.comparison_tree.column("reconstruction", width=190, anchor="w")
         self.comparison_tree.column("match", width=70, anchor="center")
         self.comparison_tree.column("status", width=70, anchor="center")
-        self.comparison_tree.column("expected", width=160, anchor="w")
-        self.comparison_tree.column("codes", width=210, anchor="w")
+        self.comparison_tree.column("codes", width=370, anchor="w")
         self.comparison_tree.tag_configure("ok", foreground="#1f7a1f")
         self.comparison_tree.tag_configure("partial", foreground="#b36b00")
         self.comparison_tree.tag_configure("bad", foreground="#b22222")
@@ -9021,7 +9202,7 @@ class DDTab(ttk.Frame):
         self.comparison_tree.bind("<<TreeviewSelect>>", self._on_comparison_selected)
         attach_tooltip(
             self.comparison_tree,
-            "Compares each reconstruction against the DD reference JSON. Green means full match, orange partial match, red mismatch.",
+            "Compares each reconstruction against the DD reference JSON. The detected-code column highlights mismatching characters with square brackets.",
         )
 
         jumps_box = ttk.LabelFrame(left, text="Sauts détectés")
@@ -9346,8 +9527,7 @@ class DDTab(ttk.Frame):
             for name in available_names:
                 analysis = self.analysis_by_name.get(name)
                 comparison = compare_dd_to_reference(analysis, self.expected_dd_codes)
-                expected_codes = " | ".join(comparison.expected_codes) if comparison.expected_codes else "-"
-                detected_codes = " | ".join(comparison.detected_codes) if comparison.detected_codes else "-"
+                detected_codes = format_detected_dd_codes_with_inline_errors(comparison)
                 tag = dd_reference_status_color(comparison)
                 self.comparison_tree.insert(
                     "",
@@ -9357,7 +9537,6 @@ class DDTab(ttk.Frame):
                         reconstruction_label(name),
                         dd_reference_status_text(comparison),
                         comparison.status.replace("_", " "),
-                        expected_codes,
                         detected_codes,
                     ),
                     tags=(tag,),
@@ -9458,7 +9637,7 @@ class DDTab(ttk.Frame):
         axes = self.figure.subplots(3, 1, sharex=False)
         axes = np.atleast_1d(axes)
 
-        color = reconstruction_color(self.current_reconstruction_name)
+        color = reconstruction_display_color(self.state, self.current_reconstruction_name)
         axes[0].plot(t, self.analysis.height, color=color, linewidth=1.1, alpha=0.45, label="height")
         axes[0].plot(t, self.analysis.smoothed_height, color=color, linewidth=2.0, label="smoothed")
         axes[0].axhline(

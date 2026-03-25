@@ -16,8 +16,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -30,8 +30,9 @@ os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
-from judging.trampoline_displacement import BED_X_MAX, BED_Y_MAX, TRAMPOLINE_GEOMETRY, X_MAX, Y_MAX
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+from judging.trampoline_displacement import BED_X_MAX, BED_Y_MAX, TRAMPOLINE_GEOMETRY, X_MAX, Y_MAX
 from reconstruction.reconstruction_dataset import (
     align_array_to_frames,
     load_bundle_entries,
@@ -491,6 +492,48 @@ def draw_trampoline_bed(ax, z_level: float) -> None:
     )
 
 
+def trampoline_contact_zone_xy(frame_points_list: list[np.ndarray], padding_m: float = 0.08) -> np.ndarray | None:
+    """Return a rectangular foot-contact zone projected onto the trampoline bed."""
+
+    foot_xy_samples: list[np.ndarray] = []
+    for frame_points in frame_points_list:
+        for kp_name in ("left_ankle", "right_ankle"):
+            point = np.asarray(frame_points[KP_INDEX[kp_name]], dtype=float)
+            if np.all(np.isfinite(point[:2])):
+                foot_xy_samples.append(point[:2])
+    if not foot_xy_samples:
+        return None
+    foot_xy = np.asarray(foot_xy_samples, dtype=float)
+    min_xy = np.nanmin(foot_xy, axis=0) - float(padding_m)
+    max_xy = np.nanmax(foot_xy, axis=0) + float(padding_m)
+    min_xy[0] = max(min_xy[0], -BED_X_MAX)
+    min_xy[1] = max(min_xy[1], -BED_Y_MAX)
+    max_xy[0] = min(max_xy[0], BED_X_MAX)
+    max_xy[1] = min(max_xy[1], BED_Y_MAX)
+    if np.any(max_xy <= min_xy):
+        return None
+    return np.array(
+        [
+            [min_xy[0], min_xy[1]],
+            [max_xy[0], min_xy[1]],
+            [max_xy[0], max_xy[1]],
+            [min_xy[0], max_xy[1]],
+        ],
+        dtype=float,
+    )
+
+
+def draw_trampoline_contact_zone(ax, polygon_xy: np.ndarray | None, z_level: float) -> Poly3DCollection | None:
+    """Draw a semi-transparent contact zone on the trampoline bed."""
+
+    if polygon_xy is None or np.asarray(polygon_xy).shape != (4, 2):
+        return None
+    vertices = np.column_stack((np.asarray(polygon_xy, dtype=float), np.full(4, float(z_level), dtype=float)))
+    patch = Poly3DCollection([vertices], facecolors="#ed8936", edgecolors="#ed8936", linewidths=1.2, alpha=0.30)
+    ax.add_collection3d(patch)
+    return patch
+
+
 def grouped_marker_points(frame_points: np.ndarray) -> dict[str, np.ndarray]:
     groups = {
         "left": [KP_INDEX[name] for name in COCO17 if name in LEFT_KEYPOINTS],
@@ -557,15 +600,25 @@ def edge_linewidth(name_a: str, name_b: str, base: float = 2.0) -> float:
 
 def init_artists(ax, color: str, label: str, marker_size: float, line_style: str = "-"):
     """Cree les artistes matplotlib pour une stick figure."""
-    scatter = {
-        "center": ax.scatter([], [], [], s=marker_size, c=color, marker="o", depthshade=False, label=label),
-        "left": ax.scatter([], [], [], s=marker_size * 1.35, c=color, marker="^", depthshade=False),
-        "right": ax.scatter([], [], [], s=marker_size * 1.35, c=color, marker="s", depthshade=False),
-    }
+    show_markers = float(marker_size) > 0.0
+    scatter = {"center": None, "left": None, "right": None}
+    if show_markers:
+        scatter = {
+            "center": ax.scatter([], [], [], s=marker_size, c=color, marker="o", depthshade=False, label=label),
+            "left": ax.scatter([], [], [], s=marker_size * 1.35, c=color, marker="^", depthshade=False),
+            "right": ax.scatter([], [], [], s=marker_size * 1.35, c=color, marker="s", depthshade=False),
+        }
     lines = []
-    for name_a, name_b in SKELETON_EDGES:
+    for edge_idx, (name_a, name_b) in enumerate(SKELETON_EDGES):
         (line,) = ax.plot(
-            [], [], [], linewidth=edge_linewidth(name_a, name_b), color=color, alpha=0.9, linestyle=line_style
+            [],
+            [],
+            [],
+            linewidth=edge_linewidth(name_a, name_b),
+            color=color,
+            alpha=0.9,
+            linestyle=line_style,
+            label=label if not show_markers and edge_idx == 0 else None,
         )
         lines.append(line)
     return scatter, lines
@@ -582,6 +635,8 @@ def update_artists(scatter, lines, frame_points: np.ndarray):
         return
     grouped = grouped_marker_points(frame_points)
     for side, artist in scatter.items():
+        if artist is None:
+            continue
         xyz = grouped[side]
         if xyz.size:
             artist._offsets3d = (xyz[:, 0], xyz[:, 1], xyz[:, 2])
@@ -629,6 +684,7 @@ def create_animation(
             ax, True, reconstruction_color(name), reconstruction_label(name), marker_size, "-"
         )
     trunk_frame_artists: dict[str, list] = {name: [] for name in show_names}
+    trampoline_contact_artist: Poly3DCollection | None = None
     label = ax.text2D(0.02, 0.95, "", transform=ax.transAxes)
 
     def init():
@@ -649,11 +705,18 @@ def create_animation(
         return init_artists
 
     def update(frame_idx: int):
+        nonlocal trampoline_contact_artist
         updated = [label]
         if framing == "tight":
             apply_axis_limits(ax, compute_frame_axis_limits(recon_points, show_names, frame_idx))
         else:
             apply_axis_limits(ax, full_limits)
+        if trampoline_contact_artist is not None:
+            try:
+                trampoline_contact_artist.remove()
+            except Exception:
+                pass
+            trampoline_contact_artist = None
         for name in show_names:
             for artist in trunk_frame_artists[name]:
                 try:
@@ -675,6 +738,13 @@ def create_animation(
                         ax, origin, rotation, scale=0.18, alpha=0.95, line_width=2.2
                     )
                     updated.extend(trunk_frame_artists[name])
+        if show_trampoline and not airborne_mask[frame_idx]:
+            contact_zone_xy = trampoline_contact_zone_xy(
+                [np.asarray(recon_points[name][frame_idx], dtype=float) for name in show_names]
+            )
+            trampoline_contact_artist = draw_trampoline_contact_zone(ax, contact_zone_xy, trampoline_z)
+            if trampoline_contact_artist is not None:
+                updated.append(trampoline_contact_artist)
         phase = "AIR" if airborne_mask[frame_idx] else "TOILE"
         label.set_text(f"t = {time_s[frame_idx]:.2f} s | {phase}")
         return updated
