@@ -66,8 +66,10 @@ class ReconstructionProfile:
     name: str
     family: str
     camera_names: list[str] | None = None
+    use_all_cameras: bool = False
     ekf_model_path: str | None = None
     model_variant: str = "single_trunk"
+    symmetrize_limbs: bool = True
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
@@ -110,6 +112,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
     parts = [profile.family]
     if profile.model_variant != "single_trunk":
         parts.append(profile.model_variant)
+    if not bool(profile.symmetrize_limbs):
+        parts.append("asym")
     if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
         parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
@@ -177,7 +181,9 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
         parts.append(profile.pose_data_mode)
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
-    if profile.camera_names:
+    if profile.use_all_cameras:
+        parts.append("all_cameras")
+    elif profile.camera_names:
         parts.append("cams")
         parts.extend(str(name) for name in profile.camera_names)
     return slugify("_".join(parts))
@@ -211,6 +217,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             seen_camera_names.add(name)
             normalized_camera_names.append(name)
         profile.camera_names = normalized_camera_names or None
+    profile.use_all_cameras = bool(profile.use_all_cameras)
+    if profile.use_all_cameras:
+        profile.camera_names = None
     if profile.ekf_model_path is not None:
         normalized_model_path = str(profile.ekf_model_path).strip()
         profile.ekf_model_path = normalized_model_path or None
@@ -257,6 +266,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
     if profile.family not in ("ekf_2d", "ekf_3d"):
         profile.ekf_model_path = None
         profile.model_variant = "single_trunk"
+        profile.symmetrize_limbs = True
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -522,7 +532,7 @@ def build_pipeline_command(
     ]
     if pose2sim_trc is not None:
         cmd.extend(["--trc-file", str(pose2sim_trc)])
-    camera_names = profile.camera_names or camera_names_override
+    camera_names = None if profile.use_all_cameras else (profile.camera_names or camera_names_override)
     if camera_names:
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
@@ -533,6 +543,8 @@ def build_pipeline_command(
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
@@ -550,6 +562,8 @@ def build_pipeline_command(
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")

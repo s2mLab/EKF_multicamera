@@ -265,6 +265,14 @@ class SegmentLengths:
     eye_offset_x: float
     eye_offset_y: float
     ear_offset_y: float
+    left_upper_arm_length: float | None = None
+    right_upper_arm_length: float | None = None
+    left_forearm_length: float | None = None
+    right_forearm_length: float | None = None
+    left_thigh_length: float | None = None
+    right_thigh_length: float | None = None
+    left_shank_length: float | None = None
+    right_shank_length: float | None = None
 
 
 @dataclass
@@ -2625,30 +2633,18 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
     head_length = median_distance(pts[:, KP_INDEX["nose"], :], shoulder_center)
     shoulder_width = median_distance(l_shoulder, r_shoulder)
     hip_width = median_distance(l_hip, r_hip)
-    upper_arm_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_shoulder"], :], pts[:, KP_INDEX["left_elbow"], :]),
-            median_distance(pts[:, KP_INDEX["right_shoulder"], :], pts[:, KP_INDEX["right_elbow"], :]),
-        ]
-    )
-    forearm_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_elbow"], :], pts[:, KP_INDEX["left_wrist"], :]),
-            median_distance(pts[:, KP_INDEX["right_elbow"], :], pts[:, KP_INDEX["right_wrist"], :]),
-        ]
-    )
-    thigh_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_hip"], :], pts[:, KP_INDEX["left_knee"], :]),
-            median_distance(pts[:, KP_INDEX["right_hip"], :], pts[:, KP_INDEX["right_knee"], :]),
-        ]
-    )
-    shank_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_knee"], :], pts[:, KP_INDEX["left_ankle"], :]),
-            median_distance(pts[:, KP_INDEX["right_knee"], :], pts[:, KP_INDEX["right_ankle"], :]),
-        ]
-    )
+    left_upper_arm_length = median_distance(pts[:, KP_INDEX["left_shoulder"], :], pts[:, KP_INDEX["left_elbow"], :])
+    right_upper_arm_length = median_distance(pts[:, KP_INDEX["right_shoulder"], :], pts[:, KP_INDEX["right_elbow"], :])
+    upper_arm_length = np.nanmedian([left_upper_arm_length, right_upper_arm_length])
+    left_forearm_length = median_distance(pts[:, KP_INDEX["left_elbow"], :], pts[:, KP_INDEX["left_wrist"], :])
+    right_forearm_length = median_distance(pts[:, KP_INDEX["right_elbow"], :], pts[:, KP_INDEX["right_wrist"], :])
+    forearm_length = np.nanmedian([left_forearm_length, right_forearm_length])
+    left_thigh_length = median_distance(pts[:, KP_INDEX["left_hip"], :], pts[:, KP_INDEX["left_knee"], :])
+    right_thigh_length = median_distance(pts[:, KP_INDEX["right_hip"], :], pts[:, KP_INDEX["right_knee"], :])
+    thigh_length = np.nanmedian([left_thigh_length, right_thigh_length])
+    left_shank_length = median_distance(pts[:, KP_INDEX["left_knee"], :], pts[:, KP_INDEX["left_ankle"], :])
+    right_shank_length = median_distance(pts[:, KP_INDEX["right_knee"], :], pts[:, KP_INDEX["right_ankle"], :])
+    shank_length = np.nanmedian([left_shank_length, right_shank_length])
 
     left_eye = pts[:, KP_INDEX["left_eye"], :]
     right_eye = pts[:, KP_INDEX["right_eye"], :]
@@ -2671,6 +2667,14 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
         "eye_offset_x": 0.05,
         "eye_offset_y": 0.03,
         "ear_offset_y": 0.07,
+        "left_upper_arm_length": 0.29,
+        "right_upper_arm_length": 0.29,
+        "left_forearm_length": 0.27,
+        "right_forearm_length": 0.27,
+        "left_thigh_length": 0.42,
+        "right_thigh_length": 0.42,
+        "left_shank_length": 0.43,
+        "right_shank_length": 0.43,
     }
     values = {
         "trunk_height": trunk_height,
@@ -2684,6 +2688,14 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
         "eye_offset_x": eye_offset_x,
         "eye_offset_y": eye_offset_y,
         "ear_offset_y": ear_offset_y,
+        "left_upper_arm_length": left_upper_arm_length,
+        "right_upper_arm_length": right_upper_arm_length,
+        "left_forearm_length": left_forearm_length,
+        "right_forearm_length": right_forearm_length,
+        "left_thigh_length": left_thigh_length,
+        "right_thigh_length": right_thigh_length,
+        "left_shank_length": left_shank_length,
+        "right_shank_length": right_shank_length,
     }
 
     for key, default_value in fallback.items():
@@ -2788,6 +2800,24 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
     }
 
 
+def segment_length_for_side(
+    lengths: SegmentLengths,
+    *,
+    side: str,
+    base_name: str,
+    symmetrize_limbs: bool = True,
+) -> float:
+    """Return one limb length for the requested side."""
+
+    shared_value = float(getattr(lengths, base_name))
+    if symmetrize_limbs:
+        return shared_value
+    side_value = getattr(lengths, f"{side}_{base_name}", None)
+    if side_value is None or not np.isfinite(side_value) or float(side_value) <= 0.0:
+        return shared_value
+    return float(side_value)
+
+
 def build_biomod(
     lengths: SegmentLengths,
     output_path: Path,
@@ -2795,6 +2825,7 @@ def build_biomod(
     reconstruction: ReconstructionResult | None = None,
     apply_initial_root_rotation_correction: bool = True,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = True,
 ) -> Path:
     """Construit un modele `.bioMod` minimal compatible avec les keypoints COCO17.
 
@@ -2969,6 +3000,18 @@ def build_biomod(
     )
 
     for side, sign in (("left", 1.0), ("right", -1.0)):
+        upper_arm_length = segment_length_for_side(
+            lengths, side=side, base_name="upper_arm_length", symmetrize_limbs=symmetrize_limbs
+        )
+        forearm_length = segment_length_for_side(
+            lengths, side=side, base_name="forearm_length", symmetrize_limbs=symmetrize_limbs
+        )
+        thigh_length = segment_length_for_side(
+            lengths, side=side, base_name="thigh_length", symmetrize_limbs=symmetrize_limbs
+        )
+        shank_length = segment_length_for_side(
+            lengths, side=side, base_name="shank_length", symmetrize_limbs=symmetrize_limbs
+        )
         shoulder_offset = (0, sign * lengths.shoulder_half_width, shoulder_parent_local_z)
         hip_offset = (0, sign * lengths.hip_half_width, 0)
 
@@ -2987,14 +3030,14 @@ def build_biomod(
                 rotations=Rotations.YX,
                 inertia_parameters=inertia["UPPER_ARM"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.upper_arm_length)],
-                    axis_scale=0.3 * lengths.upper_arm_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -upper_arm_length)],
+                    axis_scale=0.3 * upper_arm_length,
                 ),
             )
         )
         upper_arm = model.segments[upper_name]
         upper_arm.add_marker(
-            MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -lengths.upper_arm_length])
+            MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -upper_arm_length])
         )
 
         model.add_segment(
@@ -3002,20 +3045,18 @@ def build_biomod(
                 name=forearm_name,
                 parent_name=upper_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0, 0, -lengths.upper_arm_length]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0, 0, -upper_arm_length]), is_scs_local=True
                 ),
                 rotations=Rotations.ZY,
                 inertia_parameters=inertia["FOREARM"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.forearm_length)],
-                    axis_scale=0.3 * lengths.forearm_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -forearm_length)],
+                    axis_scale=0.3 * forearm_length,
                 ),
             )
         )
         forearm = model.segments[forearm_name]
-        forearm.add_marker(
-            MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -lengths.forearm_length])
-        )
+        forearm.add_marker(MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -forearm_length]))
 
         model.add_segment(
             SegmentReal(
@@ -3027,35 +3068,31 @@ def build_biomod(
                 rotations=Rotations.YXZ,
                 inertia_parameters=inertia["THIGH"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.thigh_length)],
-                    axis_scale=0.25 * lengths.thigh_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -thigh_length)],
+                    axis_scale=0.25 * thigh_length,
                 ),
             )
         )
         thigh = model.segments[thigh_name]
-        thigh.add_marker(
-            MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -lengths.thigh_length])
-        )
+        thigh.add_marker(MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -thigh_length]))
 
         model.add_segment(
             SegmentReal(
                 name=shank_name,
                 parent_name=thigh_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0, 0, -lengths.thigh_length]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0, 0, -thigh_length]), is_scs_local=True
                 ),
                 rotations=Rotations.Y,
                 inertia_parameters=inertia["SHANK"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.shank_length)],
-                    axis_scale=0.25 * lengths.shank_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -shank_length)],
+                    axis_scale=0.25 * shank_length,
                 ),
             )
         )
         shank = model.segments[shank_name]
-        shank.add_marker(
-            MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -lengths.shank_length])
-        )
+        shank.add_marker(MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -shank_length]))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.to_biomod(str(output_path), with_mesh=True)
@@ -4690,6 +4727,7 @@ def model_stage_metadata(
     subject_mass_kg: float,
     initial_rotation_correction: bool,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = True,
 ) -> dict[str, object]:
     """Metadonnees de validite du stage modele."""
     return {
@@ -4701,6 +4739,7 @@ def model_stage_metadata(
         "subject_mass_kg": float(subject_mass_kg),
         "initial_rotation_correction": bool(initial_rotation_correction),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
     }
 
 
@@ -5281,6 +5320,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("output") / "vitpose_ekf")
     parser.add_argument("--biomod", type=Path, default=Path("output") / "vitpose_ekf" / "vitpose_chain.bioMod")
     parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
+    parser.add_argument(
+        "--no-symmetrize-limbs",
+        action="store_true",
+        help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
+    )
     parser.add_argument("--model-cache", type=Path, default=None, help="Cache NPZ du stage modele.")
     parser.add_argument("--biorbd-kalman-cache", type=Path, default=None, help="Cache NPZ du Kalman marqueurs biorbd.")
     parser.add_argument(
@@ -5727,6 +5771,7 @@ def main() -> None:
         args.subject_mass_kg,
         args.initial_rotation_correction,
         model_variant=args.model_variant,
+        symmetrize_limbs=not args.no_symmetrize_limbs,
     )
     if metadata_cache_matches(model_cache_path, model_metadata) and args.biomod.exists():
         t0 = time.perf_counter()
@@ -5743,6 +5788,7 @@ def main() -> None:
             reconstruction=reconstruction,
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
         model_compute_time_s = time.perf_counter() - t0
         save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=model_compute_time_s)

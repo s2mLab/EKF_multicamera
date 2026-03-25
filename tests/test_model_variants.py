@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from reconstruction.reconstruction_registry import default_model_stem
-from vitpose_ekf_pipeline import SegmentLengths, build_biomod
+from vitpose_ekf_pipeline import SegmentLengths, build_biomod, segment_length_for_side
 
 
 def test_default_model_stem_distinguishes_back_variant():
@@ -27,7 +27,29 @@ def _lengths() -> SegmentLengths:
         eye_offset_x=0.03,
         eye_offset_y=0.025,
         ear_offset_y=0.06,
+        left_upper_arm_length=0.31,
+        right_upper_arm_length=0.27,
+        left_forearm_length=0.26,
+        right_forearm_length=0.24,
+        left_thigh_length=0.47,
+        right_thigh_length=0.43,
+        left_shank_length=0.41,
+        right_shank_length=0.39,
     )
+
+
+def test_segment_length_for_side_symmetrizes_by_default():
+    lengths = _lengths()
+
+    assert segment_length_for_side(lengths, side="left", base_name="upper_arm_length") == lengths.upper_arm_length
+    assert segment_length_for_side(lengths, side="right", base_name="upper_arm_length") == lengths.upper_arm_length
+
+
+def test_segment_length_for_side_preserves_side_specific_lengths_when_requested():
+    lengths = _lengths()
+
+    assert segment_length_for_side(lengths, side="left", base_name="upper_arm_length", symmetrize_limbs=False) == 0.31
+    assert segment_length_for_side(lengths, side="right", base_name="upper_arm_length", symmetrize_limbs=False) == 0.27
 
 
 def test_build_biomod_back_flexion_1d_creates_upper_back_segment(tmp_path: Path):

@@ -62,6 +62,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--biomod", type=Path, default=None)
     parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
+    parser.add_argument(
+        "--no-symmetrize-limbs",
+        action="store_true",
+        help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
+    )
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
         "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
@@ -258,6 +263,7 @@ def main() -> None:
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
     else:
         build_ekf_2d_bundle(
@@ -306,6 +312,7 @@ def main() -> None:
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
 
     print(f"Bundle ecrit dans {args.output_dir}", flush=True)

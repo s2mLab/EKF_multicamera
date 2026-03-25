@@ -773,3 +773,52 @@ def test_clean_trial_outputs_deletes_dataset_after_confirmation(monkeypatch, tmp
     assert summaries == ["summary"]
     assert refreshes == ["refresh"]
     assert info_messages
+
+
+def test_clean_trial_caches_deletes_only_cache_artifacts(monkeypatch, tmp_path):
+    notifications = []
+    summaries = []
+    refreshes = []
+    tab = pipeline_gui.DataExplorer2DTab.__new__(pipeline_gui.DataExplorer2DTab)
+    tab.state = SimpleNamespace(
+        pose_data_cache={("demo",): object()},
+        calibration_cache={"demo": object()},
+        notify_reconstructions_updated=lambda: notifications.append("updated"),
+        shared_reconstruction_panel=SimpleNamespace(_refresh_callback=lambda: refreshes.append("refresh")),
+    )
+    tab.update_dataset_summary = lambda: summaries.append("summary")
+    tab.after_idle = lambda callback: callback()
+    dataset_dir = tmp_path / "output" / "trial"
+    cache_root = dataset_dir / "_cache" / "pose2d"
+    cache_root.mkdir(parents=True)
+    (cache_root / "demo.npz").write_text("dummy", encoding="utf-8")
+    model_dir = dataset_dir / "models" / "demo"
+    model_dir.mkdir(parents=True)
+    preview_cache = model_dir / "preview_q0_cache.npz"
+    preview_cache.write_text("preview", encoding="utf-8")
+    kept_file = model_dir / "model.bioMod"
+    kept_file.write_text("bioMod", encoding="utf-8")
+    info_messages = []
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: dataset_dir)
+    monkeypatch.setattr(pipeline_gui, "current_dataset_name", lambda _state: "trial")
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui.messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showinfo",
+        lambda title, message: info_messages.append((title, message)),
+    )
+
+    pipeline_gui.DataExplorer2DTab.clean_trial_caches(tab)
+
+    assert not (dataset_dir / "_cache").exists()
+    assert not preview_cache.exists()
+    assert kept_file.exists()
+    assert dataset_dir.exists()
+    assert tab.state.pose_data_cache == {}
+    assert tab.state.calibration_cache == {}
+    assert notifications == ["updated"]
+    assert summaries == ["summary"]
+    assert refreshes == ["refresh"]
+    assert info_messages

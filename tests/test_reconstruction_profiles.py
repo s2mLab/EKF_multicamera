@@ -22,6 +22,19 @@ def test_canonical_profile_name_includes_camera_names():
     assert canonical_profile_name(profile) == "ekf_2d_acc_cams_m11139_m11140"
 
 
+def test_canonical_profile_name_uses_all_cameras_token():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            use_all_cameras=True,
+            camera_names=["M11139", "M11140"],
+        )
+    )
+    assert canonical_profile_name(profile) == "ekf_2d_acc_all_cameras"
+
+
 def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     profile = validate_profile(
         ReconstructionProfile(
@@ -42,6 +55,27 @@ def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     assert "--camera-names" in cmd
     camera_names_arg = cmd[cmd.index("--camera-names") + 1]
     assert camera_names_arg == "M11139,M11140"
+
+
+def test_build_pipeline_command_omits_camera_names_for_all_cameras_profile():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf_all_cameras",
+            family="ekf_2d",
+            predictor="acc",
+            use_all_cameras=True,
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        camera_names_override=["M11141", "M11458"],
+        python_executable="python",
+    )
+    assert "--camera-names" not in cmd
 
 
 def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
@@ -167,6 +201,39 @@ def test_build_pipeline_command_includes_model_variant_for_auto_built_ekf_profil
 
     assert "--model-variant" in cmd
     assert cmd[cmd.index("--model-variant") + 1] == "back_3dof"
+
+
+def test_canonical_profile_name_marks_asymmetric_auto_built_models():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_3d",
+            symmetrize_limbs=False,
+        )
+    )
+
+    assert canonical_profile_name(profile).startswith("ekf_3d_asym")
+
+
+def test_build_pipeline_command_disables_limb_symmetrization_when_requested():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf3d_asym",
+            family="ekf_3d",
+            symmetrize_limbs=False,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--no-symmetrize-limbs" in cmd
 
 
 def test_build_pipeline_command_includes_frame_stride():

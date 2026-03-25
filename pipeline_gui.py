@@ -164,6 +164,7 @@ from reconstruction.reconstruction_profiles import (
     validate_profile,
 )
 from reconstruction.reconstruction_registry import (
+    DEFAULT_MODEL_SYMMETRIZE_LIMBS,
     dataset_figures_dir,
     dataset_models_dir,
     dataset_reconstructions_dir,
@@ -1693,6 +1694,7 @@ class SharedAppState:
     shared_reconstruction_panel: object | None = None
     active_reconstruction_consumer: object | None = None
     clean_trial_outputs_callback: callable | None = None
+    clean_trial_caches_callback: callable | None = None
 
     def set_profiles(self, profiles: list[ReconstructionProfile]) -> None:
         self.profiles = list(profiles)
@@ -4508,6 +4510,7 @@ class DataExplorer2DTab(ttk.Frame):
         )
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_dataset_summary())
         self.state.clean_trial_outputs_callback = self.clean_trial_outputs
+        self.state.clean_trial_caches_callback = self.clean_trial_caches
         self.on_keypoints_changed()
 
     def selected_triangulation_flip_method(self) -> str:
@@ -4602,6 +4605,41 @@ class DataExplorer2DTab(ttk.Frame):
             messagebox.showinfo("Clean trial outputs", f"Deleted outputs for:\n{display_path(dataset_dir)}")
         except Exception as exc:
             messagebox.showerror("Clean trial outputs", str(exc))
+
+    def clean_trial_caches(self) -> None:
+        dataset_dir = current_dataset_dir(self.state)
+        trial_name = current_dataset_name(self.state)
+        cache_root = dataset_dir / "_cache"
+        preview_cache_paths = list(dataset_dir.glob("models/**/preview_q0_cache.npz")) if dataset_dir.exists() else []
+        if not cache_root.exists() and not preview_cache_paths:
+            messagebox.showinfo("Clean trial caches", f"No caches found for this dataset:\n{display_path(dataset_dir)}")
+            return
+        confirmed = messagebox.askyesno(
+            "Clean trial caches",
+            f"Delete generated caches for trial '{trial_name}'?\n\n"
+            f"{display_path(dataset_dir)}\n\n"
+            "This removes cached intermediate files only. Models, reconstructions, and figures are kept.",
+            icon=messagebox.WARNING,
+        )
+        if not confirmed:
+            return
+        try:
+            if cache_root.exists():
+                shutil.rmtree(cache_root)
+            for cache_path in preview_cache_paths:
+                if cache_path.exists():
+                    cache_path.unlink()
+            self.state.pose_data_cache.clear()
+            self.state.calibration_cache.clear()
+            self.state.notify_reconstructions_updated()
+            self.update_dataset_summary()
+            panel = getattr(self.state, "shared_reconstruction_panel", None)
+            refresh_callback = getattr(panel, "_refresh_callback", None)
+            if callable(refresh_callback):
+                self.after_idle(refresh_callback)
+            messagebox.showinfo("Clean trial caches", f"Deleted caches for:\n{display_path(dataset_dir)}")
+        except Exception as exc:
+            messagebox.showerror("Clean trial caches", str(exc))
 
     def update_dataset_summary(self) -> None:
         ensure_dataset_layout(self.state)
@@ -4855,6 +4893,13 @@ class ModelTab(CommandTab):
             state="readonly",
         )
         structure_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.symmetrize_limbs_var = tk.BooleanVar(value=DEFAULT_MODEL_SYMMETRIZE_LIMBS)
+        symmetrize_check = ttk.Checkbutton(
+            row,
+            text="Symmetrize limbs",
+            variable=self.symmetrize_limbs_var,
+        )
+        symmetrize_check.pack(side=tk.LEFT, padx=(0, 8))
         self.triang_method = tk.StringVar(value="exhaustive")
         triang_label = ttk.Label(row, text="Triangulation", width=12)
         triang_label.pack(side=tk.LEFT)
@@ -4940,6 +4985,10 @@ class ModelTab(CommandTab):
             "single_trunk: modèle actuel. back_3dof: segment UPPER_BACK rotatif inséré entre le bassin et les épaules/tête/bras.",
         )
         attach_tooltip(
+            symmetrize_check,
+            "Si coché, les longueurs bras/jambe gauche et droite sont moyennées pour construire un bioMod symétrique. Sinon, le modèle conserve les longueurs latéralisées estimées.",
+        )
+        attach_tooltip(
             triang_label, "Méthode de triangulation utilisée pour construire le modèle: once, greedy, ou exhaustive."
         )
         attach_tooltip(
@@ -4977,6 +5026,8 @@ class ModelTab(CommandTab):
         self.state.register_reconstruction_listener(self.refresh_existing_models)
         self.model_variant.trace_add("write", lambda *_args: self.update_details())
         self.model_variant.trace_add("write", lambda *_args: self.refresh_existing_models())
+        self.symmetrize_limbs_var.trace_add("write", lambda *_args: self.update_details())
+        self.symmetrize_limbs_var.trace_add("write", lambda *_args: self.refresh_existing_models())
         self.triang_method.trace_add("write", lambda *_args: self.update_details())
         self.pose_data_mode.trace_add("write", lambda *_args: self.update_details())
         self.pose_correction_mode.trace_add("write", lambda *_args: self.update_details())
@@ -5118,6 +5169,7 @@ class ModelTab(CommandTab):
             f"Model creation will use: {self.current_pose_source_label()} 2D data, "
             f"frames {frame_start} -> {frame_end}, nb {max_frames}, "
             f"structure {self.model_variant.get()}, "
+            f"{'sym' if self.symmetrize_limbs_var.get() else 'asym'}, "
             f"triangulation {self.triang_method.get()}, "
             f"root rot-fix {'on' if self.initial_rot_var.get() else 'off'}, "
             f"subject mass {self.subject_mass.get()} kg."
@@ -5202,6 +5254,7 @@ class ModelTab(CommandTab):
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
             model_variant=self.model_variant.get(),
+            symmetrize_limbs=self.symmetrize_limbs_var.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
@@ -5219,6 +5272,7 @@ class ModelTab(CommandTab):
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
             model_variant=self.model_variant.get(),
+            symmetrize_limbs=self.symmetrize_limbs_var.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=max_frames,
@@ -5248,6 +5302,7 @@ class ModelTab(CommandTab):
         expected_mode = self.pose_data_mode.get()
         expected_correction = self.current_pose_correction_mode()
         expected_model_variant = self.model_variant.get() if hasattr(self, "model_variant") else DEFAULT_MODEL_VARIANT
+        expected_symmetrize_limbs = self.symmetrize_limbs_var.get() if hasattr(self, "symmetrize_limbs_var") else True
         expected_window = int(self.state.pose_filter_window_var.get())
         expected_ratio = float(self.state.pose_outlier_ratio_var.get())
         expected_p_low = float(self.state.pose_p_low_var.get())
@@ -5263,6 +5318,7 @@ class ModelTab(CommandTab):
                 expected_mode,
                 expected_correction,
                 expected_model_variant,
+                expected_symmetrize_limbs,
                 expected_window,
                 expected_ratio,
                 expected_p_low,
@@ -5354,6 +5410,7 @@ class ModelTab(CommandTab):
         expected_mode: str,
         expected_correction: str,
         expected_model_variant: str,
+        expected_symmetrize_limbs: bool,
         expected_window: int,
         expected_ratio: float,
         expected_p_low: float,
@@ -5371,6 +5428,8 @@ class ModelTab(CommandTab):
             reconstruction_metadata.get("pose_data_mode") == expected_mode
             and str(reconstruction_metadata.get("pose_correction_mode", "none")) == expected_correction
             and str(stage_metadata.get("model_variant", DEFAULT_MODEL_VARIANT)) == expected_model_variant
+            and bool(stage_metadata.get("symmetrize_limbs", DEFAULT_MODEL_SYMMETRIZE_LIMBS))
+            == bool(expected_symmetrize_limbs)
             and int(reconstruction_metadata.get("pose_filter_window", -1)) == expected_window
             and math.isclose(
                 float(reconstruction_metadata.get("pose_outlier_threshold_ratio", math.nan)),
@@ -5455,6 +5514,8 @@ class ModelTab(CommandTab):
         selected_cameras = current_selected_camera_names(self.state)
         if selected_cameras:
             cmd.extend(["--camera-names", ",".join(selected_cameras)])
+        if not self.symmetrize_limbs_var.get():
+            cmd.append("--no-symmetrize-limbs")
         if self.frame_start.get():
             cmd.extend(["--frame-start", self.frame_start.get()])
         if self.frame_end.get():
@@ -5475,6 +5536,7 @@ class ModelTab(CommandTab):
             pose_data_mode=self.pose_data_mode.get(),
             triangulation_method=self.triang_method.get(),
             model_variant=self.model_variant.get(),
+            symmetrize_limbs=self.symmetrize_limbs_var.get(),
             pose_correction_mode=self.current_pose_correction_mode(),
             initial_rotation_correction=self.initial_rot_var.get(),
             max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
@@ -5497,6 +5559,7 @@ class ModelTab(CommandTab):
                 pose_data_mode=self.pose_data_mode.get(),
                 triangulation_method=self.triang_method.get(),
                 model_variant=self.model_variant.get(),
+                symmetrize_limbs=self.symmetrize_limbs_var.get(),
                 pose_correction_mode=self.current_pose_correction_mode(),
                 initial_rotation_correction=self.initial_rot_var.get(),
                 max_frames=int(self.max_frames.get()) if self.max_frames.get() else None,
@@ -6411,6 +6474,13 @@ class ProfilesTab(CommandTab):
         camera_names = [str(self.profile_cameras_list.get(index)) for index in indices]
         return camera_names or None
 
+    def profile_uses_all_cameras(self) -> bool:
+        selected = self.selected_profile_camera_names() or []
+        if not hasattr(self, "profile_cameras_list"):
+            return False
+        available = self.profile_cameras_list.size()
+        return available > 0 and len(selected) == available
+
     def _set_profile_camera_selection(self, camera_names: list[str] | None) -> None:
         requested = set(camera_names or [])
         self.profile_cameras_list.selection_clear(0, tk.END)
@@ -6580,7 +6650,8 @@ class ProfilesTab(CommandTab):
         profile = ReconstructionProfile(
             name=self.profile_name.get() if include_name else "",
             family=family,
-            camera_names=self.selected_profile_camera_names(),
+            camera_names=None if self.profile_uses_all_cameras() else self.selected_profile_camera_names(),
+            use_all_cameras=self.profile_uses_all_cameras(),
             ekf_model_path=selected_model_path,
             model_variant=model_variant if family in ("ekf_2d", "ekf_3d") else DEFAULT_MODEL_VARIANT,
             predictor=self.predictor.get() if family == "ekf_2d" else None,
@@ -6679,7 +6750,9 @@ class ProfilesTab(CommandTab):
                 flags.append("lock")
             if profile.no_root_unwrap:
                 flags.append("no_unwrap")
-            if getattr(profile, "camera_names", None):
+            if getattr(profile, "use_all_cameras", False):
+                flags.append("cams[all]")
+            elif getattr(profile, "camera_names", None):
                 flags.append(f"cams[{format_camera_names(profile.camera_names)}]")
             if int(getattr(profile, "frame_stride", 1)) != 1:
                 flags.append(f"1/{int(getattr(profile, 'frame_stride', 1))}")
@@ -6789,14 +6862,14 @@ class ProfilesTab(CommandTab):
 
 class ReconstructionsTab(CommandTab):
     def __init__(self, master, state: SharedAppState):
-        super().__init__(master, "Reconstructions")
+        super().__init__(master, "Reconstructions", show_command_preview=False, show_output=False)
         self.state = state
         self.status_summaries: dict[str, dict[str, object]] = {}
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
         form = ttk.LabelFrame(self.main, text="Lancer les reconstructions depuis les profils")
-        form.pack(fill=tk.X, pady=(0, 8), before=self.output)
+        form.pack(fill=tk.X, pady=(0, 8))
 
         controls = ttk.Frame(form)
         controls.pack(fill=tk.X, padx=8, pady=6)
@@ -6827,7 +6900,7 @@ class ReconstructionsTab(CommandTab):
         )
 
         timing_box = ttk.LabelFrame(self.main, text="Durées détaillées de la reconstruction sélectionnée")
-        timing_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8), before=self.output)
+        timing_box.pack(fill=tk.BOTH, expand=False, pady=(0, 8))
         self.timing_details = ScrolledText(timing_box, height=10, wrap=tk.WORD)
         self.timing_details.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         self.timing_details.insert("1.0", "Select a reconstruction to inspect timing details.")

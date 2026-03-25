@@ -48,6 +48,8 @@ class SharedReconstructionPanel(ttk.Frame):
 
         header = ttk.Frame(self)
         header.pack(fill=tk.X, padx=8, pady=(6, 2))
+        self.clean_caches_button = ttk.Button(header, text="Clean trial caches", command=lambda: None)
+        self.clean_caches_button.pack(side=tk.RIGHT, padx=(0, 8))
         self.clean_button = ttk.Button(header, text="Clean trial outputs", command=lambda: None)
         self.clean_button.pack(side=tk.RIGHT, padx=(0, 8))
         self.refresh_button = ttk.Button(header, text="Refresh available reconstructions")
@@ -97,7 +99,9 @@ class SharedReconstructionPanel(ttk.Frame):
         self._selection_callback = selection_callback
         self.refresh_button.configure(command=refresh_callback)
         clean_callback = getattr(self.state, "clean_trial_outputs_callback", None)
+        clean_caches_callback = getattr(self.state, "clean_trial_caches_callback", None)
         self.clean_button.configure(command=clean_callback or (lambda: None))
+        self.clean_caches_button.configure(command=clean_caches_callback or (lambda: None))
         self.tree.configure(selectmode=selectmode)
 
     def set_rows(self, rows: list[dict[str, object]], default_names: list[str] | None = None) -> None:
@@ -159,6 +163,7 @@ class SharedReconstructionPanel(ttk.Frame):
         self._refresh_callback = None
         self.refresh_button.configure(command=lambda: None)
         self.clean_button.configure(command=lambda: None)
+        self.clean_caches_button.configure(command=lambda: None)
         self._suspend_selection_callback = True
         try:
             for item in self.tree.get_children():
