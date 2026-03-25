@@ -118,9 +118,6 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
 
     pipeline = summary.get("pipeline_timing")
     if isinstance(pipeline, dict):
-        explicit_total = _coerce_float(pipeline.get("objective_total_s"))
-        if explicit_total is not None:
-            return explicit_total
         stages = pipeline.get("stages")
         if isinstance(stages, list):
             total = 0.0
@@ -135,6 +132,9 @@ def objective_total_seconds(summary: dict[str, object]) -> float | None:
                 used = True
             if used:
                 return total
+        explicit_total = _coerce_float(pipeline.get("objective_total_s"))
+        if explicit_total is not None:
+            return explicit_total
     return compute_time_seconds(summary)
 
 

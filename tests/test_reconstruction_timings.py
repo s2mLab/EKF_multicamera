@@ -144,6 +144,38 @@ def test_objective_model_time_can_be_recovered_from_selected_biomod_cache(tmp_pa
     assert math.isclose(reconstruction_run_seconds(summary), 2.5)
 
 
+def test_objective_total_recomputes_stages_when_explicit_total_misses_model_cache(tmp_path: Path):
+    model_dir = tmp_path / "model_demo"
+    model_dir.mkdir()
+    biomod_path = model_dir / "model_demo.bioMod"
+    biomod_path.write_text("version 4", encoding="utf-8")
+    np.savez(
+        model_dir / "model_stage.npz",
+        lengths=np.asarray("{}", dtype=object),
+        biomod_path=np.asarray(str(biomod_path), dtype=object),
+        compute_time_s=np.asarray(11.3, dtype=float),
+        metadata=np.asarray("{}", dtype=object),
+    )
+
+    summary = {
+        "selected_model": str(biomod_path),
+        "pipeline_timing": {
+            "objective_total_s": 4.2,
+            "stages": [
+                make_timing_stage("pose_data", "2D cleaning", compute_time_s=0.4),
+                make_timing_stage("triangulation", "Triangulation", compute_time_s=0.1),
+                make_timing_stage("model_creation", "Model creation", compute_time_s=0.0, source="provided"),
+                make_timing_stage("ekf_2d_initial_state", "EKF 2D initial state", compute_time_s=0.4),
+                make_timing_stage("ekf_2d", "EKF 2D", compute_time_s=3.3),
+            ],
+        },
+    }
+
+    assert math.isclose(objective_total_seconds(summary), 15.5)
+    assert math.isclose(model_compute_seconds(summary), 11.3)
+    assert math.isclose(reconstruction_run_seconds(summary), 4.2)
+
+
 def test_build_pipeline_diagram_marks_cached_stages():
     diagram = build_pipeline_diagram(
         [
