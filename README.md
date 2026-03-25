@@ -358,6 +358,12 @@ The repository contains a single CI workflow under:
 
 - [.github/workflows/ci.yml](/Users/mickaelbegon/Documents/Playground/.github/workflows/ci.yml)
 
+## TODO
+
+- Improve hip and knee flexion handling for EKF outputs to distinguish `piked` and `grouped` body shapes more robustly.
+- Compute hip and knee flexion angles directly from triangulated 3D data.
+- Continue developing the execution-error analysis module.
+
 ## Notes
 
 - The GUI is the easiest entry point if you want to explore reconstructions interactively.

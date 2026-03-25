@@ -18,9 +18,9 @@ import concurrent.futures as cf
 import json
 import math
 import os
+import sys
 import tempfile
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -35,8 +35,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 from matplotlib.animation import FuncAnimation, PillowWriter
+from PIL import Image
 
 from animation.animate_dual_stick_comparison import (
     KP_INDEX,
@@ -213,8 +213,8 @@ def camera_layout(n_cameras: int) -> tuple[int, int]:
 def layer_style(name: str, marker_size: float) -> dict[str, object]:
     if name == "raw":
         return {
-            "color": reconstruction_color(name),
-            "label": reconstruction_label(name),
+            "color": "black",
+            "label": "Raw 2D",
             "linestyle": "-",
             "linewidth": 1.0,
             "alpha": 0.7,
@@ -296,6 +296,26 @@ def compute_pose_crop_limits(
                 camera_limits[frame_idx] = camera_limits[last_valid]
         limits[cam_name] = camera_limits
     return limits
+
+
+def compose_crop_reference_points(
+    base_points_2d: np.ndarray,
+    layer_2d: dict[str, np.ndarray],
+    show: tuple[str, ...],
+) -> np.ndarray:
+    """Build crop references from raw detections and selected reprojections."""
+
+    stacked = [np.asarray(base_points_2d, dtype=float)]
+    for name in show:
+        if name == "raw":
+            continue
+        points_2d = layer_2d.get(name)
+        if points_2d is None:
+            continue
+        stacked.append(np.asarray(points_2d, dtype=float))
+    if len(stacked) == 1:
+        return stacked[0]
+    return np.concatenate(stacked, axis=2)
 
 
 def apply_2d_axis_limits(
@@ -436,12 +456,15 @@ def create_animation(
         name for name in show if name != "raw" and name in layer_2d
     ]
     styles = {name: layer_style(name, marker_size) for name in display_names}
+    crop_reference_points = compose_crop_reference_points(raw_2d, layer_2d, show)
 
     artists: dict[str, list[dict[str, object]]] = {key: [] for key in display_names}
     line_artists: dict[str, list[list]] = {key: [] for key in display_names}
     title = fig.suptitle("", fontsize=14)
     crop_limits = (
-        compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
+        compute_pose_crop_limits(crop_reference_points, calibrations, camera_names, crop_margin)
+        if crop_mode == "pose"
+        else {}
     )
 
     for ax_idx, ax in enumerate(axes):
@@ -634,7 +657,11 @@ def render_frame(
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
     axes = np.atleast_1d(axes).ravel()
     crop_limits = (
-        compute_pose_crop_limits(raw_2d, calibrations, camera_names, crop_margin) if crop_mode == "pose" else {}
+        compute_pose_crop_limits(
+            compose_crop_reference_points(raw_2d, layer_2d, show), calibrations, camera_names, crop_margin
+        )
+        if crop_mode == "pose"
+        else {}
     )
     display_names = ([] if "raw" not in show else ["raw"]) + [
         name for name in show if name != "raw" and name in layer_2d

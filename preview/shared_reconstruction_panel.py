@@ -112,14 +112,16 @@ class SharedReconstructionPanel(ttk.Frame):
                     continue
                 row_names.append(name)
                 reproj_mean = row.get("reproj_mean")
+                row_family = str(row.get("family", "-"))
+                row_index = "" if name == "raw" or row_family == "2d" else str(row_idx)
                 self.tree.insert(
                     "",
                     "end",
                     iid=name,
                     values=(
-                        str(row_idx),
+                        row_index,
                         str(row.get("label", name)),
-                        str(row.get("family", "-")),
+                        row_family,
                         row.get("frames", "-"),
                         "-" if reproj_mean is None else f"{float(reproj_mean):.2f}",
                         str(row.get("path", "")),
