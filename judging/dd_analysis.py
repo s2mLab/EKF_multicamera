@@ -12,8 +12,6 @@ from scipy.spatial.transform import Rotation as R
 from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
-    TRUNK_ROTATION_NAMES,
-    TRUNK_TRANSLATION_NAMES,
     reextract_euler_with_gaps,
     unwrap_with_gaps,
 )
@@ -392,15 +390,30 @@ def detect_body_shape(
 ) -> str:
     """Infer a coarse FIG body shape from hip and knee flexion peaks."""
 
-    hip_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, hip_indices]), axis=0))
-    knee_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, knee_indices]), axis=0))
-    hip_value = float(np.nanmax(hip_peak_deg))
-    knee_value = float(np.nanmax(knee_peak_deg))
+    hip_curve, knee_curve = flexion_curves_from_segment(q_segment, hip_indices, knee_indices)
+    hip_value = float(np.rad2deg(np.nanmax(hip_curve))) if np.any(np.isfinite(hip_curve)) else float("nan")
+    knee_value = float(np.rad2deg(np.nanmax(knee_curve))) if np.any(np.isfinite(knee_curve)) else float("nan")
     if hip_value >= hip_threshold_deg and knee_value >= knee_tuck_threshold_deg:
         return "grouped"
     if hip_value >= hip_threshold_deg and knee_value <= knee_pike_threshold_deg:
         return "piked"
     return "straight"
+
+
+def normalize_flexion_curve_rad(curve_rad: np.ndarray) -> np.ndarray:
+    """Fold wrapped joint angles back to a physiological flexion range.
+
+    EKF trajectories may keep accumulating Euler branches, so a flexion DoF can
+    appear near ``2π + θ`` or ``-2π + θ``. For grouped/piked detection we only
+    care about the smallest equivalent flexion magnitude, therefore angles are
+    wrapped modulo ``2π`` and mirrored into ``[0, π]``.
+    """
+
+    curve = np.asarray(curve_rad, dtype=float)
+    wrapped = np.mod(curve, 2.0 * np.pi)
+    normalized = np.where(wrapped > np.pi, 2.0 * np.pi - wrapped, wrapped)
+    normalized[~np.isfinite(curve)] = np.nan
+    return normalized
 
 
 def flexion_curves_from_segment(
@@ -410,8 +423,10 @@ def flexion_curves_from_segment(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return aggregate hip and knee flexion curves for one jump segment."""
 
-    hip_curve = np.nanmax(np.abs(np.asarray(q_segment[:, hip_indices], dtype=float)), axis=1)
-    knee_curve = np.nanmax(np.abs(np.asarray(q_segment[:, knee_indices], dtype=float)), axis=1)
+    hip_values = normalize_flexion_curve_rad(np.asarray(q_segment[:, hip_indices], dtype=float))
+    knee_values = normalize_flexion_curve_rad(np.asarray(q_segment[:, knee_indices], dtype=float))
+    hip_curve = np.nanmax(hip_values, axis=1)
+    knee_curve = np.nanmax(knee_values, axis=1)
     return hip_curve, knee_curve
 
 

@@ -6,6 +6,8 @@ from judging.dd_analysis import (
     analyze_single_jump,
     body_shape_phase_masks,
     default_body_shape_indices,
+    flexion_curves_from_segment,
+    normalize_flexion_curve_rad,
     signed_threshold_crossing_indices,
 )
 
@@ -99,3 +101,32 @@ def test_body_shape_phase_masks_separate_grouped_and_piked_frames():
 
     assert grouped_mask.tolist() == [False, True, False, False]
     assert piked_mask.tolist() == [False, False, True, True]
+
+
+def test_normalize_flexion_curve_rad_folds_wrapped_angles_back_to_physiological_range():
+    curve = np.deg2rad(np.array([20.0, 350.0, 380.0, -370.0]))
+
+    normalized = normalize_flexion_curve_rad(curve)
+
+    np.testing.assert_allclose(np.rad2deg(normalized), np.array([20.0, 10.0, 20.0, 10.0]))
+
+
+def test_flexion_curves_from_segment_uses_modulo_2pi_for_grouped_vs_piked_detection():
+    q_segment = np.deg2rad(
+        np.array(
+            [
+                [20.0, 22.0, 15.0, 18.0],
+                [440.0, 430.0, 445.0, 438.0],
+                [445.0, 438.0, 375.0, 382.0],
+            ],
+            dtype=float,
+        )
+    )
+
+    hip_curve, knee_curve = flexion_curves_from_segment(q_segment, [0, 1], [2, 3])
+    grouped_mask, piked_mask = body_shape_phase_masks(hip_curve, knee_curve)
+
+    np.testing.assert_allclose(np.rad2deg(hip_curve), np.array([22.0, 80.0, 85.0]))
+    np.testing.assert_allclose(np.rad2deg(knee_curve), np.array([18.0, 85.0, 22.0]))
+    assert grouped_mask.tolist() == [False, True, False]
+    assert piked_mask.tolist() == [False, False, False]
