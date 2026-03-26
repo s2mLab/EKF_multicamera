@@ -31,6 +31,7 @@ from vitpose_ekf_pipeline import (
     compute_epipolar_frame_coherence,
     compute_framewise_epipolar_measurement_weights,
     load_pose_data,
+    once_triangulation_from_best_cameras,
     project_point_with_projection_matrices,
     q_names_from_model,
     sample_frames_uniformly,
@@ -93,6 +94,44 @@ def test_project_point_with_projection_matrices_matches_camera_projection():
     projected = project_point_with_projection_matrices(np.asarray([camera.P for camera in cameras], dtype=float), point)
     expected = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
     np.testing.assert_allclose(projected, expected, atol=1e-8)
+
+
+def test_once_triangulation_ignores_nan_observations_and_requires_enough_valid_views():
+    point = np.array([0.2, -0.1, 2.0], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0), _make_camera("cam2", -0.8)]
+    observations = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
+    observations[2] = np.array([np.nan, np.nan], dtype=float)
+    confidences = np.array([1.0, 0.8, 0.9], dtype=float)
+
+    triangulated, mean_error, per_view_error, coherence_per_view, excluded_views = once_triangulation_from_best_cameras(
+        [camera.P for camera in cameras],
+        observations,
+        confidences,
+        cameras,
+        error_threshold_px=5.0,
+        min_cameras_for_triangulation=2,
+    )
+
+    np.testing.assert_allclose(triangulated, point, atol=1e-8)
+    assert np.isfinite(mean_error)
+    assert np.isnan(per_view_error[2])
+    assert coherence_per_view[2] == 0.0
+    assert bool(excluded_views[2]) is True
+
+    triangulated, mean_error, per_view_error, coherence_per_view, excluded_views = once_triangulation_from_best_cameras(
+        [camera.P for camera in cameras],
+        observations,
+        confidences,
+        cameras,
+        error_threshold_px=5.0,
+        min_cameras_for_triangulation=3,
+    )
+
+    assert np.all(np.isnan(triangulated))
+    assert np.isnan(mean_error)
+    assert np.all(np.isnan(per_view_error))
+    assert np.all(coherence_per_view == 0.0)
+    assert np.array_equal(excluded_views, np.array([False, False, True]))
 
 
 def test_project_points_and_jacobians_matches_scalar_projection():
@@ -945,7 +984,7 @@ def test_choose_ekf_prediction_gate_measurements_skips_when_error_delta_is_too_s
 def test_upper_back_pseudo_measurement_block_tracks_mean_hip_flexion():
     ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
     ekf.nq = 6
-    ekf.upper_back_rotx_idx = 1
+    ekf.upper_back_sagittal_idx = 1
     ekf.hip_flexion_indices = (3, 4)
     ekf.upper_back_sagittal_gain = 0.2
     ekf.upper_back_pseudo_std_rad = np.deg2rad(10.0)

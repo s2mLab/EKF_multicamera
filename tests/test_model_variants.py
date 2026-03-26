@@ -59,13 +59,23 @@ def test_build_biomod_back_flexion_1d_creates_upper_back_segment(tmp_path: Path)
 
     text = output_path.read_text()
     assert "segment\tUPPER_BACK" in text
+    trunk_start = text.index("segment\tTRUNK")
+    trunk_end = text.index("endsegment", trunk_start)
+    trunk_block = text[trunk_start:trunk_end]
     upper_back_start = text.index("segment\tUPPER_BACK")
     upper_back_end = text.index("endsegment", upper_back_start)
     upper_back_block = text[upper_back_start:upper_back_end]
-    assert "rotations\tx" in upper_back_block.lower()
+    assert "rotations\ty" in upper_back_block.lower()
     assert "parent\tTRUNK" in text
     assert "marker\tleft_shoulder" in text
     assert "parent\tUPPER_BACK" in text
+    assert "mesh\t0.000000\t-0.120000\t0.000000" in trunk_block
+    assert "mesh\t0.000000\t0.000000\t0.000000" in trunk_block
+    assert "mesh\t0.000000\t0.120000\t0.000000" in trunk_block
+    assert "mesh\t0.000000\t0.300000\t0.300000" not in upper_back_block
+    assert "mesh\t0.000000\t0.180000\t0.300000" in upper_back_block
+    assert "mesh\t0.000000\t-0.180000\t0.300000" in upper_back_block
+    assert upper_back_block.count("mesh\t0.000000\t0.000000\t0.300000") >= 2
 
 
 def test_build_biomod_back_3dof_creates_upper_back_segment(tmp_path: Path):
@@ -75,6 +85,11 @@ def test_build_biomod_back_3dof_creates_upper_back_segment(tmp_path: Path):
 
     text = output_path.read_text()
     assert "segment\tUPPER_BACK" in text
+    upper_back_start = text.index("segment\tUPPER_BACK")
+    upper_back_end = text.index("endsegment", upper_back_start)
+    upper_back_block = text[upper_back_start:upper_back_end]
     assert "parent\tTRUNK" in text
     assert "marker\tleft_shoulder" in text
     assert "parent\tUPPER_BACK" in text
+    assert "mesh\t0.000000\t0.180000\t0.300000" in upper_back_block
+    assert "mesh\t0.000000\t-0.180000\t0.300000" in upper_back_block

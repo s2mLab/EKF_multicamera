@@ -2903,6 +2903,21 @@ def build_biomod(
             local_com=(0.0, 0.0, 0.5 * upper_back_height),
         )
 
+    trunk_mesh_points = [
+        (0.0, -lengths.hip_half_width, 0.0),
+        (0.0, lengths.hip_half_width, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, lower_back_height),
+    ]
+    if model_variant in {"back_flexion_1d", "back_3dof"}:
+        trunk_mesh_points = [
+            (0.0, -lengths.hip_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, lengths.hip_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, lower_back_height),
+        ]
+
     model.add_segment(
         SegmentReal(
             name="TRUNK",
@@ -2910,12 +2925,7 @@ def build_biomod(
             rotations=Rotations.YXZ,
             inertia_parameters=trunk_inertia,
             mesh=mesh_with_axes(
-                [
-                    (0.0, -lengths.hip_half_width, 0.0),
-                    (0.0, lengths.hip_half_width, 0.0),
-                    (0.0, 0.0, 0.0),
-                    (0.0, 0.0, lower_back_height),
-                ],
+                trunk_mesh_points,
                 axis_scale=0.25 * max(lower_back_height, 1e-3),
             ),
         )
@@ -2927,6 +2937,13 @@ def build_biomod(
     shoulder_parent_name = "TRUNK"
     shoulder_parent_local_z = lower_back_height
     if model_variant in {"back_flexion_1d", "back_3dof"}:
+        upper_back_mesh_points = [
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, upper_back_height),
+            (0.0, lengths.shoulder_half_width, upper_back_height),
+            (0.0, 0.0, upper_back_height),
+            (0.0, -lengths.shoulder_half_width, upper_back_height),
+        ]
         model.add_segment(
             SegmentReal(
                 name="UPPER_BACK",
@@ -2934,10 +2951,10 @@ def build_biomod(
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
                 ),
-                rotations=(Rotations.X if model_variant == "back_flexion_1d" else Rotations.YXZ),
+                rotations=(Rotations.Y if model_variant == "back_flexion_1d" else Rotations.YXZ),
                 inertia_parameters=upper_back_inertia,
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, upper_back_height)],
+                    upper_back_mesh_points,
                     axis_scale=0.2 * max(upper_back_height, 1e-3),
                 ),
             )
@@ -3387,10 +3404,10 @@ class MultiViewKinematicEKF:
         )
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
-        self.upper_back_rotx_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
+        self.upper_back_sagittal_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
         self.upper_back_zero_prior_indices = tuple(
             idx
-            for idx in (self.lock_map.get("UPPER_BACK:RotY"), self.lock_map.get("UPPER_BACK:RotZ"))
+            for idx in (self.lock_map.get("UPPER_BACK:RotX"), self.lock_map.get("UPPER_BACK:RotZ"))
             if idx is not None
         )
         self.locked_q_indices: set[int] = set()
@@ -3472,7 +3489,7 @@ class MultiViewKinematicEKF:
         return frame_coherence, effective_confidences, measurement_variances
 
     def _resolve_upper_back_pseudo_observation_indices(self) -> tuple[int | None, tuple[int, ...]]:
-        upper_back_rotx_idx = self.lock_map.get("UPPER_BACK:RotX")
+        upper_back_sagittal_idx = self.lock_map.get("UPPER_BACK:RotY")
         hip_candidates = (
             "LEFT_THIGH:RotY",
             "RIGHT_THIGH:RotY",
@@ -3480,23 +3497,23 @@ class MultiViewKinematicEKF:
             "RIGHT_THIGH:RotX",
         )
         hip_indices = tuple(self.lock_map[name] for name in hip_candidates if name in self.lock_map)
-        if upper_back_rotx_idx is None or len(hip_indices) < 2:
+        if upper_back_sagittal_idx is None or len(hip_indices) < 2:
             return None, tuple()
-        return int(upper_back_rotx_idx), hip_indices
+        return int(upper_back_sagittal_idx), hip_indices
 
     def _upper_back_pseudo_measurement_block(
         self,
         reference_q: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-        if self.upper_back_rotx_idx is None or len(self.hip_flexion_indices) < 2:
+        if self.upper_back_sagittal_idx is None or len(self.hip_flexion_indices) < 2:
             return None
         hip_flexion = np.asarray(reference_q[list(self.hip_flexion_indices)], dtype=float)
         if not np.all(np.isfinite(hip_flexion)):
             return None
         target_value = self.upper_back_sagittal_gain * float(np.mean(hip_flexion))
         H_q = np.zeros((1, self.nq), dtype=float)
-        H_q[0, self.upper_back_rotx_idx] = 1.0
-        h = np.array([float(reference_q[self.upper_back_rotx_idx])], dtype=float)
+        H_q[0, self.upper_back_sagittal_idx] = 1.0
+        h = np.array([float(reference_q[self.upper_back_sagittal_idx])], dtype=float)
         z = np.array([target_value], dtype=float)
         variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
         return z, h, H_q, variance
