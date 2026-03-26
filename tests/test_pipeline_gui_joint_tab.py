@@ -236,3 +236,49 @@ def test_joint_kinematics_rotation_unit_popup_converts_rotational_dofs(monkeypat
     np.testing.assert_allclose(axis.plots[0]["args"][1], expected_left)
     np.testing.assert_allclose(axis.plots[1]["args"][1], expected_right)
     assert axis.ylabel == "deg"
+
+
+def test_pair_dof_names_includes_upper_back_singletons():
+    q_names = np.asarray(
+        ["LEFT_KNEE:RotY", "RIGHT_KNEE:RotY", "UPPER_BACK:RotX", "UPPER_BACK:RotY", "UPPER_BACK:RotZ"],
+        dtype=object,
+    )
+
+    pairs = pipeline_gui.pair_dof_names(q_names)
+
+    assert ("KNEE:RotY", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY") in pairs
+    assert ("UPPER_BACK:RotX", "UPPER_BACK:RotX", None) in pairs
+    assert ("UPPER_BACK:RotY", "UPPER_BACK:RotY", None) in pairs
+    assert ("UPPER_BACK:RotZ", "UPPER_BACK:RotZ", None) in pairs
+
+
+def test_upper_back_target_series_uses_hips_for_roty_and_zero_for_other_axes():
+    series = np.array(
+        [
+            [0.0, 1.0, 0.5, -0.2, 0.3],
+            [0.0, 0.5, 1.5, 0.1, -0.1],
+        ],
+        dtype=float,
+    )
+    name_to_index = {
+        "UPPER_BACK:RotY": 0,
+        "LEFT_THIGH:RotY": 1,
+        "RIGHT_THIGH:RotY": 2,
+        "UPPER_BACK:RotX": 3,
+        "UPPER_BACK:RotZ": 4,
+    }
+    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
+
+    roty_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
+        tab, series, name_to_index, "UPPER_BACK:RotY"
+    )
+    rotx_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
+        tab, series, name_to_index, "UPPER_BACK:RotX"
+    )
+    rotz_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
+        tab, series, name_to_index, "UPPER_BACK:RotZ"
+    )
+
+    np.testing.assert_allclose(roty_target, np.array([0.15, 0.2], dtype=float))
+    np.testing.assert_allclose(rotx_target, np.zeros(2))
+    np.testing.assert_allclose(rotz_target, np.zeros(2))

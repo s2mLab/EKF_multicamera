@@ -257,6 +257,7 @@ FACE_KEYPOINTS = {
     "right_ear",
 }
 BODY_ONLY_KEYPOINTS = tuple(name for name in COCO17 if name not in FACE_KEYPOINTS)
+SUPPORTED_MODEL_PREVIEW_VIEWERS = ("matplotlib", "pyorerun")
 LOWER_LIMB_EDGES = {
     ("left_hip", "left_knee"),
     ("left_knee", "left_ankle"),
@@ -772,10 +773,55 @@ def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str | None]]:
         if right_name in names:
             pair_label = name.replace("LEFT_", "", 1)
             pairs.append((pair_label, name, right_name))
-    if "UPPER_BACK:RotX" in names:
-        pairs.append(("UPPER_BACK:RotX", "UPPER_BACK:RotX", None))
+    for name in names:
+        if name.startswith("UPPER_BACK:"):
+            pairs.append((name, name, None))
     pairs.sort(key=lambda item: item[0])
     return pairs
+
+
+def resolve_biomod_path(biomod_path: str | Path | None) -> Path | None:
+    if biomod_path is None:
+        return None
+    path = Path(str(biomod_path))
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def infer_model_variant_from_biomod(biomod_path: str | Path | None) -> str:
+    path = resolve_biomod_path(biomod_path)
+    if path is None or not path.exists():
+        return DEFAULT_MODEL_VARIANT
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return DEFAULT_MODEL_VARIANT
+
+    in_upper_back = False
+    rotations_value = ""
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line.startswith("segment\t"):
+            in_upper_back = line.split("\t", 1)[1].strip() == "UPPER_BACK"
+            continue
+        if not in_upper_back:
+            continue
+        if line == "endsegment":
+            break
+        if line.startswith("rotations\t"):
+            rotations_value = line.split("\t", 1)[1].strip().lower().replace(" ", "")
+            break
+
+    if not rotations_value:
+        return "back_flexion_1d" if "UPPER_BACK" in "\n".join(lines) else DEFAULT_MODEL_VARIANT
+    if rotations_value in {"x", "rx", "y", "ry"}:
+        return "back_flexion_1d"
+    return "back_3dof"
+
+
+def biomod_supports_upper_back_options(biomod_path: str | Path | None) -> bool:
+    return infer_model_variant_from_biomod(biomod_path) in {"back_flexion_1d", "back_3dof"}
 
 
 def set_equal_3d_limits(ax, points_dict: dict[str, np.ndarray], frame_idx: int | None) -> None:
@@ -1491,11 +1537,13 @@ class LabeledEntry(ttk.Frame):
         label_padx: tuple[int, int] = (0, 6),
         filetypes: tuple[tuple[str, str], ...] | None = None,
         browse_initialdir: str | None = None,
+        on_browse_selected=None,
     ):
         super().__init__(master)
         self.directory = directory
         self.filetypes = filetypes
         self.browse_initialdir = browse_initialdir
+        self.on_browse_selected = on_browse_selected
         self.label_widget = ttk.Label(self, text=label, width=label_width)
         self.label_widget.pack(side=tk.LEFT, padx=label_padx)
         self.var = tk.StringVar(value=default)
@@ -1575,6 +1623,8 @@ class LabeledEntry(ttk.Frame):
                 self.var.set(str(rel))
             except Exception:
                 self.var.set(path)
+            if callable(self.on_browse_selected):
+                self.on_browse_selected(self.get())
 
     def get(self) -> str:
         return self.var.get().strip()
@@ -1653,6 +1703,105 @@ class ToolTip:
         if self.tipwindow is not None:
             self.tipwindow.destroy()
             self.tipwindow = None
+
+
+def extend_listbox_selection(widget: tk.Listbox, direction: int) -> str:
+    """Extend one listbox selection by one row with Shift+Up/Down semantics."""
+
+    size = int(widget.size())
+    if size <= 0:
+        return "break"
+    selected = [int(index) for index in widget.curselection()]
+    if selected:
+        target = min(selected) - 1 if direction < 0 else max(selected) + 1
+    else:
+        try:
+            active = int(widget.index(tk.ACTIVE))
+        except Exception:
+            active = 0
+        target = active + (1 if direction > 0 else -1)
+    target = max(0, min(size - 1, int(target)))
+    widget.selection_set(target)
+    try:
+        widget.activate(target)
+    except Exception:
+        pass
+    try:
+        widget.see(target)
+    except Exception:
+        pass
+    return "break"
+
+
+def select_all_listbox(widget: tk.Listbox) -> str:
+    """Select all rows in one Tk listbox."""
+
+    if int(widget.size()) > 0:
+        widget.selection_set(0, tk.END)
+        try:
+            widget.activate(0)
+        except Exception:
+            pass
+    return "break"
+
+
+def bind_extended_listbox_shortcuts(widget: tk.Listbox) -> None:
+    """Add additive keyboard selection shortcuts to one multi-select listbox."""
+
+    widget.bind("<Shift-Up>", lambda _event: extend_listbox_selection(widget, -1), add="+")
+    widget.bind("<Shift-Down>", lambda _event: extend_listbox_selection(widget, 1), add="+")
+    for sequence in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+        widget.bind(sequence, lambda _event: select_all_listbox(widget), add="+")
+
+
+def extend_treeview_selection(tree: ttk.Treeview, direction: int) -> str:
+    """Extend one Treeview selection by one row with Shift+Up/Down semantics."""
+
+    rows = list(tree.get_children(""))
+    if not rows:
+        return "break"
+    selected = list(tree.selection())
+    if selected:
+        anchor = rows.index(selected[0]) if direction < 0 else rows.index(selected[-1])
+        target_index = anchor + (-1 if direction < 0 else 1)
+    else:
+        focus_item = tree.focus()
+        focus_index = rows.index(focus_item) if focus_item in rows else 0
+        target_index = focus_index + (-1 if direction < 0 else 1)
+    target_index = max(0, min(len(rows) - 1, int(target_index)))
+    target_item = rows[target_index]
+    updated = []
+    for item in selected:
+        if item in rows:
+            updated.append(item)
+    if target_item not in updated:
+        updated.append(target_item)
+    tree.selection_set(tuple(updated))
+    tree.focus(target_item)
+    try:
+        tree.see(target_item)
+    except Exception:
+        pass
+    return "break"
+
+
+def select_all_treeview(tree: ttk.Treeview) -> str:
+    """Select all rows in one Treeview."""
+
+    rows = list(tree.get_children(""))
+    if rows:
+        tree.selection_set(tuple(rows))
+        tree.focus(rows[0])
+    return "break"
+
+
+def bind_extended_treeview_shortcuts(tree: ttk.Treeview) -> None:
+    """Add additive keyboard selection shortcuts to one multi-select Treeview."""
+
+    tree.bind("<Shift-Up>", lambda _event: extend_treeview_selection(tree, -1), add="+")
+    tree.bind("<Shift-Down>", lambda _event: extend_treeview_selection(tree, 1), add="+")
+    for sequence in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+        tree.bind(sequence, lambda _event: select_all_treeview(tree), add="+")
 
 
 def attach_tooltip(widget: tk.Widget, text: str) -> ToolTip:
@@ -3487,6 +3636,7 @@ class MultiViewTab(CommandTab):
             height=5,
         )
         self.multiview_cameras_list.pack(fill=tk.BOTH, expand=True)
+        bind_extended_listbox_shortcuts(self.multiview_cameras_list)
         self.multiview_cameras_list.bind(
             "<<ListboxSelect>>", lambda _event: self.on_multiview_camera_selection_changed()
         )
@@ -4415,6 +4565,7 @@ class DataExplorer2DTab(ttk.Frame):
         for idx in range(len(COCO17)):
             self.keypoint_list.selection_set(idx)
         self.keypoint_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        bind_extended_listbox_shortcuts(self.keypoint_list)
 
         self.figure = Figure(figsize=(12, 8))
         self.canvas = FigureCanvasTkAgg(self.figure, master=figure_box)
@@ -4869,6 +5020,7 @@ class ModelTab(CommandTab):
         self.preview_q_t0: np.ndarray | None = None
         self.preview_q_current: np.ndarray | None = None
         self.preview_q_names: list[str] = []
+        self.preview_viewer = tk.StringVar(value="matplotlib")
         self.preview_model = None
         self.preview_marker_names: list[str] = []
         self.preview_segment_frames: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -5029,6 +5181,7 @@ class ModelTab(CommandTab):
         self.state.register_reconstruction_listener(self.refresh_existing_models)
         self.model_variant.trace_add("write", lambda *_args: self.update_details())
         self.model_variant.trace_add("write", lambda *_args: self.refresh_existing_models())
+        self.preview_viewer.trace_add("write", lambda *_args: self.update_preview_viewer_controls())
         self.symmetrize_limbs_var.trace_add("write", lambda *_args: self.update_details())
         self.symmetrize_limbs_var.trace_add("write", lambda *_args: self.refresh_existing_models())
         self.triang_method.trace_add("write", lambda *_args: self.update_details())
@@ -5100,6 +5253,19 @@ class ModelTab(CommandTab):
             variable=self.show_local_frames_var,
             command=self.refresh_preview,
         ).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(preview_controls_top, text="Viewer", width=7).pack(side=tk.LEFT)
+        self.preview_viewer_box = ttk.Combobox(
+            preview_controls_top,
+            textvariable=self.preview_viewer,
+            values=list(SUPPORTED_MODEL_PREVIEW_VIEWERS),
+            width=11,
+            state="readonly",
+        )
+        self.preview_viewer_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.open_preview_viewer_button = ttk.Button(
+            preview_controls_top, text="Open pyorerun", command=self.open_preview_in_viewer
+        )
+        self.open_preview_viewer_button.pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(preview_controls_top, text="Pose", width=6).pack(side=tk.LEFT)
         self.preview_pose_mode = tk.StringVar(value="q=0")
         self.preview_pose_box = ttk.Combobox(
@@ -5138,6 +5304,14 @@ class ModelTab(CommandTab):
             self.preview_pose_box,
             "Choisit la pose de référence utilisée pour afficher le modèle: neutre q=0 ou q(t0) estimé à partir de la première frame triangulée valide.",
         )
+        attach_tooltip(
+            self.preview_viewer_box,
+            "Choisit entre le preview intégré matplotlib et une ouverture externe dans pyorerun.",
+        )
+        attach_tooltip(
+            self.open_preview_viewer_button,
+            "Ouvre le modèle courant dans pyorerun avec la pose actuellement affichée. Le preview matplotlib reste disponible dans l'onglet.",
+        )
         attach_tooltip(self.preview_dof_box, "Choisit le DoF du modele a modifier manuellement dans le preview.")
         attach_tooltip(self.preview_dof_slider, "Fait varier le DoF selectionne entre -2pi et 2pi.")
         self.preview_figure = Figure(figsize=(8, 6))
@@ -5154,6 +5328,7 @@ class ModelTab(CommandTab):
         self.update_details()
         self.sync_paths_from_state()
         self.refresh_existing_models()
+        self.update_preview_viewer_controls()
 
     def current_pose_correction_mode(self) -> str:
         return normalize_pose_correction_mode(self.pose_correction_mode.get())
@@ -5295,6 +5470,58 @@ class ModelTab(CommandTab):
 
         self.refresh_existing_models()
 
+    def update_preview_viewer_controls(self) -> None:
+        if not hasattr(self, "open_preview_viewer_button"):
+            return
+        viewer = self.preview_viewer.get().strip()
+        if viewer == "pyorerun":
+            self.open_preview_viewer_button.configure(state="normal", text="Open pyorerun")
+        else:
+            self.open_preview_viewer_button.configure(state="disabled", text="Built-in viewer")
+
+    def _pyorerun_states_path(self, biomod_path: Path) -> Path:
+        return biomod_path.parent / "preview_pyorerun_states.npz"
+
+    def _write_pyorerun_preview_states(self, states_path: Path) -> bool:
+        q_values = self.preview_q_current
+        if q_values is None or np.asarray(q_values, dtype=float).size == 0:
+            return False
+        q_row = np.asarray(q_values, dtype=float).reshape(1, -1)
+        if not np.all(np.isfinite(q_row)):
+            return False
+        q_series = np.repeat(q_row, 2, axis=0)
+        states_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(states_path, q=q_series)
+        return True
+
+    def open_preview_in_viewer(self) -> None:
+        viewer = self.preview_viewer.get().strip()
+        if viewer != "pyorerun":
+            return
+        try:
+            biomod_path = self._preview_model_path(use_selected_model=True)
+            if not biomod_path.exists():
+                biomod_path = self._preview_model_path(use_selected_model=False)
+            if not biomod_path.exists():
+                raise ValueError("No bioMod available to open in pyorerun.")
+            states_path = self._pyorerun_states_path(biomod_path)
+            has_states = self._write_pyorerun_preview_states(states_path)
+            cmd = [
+                sys.executable,
+                "tools/show_biomod_pyorerun.py",
+                "--biomod",
+                display_path(biomod_path),
+                "--fps",
+                self.state.fps_var.get(),
+            ]
+            if has_states:
+                cmd.extend(["--mode", "trajectory", "--states", display_path(states_path)])
+            else:
+                cmd.extend(["--mode", "neutral"])
+            subprocess.Popen(cmd, cwd=ROOT)
+        except Exception as exc:
+            messagebox.showerror("pyorerun", str(exc))
+
     def refresh_existing_models(self) -> None:
         for item in self.model_tree.get_children():
             self.model_tree.delete(item)
@@ -5359,13 +5586,13 @@ class ModelTab(CommandTab):
         if selected:
             for item in selected:
                 values = self.model_tree.item(item, "values")
-                if len(values) >= 2 and values[1] and not str(values[1]).startswith("No existing"):
-                    paths.append(parse_displayed_path(str(values[1])))
+                if len(values) >= 3 and values[2] and not str(values[2]).startswith("No existing"):
+                    paths.append(parse_displayed_path(str(values[2])))
         else:
             for item in self.model_tree.get_children():
                 values = self.model_tree.item(item, "values")
-                if len(values) >= 2 and values[1] and not str(values[1]).startswith("No existing"):
-                    paths.append(parse_displayed_path(str(values[1])))
+                if len(values) >= 3 and values[2] and not str(values[2]).startswith("No existing"):
+                    paths.append(parse_displayed_path(str(values[2])))
 
         model_dirs = sorted({path.parent for path in paths if path.exists()})
         if not model_dirs:
@@ -5988,9 +6215,15 @@ class ProfilesTab(CommandTab):
         form = ttk.LabelFrame(self.main, text="Profils de reconstruction")
         form.pack(fill=tk.X, pady=(0, 8), before=self.output)
 
-        self.config_path = LabeledEntry(form, "Config JSON", browse=True)
+        self.config_path = LabeledEntry(
+            form,
+            "Config JSON",
+            browse=True,
+            on_browse_selected=self._on_profiles_path_browsed,
+        )
         self.config_path.var = state.profiles_config_var
         self.config_path.entry_widget.configure(textvariable=self.config_path.var)
+        self.config_path.entry_widget.bind("<Return>", lambda _event: self.load_profiles_from_json())
         self.config_path.pack(fill=tk.X, padx=8, pady=4)
         self.config_path.set_tooltip("Fichier JSON dans lequel charger ou sauvegarder les profils.")
 
@@ -6036,6 +6269,7 @@ class ProfilesTab(CommandTab):
             width=40,
         )
         self.profile_cameras_list.pack(fill=tk.BOTH, expand=True)
+        bind_extended_listbox_shortcuts(self.profile_cameras_list)
 
         self.pose_mode_frame = ttk.Frame(form)
         mode_label = ttk.Label(self.pose_mode_frame, text="2D mode", width=10)
@@ -6119,18 +6353,26 @@ class ProfilesTab(CommandTab):
             self.ekf2d_frame,
             "EKF2D meas",
             "1.5",
-            label_width=10,
-            entry_width=4,
+            label_width=8,
+            entry_width=3,
         )
         self.measurement_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.process_noise = LabeledEntry(
             self.ekf2d_frame,
             "EKF2D proc",
             "1.0",
-            label_width=10,
-            entry_width=4,
+            label_width=8,
+            entry_width=3,
         )
-        self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.upper_back_pseudo_std_deg = LabeledEntry(
+            self.ekf2d_frame,
+            "3D pseudo-obs",
+            "10",
+            label_width=11,
+            entry_width=3,
+        )
+        self.upper_back_pseudo_std_deg.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.ekf2d_observation_frame = ttk.Frame(form)
         ekf2d_flip_method_label = ttk.Label(self.ekf2d_observation_frame, text="Flip left/right method", width=20)
@@ -6196,17 +6438,9 @@ class ProfilesTab(CommandTab):
             entry_width=4,
         )
         self.upper_back_sagittal_gain.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        self.upper_back_pseudo_std_deg = LabeledEntry(
-            self.ekf2d_params_frame,
-            "Back std",
-            "10",
-            label_width=7,
-            entry_width=4,
-        )
-        self.upper_back_pseudo_std_deg.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.lock_var = tk.BooleanVar(value=False)
-        lock_check = ttk.Checkbutton(self.ekf2d_params_frame, text="dof_locking", variable=self.lock_var)
-        lock_check.pack(side=tk.LEFT, padx=(0, 8))
+        self.ekf2d_lock_check = ttk.Checkbutton(self.ekf2d_params_frame, text="dof_locking", variable=self.lock_var)
+        self.ekf2d_lock_check.pack(side=tk.LEFT, padx=(0, 8))
         self.ekf2d_initial_frame_info = ttk.Label(
             self.ekf2d_params_frame,
             text="q0 support: first valid frame only",
@@ -6265,18 +6499,6 @@ class ProfilesTab(CommandTab):
             models_body, selectmode="browse", exportselection=False, height=5, width=40
         )
         self.profile_models_list.pack(fill=tk.BOTH, expand=True)
-        model_variant_row = ttk.Frame(self.ekf_model_frame)
-        model_variant_row.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(model_variant_row, text="Model variant", width=16).pack(side=tk.LEFT)
-        self.profile_model_variant = tk.StringVar(value=DEFAULT_MODEL_VARIANT)
-        self.profile_model_variant_box = ttk.Combobox(
-            model_variant_row,
-            textvariable=self.profile_model_variant,
-            values=list(SUPPORTED_MODEL_VARIANTS),
-            width=18,
-            state="readonly",
-        )
-        self.profile_model_variant_box.pack(side=tk.LEFT, padx=(0, 8))
         self.ekf_model_info_var = tk.StringVar(value="used by EKF profiles only")
         ttk.Label(self.ekf_model_frame, textvariable=self.ekf_model_info_var, foreground="#4f5b66").pack(
             side=tk.TOP,
@@ -6287,7 +6509,9 @@ class ProfilesTab(CommandTab):
         )
         self.ekf_model_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 0))
 
-        self.config_path.set_tooltip("Fichier JSON contenant les profils de reconstruction sauvegardes.")
+        self.config_path.set_tooltip(
+            "Fichier JSON contenant les profils de reconstruction sauvegardes. Browse charge le fichier immédiatement; appuyez sur Entrée après une modification manuelle du chemin."
+        )
         self.profile_name.set_tooltip("Nom lisible du profil de reconstruction.")
         attach_tooltip(family_label, "Famille d'algorithme a configurer dans le profil.")
         attach_tooltip(family_box, "Famille d'algorithme a configurer dans le profil.")
@@ -6337,7 +6561,7 @@ class ProfilesTab(CommandTab):
             self.coherence_box,
             "Epipolar (precomputed): cohérence Sampson précalculée sur la séquence. Epipolar fast (precomputed): distance symétrique précalculée. Epipolar (framewise): Sampson recalculé à chaque frame. Epipolar fast (framewise): distance symétrique recalculée à chaque frame.",
         )
-        attach_tooltip(lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
+        attach_tooltip(self.ekf2d_lock_check, "Verrouille certains DoF pour stabiliser l'EKF 2D.")
         attach_tooltip(
             q0_method_label,
             "Methode pour trouver q0: IK 3D sur la triangulation, bootstrap EKF classique, ou bootstrap depuis une pose racine geometrique extraite des hanches/epaules.",
@@ -6350,7 +6574,7 @@ class ProfilesTab(CommandTab):
             "Nombre de passes EKF 2D utilisées pour affiner q0 sur la première frame valide quand le bootstrap est actif."
         )
         self.upper_back_sagittal_gain.set_tooltip(
-            "Fraction de la flexion moyenne des hanches utilisée comme cible douce pour UPPER_BACK:RotX."
+            "Fraction de la flexion moyenne des hanches utilisée comme cible douce pour UPPER_BACK:RotY."
         )
         self.upper_back_pseudo_std_deg.set_tooltip(
             "Ecart-type angulaire (en degrés) de la pseudo-observation du dos. Plus petit = contrainte plus forte."
@@ -6378,10 +6602,6 @@ class ProfilesTab(CommandTab):
             self.profile_models_list,
             "Choisit un bioMod existant pour EKF 2D/3D. 'auto' reconstruit le modèle à partir des données 2D; choisir un modèle existant évite cette étape et réduit le temps de calcul.",
         )
-        attach_tooltip(
-            self.profile_model_variant_box,
-            "Variante du modèle utilisée seulement si le profil reconstruit son bioMod au lieu d'en réutiliser un existant.",
-        )
         actions = ttk.Frame(form)
         actions.pack(fill=tk.X, padx=8, pady=6)
         self.add_profile_button = ttk.Button(actions, text="Add profile", command=self.add_current_profile)
@@ -6393,7 +6613,6 @@ class ProfilesTab(CommandTab):
         ttk.Button(actions, text="Generate all supported", command=self.generate_all_supported).pack(
             side=tk.LEFT, padx=(8, 0)
         )
-        ttk.Button(actions, text="Load JSON", command=self.load_profiles_from_json).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Save JSON", command=self.save_profiles_to_json).pack(side=tk.LEFT, padx=(8, 0))
 
         cols = ("enabled", "name", "family", "mode", "triang", "flip", "flags")
@@ -6412,9 +6631,10 @@ class ProfilesTab(CommandTab):
             self.profile_tree.heading(col, text=headings[col])
             self.profile_tree.column(col, width=widths[col], anchor="w")
         self.profile_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        bind_extended_treeview_shortcuts(self.profile_tree)
         self.profile_tree.bind("<Delete>", lambda _event: self.remove_selected_profiles())
         self.profile_tree.bind("<BackSpace>", lambda _event: self.remove_selected_profiles())
-        self.profile_tree.bind("<Double-1>", lambda _event: self.load_selected_profile_from_tree())
+        self.profile_tree.bind("<Double-1>", self.load_selected_profile_from_tree)
 
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
         self.family.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6424,7 +6644,6 @@ class ProfilesTab(CommandTab):
         self.triang_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.coherence_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.predictor.trace_add("write", lambda *_args: self.sync_profile_name())
-        self.profile_model_variant.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_initial_state_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.biorbd_kalman_init_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6493,6 +6712,7 @@ class ProfilesTab(CommandTab):
             self.ekf2d_params_frame.pack(fill=tk.X, padx=8, pady=4)
         if family == "ekf_3d":
             self.ekf3d_frame.pack(fill=tk.X, padx=8, pady=4)
+        self.update_upper_back_option_visibility()
         self.update_profile_model_info()
         self.update_add_profile_button_state()
 
@@ -6572,6 +6792,7 @@ class ProfilesTab(CommandTab):
         target_value = selected_value if selected_value in self._profile_model_choices else fallback_value
         self._set_profile_model_selection_by_label(target_value)
         self.update_profile_model_summary()
+        self.update_upper_back_option_visibility()
         self.update_profile_model_info()
         self.update_add_profile_button_state()
         self.sync_profile_name()
@@ -6639,18 +6860,48 @@ class ProfilesTab(CommandTab):
             return
         selected_model = self.selected_profile_model_path()
         if selected_model:
-            self.ekf_model_info_var.set("reuse existing model (faster)")
+            variant = infer_model_variant_from_biomod(selected_model)
+            self.ekf_model_info_var.set(f"reuse existing {variant} model (faster)")
         else:
-            model_variant = (
-                self.profile_model_variant.get() if hasattr(self, "profile_model_variant") else DEFAULT_MODEL_VARIANT
-            )
-            if model_variant == DEFAULT_MODEL_VARIANT:
-                self.ekf_model_info_var.set("auto-build model from current 2D data (slower)")
-            else:
-                self.ekf_model_info_var.set(f"auto-build {model_variant} model from current 2D data")
+            self.ekf_model_info_var.set("auto-build single_trunk model from current 2D data (slower)")
+
+    def selected_profile_model_variant(self) -> str:
+        return infer_model_variant_from_biomod(self.selected_profile_model_path())
+
+    def update_upper_back_option_visibility(self) -> None:
+        if not hasattr(self, "upper_back_pseudo_std_deg") or not hasattr(self, "upper_back_sagittal_gain"):
+            return
+        if not hasattr(self, "profile_models_list"):
+            return
+        supports_upper_back = self.family.get() == "ekf_2d" and biomod_supports_upper_back_options(
+            self.selected_profile_model_path()
+        )
+        upper_back_widgets = [
+            (self.upper_back_pseudo_std_deg, {"side": tk.LEFT, "fill": tk.X, "expand": True}),
+            (
+                self.upper_back_sagittal_gain,
+                {
+                    "side": tk.LEFT,
+                    "fill": tk.X,
+                    "expand": True,
+                    "padx": (0, 6),
+                    "before": getattr(self, "ekf2d_lock_check", None),
+                },
+            ),
+        ]
+        for widget, pack_kwargs in upper_back_widgets:
+            if not hasattr(widget, "pack_info") or not hasattr(widget, "pack_forget"):
+                continue
+            visible = bool(widget.winfo_manager())
+            if supports_upper_back and not visible:
+                pack_kwargs = {key: value for key, value in pack_kwargs.items() if value is not None}
+                widget.pack(**pack_kwargs)
+            elif not supports_upper_back and visible:
+                widget.pack_forget()
 
     def on_profile_model_changed(self) -> None:
         self.update_profile_model_summary()
+        self.update_upper_back_option_visibility()
         self.update_profile_model_info()
         self.update_add_profile_button_state()
         self.sync_profile_name()
@@ -6694,7 +6945,7 @@ class ProfilesTab(CommandTab):
         if family == "ekf_2d" and not selected_model_path:
             raise ValueError("EKF 2D requires selecting an existing bioMod.")
         model_variant = (
-            self.profile_model_variant.get() if hasattr(self, "profile_model_variant") else DEFAULT_MODEL_VARIANT
+            infer_model_variant_from_biomod(selected_model_path) if selected_model_path else DEFAULT_MODEL_VARIANT
         )
         profile = ReconstructionProfile(
             name=self.profile_name.get() if include_name else "",
@@ -6837,15 +7088,30 @@ class ProfilesTab(CommandTab):
                 ),
             )
 
-    def load_selected_profile_from_tree(self) -> None:
+    def load_selected_profile_from_tree(self, event=None) -> str | None:
+        row_id = None
+        if event is not None:
+            try:
+                row_id = self.profile_tree.identify_row(event.y)
+            except Exception:
+                row_id = None
         selected = self.profile_tree.selection()
-        if not selected:
-            return
+        if row_id:
+            try:
+                self.profile_tree.selection_set((row_id,))
+                self.profile_tree.focus(row_id)
+            except Exception:
+                pass
+        elif selected:
+            row_id = selected[0]
+        if not row_id:
+            return None
         try:
-            profile = self.state.profiles[int(selected[0])]
+            profile = self.state.profiles[int(row_id)]
         except Exception:
-            return
+            return None
         self.load_profile_into_form(profile)
+        return "break"
 
     def load_profile_into_form(self, profile: ReconstructionProfile) -> None:
         self._updating_profile_name = True
@@ -6868,6 +7134,18 @@ class ProfilesTab(CommandTab):
             self.lock_var.set(bool(getattr(profile, "dof_locking", False)))
             self.initial_rot_var.set(bool(getattr(profile, "initial_rotation_correction", False)))
             self.unwrap_var.set(bool(getattr(profile, "no_root_unwrap", False)))
+            self.state.pose_filter_window_var.set(str(int(getattr(profile, "pose_filter_window", 9))))
+            self.state.pose_outlier_ratio_var.set(f"{float(getattr(profile, 'pose_outlier_threshold_ratio', 0.10)):g}")
+            self.state.pose_p_low_var.set(f"{float(getattr(profile, 'pose_amplitude_lower_percentile', 5.0)):g}")
+            self.state.pose_p_high_var.set(f"{float(getattr(profile, 'pose_amplitude_upper_percentile', 95.0)):g}")
+            self.state.flip_improvement_ratio_var.set(f"{float(getattr(profile, 'flip_improvement_ratio', 0.7)):g}")
+            self.state.flip_min_gain_px_var.set(f"{float(getattr(profile, 'flip_min_gain_px', 3.0)):g}")
+            self.state.flip_min_other_cameras_var.set(str(int(getattr(profile, "flip_min_other_cameras", 2))))
+            self.state.flip_restrict_to_outliers_var.set(bool(getattr(profile, "flip_restrict_to_outliers", True)))
+            self.state.flip_outlier_percentile_var.set(f"{float(getattr(profile, 'flip_outlier_percentile', 85.0)):g}")
+            self.state.flip_outlier_floor_px_var.set(f"{float(getattr(profile, 'flip_outlier_floor_px', 5.0)):g}")
+            self.state.flip_temporal_weight_var.set(f"{float(getattr(profile, 'flip_temporal_weight', 0.35)):g}")
+            self.state.flip_temporal_tau_px_var.set(f"{float(getattr(profile, 'flip_temporal_tau_px', 20.0)):g}")
             self.biorbd_noise.var.set(f"{float(getattr(profile, 'biorbd_kalman_noise_factor', 1e-8)):g}")
             self.biorbd_error.var.set(f"{float(getattr(profile, 'biorbd_kalman_error_factor', 1e-4)):g}")
             self.biorbd_kalman_init_method.set(
@@ -6876,7 +7154,6 @@ class ProfilesTab(CommandTab):
             self.measurement_noise.var.set(f"{float(getattr(profile, 'measurement_noise_scale', 1.5)):g}")
             self.process_noise.var.set(f"{float(getattr(profile, 'process_noise_scale', 1.0)):g}")
             self.coherence_floor.var.set(f"{float(getattr(profile, 'coherence_confidence_floor', 0.35)):g}")
-            self.profile_model_variant.set(getattr(profile, "model_variant", DEFAULT_MODEL_VARIANT))
 
             if getattr(profile, "use_all_cameras", False) or getattr(profile, "camera_names", None) is None:
                 self._set_profile_camera_selection(
@@ -6899,6 +7176,7 @@ class ProfilesTab(CommandTab):
         self.update_family_controls()
         self.update_profile_camera_summary()
         self.update_profile_model_summary()
+        self.update_upper_back_option_visibility()
         self.update_profile_model_info()
         self.update_add_profile_button_state()
 
@@ -6938,6 +7216,9 @@ class ProfilesTab(CommandTab):
             synchronize_profiles_initial_rotation_correction(self.state)
         except Exception as exc:
             messagebox.showerror("Profiles", str(exc))
+
+    def _on_profiles_path_browsed(self, _path: str) -> None:
+        self.load_profiles_from_json()
 
     def save_profiles_to_json(self) -> None:
         try:
@@ -7030,6 +7311,7 @@ class ReconstructionsTab(CommandTab):
             self.profile_tree.heading(col, text=label)
             self.profile_tree.column(col, width=width, anchor="w")
         self.profile_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        bind_extended_treeview_shortcuts(self.profile_tree)
         attach_tooltip(self.profile_tree, "Selectionnez les profils a executer pour le dataset courant.")
         attach_tooltip(
             self.export_trc_button,
@@ -7282,14 +7564,20 @@ class ReconstructionsTab(CommandTab):
         self.timing_details.configure(state=tk.DISABLED)
 
     def clear_reconstructions(self) -> None:
+        selected_names = [str(name) for name in getattr(self.state, "shared_reconstruction_selection", []) if str(name)]
+        if not selected_names:
+            messagebox.showinfo("Reconstructions", "Select one or more reconstructions in the top panel first.")
+            return
         dataset_dir = current_dataset_dir(self.state)
-        recon_dirs = reconstruction_dirs_for_path(dataset_dir)
+        available_dirs = {recon_dir.name: recon_dir for recon_dir in reconstruction_dirs_for_path(dataset_dir)}
+        recon_dirs = [available_dirs[name] for name in selected_names if name in available_dirs]
         if not recon_dirs:
-            messagebox.showinfo("Reconstructions", f"Aucune reconstruction à supprimer dans {dataset_dir}.")
+            messagebox.showinfo("Reconstructions", "The selected reconstructions are no longer available.")
             return
         confirmed = messagebox.askyesno(
             "Clear reconstructions",
-            f"Supprimer {len(recon_dirs)} reconstruction(s) du dataset courant ?\n\n{dataset_dir}",
+            "Supprimer les reconstruction(s) sélectionnée(s) ?\n\n"
+            + "\n".join(f"- {recon_dir.name}" for recon_dir in recon_dirs),
             icon="warning",
         )
         if not confirmed:
@@ -7300,6 +7588,9 @@ class ReconstructionsTab(CommandTab):
                 shutil.rmtree(recon_dir)
             except Exception as exc:
                 errors.append(f"{recon_dir.name}: {exc}")
+        self.state.shared_reconstruction_selection = [
+            name for name in getattr(self.state, "shared_reconstruction_selection", []) if name not in selected_names
+        ]
         self.refresh_status_rows()
         self.state.notify_reconstructions_updated()
         if errors:
@@ -7778,6 +8069,7 @@ class JointKinematicsTab(ttk.Frame):
 
         self.pair_list = tk.Listbox(controls, selectmode=tk.MULTIPLE, exportselection=False, height=6)
         self.pair_list.pack(fill=tk.X, padx=8, pady=4)
+        bind_extended_listbox_shortcuts(self.pair_list)
         attach_tooltip(quantity_label, "Choisit entre positions q et vitesses qdot pour les autres DoF.")
         attach_tooltip(quantity_box, "Choisit entre positions q et vitesses qdot pour les autres DoF.")
         attach_tooltip(rot_unit_label, "Choisit l'unité d'affichage des DoF de rotation.")
@@ -7850,23 +8142,29 @@ class JointKinematicsTab(ttk.Frame):
         return "m" if self.quantity.get() == "q" else "m/s"
 
     @staticmethod
-    def _upper_back_target_series(series: np.ndarray, name_to_index: dict[str, int]) -> np.ndarray | None:
-        """Return the default sagittal prior target for `UPPER_BACK:RotX` if available."""
+    def _upper_back_target_series(
+        self, series: np.ndarray, name_to_index: dict[str, int], dof_name: str
+    ) -> np.ndarray | None:
+        """Return the default pseudo-observation target for one upper-back DoF."""
 
-        hip_candidates = (
-            "LEFT_THIGH:RotY",
-            "RIGHT_THIGH:RotY",
-            "LEFT_THIGH:RotX",
-            "RIGHT_THIGH:RotX",
-        )
-        hip_indices = [name_to_index[name] for name in hip_candidates if name in name_to_index]
-        if len(hip_indices) < 2:
-            return None
-        hip_values = np.asarray(series[:, hip_indices], dtype=float)
-        if hip_values.ndim != 2 or hip_values.shape[1] < 2:
-            return None
-        with np.errstate(invalid="ignore"):
-            return 0.2 * np.nanmean(hip_values, axis=1)
+        if dof_name == "UPPER_BACK:RotY":
+            hip_candidates = (
+                "LEFT_THIGH:RotY",
+                "RIGHT_THIGH:RotY",
+                "LEFT_THIGH:RotX",
+                "RIGHT_THIGH:RotX",
+            )
+            hip_indices = [name_to_index[name] for name in hip_candidates if name in name_to_index]
+            if len(hip_indices) < 2:
+                return None
+            hip_values = np.asarray(series[:, hip_indices], dtype=float)
+            if hip_values.ndim != 2 or hip_values.shape[1] < 2:
+                return None
+            with np.errstate(invalid="ignore"):
+                return 0.2 * np.nanmean(hip_values, axis=1)
+        if dof_name in {"UPPER_BACK:RotX", "UPPER_BACK:RotZ"}:
+            return np.zeros(series.shape[0], dtype=float)
+        return None
 
     def sync_dataset_dir(self) -> None:
         self.refresh_available_reconstructions()
@@ -7994,8 +8292,8 @@ class JointKinematicsTab(ttk.Frame):
                             markersize=3.0,
                             label=f"{legend_label} | R",
                         )
-                    elif left_name == "UPPER_BACK:RotX":
-                        target_values = self._upper_back_target_series(series, name_to_index)
+                    elif left_name.startswith("UPPER_BACK:"):
+                        target_values = self._upper_back_target_series(series, name_to_index, left_name)
                         if target_values is not None:
                             ax.plot(
                                 time_s,

@@ -29,6 +29,47 @@ def show_placeholder_figure(
     canvas.draw_idle()
 
 
+def _extend_treeview_selection(tree: ttk.Treeview, direction: int) -> str:
+    rows = list(tree.get_children(""))
+    if not rows:
+        return "break"
+    selected = list(tree.selection())
+    if selected:
+        anchor = rows.index(selected[0]) if direction < 0 else rows.index(selected[-1])
+        target_index = anchor + (-1 if direction < 0 else 1)
+    else:
+        focus_item = tree.focus()
+        focus_index = rows.index(focus_item) if focus_item in rows else 0
+        target_index = focus_index + (-1 if direction < 0 else 1)
+    target_index = max(0, min(len(rows) - 1, int(target_index)))
+    target_item = rows[target_index]
+    updated = [item for item in selected if item in rows]
+    if target_item not in updated:
+        updated.append(target_item)
+    tree.selection_set(tuple(updated))
+    tree.focus(target_item)
+    try:
+        tree.see(target_item)
+    except Exception:
+        pass
+    return "break"
+
+
+def _select_all_treeview(tree: ttk.Treeview) -> str:
+    rows = list(tree.get_children(""))
+    if rows:
+        tree.selection_set(tuple(rows))
+        tree.focus(rows[0])
+    return "break"
+
+
+def bind_extended_treeview_shortcuts(tree: ttk.Treeview) -> None:
+    tree.bind("<Shift-Up>", lambda _event: _extend_treeview_selection(tree, -1), add="+")
+    tree.bind("<Shift-Down>", lambda _event: _extend_treeview_selection(tree, 1), add="+")
+    for sequence in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):
+        tree.bind(sequence, lambda _event: _select_all_treeview(tree), add="+")
+
+
 class SharedReconstructionPanel(ttk.Frame):
     """Single reconstruction selector shared by the active analysis tab."""
 
@@ -79,6 +120,7 @@ class SharedReconstructionPanel(ttk.Frame):
         self.tree.column("reproj", width=95, anchor="w")
         self.tree.column("path", width=380, anchor="w")
         self.tree.pack(fill=tk.X, expand=False, padx=8, pady=(0, 6))
+        bind_extended_treeview_shortcuts(self.tree)
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
         if tooltip_fn is not None:
             tooltip_fn(self.tree, "Shared reconstruction selector used by the active analysis tab.")
