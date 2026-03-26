@@ -774,7 +774,7 @@ def pair_dof_names(q_names: np.ndarray) -> list[tuple[str, str, str | None]]:
             pair_label = name.replace("LEFT_", "", 1)
             pairs.append((pair_label, name, right_name))
     for name in names:
-        if name.startswith("UPPER_BACK:"):
+        if name.startswith(("UPPER_BACK:", "LOWER_TRUNK:")):
             pairs.append((name, name, None))
     pairs.sort(key=lambda item: item[0])
     return pairs
@@ -798,30 +798,48 @@ def infer_model_variant_from_biomod(biomod_path: str | Path | None) -> str:
     except Exception:
         return DEFAULT_MODEL_VARIANT
 
-    in_upper_back = False
+    current_segment_name = None
     rotations_value = ""
     for raw_line in lines:
         line = raw_line.strip()
         if line.startswith("segment\t"):
-            in_upper_back = line.split("\t", 1)[1].strip() == "UPPER_BACK"
+            current_segment_name = line.split("\t", 1)[1].strip()
             continue
-        if not in_upper_back:
+        if current_segment_name not in {"UPPER_BACK", "LOWER_TRUNK"}:
             continue
         if line == "endsegment":
-            break
+            if rotations_value:
+                break
+            current_segment_name = None
+            continue
         if line.startswith("rotations\t"):
             rotations_value = line.split("\t", 1)[1].strip().lower().replace(" ", "")
-            break
+            if current_segment_name == "LOWER_TRUNK":
+                return (
+                    "upper_root_back_flexion_1d"
+                    if rotations_value in {"x", "rx", "y", "ry"}
+                    else "upper_root_back_3dof"
+                )
+            if current_segment_name == "UPPER_BACK":
+                return "back_flexion_1d" if rotations_value in {"x", "rx", "y", "ry"} else "back_3dof"
 
     if not rotations_value:
-        return "back_flexion_1d" if "UPPER_BACK" in "\n".join(lines) else DEFAULT_MODEL_VARIANT
-    if rotations_value in {"x", "rx", "y", "ry"}:
-        return "back_flexion_1d"
-    return "back_3dof"
+        text = "\n".join(lines)
+        if "LOWER_TRUNK" in text:
+            return "upper_root_back_flexion_1d"
+        if "UPPER_BACK" in text:
+            return "back_flexion_1d"
+        return DEFAULT_MODEL_VARIANT
+    return DEFAULT_MODEL_VARIANT
 
 
 def biomod_supports_upper_back_options(biomod_path: str | Path | None) -> bool:
-    return infer_model_variant_from_biomod(biomod_path) in {"back_flexion_1d", "back_3dof"}
+    return infer_model_variant_from_biomod(biomod_path) in {
+        "back_flexion_1d",
+        "back_3dof",
+        "upper_root_back_flexion_1d",
+        "upper_root_back_3dof",
+    }
 
 
 def set_equal_3d_limits(ax, points_dict: dict[str, np.ndarray], frame_idx: int | None) -> None:
@@ -948,7 +966,7 @@ def draw_upper_back_preview(
         if segment_frames is not None
         else {}
     )
-    upper_back_frame = segment_map.get("UPPER_BACK")
+    upper_back_frame = segment_map.get("UPPER_BACK") or segment_map.get("LOWER_TRUNK")
     trunk_frame = segment_map.get("TRUNK")
     hip_center = 0.5 * (left_hip + right_hip)
     upper_center = 0.5 * (left_shoulder + right_shoulder)
@@ -5256,11 +5274,11 @@ class ModelTab(CommandTab):
         self.subject_mass.set_tooltip("Masse du sujet utilisée pour les paramètres inertiels du modèle.")
         attach_tooltip(
             structure_label,
-            "Topologie du bioMod: single_trunk garde le modèle actuel; back_flexion_1d ajoute une flexion sagittale du dos; back_3dof ajoute un segment de dos à 3 DoF au milieu du tronc.",
+            "Topologie du bioMod: single_trunk garde le modèle actuel; back_flexion_1d/back_3dof gardent la racine au bassin; upper_root_back_* place la racine au haut du tronc et met le dos mobile vers le bassin.",
         )
         attach_tooltip(
             structure_box,
-            "single_trunk: modèle actuel. back_flexion_1d: UPPER_BACK avec 1 DoF sagittal. back_3dof: UPPER_BACK avec 3 DoF entre le bassin et les épaules/tête/bras.",
+            "single_trunk: modèle actuel. back_flexion_1d/back_3dof: UPPER_BACK entre bassin et épaules. upper_root_back_flexion_1d/upper_root_back_3dof: racine au haut du tronc, LOWER_TRUNK mobile vers le bassin.",
         )
         attach_tooltip(
             symmetrize_check,
@@ -6698,7 +6716,7 @@ class ProfilesTab(CommandTab):
             "Nombre de passes EKF 2D utilisées pour affiner q0 sur la première frame valide quand le bootstrap est actif."
         )
         self.upper_back_sagittal_gain.set_tooltip(
-            "Fraction de la flexion moyenne des hanches utilisée comme cible douce pour UPPER_BACK:RotY."
+            "Fraction de la flexion moyenne des hanches utilisée comme cible douce pour le DoF sagittal du dos (UPPER_BACK:RotY ou LOWER_TRUNK:RotY selon le modèle)."
         )
         self.upper_back_pseudo_std_deg.set_tooltip(
             "Ecart-type angulaire (en degrés) de la pseudo-observation du dos. Plus petit = contrainte plus forte."
@@ -8015,6 +8033,11 @@ class RootKinematicsTab(ttk.Frame):
                     )
                     if model_marker_points is not None:
                         model_biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), name)
+                        root_translation_origin = (
+                            "upper_trunk"
+                            if infer_model_variant_from_biomod(model_biomod_path).startswith("upper_root_")
+                            else "pelvis"
+                        )
                         series, model_marker_points = root_series_from_model_markers(
                             np.asarray(recon_q[name], dtype=float),
                             biomod_path=model_biomod_path,
@@ -8024,15 +8047,22 @@ class RootKinematicsTab(ttk.Frame):
                             dt=dt,
                             initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                             unwrap_rotations=bool(self.unwrap_var.get()),
+                            translation_origin=root_translation_origin,
                         )
                         geometric_family = True
                 if series is None and geometric_family and name in recon_3d:
+                    model_biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), name)
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
                         quantity=effective_quantity,
                         dt=dt,
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
+                        translation_origin=(
+                            "upper_trunk"
+                            if infer_model_variant_from_biomod(model_biomod_path).startswith("upper_root_")
+                            else "pelvis"
+                        ),
                     )
                 elif series is None and name in recon_q:
                     series = root_series_from_q(
@@ -8046,12 +8076,18 @@ class RootKinematicsTab(ttk.Frame):
                         renormalize_rotations=bool(self.reextract_var.get()),
                     )
                 elif series is None and name in recon_3d:
+                    model_biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), name)
                     series = root_series_from_points(
                         np.asarray(recon_3d[name], dtype=float),
                         quantity=effective_quantity,
                         dt=dt,
                         initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
                         unwrap_rotations=bool(self.unwrap_var.get()),
+                        translation_origin=(
+                            "upper_trunk"
+                            if infer_model_variant_from_biomod(model_biomod_path).startswith("upper_root_")
+                            else "pelvis"
+                        ),
                     )
                 elif series is None and name in recon_q_root and not geometric_rotfix_mismatch:
                     series = root_series_from_precomputed(
@@ -8271,7 +8307,7 @@ class JointKinematicsTab(ttk.Frame):
     ) -> np.ndarray | None:
         """Return the default pseudo-observation target for one upper-back DoF."""
 
-        if dof_name == "UPPER_BACK:RotY":
+        if dof_name.endswith(":RotY") and dof_name.startswith(("UPPER_BACK:", "LOWER_TRUNK:")):
             hip_candidates = (
                 "LEFT_THIGH:RotY",
                 "RIGHT_THIGH:RotY",
@@ -8286,8 +8322,9 @@ class JointKinematicsTab(ttk.Frame):
                 return None
             with np.errstate(invalid="ignore"):
                 return 0.2 * np.nanmean(hip_values, axis=1)
-        if dof_name in {"UPPER_BACK:RotX", "UPPER_BACK:RotZ"}:
-            return np.zeros(series.shape[0], dtype=float)
+        if dof_name.endswith(":RotX") or dof_name.endswith(":RotZ"):
+            if dof_name.startswith(("UPPER_BACK:", "LOWER_TRUNK:")):
+                return np.zeros(series.shape[0], dtype=float)
         return None
 
     def sync_dataset_dir(self) -> None:
@@ -8416,7 +8453,7 @@ class JointKinematicsTab(ttk.Frame):
                             markersize=3.0,
                             label=f"{legend_label} | R",
                         )
-                    elif left_name.startswith("UPPER_BACK:"):
+                    elif left_name.startswith(("UPPER_BACK:", "LOWER_TRUNK:")):
                         target_values = self._upper_back_target_series(series, name_to_index, left_name)
                         if target_values is not None:
                             ax.plot(
@@ -9756,6 +9793,7 @@ class CameraToolsTab(ttk.Frame):
             refresh_callback=self.refresh_available_reconstructions,
             selection_callback=self._on_reconstruction_selection_changed,
             selectmode=self.shared_reconstruction_selectmode,
+            allow_empty_selection=True,
         )
         self.refresh_available_reconstructions()
 
@@ -10088,12 +10126,31 @@ class CameraToolsTab(ttk.Frame):
         ax.grid(alpha=0.18)
         ax.set_xlabel("x (px)")
         ax.set_ylabel("y (px)")
-        handles, labels = ax.get_legend_handles_labels()
-        if handles:
-            uniq = {}
-            for handle, label in zip(handles, labels):
-                uniq[label] = handle
-            ax.legend(list(uniq.values()), list(uniq.keys()), loc="best", fontsize=8)
+        side_handles = [
+            plt.Line2D(
+                [],
+                [],
+                color="#666666",
+                marker="^",
+                linestyle="None",
+                markersize=7,
+                markerfacecolor="none",
+                markeredgewidth=1.4,
+                label="Left side",
+            ),
+            plt.Line2D(
+                [],
+                [],
+                color="#666666",
+                marker="s",
+                linestyle="None",
+                markersize=7,
+                markerfacecolor="none",
+                markeredgewidth=1.4,
+                label="Right side",
+            ),
+        ]
+        ax.legend(side_handles, ["Left side", "Right side"], loc="best", fontsize=8)
         detail_arrays = self.flip_detail_arrays.get(method, {})
         suspect = bool(self.flip_masks.get(method, np.zeros((0, 0), dtype=bool))[cam_idx, frame_local_idx])
         self.flip_figure.suptitle(

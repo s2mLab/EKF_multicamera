@@ -749,7 +749,9 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
         vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda _model, _reconstruction: triangulation_state
     )
     monkeypatch.setattr(
-        vitpose_ekf_pipeline, "first_valid_root_pose_from_triangulation", lambda _reconstruction: (12, root_pose)
+        vitpose_ekf_pipeline,
+        "first_valid_root_pose_from_triangulation",
+        lambda _reconstruction, **_kwargs: (12, root_pose),
     )
 
     state, diagnostics = compute_biorbd_kalman_initial_state(
@@ -1022,3 +1024,9 @@ def test_upper_back_zero_prior_blocks_pull_lateral_and_axial_dofs_to_zero():
     np.testing.assert_allclose(second_h, np.array([-0.15], dtype=float))
     np.testing.assert_allclose(second_h_q, np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=float))
     np.testing.assert_allclose(second_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))
+
+
+def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():
+    q_names = np.asarray(["TRUNK:RotY", "LOWER_TRUNK:RotY", "LEFT_THIGH:RotY", "RIGHT_THIGH:RotY"], dtype=object)
+
+    assert vitpose_ekf_pipeline.back_pseudo_segment_name_for_q_names(q_names) == "LOWER_TRUNK"

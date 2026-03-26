@@ -233,6 +233,8 @@ def test_shared_reconstruction_tree_shortcuts_extend_and_select_all():
     panel._selection_callback = None
     panel._refresh_callback = None
     panel._suspend_selection_callback = False
+    panel._allow_empty_selection = False
+    panel._explicitly_cleared = False
     panel.state = SimpleNamespace(set_shared_reconstruction_selection=lambda _names: None)
 
     SharedReconstructionPanel.set_rows(
@@ -254,6 +256,74 @@ def test_shared_reconstruction_tree_shortcuts_extend_and_select_all():
     assert panel.tree.focus() == "recon_b"
     assert _select_all_treeview(panel.tree) == "break"
     assert panel.tree.selection() == ("recon_a", "recon_b", "recon_c")
+
+
+def test_shared_reconstruction_panel_can_clear_browse_selection_on_same_row_click():
+    published = []
+    callbacks = []
+    panel = SharedReconstructionPanel.__new__(SharedReconstructionPanel)
+    panel.tree = _FakeTree()
+    panel._default_names = ["recon_a"]
+    panel._selection_callback = lambda: callbacks.append("called")
+    panel._refresh_callback = None
+    panel._suspend_selection_callback = False
+    panel._allow_empty_selection = True
+    panel._selectmode = "browse"
+    panel._explicitly_cleared = False
+    panel.state = SimpleNamespace(set_shared_reconstruction_selection=lambda names: published.append(list(names)))
+
+    SharedReconstructionPanel.set_rows(
+        panel,
+        rows=[
+            {"name": "recon_a", "label": "A", "family": "ekf_2d", "frames": 12, "reproj_mean": 1.2, "path": "/a"},
+            {"name": "recon_b", "label": "B", "family": "ekf_2d", "frames": 10, "reproj_mean": 1.5, "path": "/b"},
+        ],
+        default_names=["recon_a"],
+    )
+    panel.tree.selection_set(("recon_a",))
+    panel.tree._identified_row = "recon_a"
+
+    result = SharedReconstructionPanel._on_button_press(panel, SimpleNamespace(y=12))
+
+    assert result == "break"
+    assert panel.tree.selection() == ()
+    assert panel.selected_names() == []
+    assert published[-1] == []
+    assert callbacks == ["called"]
+
+
+def test_shared_reconstruction_panel_can_clear_browse_selection_on_blank_click():
+    published = []
+    callbacks = []
+    panel = SharedReconstructionPanel.__new__(SharedReconstructionPanel)
+    panel.tree = _FakeTree()
+    panel._default_names = ["recon_a"]
+    panel._selection_callback = lambda: callbacks.append("called")
+    panel._refresh_callback = None
+    panel._suspend_selection_callback = False
+    panel._allow_empty_selection = True
+    panel._selectmode = "browse"
+    panel._explicitly_cleared = False
+    panel.state = SimpleNamespace(set_shared_reconstruction_selection=lambda names: published.append(list(names)))
+
+    SharedReconstructionPanel.set_rows(
+        panel,
+        rows=[
+            {"name": "recon_a", "label": "A", "family": "ekf_2d", "frames": 12, "reproj_mean": 1.2, "path": "/a"},
+            {"name": "recon_b", "label": "B", "family": "ekf_2d", "frames": 10, "reproj_mean": 1.5, "path": "/b"},
+        ],
+        default_names=["recon_a"],
+    )
+    panel.tree.selection_set(("recon_a",))
+    panel.tree._identified_row = ""
+
+    result = SharedReconstructionPanel._on_button_press(panel, SimpleNamespace(y=999))
+
+    assert result == "break"
+    assert panel.tree.selection() == ()
+    assert panel.selected_names() == []
+    assert published[-1] == []
+    assert callbacks == ["called"]
 
 
 def test_compose_multiview_crop_points_includes_selected_reprojections():
@@ -610,10 +680,16 @@ def test_infer_model_variant_from_biomod_detects_upper_back_layouts(tmp_path):
     one_dof.write_text("segment\tUPPER_BACK\nrotations\ty\nendsegment\n", encoding="utf-8")
     three_dof = tmp_path / "back_3dof.bioMod"
     three_dof.write_text("segment\tUPPER_BACK\nrotations\tyxz\nendsegment\n", encoding="utf-8")
+    upper_root_one_dof = tmp_path / "upper_root_back_1d.bioMod"
+    upper_root_one_dof.write_text("segment\tLOWER_TRUNK\nrotations\ty\nendsegment\n", encoding="utf-8")
+    upper_root_three_dof = tmp_path / "upper_root_back_3dof.bioMod"
+    upper_root_three_dof.write_text("segment\tLOWER_TRUNK\nrotations\tyxz\nendsegment\n", encoding="utf-8")
 
     assert pipeline_gui.infer_model_variant_from_biomod(single_trunk) == pipeline_gui.DEFAULT_MODEL_VARIANT
     assert pipeline_gui.infer_model_variant_from_biomod(one_dof) == "back_flexion_1d"
     assert pipeline_gui.infer_model_variant_from_biomod(three_dof) == "back_3dof"
+    assert pipeline_gui.infer_model_variant_from_biomod(upper_root_one_dof) == "upper_root_back_flexion_1d"
+    assert pipeline_gui.infer_model_variant_from_biomod(upper_root_three_dof) == "upper_root_back_3dof"
 
 
 def test_biomod_supports_upper_back_options(tmp_path):

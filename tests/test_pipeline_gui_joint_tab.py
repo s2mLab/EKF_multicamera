@@ -245,7 +245,14 @@ def test_joint_kinematics_rotation_unit_popup_converts_rotational_dofs(monkeypat
 
 def test_pair_dof_names_includes_upper_back_singletons():
     q_names = np.asarray(
-        ["LEFT_KNEE:RotY", "RIGHT_KNEE:RotY", "UPPER_BACK:RotX", "UPPER_BACK:RotY", "UPPER_BACK:RotZ"],
+        [
+            "LEFT_KNEE:RotY",
+            "RIGHT_KNEE:RotY",
+            "UPPER_BACK:RotX",
+            "UPPER_BACK:RotY",
+            "UPPER_BACK:RotZ",
+            "LOWER_TRUNK:RotY",
+        ],
         dtype=object,
     )
 
@@ -255,6 +262,7 @@ def test_pair_dof_names_includes_upper_back_singletons():
     assert ("UPPER_BACK:RotX", "UPPER_BACK:RotX", None) in pairs
     assert ("UPPER_BACK:RotY", "UPPER_BACK:RotY", None) in pairs
     assert ("UPPER_BACK:RotZ", "UPPER_BACK:RotZ", None) in pairs
+    assert ("LOWER_TRUNK:RotY", "LOWER_TRUNK:RotY", None) in pairs
 
 
 def test_upper_back_target_series_uses_hips_for_roty_and_zero_for_other_axes():
@@ -281,6 +289,17 @@ def test_upper_back_target_series_uses_hips_for_roty_and_zero_for_other_axes():
     np.testing.assert_allclose(rotz_target, np.zeros(2))
 
 
+def test_upper_back_target_series_supports_lower_trunk_variant():
+    series = np.array([[1.0, 0.5], [0.2, 0.4]], dtype=float)
+    name_to_index = {
+        "LEFT_THIGH:RotY": 0,
+        "RIGHT_THIGH:RotY": 1,
+    }
+    target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "LOWER_TRUNK:RotY")
+
+    np.testing.assert_allclose(target, np.array([0.15, 0.06], dtype=float))
+
+
 def test_draw_upper_back_preview_draws_back_centerline():
     axis = _FakeAxis()
     frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
@@ -294,6 +313,20 @@ def test_draw_upper_back_preview_draws_back_centerline():
     ]
 
     pipeline_gui.draw_upper_back_preview(axis, frame_points, segment_frames)
+
+    assert len(axis.plots) >= 2
+    assert len(axis.scatters) == 1
+
+
+def test_draw_upper_back_preview_without_segment_frames_uses_mid_back_point():
+    axis = _FakeAxis()
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 0.3, 1.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -0.3, 1.0])
+
+    pipeline_gui.draw_upper_back_preview(axis, frame_points)
 
     assert len(axis.plots) >= 2
     assert len(axis.scatters) == 1

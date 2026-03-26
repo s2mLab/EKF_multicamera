@@ -28,7 +28,13 @@ from reconstruction.reconstruction_registry import (
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
+SUPPORTED_MODEL_VARIANTS = (
+    "single_trunk",
+    "back_flexion_1d",
+    "back_3dof",
+    "upper_root_back_flexion_1d",
+    "upper_root_back_3dof",
+)
 SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (

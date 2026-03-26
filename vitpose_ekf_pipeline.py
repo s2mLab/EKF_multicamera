@@ -64,7 +64,13 @@ DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
 DEFAULT_TRIANGULATION_WORKERS = 6
 DEFAULT_MODEL_VARIANT = "single_trunk"
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
+SUPPORTED_MODEL_VARIANTS = (
+    "single_trunk",
+    "back_flexion_1d",
+    "back_3dof",
+    "upper_root_back_flexion_1d",
+    "upper_root_back_3dof",
+)
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -159,6 +165,31 @@ FLIP_PROXIMAL_KEYPOINT_WEIGHTS = {
     "left_ear": 0.3,
     "right_ear": 0.3,
 }
+
+
+def model_variant_has_back_dofs(model_variant: str) -> bool:
+    return str(model_variant) in {
+        "back_flexion_1d",
+        "back_3dof",
+        "upper_root_back_flexion_1d",
+        "upper_root_back_3dof",
+    }
+
+
+def model_variant_uses_upper_trunk_root(model_variant: str) -> bool:
+    return str(model_variant) in {"upper_root_back_flexion_1d", "upper_root_back_3dof"}
+
+
+def back_dof_segment_name_for_variant(model_variant: str) -> str | None:
+    if str(model_variant) in {"back_flexion_1d", "back_3dof"}:
+        return "UPPER_BACK"
+    if str(model_variant) in {"upper_root_back_flexion_1d", "upper_root_back_3dof"}:
+        return "LOWER_TRUNK"
+    return None
+
+
+def root_translation_origin_for_model_variant(model_variant: str) -> str:
+    return "upper_trunk" if model_variant_uses_upper_trunk_root(model_variant) else "pelvis"
 
 
 @dataclass
@@ -2889,34 +2920,58 @@ def build_biomod(
     upper_back_height = 0.0
     trunk_inertia = inertia["TRUNK"]
     upper_back_inertia = None
-    if model_variant in {"back_flexion_1d", "back_3dof"}:
+    lower_back_inertia = None
+    uses_back_dofs = model_variant_has_back_dofs(model_variant)
+    uses_upper_root = model_variant_uses_upper_trunk_root(model_variant)
+    if uses_back_dofs:
         lower_back_height = 0.5 * lengths.trunk_height
         upper_back_height = lengths.trunk_height - lower_back_height
-        trunk_inertia = scaled_inertia(
-            inertia["TRUNK"],
-            mass_scale=0.55,
-            local_com=(0.0, 0.0, 0.5 * lower_back_height),
-        )
-        upper_back_inertia = scaled_inertia(
-            inertia["TRUNK"],
-            mass_scale=0.45,
-            local_com=(0.0, 0.0, 0.5 * upper_back_height),
-        )
+        if uses_upper_root:
+            trunk_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.45,
+                local_com=(0.0, 0.0, -0.5 * upper_back_height),
+            )
+            lower_back_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.55,
+                local_com=(0.0, 0.0, -0.5 * lower_back_height),
+            )
+        else:
+            trunk_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.55,
+                local_com=(0.0, 0.0, 0.5 * lower_back_height),
+            )
+            upper_back_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.45,
+                local_com=(0.0, 0.0, 0.5 * upper_back_height),
+            )
 
-    trunk_mesh_points = [
-        (0.0, -lengths.hip_half_width, 0.0),
-        (0.0, lengths.hip_half_width, 0.0),
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, lower_back_height),
-    ]
-    if model_variant in {"back_flexion_1d", "back_3dof"}:
+    if uses_upper_root:
+        trunk_mesh_points = [
+            (0.0, -lengths.shoulder_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, lengths.shoulder_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, -upper_back_height),
+        ]
+    else:
         trunk_mesh_points = [
             (0.0, -lengths.hip_half_width, 0.0),
-            (0.0, 0.0, 0.0),
             (0.0, lengths.hip_half_width, 0.0),
             (0.0, 0.0, 0.0),
             (0.0, 0.0, lower_back_height),
         ]
+        if uses_back_dofs:
+            trunk_mesh_points = [
+                (0.0, -lengths.hip_half_width, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, lengths.hip_half_width, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, lower_back_height),
+            ]
 
     model.add_segment(
         SegmentReal(
@@ -2926,57 +2981,105 @@ def build_biomod(
             inertia_parameters=trunk_inertia,
             mesh=mesh_with_axes(
                 trunk_mesh_points,
-                axis_scale=0.25 * max(lower_back_height, 1e-3),
+                axis_scale=0.25 * max(lengths.trunk_height, 1e-3),
             ),
         )
     )
     trunk = model.segments["TRUNK"]
-    trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
-    trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
 
     shoulder_parent_name = "TRUNK"
-    shoulder_parent_local_z = lower_back_height
-    if model_variant in {"back_flexion_1d", "back_3dof"}:
-        upper_back_mesh_points = [
+    shoulder_parent_local_z = 0.0 if uses_upper_root else lower_back_height
+    leg_parent_name = "TRUNK"
+    leg_parent_local_z = 0.0
+
+    if uses_upper_root:
+        trunk.add_marker(
+            MarkerReal(name="left_shoulder", parent_name="TRUNK", position=[0, lengths.shoulder_half_width, 0])
+        )
+        trunk.add_marker(
+            MarkerReal(name="right_shoulder", parent_name="TRUNK", position=[0, -lengths.shoulder_half_width, 0])
+        )
+        lower_trunk_mesh_points = [
             (0.0, 0.0, 0.0),
-            (0.0, 0.0, upper_back_height),
-            (0.0, lengths.shoulder_half_width, upper_back_height),
-            (0.0, 0.0, upper_back_height),
-            (0.0, -lengths.shoulder_half_width, upper_back_height),
+            (0.0, -lengths.hip_half_width, -lower_back_height),
+            (0.0, 0.0, -lower_back_height),
+            (0.0, lengths.hip_half_width, -lower_back_height),
         ]
         model.add_segment(
             SegmentReal(
-                name="UPPER_BACK",
+                name="LOWER_TRUNK",
                 parent_name="TRUNK",
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0.0, 0.0, -upper_back_height]), is_scs_local=True
                 ),
-                rotations=(Rotations.Y if model_variant == "back_flexion_1d" else Rotations.YXZ),
-                inertia_parameters=upper_back_inertia,
+                rotations=(Rotations.Y if model_variant == "upper_root_back_flexion_1d" else Rotations.YXZ),
+                inertia_parameters=lower_back_inertia,
                 mesh=mesh_with_axes(
-                    upper_back_mesh_points,
-                    axis_scale=0.2 * max(upper_back_height, 1e-3),
+                    lower_trunk_mesh_points,
+                    axis_scale=0.2 * max(lower_back_height, 1e-3),
                 ),
             )
         )
-        shoulder_parent_name = "UPPER_BACK"
-        shoulder_parent_local_z = upper_back_height
+        lower_trunk = model.segments["LOWER_TRUNK"]
+        lower_trunk.add_marker(
+            MarkerReal(
+                name="left_hip", parent_name="LOWER_TRUNK", position=[0, lengths.hip_half_width, -lower_back_height]
+            )
+        )
+        lower_trunk.add_marker(
+            MarkerReal(
+                name="right_hip",
+                parent_name="LOWER_TRUNK",
+                position=[0, -lengths.hip_half_width, -lower_back_height],
+            )
+        )
+        leg_parent_name = "LOWER_TRUNK"
+        leg_parent_local_z = -lower_back_height
+    else:
+        trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
+        trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
+        if uses_back_dofs:
+            upper_back_mesh_points = [
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, upper_back_height),
+                (0.0, lengths.shoulder_half_width, upper_back_height),
+                (0.0, 0.0, upper_back_height),
+                (0.0, -lengths.shoulder_half_width, upper_back_height),
+            ]
+            model.add_segment(
+                SegmentReal(
+                    name="UPPER_BACK",
+                    parent_name="TRUNK",
+                    segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
+                        np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
+                    ),
+                    rotations=(Rotations.Y if model_variant == "back_flexion_1d" else Rotations.YXZ),
+                    inertia_parameters=upper_back_inertia,
+                    mesh=mesh_with_axes(
+                        upper_back_mesh_points,
+                        axis_scale=0.2 * max(upper_back_height, 1e-3),
+                    ),
+                )
+            )
+            shoulder_parent_name = "UPPER_BACK"
+            shoulder_parent_local_z = upper_back_height
 
     shoulder_parent = model.segments[shoulder_parent_name]
-    shoulder_parent.add_marker(
-        MarkerReal(
-            name="left_shoulder",
-            parent_name=shoulder_parent_name,
-            position=[0, lengths.shoulder_half_width, shoulder_parent_local_z],
+    if not uses_upper_root:
+        shoulder_parent.add_marker(
+            MarkerReal(
+                name="left_shoulder",
+                parent_name=shoulder_parent_name,
+                position=[0, lengths.shoulder_half_width, shoulder_parent_local_z],
+            )
         )
-    )
-    shoulder_parent.add_marker(
-        MarkerReal(
-            name="right_shoulder",
-            parent_name=shoulder_parent_name,
-            position=[0, -lengths.shoulder_half_width, shoulder_parent_local_z],
+        shoulder_parent.add_marker(
+            MarkerReal(
+                name="right_shoulder",
+                parent_name=shoulder_parent_name,
+                position=[0, -lengths.shoulder_half_width, shoulder_parent_local_z],
+            )
         )
-    )
 
     model.add_segment(
         SegmentReal(
@@ -3030,7 +3133,7 @@ def build_biomod(
             lengths, side=side, base_name="shank_length", symmetrize_limbs=symmetrize_limbs
         )
         shoulder_offset = (0, sign * lengths.shoulder_half_width, shoulder_parent_local_z)
-        hip_offset = (0, sign * lengths.hip_half_width, 0)
+        hip_offset = (0, sign * lengths.hip_half_width, leg_parent_local_z)
 
         upper_name = f"{side.upper()}_UPPER_ARM"
         forearm_name = f"{side.upper()}_FOREARM"
@@ -3078,7 +3181,7 @@ def build_biomod(
         model.add_segment(
             SegmentReal(
                 name=thigh_name,
-                parent_name="TRUNK",
+                parent_name=leg_parent_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.asarray(hip_offset, dtype=float), is_scs_local=True
                 ),
@@ -3404,10 +3507,14 @@ class MultiViewKinematicEKF:
         )
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
+        self.upper_back_segment_name = back_pseudo_segment_name_for_q_names(self.q_names)
         self.upper_back_sagittal_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
         self.upper_back_zero_prior_indices = tuple(
             idx
-            for idx in (self.lock_map.get("UPPER_BACK:RotX"), self.lock_map.get("UPPER_BACK:RotZ"))
+            for idx in (
+                self.lock_map.get(f"{self.upper_back_segment_name}:RotX") if self.upper_back_segment_name else None,
+                self.lock_map.get(f"{self.upper_back_segment_name}:RotZ") if self.upper_back_segment_name else None,
+            )
             if idx is not None
         )
         self.locked_q_indices: set[int] = set()
@@ -3489,7 +3596,9 @@ class MultiViewKinematicEKF:
         return frame_coherence, effective_confidences, measurement_variances
 
     def _resolve_upper_back_pseudo_observation_indices(self) -> tuple[int | None, tuple[int, ...]]:
-        upper_back_sagittal_idx = self.lock_map.get("UPPER_BACK:RotY")
+        if not self.upper_back_segment_name:
+            return None, ()
+        upper_back_sagittal_idx = self.lock_map.get(f"{self.upper_back_segment_name}:RotY")
         hip_candidates = (
             "LEFT_THIGH:RotY",
             "RIGHT_THIGH:RotY",
@@ -3881,6 +3990,24 @@ def q_names_from_model(model) -> list[str]:
     ]
 
 
+def root_translation_origin_for_q_names(q_names: list[str] | np.ndarray) -> str:
+    q_name_set = {str(name) for name in q_names}
+    return "upper_trunk" if any(name.startswith("LOWER_TRUNK:") for name in q_name_set) else "pelvis"
+
+
+def root_translation_origin_for_model(model) -> str:
+    return root_translation_origin_for_q_names(q_names_from_model(model))
+
+
+def back_pseudo_segment_name_for_q_names(q_names: list[str] | np.ndarray) -> str | None:
+    q_name_set = {str(name) for name in q_names}
+    if any(name.startswith("LOWER_TRUNK:") for name in q_name_set):
+        return "LOWER_TRUNK"
+    if any(name.startswith("UPPER_BACK:") for name in q_name_set):
+        return "UPPER_BACK"
+    return None
+
+
 def _segment_rotation_sequence_and_offsets(segment_dof_names: list[str]) -> tuple[str | None, np.ndarray]:
     """Infer a contiguous Euler rotation block from one segment DoF list."""
 
@@ -3950,21 +4077,29 @@ def canonicalize_model_q_rotation_branches(model, q_values: np.ndarray) -> np.nd
 
 def first_valid_root_translation_from_triangulation(
     reconstruction: ReconstructionResult,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> tuple[int | None, np.ndarray | None]:
-    """Estime `TransX/Y/Z` de la racine au milieu des hanches triangulees."""
-    left_idx = KP_INDEX["left_hip"]
-    right_idx = KP_INDEX["right_hip"]
+    """Estime `TransX/Y/Z` de la racine depuis le tronc triangulé."""
+    if str(root_translation_origin) == "upper_trunk":
+        left_idx = KP_INDEX["left_shoulder"]
+        right_idx = KP_INDEX["right_shoulder"]
+    else:
+        left_idx = KP_INDEX["left_hip"]
+        right_idx = KP_INDEX["right_hip"]
     for frame_idx in range(reconstruction.points_3d.shape[0]):
-        left_hip = reconstruction.points_3d[frame_idx, left_idx]
-        right_hip = reconstruction.points_3d[frame_idx, right_idx]
-        if np.all(np.isfinite(left_hip)) and np.all(np.isfinite(right_hip)):
-            return frame_idx, 0.5 * (left_hip + right_hip)
+        left_point = reconstruction.points_3d[frame_idx, left_idx]
+        right_point = reconstruction.points_3d[frame_idx, right_idx]
+        if np.all(np.isfinite(left_point)) and np.all(np.isfinite(right_point)):
+            return frame_idx, 0.5 * (left_point + right_point)
     return None, None
 
 
 def root_translation_from_triangulation_frame(
     reconstruction: ReconstructionResult,
     frame_idx: int,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> np.ndarray | None:
     """Estimate the root translation from one specific triangulated frame."""
 
@@ -3973,20 +4108,30 @@ def root_translation_from_triangulation_frame(
     frame_idx = int(frame_idx)
     if frame_idx < 0 or frame_idx >= reconstruction.points_3d.shape[0]:
         return None
-    left_idx = KP_INDEX["left_hip"]
-    right_idx = KP_INDEX["right_hip"]
-    left_hip = reconstruction.points_3d[frame_idx, left_idx]
-    right_hip = reconstruction.points_3d[frame_idx, right_idx]
-    if np.all(np.isfinite(left_hip)) and np.all(np.isfinite(right_hip)):
-        return 0.5 * (left_hip + right_hip)
+    if str(root_translation_origin) == "upper_trunk":
+        left_idx = KP_INDEX["left_shoulder"]
+        right_idx = KP_INDEX["right_shoulder"]
+    else:
+        left_idx = KP_INDEX["left_hip"]
+        right_idx = KP_INDEX["right_hip"]
+    left_point = reconstruction.points_3d[frame_idx, left_idx]
+    right_point = reconstruction.points_3d[frame_idx, right_idx]
+    if np.all(np.isfinite(left_point)) and np.all(np.isfinite(right_point)):
+        return 0.5 * (left_point + right_point)
     return None
 
 
 def first_valid_root_pose_from_triangulation(
     reconstruction: ReconstructionResult,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> tuple[int | None, np.ndarray | None]:
     """Estime les 6 DoF de la racine a partir du tronc triangule."""
-    root_q = compute_trunk_dofs_from_points(reconstruction.points_3d, unwrap_rotations=False)
+    root_q = compute_trunk_dofs_from_points(
+        reconstruction.points_3d,
+        unwrap_rotations=False,
+        translation_origin=root_translation_origin,
+    )
     for frame_idx in range(root_q.shape[0]):
         if np.all(np.isfinite(root_q[frame_idx])):
             return frame_idx, np.asarray(root_q[frame_idx], dtype=float)
@@ -3998,9 +4143,10 @@ def apply_root_translation_guess_to_state(model, state: np.ndarray, translation_
     if translation_xyz is None or not np.all(np.isfinite(translation_xyz)):
         return np.array(state, copy=True)
     q_names = q_names_from_model(model)
+    root_segment_name = "TRUNK"
     updated_state = np.array(state, copy=True)
     for axis_idx, axis_name in enumerate(("TransX", "TransY", "TransZ")):
-        target_name = f"TRUNK:{axis_name}"
+        target_name = f"{root_segment_name}:{axis_name}"
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(translation_xyz[axis_idx])
     return updated_state
@@ -4014,9 +4160,18 @@ def apply_root_pose_guess_to_state(model, state: np.ndarray, root_pose: np.ndarr
     if root_pose.size < 6 or not np.all(np.isfinite(root_pose[:6])):
         return np.array(state, copy=True)
     q_names = q_names_from_model(model)
+    root_segment_name = "TRUNK"
     updated_state = np.array(state, copy=True)
     for value, target_name in zip(
-        root_pose[:6], ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ", "TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ")
+        root_pose[:6],
+        (
+            f"{root_segment_name}:TransX",
+            f"{root_segment_name}:TransY",
+            f"{root_segment_name}:TransZ",
+            f"{root_segment_name}:RotY",
+            f"{root_segment_name}:RotX",
+            f"{root_segment_name}:RotZ",
+        ),
     ):
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(value)
@@ -4041,8 +4196,17 @@ def align_root_translation_guess_to_frame_zero(
 
     if source_frame_idx is None:
         return np.array(state, copy=True)
-    source_translation = root_translation_from_triangulation_frame(reconstruction, int(source_frame_idx))
-    target_translation = root_translation_from_triangulation_frame(reconstruction, 0)
+    root_translation_origin = root_translation_origin_for_model(model)
+    source_translation = root_translation_from_triangulation_frame(
+        reconstruction,
+        int(source_frame_idx),
+        root_translation_origin=root_translation_origin,
+    )
+    target_translation = root_translation_from_triangulation_frame(
+        reconstruction,
+        0,
+        root_translation_origin=root_translation_origin,
+    )
     if source_translation is None or target_translation is None:
         return np.array(state, copy=True)
     return apply_root_translation_guess_to_state(model, state, target_translation)
@@ -4058,6 +4222,7 @@ def compute_biorbd_kalman_initial_state(
         return None, {"method": "none", "used_init_state": False}
 
     state = initial_state_from_triangulation(model, reconstruction)
+    root_translation_origin = root_translation_origin_for_model(model)
     diagnostics: dict[str, object] = {
         "method": str(method),
         "used_init_state": True,
@@ -4076,7 +4241,10 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(aligned_state, state, equal_nan=True)
         return aligned_state, diagnostics
     if method == "triangulation_ik_root_translation":
-        frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
+        frame_idx, root_translation = first_valid_root_translation_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
         updated_state = apply_root_translation_guess_to_state(model, state, root_translation)
@@ -4092,7 +4260,10 @@ def compute_biorbd_kalman_initial_state(
         return aligned_state, diagnostics
     if method == "root_pose_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
-        frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+        frame_idx, root_pose = first_valid_root_pose_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_pose is not None)
@@ -4110,7 +4281,10 @@ def compute_biorbd_kalman_initial_state(
         return aligned_state, diagnostics
     if method == "root_translation_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
-        frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
+        frame_idx, root_translation = first_valid_root_translation_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
@@ -4264,7 +4438,10 @@ def initial_state_from_root_pose_bootstrap(
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
-    frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+    frame_idx, root_pose = first_valid_root_pose_from_triangulation(
+        reconstruction,
+        root_translation_origin=root_translation_origin_for_model(model),
+    )
     diagnostics_seed = {
         "method": "root_pose_bootstrap",
         "root_pose_frame_idx": None if frame_idx is None else int(frame_idx),

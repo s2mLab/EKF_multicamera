@@ -77,6 +77,7 @@ def build_root_rotation_matrices(
     right_hip_idx: int = 12,
     left_shoulder_idx: int = 5,
     right_shoulder_idx: int = 6,
+    translation_origin: str = "pelvis",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build trunk translations and body-to-world rotation matrices from markers."""
 
@@ -108,7 +109,7 @@ def build_root_rotation_matrices(
         y_axis = normalize(np.cross(z_axis, x_axis))
         if not (np.all(np.isfinite(x_axis)) and np.all(np.isfinite(y_axis)) and np.all(np.isfinite(z_axis))):
             continue
-        translations[frame_idx] = hip_center
+        translations[frame_idx] = shoulder_center if str(translation_origin) == "upper_trunk" else hip_center
         rotation_matrices[frame_idx] = np.column_stack((x_axis, y_axis, z_axis))
     return translations, rotation_matrices
 
@@ -158,10 +159,14 @@ def root_z_correction_angle_from_points(
     return root_z_correction_angle_from_rotation_matrices(rotation_matrices)
 
 
-def compute_trunk_dofs_from_points(points_3d: np.ndarray, unwrap_rotations: bool = True) -> np.ndarray:
+def compute_trunk_dofs_from_points(
+    points_3d: np.ndarray,
+    unwrap_rotations: bool = True,
+    translation_origin: str = "pelvis",
+) -> np.ndarray:
     """Convert 3D trunk markers into the ordered root DoFs [T, R]."""
 
-    translations, rotation_matrices = build_root_rotation_matrices(points_3d)
+    translations, rotation_matrices = build_root_rotation_matrices(points_3d, translation_origin=translation_origin)
     rotations_xyz = np.full((points_3d.shape[0], 3), np.nan, dtype=float)
     for frame_idx in range(points_3d.shape[0]):
         matrix = rotation_matrices[frame_idx]

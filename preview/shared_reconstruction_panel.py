@@ -86,6 +86,9 @@ class SharedReconstructionPanel(ttk.Frame):
         self._selection_callback = None
         self._refresh_callback = None
         self._suspend_selection_callback = False
+        self._selectmode = "extended"
+        self._allow_empty_selection = False
+        self._explicitly_cleared = False
 
         header = ttk.Frame(self)
         header.pack(fill=tk.X, padx=8, pady=(6, 2))
@@ -122,6 +125,7 @@ class SharedReconstructionPanel(ttk.Frame):
         self.tree.pack(fill=tk.X, expand=False, padx=8, pady=(0, 6))
         bind_extended_treeview_shortcuts(self.tree)
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_changed)
+        self.tree.bind("<Button-1>", self._on_button_press, add="+")
         if tooltip_fn is not None:
             tooltip_fn(self.tree, "Shared reconstruction selector used by the active analysis tab.")
         self.show_placeholder("Select a tab that uses reconstruction comparisons.")
@@ -133,6 +137,7 @@ class SharedReconstructionPanel(ttk.Frame):
         refresh_callback,
         selection_callback,
         selectmode: str = "extended",
+        allow_empty_selection: bool = False,
     ) -> None:
         """Bind the shared panel to one tab consumer."""
 
@@ -140,6 +145,9 @@ class SharedReconstructionPanel(ttk.Frame):
         self._refresh_callback = refresh_callback
         self._selection_callback = selection_callback
         self.refresh_button.configure(command=refresh_callback)
+        self._selectmode = selectmode
+        self._allow_empty_selection = bool(allow_empty_selection)
+        self._explicitly_cleared = False
         clean_callback = getattr(self.state, "clean_trial_outputs_callback", None)
         clean_caches_callback = getattr(self.state, "clean_trial_caches_callback", None)
         self.clean_button.configure(command=clean_callback or (lambda: None))
@@ -151,6 +159,7 @@ class SharedReconstructionPanel(ttk.Frame):
 
         previous = set(self.selected_names())
         self._default_names = list(default_names or [])
+        self._explicitly_cleared = False
         self._suspend_selection_callback = True
         try:
             for item in self.tree.get_children():
@@ -195,6 +204,8 @@ class SharedReconstructionPanel(ttk.Frame):
         selected = list(self.tree.selection())
         if selected:
             return selected
+        if getattr(self, "_allow_empty_selection", False) and getattr(self, "_explicitly_cleared", False):
+            return []
         return [name for name in self._default_names if self.tree.exists(name)]
 
     def show_placeholder(self, message: str) -> None:
@@ -219,9 +230,40 @@ class SharedReconstructionPanel(ttk.Frame):
     def _publish_selection(self) -> None:
         self.state.set_shared_reconstruction_selection(self.selected_names())
 
+    def _clear_selection(self) -> None:
+        self._suspend_selection_callback = True
+        try:
+            self.tree.selection_set(())
+            self.tree.focus("")
+        finally:
+            self._suspend_selection_callback = False
+        self._explicitly_cleared = True
+        self._publish_selection()
+        if self._selection_callback is not None:
+            self._selection_callback()
+
+    def _on_button_press(self, event=None):
+        if not self._allow_empty_selection or self._selectmode != "browse":
+            return None
+        row_id = self.tree.identify_row(event.y) if event is not None else ""
+        current = list(self.tree.selection())
+        if row_id == "__placeholder__":
+            return "break"
+        if not row_id:
+            if current:
+                self._clear_selection()
+                return "break"
+            return None
+        if row_id in current and len(current) == 1:
+            self._clear_selection()
+            return "break"
+        return None
+
     def _on_selection_changed(self, _event=None) -> None:
         if self._suspend_selection_callback:
             return
+        if self.tree.selection():
+            self._explicitly_cleared = False
         self._publish_selection()
         if self._selection_callback is not None:
             self._selection_callback()

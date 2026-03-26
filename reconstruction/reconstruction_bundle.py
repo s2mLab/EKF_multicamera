@@ -65,6 +65,7 @@ from vitpose_ekf_pipeline import (
     CameraCalibration,
     PoseData,
     ReconstructionResult,
+    SegmentLengths,
     apply_left_right_flip_corrections,
     apply_left_right_flip_to_points,
     build_biomod,
@@ -1011,6 +1012,7 @@ def extract_root_from_points(
     points_3d: np.ndarray,
     apply_initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    translation_origin: str = "pelvis",
 ) -> tuple[np.ndarray, bool]:
     correction_angle = root_z_correction_angle_from_points(
         points_3d,
@@ -1025,6 +1027,7 @@ def extract_root_from_points(
         right_hip_idx=KP_INDEX["right_hip"],
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
+        translation_origin=translation_origin,
     )
     correction_detected = abs(correction_angle) > 1e-8
     correction_applied = bool(apply_initial_rotation_correction and correction_detected)
