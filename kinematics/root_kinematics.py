@@ -193,12 +193,14 @@ def extract_root_from_q(
     for out_idx, dof_name in enumerate(ROOT_Q_NAMES):
         if str(dof_name) in name_to_index:
             root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
-    if renormalize_rotations:
-        root_q[:, ROOT_ROTATION_SLICE] = reextract_euler_with_gaps(
-            root_q[:, ROOT_ROTATION_SLICE], TRUNK_ROOT_ROTATION_SEQUENCE
-        )
-    if unwrap_rotations:
-        root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
+    rotations = np.array(root_q[:, ROOT_ROTATION_SLICE], copy=True)
+    if renormalize_rotations or unwrap_rotations:
+        passes = 2 if unwrap_rotations else 1
+        for _ in range(passes):
+            rotations = reextract_euler_with_gaps(rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
+            if unwrap_rotations:
+                rotations = unwrap_with_gaps(rotations)
+        root_q[:, ROOT_ROTATION_SLICE] = rotations
     return root_q
 
 

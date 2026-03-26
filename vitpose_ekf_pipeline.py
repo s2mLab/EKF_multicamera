@@ -32,7 +32,13 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations
-from kinematics.root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
+from kinematics.root_kinematics import (
+    ROOT_ROTATION_SLICE,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    compute_trunk_dofs_from_points,
+    reextract_euler_with_gaps,
+    root_z_correction_angle_from_points,
+)
 
 try:
     import tomllib
@@ -3372,10 +3378,25 @@ def unwrap_root_rotations(q: np.ndarray, q_names: np.ndarray | list[str]) -> np.
     q_unwrapped = np.array(q, copy=True)
     name_to_index = {str(name): i for i, name in enumerate(q_names)}
     root_rotation_names = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
-    for dof_name in root_rotation_names:
-        if dof_name in name_to_index:
-            q_unwrapped[:, name_to_index[dof_name]] = unwrap_with_gaps(q_unwrapped[:, name_to_index[dof_name]])
+    root_rotation_indices = [name_to_index[dof_name] for dof_name in root_rotation_names if dof_name in name_to_index]
+    if root_rotation_indices:
+        stabilized_rotations = np.array(q_unwrapped[:, root_rotation_indices], copy=True)
+        # A second reextract+unwrap pass makes the root angles more robust to
+        # residual Euler branch discontinuities left by the first unwrap.
+        for _ in range(2):
+            stabilized_rotations = reextract_euler_with_gaps(stabilized_rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
+            stabilized_rotations = unwrap_with_gaps(stabilized_rotations)
+        q_unwrapped[:, root_rotation_indices] = stabilized_rotations
     return q_unwrapped
+
+
+def canonicalize_state_q_rotation_branches(model, state: np.ndarray) -> np.ndarray:
+    """Canonicalize only the generalized coordinates portion of one EKF state."""
+
+    state_array = np.asarray(state, dtype=float).reshape(-1)
+    canonical_state = np.array(state_array, copy=True)
+    canonical_state[: model.nbQ()] = canonicalize_model_q_rotation_branches(model, canonical_state[: model.nbQ()])
+    return canonical_state
 
 
 def debug_state_summary(state: np.ndarray, q_names: np.ndarray | list[str], nq: int, prefix: str) -> str:
@@ -4032,7 +4053,8 @@ def initial_state_from_triangulation(model, reconstruction: ReconstructionResult
         q0 = np.asarray(biorbd.InverseKinematics(model, marker_positions).solve()).reshape(-1)
     except Exception:
         q0 = np.zeros(model.nbQ())
-    return np.concatenate((q0, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
+    state = np.concatenate((q0, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
+    return canonicalize_state_q_rotation_branches(model, state)
 
 
 def q_names_from_model(model) -> list[str]:
@@ -4293,7 +4315,7 @@ def compute_biorbd_kalman_initial_state(
             source_frame_idx=diagnostics["bootstrap_frame_idx"],
         )
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(aligned_state, state, equal_nan=True)
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "triangulation_ik_root_translation":
         frame_idx, root_translation = first_valid_root_translation_from_triangulation(
             reconstruction,
@@ -4311,7 +4333,7 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "root_pose_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
         frame_idx, root_pose = first_valid_root_pose_from_triangulation(
@@ -4332,7 +4354,7 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "root_translation_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
         frame_idx, root_translation = first_valid_root_translation_from_triangulation(
@@ -4352,7 +4374,7 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     raise ValueError(f"Unsupported biorbd kalman init method: {method}")
 
 

@@ -20,6 +20,7 @@ from vitpose_ekf_pipeline import (
     canonical_coherence_method,
     canonical_triangulation_method,
     canonicalize_model_q_rotation_branches,
+    canonicalize_state_q_rotation_branches,
     choose_ekf_prediction_gate_measurements,
     compute_biorbd_kalman_initial_state,
     compute_camera_epipolar_cost,
@@ -789,9 +790,9 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
     assert state[q_names.index("TRUNK:TransX")] == 1.0
     assert state[q_names.index("TRUNK:TransY")] == 2.0
     assert state[q_names.index("TRUNK:TransZ")] == 3.0
-    assert state[q_names.index("TRUNK:RotY")] == 0.4
-    assert state[q_names.index("TRUNK:RotX")] == -0.2
-    assert state[q_names.index("TRUNK:RotZ")] == 1.1
+    assert math.isclose(state[q_names.index("TRUNK:RotY")], 0.4)
+    assert math.isclose(state[q_names.index("TRUNK:RotX")], -0.2)
+    assert math.isclose(state[q_names.index("TRUNK:RotZ")], 1.1)
     assert state[q_names.index("LEFT_UPPER_ARM:RotY")] == 0.0
     assert state[q_names.index("LEFT_THIGH:RotY")] == 0.0
 
@@ -859,6 +860,27 @@ def test_canonicalize_model_q_rotation_branches_reextracts_multi_axis_blocks():
     assert abs(canonical_q[q_names.index("TRUNK:RotZ")]) < abs(root_input[2])
 
 
+def test_canonicalize_state_q_rotation_branches_only_changes_q_block():
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    nq = model.nbQ()
+    state = np.zeros(3 * nq, dtype=float)
+    state[q_names.index("TRUNK:RotY")] = math.pi + 0.4
+    state[q_names.index("TRUNK:RotX")] = -0.2
+    state[q_names.index("TRUNK:RotZ")] = 2.0 * math.pi + 0.3
+    state[nq:] = 7.0
+
+    canonical_state = canonicalize_state_q_rotation_branches(model, state)
+
+    np.testing.assert_allclose(canonical_state[nq:], state[nq:], atol=1e-12)
+    np.testing.assert_allclose(
+        Rotation.from_euler("YXZ", canonical_state[[3, 4, 5]], degrees=False).as_matrix(),
+        Rotation.from_euler("YXZ", state[[3, 4, 5]], degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    assert abs(canonical_state[q_names.index("TRUNK:RotZ")]) < abs(state[q_names.index("TRUNK:RotZ")])
+
+
 def test_initial_state_from_ekf_bootstrap_canonicalizes_rotation_branches(monkeypatch):
     model = _FakeModel()
     q_names = q_names_from_model(model)
@@ -913,6 +935,28 @@ def test_initial_state_from_ekf_bootstrap_canonicalizes_rotation_branches(monkey
         Rotation.from_euler("YXZ", [math.pi + 0.25, -0.15, 2.0 * math.pi + 0.35], degrees=False).as_matrix(),
         atol=1e-12,
     )
+
+
+def test_compute_biorbd_kalman_initial_state_canonicalizes_triangulation_ik(monkeypatch):
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    nq = model.nbQ()
+    state = np.zeros(3 * nq, dtype=float)
+    state[q_names.index("TRUNK:RotY")] = math.pi + 0.35
+    state[q_names.index("TRUNK:RotX")] = -0.15
+    state[q_names.index("TRUNK:RotZ")] = 2.0 * math.pi + 0.25
+
+    monkeypatch.setattr(vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda *_args, **_kwargs: state)
+
+    corrected_state, diagnostics = compute_biorbd_kalman_initial_state(model, object(), method="triangulation_ik")
+
+    assert diagnostics["method"] == "triangulation_ik"
+    np.testing.assert_allclose(
+        Rotation.from_euler("YXZ", corrected_state[[3, 4, 5]], degrees=False).as_matrix(),
+        Rotation.from_euler("YXZ", state[[3, 4, 5]], degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    assert abs(corrected_state[q_names.index("TRUNK:RotZ")]) < abs(state[q_names.index("TRUNK:RotZ")])
 
 
 def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction_matches():
