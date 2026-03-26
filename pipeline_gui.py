@@ -118,7 +118,7 @@ from kinematics.root_series import (
 )
 from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.dataset_preview_loader import load_dataset_preview_resources
-from preview.dataset_preview_state import build_dataset_preview_state
+from preview.dataset_preview_state import DatasetPreviewState, build_dataset_preview_state
 from preview.preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -920,6 +920,67 @@ def draw_skeleton_3d(ax, frame_points: np.ndarray, color: str, label: str, marke
             label_drawn = True
 
 
+def draw_upper_back_preview(
+    ax, frame_points: np.ndarray, segment_frames: list[tuple[str, np.ndarray, np.ndarray]]
+) -> None:
+    """Draw the central back line/markers for models that include UPPER_BACK."""
+
+    if frame_points is None:
+        return
+    segment_map = {
+        str(name): (np.asarray(origin, dtype=float), np.asarray(rotation, dtype=float))
+        for name, origin, rotation in segment_frames
+    }
+    upper_back_frame = segment_map.get("UPPER_BACK")
+    if upper_back_frame is None:
+        return
+    trunk_frame = segment_map.get("TRUNK")
+    lower_center = upper_back_frame[0]
+    upper_center = 0.5 * (
+        np.asarray(frame_points[KP_INDEX["left_shoulder"]], dtype=float)
+        + np.asarray(frame_points[KP_INDEX["right_shoulder"]], dtype=float)
+    )
+    if not (np.all(np.isfinite(lower_center)) and np.all(np.isfinite(upper_center))):
+        return
+    hip_center = 0.5 * (
+        np.asarray(frame_points[KP_INDEX["left_hip"]], dtype=float)
+        + np.asarray(frame_points[KP_INDEX["right_hip"]], dtype=float)
+    )
+    if trunk_frame is not None:
+        trunk_origin, trunk_rotation = trunk_frame
+        if np.all(np.isfinite(trunk_origin)) and np.all(np.isfinite(trunk_rotation)):
+            lower_extent = trunk_origin + trunk_rotation[:, 2] * max(np.linalg.norm(lower_center - trunk_origin), 1e-6)
+            if np.all(np.isfinite(lower_extent)):
+                hip_center = lower_extent
+    if np.all(np.isfinite(hip_center)):
+        ax.plot(
+            [hip_center[0], lower_center[0]],
+            [hip_center[1], lower_center[1]],
+            [hip_center[2], lower_center[2]],
+            color="#1d4e89",
+            linewidth=2.6,
+            alpha=0.9,
+        )
+    ax.plot(
+        [lower_center[0], upper_center[0]],
+        [lower_center[1], upper_center[1]],
+        [lower_center[2], upper_center[2]],
+        color="#1d4e89",
+        linewidth=2.6,
+        alpha=0.9,
+        label="Back centerline",
+    )
+    ax.scatter(
+        [lower_center[0], upper_center[0]],
+        [lower_center[1], upper_center[1]],
+        [lower_center[2], upper_center[2]],
+        s=38,
+        c="#1d4e89",
+        marker="D",
+        depthshade=False,
+    )
+
+
 def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
     left_hip = frame_points[KP_INDEX["left_hip"]]
     right_hip = frame_points[KP_INDEX["right_hip"]]
@@ -1400,7 +1461,7 @@ def load_preview_bundle(
         if master_frames is None:
             master_points = bundle["recon_3d"]["triangulation_fast"]
             master_frames = np.asarray(data["frames"], dtype=int)
-    if master_frames is None and pose2sim_trc.exists():
+    if master_frames is None and pose2sim_trc is not None and pose2sim_trc.exists():
         pose2sim_points, pose2sim_time, pose2sim_rate = parse_trc_points(pose2sim_trc)
         master_frames = np.arange(pose2sim_points.shape[0], dtype=int)
         master_points = pose2sim_points
@@ -6126,6 +6187,7 @@ class ModelTab(CommandTab):
             draw_skeleton_3d(ax, self.preview_support_points, "#b8c4d6", "Triangulation")
             points_dict["triangulation"] = self.preview_support_points[np.newaxis, :, :]
         draw_skeleton_3d(ax, self.preview_points, "#4c72b0", "Model")
+        draw_upper_back_preview(ax, self.preview_points, self.preview_segment_frames)
         points_dict["model"] = self.preview_points[np.newaxis, :, :]
         valid = self.preview_points[np.all(np.isfinite(self.preview_points), axis=1)]
         if valid.size:
@@ -8143,7 +8205,7 @@ class JointKinematicsTab(ttk.Frame):
 
     @staticmethod
     def _upper_back_target_series(
-        self, series: np.ndarray, name_to_index: dict[str, int], dof_name: str
+        series: np.ndarray, name_to_index: dict[str, int], dof_name: str
     ) -> np.ndarray | None:
         """Return the default pseudo-observation target for one upper-back DoF."""
 

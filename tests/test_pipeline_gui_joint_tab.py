@@ -11,10 +11,15 @@ import pipeline_gui
 class _FakeAxis:
     def __init__(self):
         self.plots = []
+        self.scatters = []
         self.ylabel = None
 
     def plot(self, *args, **kwargs):
         self.plots.append({"args": args, "kwargs": kwargs})
+        return None
+
+    def scatter(self, *args, **kwargs):
+        self.scatters.append({"args": args, "kwargs": kwargs})
         return None
 
     def set_title(self, *_args, **_kwargs):
@@ -267,18 +272,28 @@ def test_upper_back_target_series_uses_hips_for_roty_and_zero_for_other_axes():
         "UPPER_BACK:RotX": 3,
         "UPPER_BACK:RotZ": 4,
     }
-    tab = pipeline_gui.JointKinematicsTab.__new__(pipeline_gui.JointKinematicsTab)
-
-    roty_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
-        tab, series, name_to_index, "UPPER_BACK:RotY"
-    )
-    rotx_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
-        tab, series, name_to_index, "UPPER_BACK:RotX"
-    )
-    rotz_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(
-        tab, series, name_to_index, "UPPER_BACK:RotZ"
-    )
+    roty_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotY")
+    rotx_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotX")
+    rotz_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotZ")
 
     np.testing.assert_allclose(roty_target, np.array([0.15, 0.2], dtype=float))
     np.testing.assert_allclose(rotx_target, np.zeros(2))
     np.testing.assert_allclose(rotz_target, np.zeros(2))
+
+
+def test_draw_upper_back_preview_draws_back_centerline():
+    axis = _FakeAxis()
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 0.3, 1.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -0.3, 1.0])
+    segment_frames = [
+        ("TRUNK", np.array([0.0, 0.0, 0.0]), np.eye(3)),
+        ("UPPER_BACK", np.array([0.0, 0.0, 0.5]), np.eye(3)),
+    ]
+
+    pipeline_gui.draw_upper_back_preview(axis, frame_points, segment_frames)
+
+    assert len(axis.plots) >= 2
+    assert len(axis.scatters) == 1

@@ -1334,3 +1334,14 @@ def test_clear_reconstructions_deletes_only_selected_rows(monkeypatch, tmp_path)
     assert notifications == ["updated"]
     assert refreshes == ["refresh"]
     assert info_messages
+
+
+def test_load_preview_bundle_accepts_missing_pose2sim_trc(tmp_path):
+    output_dir = tmp_path / "empty_dataset"
+    output_dir.mkdir(parents=True)
+
+    bundle = pipeline_gui.load_preview_bundle(output_dir, biomod_path=None, pose2sim_trc=None, align_root=False)
+
+    np.testing.assert_array_equal(bundle["frames"], np.array([], dtype=int))
+    np.testing.assert_array_equal(bundle["time_s"], np.array([], dtype=float))
+    assert bundle["recon_3d"] == {}
