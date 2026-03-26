@@ -243,6 +243,14 @@ def test_dd_sync_dataset_dir_no_longer_depends_on_local_dataset_widget():
     assert calls == ["dd", "refresh"]
 
 
+def test_jump_list_label_with_reference_shows_detected_and_expected_codes():
+    jump = SimpleNamespace(somersault_turns=-0.99, twist_turns=-0.02, code="40/")
+
+    label = pipeline_gui.jump_list_label_with_reference(4, jump, "42/")
+
+    assert label == "S4 | som -0.99 | tw -0.02 | det 40/ | exp 42/"
+
+
 def test_sanitize_filetypes_keeps_regular_patterns(monkeypatch):
     filetypes = (
         ("JSON files", "*.json"),
@@ -294,6 +302,161 @@ def test_profiles_tab_selected_profile_flip_method_disables_flip_for_none():
     assert pipeline_gui.ProfilesTab.selected_profile_flip_method(tab) is None
 
 
+def test_profiles_tab_refresh_profile_tree_shows_flip_mode_column():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.profile_tree = _FakeTree()
+    tab.state = SimpleNamespace(
+        profiles=[
+            pipeline_gui.ReconstructionProfile(
+                name="demo",
+                family="ekf_2d",
+                pose_data_mode="cleaned",
+                triangulation_method="exhaustive",
+                flip=True,
+                flip_method="epipolar_fast",
+            )
+        ]
+    )
+
+    pipeline_gui.ProfilesTab.refresh_profile_tree(tab)
+
+    assert tab.profile_tree.rows["0"][5] == "Epipolar fast (local)"
+
+
+def test_profiles_tab_load_profile_into_form_restores_profile_options():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    tab.state = SimpleNamespace(initial_rotation_correction_var=SimpleNamespace(get=lambda: False))
+    tab._updating_profile_name = False
+    tab.profile_name = _FakeEntryField("")
+    tab.family = SimpleNamespace(get=lambda: tab._family, set=lambda value: setattr(tab, "_family", value))
+    tab._family = "ekf_2d"
+    tab.pose_data_mode = SimpleNamespace(
+        get=lambda: tab._pose_mode, set=lambda value: setattr(tab, "_pose_mode", value)
+    )
+    tab._pose_mode = "raw"
+    tab.frame_stride = SimpleNamespace(get=lambda: tab._stride, set=lambda value: setattr(tab, "_stride", value))
+    tab._stride = "1"
+    tab.triang_method = SimpleNamespace(get=lambda: tab._triang, set=lambda value: setattr(tab, "_triang", value))
+    tab._triang = "greedy"
+    tab.predictor = SimpleNamespace(get=lambda: tab._predictor, set=lambda value: setattr(tab, "_predictor", value))
+    tab._predictor = "acc"
+    tab.coherence_method = SimpleNamespace(
+        get=lambda: tab._coherence,
+        set=lambda value: setattr(tab, "_coherence", value),
+    )
+    tab._coherence = pipeline_gui.coherence_method_display_name("epipolar")
+    tab.ekf2d_initial_state_method = SimpleNamespace(
+        get=lambda: tab._q0,
+        set=lambda value: setattr(tab, "_q0", value),
+    )
+    tab._q0 = "ekf_bootstrap"
+    tab.ekf2d_bootstrap_passes = _FakeEntryField("5")
+    tab.upper_back_sagittal_gain = _FakeEntryField("0.2")
+    tab.upper_back_pseudo_std_deg = _FakeEntryField("10")
+    tab.flip_method = SimpleNamespace(
+        get=lambda: tab._flip_method, set=lambda value: setattr(tab, "_flip_method", value)
+    )
+    tab._flip_method = "none"
+    tab.flip_method_label_var = SimpleNamespace(set=lambda value: setattr(tab, "_flip_label", value))
+    tab._flip_label = ""
+    tab.lock_var = SimpleNamespace(get=lambda: tab._lock, set=lambda value: setattr(tab, "_lock", bool(value)))
+    tab._lock = False
+    tab.initial_rot_var = SimpleNamespace(
+        get=lambda: tab._rotfix, set=lambda value: setattr(tab, "_rotfix", bool(value))
+    )
+    tab._rotfix = False
+    tab.unwrap_var = SimpleNamespace(get=lambda: tab._unwrap, set=lambda value: setattr(tab, "_unwrap", bool(value)))
+    tab._unwrap = False
+    tab.biorbd_noise = _FakeEntryField("1e-8")
+    tab.biorbd_error = _FakeEntryField("1e-4")
+    tab.biorbd_kalman_init_method = SimpleNamespace(
+        get=lambda: tab._ekf3d_init,
+        set=lambda value: setattr(tab, "_ekf3d_init", value),
+    )
+    tab._ekf3d_init = "triangulation_ik_root_translation"
+    tab.measurement_noise = _FakeEntryField("1.5")
+    tab.process_noise = _FakeEntryField("1.0")
+    tab.coherence_floor = _FakeEntryField("0.35")
+    tab.profile_model_variant = SimpleNamespace(
+        get=lambda: tab._model_variant,
+        set=lambda value: setattr(tab, "_model_variant", value),
+    )
+    tab._model_variant = pipeline_gui.DEFAULT_MODEL_VARIANT
+    tab.profile_cameras_list = _FakeListbox()
+    for name in ("cam_a", "cam_b", "cam_c"):
+        tab.profile_cameras_list.insert("end", name)
+    tab.profile_cameras_summary = SimpleNamespace(set=lambda value: setattr(tab, "_camera_summary", value))
+    tab._camera_summary = ""
+    tab.profile_models_list = _FakeListbox()
+    for label in ("model_a", "model_b"):
+        tab.profile_models_list.insert("end", label)
+    tab.profile_models_summary = SimpleNamespace(set=lambda value: setattr(tab, "_model_summary", value))
+    tab.ekf_model_info_var = SimpleNamespace(set=lambda value: setattr(tab, "_model_info", value))
+    tab._profile_model_choices = {
+        "model_a": "output/demo/models/model_a.bioMod",
+        "model_b": "output/demo/models/model_b.bioMod",
+    }
+    tab._model_summary = ""
+    tab._model_info = ""
+    tab.add_profile_button = _FakeButton()
+    tab.refresh_profile_camera_choices = lambda: None
+    tab.refresh_profile_model_choices = lambda: None
+    tab.update_family_controls = lambda: None
+
+    profile = pipeline_gui.ReconstructionProfile(
+        name="ekf_profile",
+        family="ekf_2d",
+        camera_names=["cam_b", "cam_c"],
+        ekf_model_path="output/demo/models/model_b.bioMod",
+        model_variant="back_flexion_1d",
+        predictor="dyn",
+        ekf2d_initial_state_method="root_pose_bootstrap",
+        ekf2d_bootstrap_passes=7,
+        flip=True,
+        flip_method="ekf_prediction_gate",
+        dof_locking=True,
+        initial_rotation_correction=True,
+        pose_data_mode="cleaned",
+        frame_stride=3,
+        triangulation_method="exhaustive",
+        coherence_method="epipolar_fast_framewise",
+        no_root_unwrap=True,
+        measurement_noise_scale=2.0,
+        process_noise_scale=0.5,
+        coherence_confidence_floor=0.4,
+        upper_back_sagittal_gain=0.35,
+        upper_back_pseudo_std_deg=6.0,
+    )
+
+    pipeline_gui.ProfilesTab.load_profile_into_form(tab, profile)
+
+    assert tab.profile_name.get() == "ekf_profile"
+    assert tab._family == "ekf_2d"
+    assert tab._predictor == "dyn"
+    assert tab._flip_method == "ekf_prediction_gate"
+    assert tab._flip_label == "EKF prediction gate"
+    assert tab._coherence == pipeline_gui.coherence_method_display_name("epipolar_fast_framewise")
+    assert tab.ekf2d_bootstrap_passes.get() == "7"
+    assert tab.upper_back_sagittal_gain.get() == "0.35"
+    assert tab.upper_back_pseudo_std_deg.get() == "6"
+    assert tab.profile_cameras_list.curselection() == (1, 2)
+    assert tab.profile_models_list.curselection() == (1,)
+    assert tab.add_profile_button.state == "normal"
+
+
+def test_profiles_tab_load_selected_profile_from_tree_uses_current_selection():
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    loaded = []
+    tab.state = SimpleNamespace(profiles=[pipeline_gui.ReconstructionProfile(name="demo", family="pose2sim")])
+    tab.profile_tree = _FakeTree()
+    tab.profile_tree.selection_set(("0",))
+    tab.load_profile_into_form = lambda profile: loaded.append(profile.name)
+
+    pipeline_gui.ProfilesTab.load_selected_profile_from_tree(tab)
+
+    assert loaded == ["demo"]
+
+
 def test_profiles_tab_build_command_uses_runtime_profiles_cache(monkeypatch):
     tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
     tab.state = SimpleNamespace(
@@ -341,6 +504,48 @@ def test_reconstructions_tab_build_command_uses_runtime_profiles_cache(monkeypat
     cmd = pipeline_gui.ReconstructionsTab.build_command(tab)
 
     assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
+
+
+def test_reconstructions_tab_export_selected_pseudo_root_from_points_writes_npz(monkeypatch, tmp_path):
+    recon_dir = tmp_path / "output" / "trial" / "reconstructions" / "demo"
+    recon_dir.mkdir(parents=True)
+    points_3d = np.zeros((3, 17, 3), dtype=float)
+    for frame_idx in range(points_3d.shape[0]):
+        z_offset = 1.0 + 0.1 * frame_idx
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_hip"]] = (-0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_hip"]] = (0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_shoulder"]] = (-0.25, 0.0, z_offset + 0.5)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_shoulder"]] = (0.25, 0.0, z_offset + 0.5)
+    bundle_path = recon_dir / "reconstruction_bundle.npz"
+    np.savez(
+        bundle_path,
+        points_3d=points_3d,
+        frames=np.array([0, 1, 2], dtype=int),
+        time_s=np.array([0.0, 1.0 / 120.0, 2.0 / 120.0], dtype=float),
+    )
+
+    info_messages = []
+    tab = pipeline_gui.ReconstructionsTab.__new__(pipeline_gui.ReconstructionsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        initial_rotation_correction_var=SimpleNamespace(get=lambda: True),
+    )
+    tab.status_summaries = {"demo": {"initial_rotation_correction_applied": True}}
+    tab._selected_reconstruction_dir = lambda: recon_dir
+    monkeypatch.setattr(
+        pipeline_gui.messagebox, "showinfo", lambda title, message: info_messages.append((title, message))
+    )
+
+    pipeline_gui.ReconstructionsTab.export_selected_pseudo_root_from_points(tab)
+
+    output_path = recon_dir / "demo_pseudo_root_q.npz"
+    assert output_path.exists()
+    exported = np.load(output_path, allow_pickle=True)
+    assert exported["q"].shape == (3, 6)
+    assert exported["qdot"].shape == (3, 6)
+    assert exported["qddot"].shape == (3, 6)
+    assert exported["q_names"].tolist() == pipeline_gui.ROOT_Q_NAMES.tolist()
+    assert info_messages
 
 
 def test_multiview_tab_build_command_uses_selected_cameras_and_images_root(monkeypatch):

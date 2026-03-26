@@ -93,6 +93,7 @@ from kinematics.analysis_3d import (
     valid_segment_length_samples,
 )
 from kinematics.root_kinematics import (
+    ROOT_Q_NAMES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
@@ -6395,7 +6396,7 @@ class ProfilesTab(CommandTab):
         ttk.Button(actions, text="Load JSON", command=self.load_profiles_from_json).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Save JSON", command=self.save_profiles_to_json).pack(side=tk.LEFT, padx=(8, 0))
 
-        cols = ("enabled", "name", "family", "mode", "triang", "flags")
+        cols = ("enabled", "name", "family", "mode", "triang", "flip", "flags")
         self.profile_tree = ttk.Treeview(form, columns=cols, show="headings", height=8, selectmode="extended")
         headings = {
             "enabled": "Use",
@@ -6403,15 +6404,17 @@ class ProfilesTab(CommandTab):
             "family": "Family",
             "mode": "2D mode",
             "triang": "Triang",
+            "flip": "Flip",
             "flags": "Flags",
         }
-        widths = {"enabled": 50, "name": 240, "family": 90, "mode": 90, "triang": 100, "flags": 320}
+        widths = {"enabled": 50, "name": 240, "family": 90, "mode": 90, "triang": 100, "flip": 150, "flags": 260}
         for col in cols:
             self.profile_tree.heading(col, text=headings[col])
             self.profile_tree.column(col, width=widths[col], anchor="w")
         self.profile_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.profile_tree.bind("<Delete>", lambda _event: self.remove_selected_profiles())
         self.profile_tree.bind("<BackSpace>", lambda _event: self.remove_selected_profiles())
+        self.profile_tree.bind("<Double-1>", lambda _event: self.load_selected_profile_from_tree())
 
         self.family.trace_add("write", lambda *_args: self.update_family_controls())
         self.family.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -6594,6 +6597,26 @@ class ProfilesTab(CommandTab):
                 self.profile_models_list.selection_set(index)
                 self.profile_models_list.see(index)
                 break
+
+    def _set_profile_model_selection_by_path(self, model_path: str | None) -> None:
+        if model_path is None:
+            self._set_profile_model_selection_by_label(None)
+            return
+        requested = str(model_path)
+        requested_resolved = str(Path(requested).resolve())
+        for label, value in self._profile_model_choices.items():
+            if value is None:
+                continue
+            if str(value) == requested:
+                self._set_profile_model_selection_by_label(label)
+                return
+            try:
+                if str(Path(str(value)).resolve()) == requested_resolved:
+                    self._set_profile_model_selection_by_label(label)
+                    return
+            except Exception:
+                continue
+        self._set_profile_model_selection_by_label(None)
 
     def update_profile_model_summary(self) -> None:
         selected_label = self.selected_profile_model_label()
@@ -6796,6 +6819,9 @@ class ProfilesTab(CommandTab):
             triang_value = (
                 profile.triangulation_method if profile.family in ("triangulation", "ekf_3d", "ekf_2d") else "-"
             )
+            flip_value = (
+                flip_method_display_name(getattr(profile, "flip_method", "epipolar")) if profile.flip else "None"
+            )
             self.profile_tree.insert(
                 "",
                 "end",
@@ -6806,9 +6832,75 @@ class ProfilesTab(CommandTab):
                     profile.family,
                     mode_value,
                     triang_value,
+                    flip_value,
                     ",".join(flags),
                 ),
             )
+
+    def load_selected_profile_from_tree(self) -> None:
+        selected = self.profile_tree.selection()
+        if not selected:
+            return
+        try:
+            profile = self.state.profiles[int(selected[0])]
+        except Exception:
+            return
+        self.load_profile_into_form(profile)
+
+    def load_profile_into_form(self, profile: ReconstructionProfile) -> None:
+        self._updating_profile_name = True
+        try:
+            self.family.set(profile.family)
+            self.refresh_profile_camera_choices()
+            self.refresh_profile_model_choices()
+
+            self.pose_data_mode.set(profile.pose_data_mode)
+            self.frame_stride.set(str(int(getattr(profile, "frame_stride", 1))))
+            self.triang_method.set(getattr(profile, "triangulation_method", "exhaustive"))
+            self.predictor.set(getattr(profile, "predictor", "acc") or "acc")
+            self.coherence_method.set(coherence_method_display_name(getattr(profile, "coherence_method", "epipolar")))
+            self.ekf2d_initial_state_method.set(getattr(profile, "ekf2d_initial_state_method", "ekf_bootstrap"))
+            self.ekf2d_bootstrap_passes.var.set(str(int(getattr(profile, "ekf2d_bootstrap_passes", 5))))
+            self.upper_back_sagittal_gain.var.set(f"{float(getattr(profile, 'upper_back_sagittal_gain', 0.2)):g}")
+            self.upper_back_pseudo_std_deg.var.set(f"{float(getattr(profile, 'upper_back_pseudo_std_deg', 10.0)):g}")
+            self.flip_method.set(getattr(profile, "flip_method", "epipolar") if profile.flip else "none")
+            self.on_flip_method_changed()
+            self.lock_var.set(bool(getattr(profile, "dof_locking", False)))
+            self.initial_rot_var.set(bool(getattr(profile, "initial_rotation_correction", False)))
+            self.unwrap_var.set(bool(getattr(profile, "no_root_unwrap", False)))
+            self.biorbd_noise.var.set(f"{float(getattr(profile, 'biorbd_kalman_noise_factor', 1e-8)):g}")
+            self.biorbd_error.var.set(f"{float(getattr(profile, 'biorbd_kalman_error_factor', 1e-4)):g}")
+            self.biorbd_kalman_init_method.set(
+                getattr(profile, "biorbd_kalman_init_method", "triangulation_ik_root_translation")
+            )
+            self.measurement_noise.var.set(f"{float(getattr(profile, 'measurement_noise_scale', 1.5)):g}")
+            self.process_noise.var.set(f"{float(getattr(profile, 'process_noise_scale', 1.0)):g}")
+            self.coherence_floor.var.set(f"{float(getattr(profile, 'coherence_confidence_floor', 0.35)):g}")
+            self.profile_model_variant.set(getattr(profile, "model_variant", DEFAULT_MODEL_VARIANT))
+
+            if getattr(profile, "use_all_cameras", False) or getattr(profile, "camera_names", None) is None:
+                self._set_profile_camera_selection(
+                    [str(self.profile_cameras_list.get(i)) for i in range(self.profile_cameras_list.size())]
+                )
+            else:
+                self._set_profile_camera_selection(list(profile.camera_names or []))
+
+            selected_model_path = getattr(profile, "ekf_model_path", None)
+            if selected_model_path:
+                self._set_profile_model_selection_by_path(str(selected_model_path))
+            elif profile.family != "ekf_2d":
+                self._set_profile_model_selection_by_label("auto")
+            else:
+                self._set_profile_model_selection_by_label(None)
+        finally:
+            self._updating_profile_name = False
+
+        self.profile_name.var.set(profile.name)
+        self.update_family_controls()
+        self.update_profile_camera_summary()
+        self.update_profile_model_summary()
+        self.update_profile_model_info()
+        self.update_add_profile_button_state()
 
     def add_current_profile(self) -> None:
         try:
@@ -6914,15 +7006,26 @@ class ReconstructionsTab(CommandTab):
         )
         self.export_trc_button = ttk.Button(controls, text="Export TRC from q", command=self.export_selected_trc_from_q)
         self.export_trc_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.export_pseudo_root_button = ttk.Button(
+            controls,
+            text="Export pseudo q root",
+            command=self.export_selected_pseudo_root_from_points,
+        )
+        self.export_pseudo_root_button.pack(side=tk.LEFT, padx=(8, 0))
 
         self.profile_tree = ttk.Treeview(
-            form, columns=("name", "family", "mode", "flags"), show="headings", height=6, selectmode="extended"
+            form,
+            columns=("name", "family", "mode", "flip", "flags"),
+            show="headings",
+            height=6,
+            selectmode="extended",
         )
         for col, label, width in [
             ("name", "Name", 260),
             ("family", "Family", 90),
             ("mode", "2D mode", 90),
-            ("flags", "Flags", 420),
+            ("flip", "Flip", 150),
+            ("flags", "Flags", 300),
         ]:
             self.profile_tree.heading(col, text=label)
             self.profile_tree.column(col, width=width, anchor="w")
@@ -6931,6 +7034,10 @@ class ReconstructionsTab(CommandTab):
         attach_tooltip(
             self.export_trc_button,
             "Reconstruit les marqueurs du modèle depuis q pour la reconstruction sélectionnée et écrit un fichier TRC dans son dossier.",
+        )
+        attach_tooltip(
+            self.export_pseudo_root_button,
+            "Exporte les pseudo q de la racine obtenus géométriquement depuis les marqueurs du tronc de la reconstruction sélectionnée.",
         )
 
         timing_box = ttk.LabelFrame(self.main, text="Durées détaillées de la reconstruction sélectionnée")
@@ -6992,8 +7099,14 @@ class ReconstructionsTab(CommandTab):
                 flags.append("rotfix")
             if int(getattr(profile, "frame_stride", 1)) != 1:
                 flags.append(f"1/{int(getattr(profile, 'frame_stride', 1))}")
+            flip_value = (
+                flip_method_display_name(getattr(profile, "flip_method", "epipolar")) if profile.flip else "None"
+            )
             self.profile_tree.insert(
-                "", "end", iid=str(idx), values=(profile.name, profile.family, profile.pose_data_mode, ",".join(flags))
+                "",
+                "end",
+                iid=str(idx),
+                values=(profile.name, profile.family, profile.pose_data_mode, flip_value, ",".join(flags)),
             )
 
     def refresh_status_rows(self) -> None:
@@ -7092,6 +7205,69 @@ class ReconstructionsTab(CommandTab):
             qdot_root = centered_finite_difference(q_root, 1.0 / max(float(data_rate), 1.0))
         write_trc_root_kinematics_sidecar(output_path, q_root, qdot_root, frames, time_s)
         messagebox.showinfo("Export TRC from q", f"TRC written to:\n{output_path}")
+
+    def export_selected_pseudo_root_from_points(self) -> None:
+        """Export root pseudo-q derived geometrically from trunk markers."""
+
+        recon_dir = self._selected_reconstruction_dir()
+        if recon_dir is None:
+            messagebox.showinfo("Export pseudo q root", "Select one reconstruction first.")
+            return
+        bundle_path = recon_dir / "reconstruction_bundle.npz"
+        if not bundle_path.exists():
+            messagebox.showerror("Export pseudo q root", f"Bundle not found:\n{bundle_path}")
+            return
+
+        data = np.load(bundle_path, allow_pickle=True)
+        if "points_3d" not in data:
+            messagebox.showinfo(
+                "Export pseudo q root",
+                "The selected reconstruction does not contain 3D markers/points.",
+            )
+            return
+
+        points_3d = np.asarray(data["points_3d"], dtype=float)
+        frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(points_3d.shape[0], dtype=int)
+        fps = max(float(self.state.fps_var.get()), 1.0)
+        time_s = (
+            np.asarray(data["time_s"], dtype=float)
+            if "time_s" in data
+            else np.arange(points_3d.shape[0], dtype=float) / fps
+        )
+        if time_s.shape[0] > 1 and np.all(np.isfinite(time_s)):
+            dt = np.diff(time_s)
+            positive_dt = dt[np.isfinite(dt) & (dt > 0)]
+            fps = float(1.0 / np.median(positive_dt)) if positive_dt.size else fps
+
+        summary = self.status_summaries.get(recon_dir.name, {})
+        initial_rotation_correction = bool(
+            summary.get(
+                "initial_rotation_correction_applied",
+                summary.get("initial_rotation_correction_requested", self.state.initial_rotation_correction_var.get()),
+            )
+        )
+        q_root, correction_applied = extract_root_from_points(
+            points_3d,
+            initial_rotation_correction,
+            False,
+        )
+        qdot_root = centered_finite_difference(q_root, 1.0 / max(fps, 1.0))
+        qddot_root = centered_finite_difference(qdot_root, 1.0 / max(fps, 1.0))
+        output_path = recon_dir / f"{recon_dir.name}_pseudo_root_q.npz"
+        np.savez(
+            output_path,
+            name=recon_dir.name,
+            family="pseudo_root",
+            source="geometric_trunk_markers",
+            q=q_root,
+            qdot=qdot_root,
+            qddot=qddot_root,
+            q_names=np.asarray(ROOT_Q_NAMES, dtype=object),
+            frames=frames,
+            time_s=time_s,
+            initial_rotation_correction_applied=correction_applied,
+        )
+        messagebox.showinfo("Export pseudo q root", f"Pseudo root q written to:\n{output_path}")
 
     def refresh_timing_details(self) -> None:
         text = "Select a reconstruction to inspect timing details."

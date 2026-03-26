@@ -191,11 +191,12 @@ def jump_list_label(index: int, jump: DDJumpAnalysis) -> str:
 
 
 def jump_list_label_with_reference(index: int, jump: DDJumpAnalysis, expected_code: str | None = None) -> str:
-    """Build one jump-list label and append the expected DD code when available."""
+    """Build one jump-list label and append detected/expected DD codes when available."""
 
     label = jump_list_label(index, jump)
     if expected_code:
-        return f"{label} | ref {expected_code}"
+        detected_code = str(jump.code or "-")
+        return f"{label} | det {detected_code} | exp {expected_code}"
     return label
 
 
