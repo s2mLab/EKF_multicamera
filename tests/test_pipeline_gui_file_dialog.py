@@ -271,6 +271,20 @@ def test_compose_multiview_crop_points_includes_selected_reprojections():
     np.testing.assert_allclose(crop_points[:, :, 3:], reproj)
 
 
+def test_square_crop_bounds_returns_square_window():
+    x0, x1, y1, y0 = pipeline_gui.square_crop_bounds(
+        xmin=1200.0,
+        xmax=1380.0,
+        ymin=550.0,
+        ymax=800.0,
+        width=1920.0,
+        height=1080.0,
+        margin=0.1,
+    )
+
+    assert np.isclose(x1 - x0, y1 - y0)
+
+
 def test_preview_pose_frame_indices_aligns_sparse_bundle_frames():
     pose_frames = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=int)
     target_frames = np.array([0, 3, 6], dtype=int)
@@ -848,6 +862,77 @@ class _FakeButton:
             self.text = kwargs["text"]
 
 
+class _FakeAxis:
+    def __init__(self):
+        self.images = []
+
+    def imshow(self, image):
+        self.images.append(image)
+
+    def set_xlim(self, *_args, **_kwargs):
+        return None
+
+    def set_ylim(self, *_args, **_kwargs):
+        return None
+
+    def set_aspect(self, *_args, **_kwargs):
+        return None
+
+    def set_title(self, *_args, **_kwargs):
+        return None
+
+    def grid(self, *_args, **_kwargs):
+        return None
+
+    def set_xlabel(self, *_args, **_kwargs):
+        return None
+
+    def set_ylabel(self, *_args, **_kwargs):
+        return None
+
+    def get_legend_handles_labels(self):
+        return [], []
+
+    def legend(self, *_args, **_kwargs):
+        return None
+
+    def text(self, *_args, **_kwargs):
+        return None
+
+    def set_axis_off(self):
+        return None
+
+
+class _FakeFigure:
+    def __init__(self):
+        self.axis = _FakeAxis()
+
+    def clear(self):
+        return None
+
+    def subplots(self, *_args, **_kwargs):
+        return self.axis
+
+    def suptitle(self, *_args, **_kwargs):
+        return None
+
+    def tight_layout(self):
+        return None
+
+
+class _FakeCanvas:
+    def draw_idle(self):
+        return None
+
+
+class _FakeText:
+    def delete(self, *_args, **_kwargs):
+        return None
+
+    def insert(self, *_args, **_kwargs):
+        return None
+
+
 def test_model_tab_sync_frame_range_defaults_uses_available_2d_bounds(monkeypatch):
     tab = pipeline_gui.ModelTab.__new__(pipeline_gui.ModelTab)
     tab.frame_start = _FakeEntryField("")
@@ -1345,3 +1430,66 @@ def test_load_preview_bundle_accepts_missing_pose2sim_trc(tmp_path):
     np.testing.assert_array_equal(bundle["frames"], np.array([], dtype=int))
     np.testing.assert_array_equal(bundle["time_s"], np.array([], dtype=float))
     assert bundle["recon_3d"] == {}
+
+
+def test_camera_tools_tab_sync_dataset_dir_infers_images_root(monkeypatch, tmp_path):
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.state = SimpleNamespace(keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"))
+    tab.images_root_entry = _FakeEntryField("")
+    tab.refresh_available_reconstructions = lambda: None
+    tab.update_camera_filter_status = lambda: None
+    tab.load_resources = lambda: None
+    inferred_root = tmp_path / "inputs" / "images" / "trial"
+    inferred_root.mkdir(parents=True)
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui, "infer_execution_images_root", lambda _path: inferred_root)
+
+    pipeline_gui.CameraToolsTab.sync_dataset_dir(tab)
+
+    assert tab.images_root == inferred_root
+    assert tab.images_root_entry.get() == str(inferred_root)
+
+
+def test_camera_tools_render_flip_preview_uses_image_frame_number_before_overlay(monkeypatch, tmp_path):
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.base_pose_data = SimpleNamespace(
+        camera_names=["M11139"],
+        frames=np.array([24], dtype=int),
+        keypoints=np.zeros((1, 1, 17, 2), dtype=float),
+    )
+    tab.base_pose_data.keypoints[0, 0, 11] = np.array([100.0, 200.0], dtype=float)
+    tab.calibrations = {"M11139": SimpleNamespace(image_size=(1920, 1080))}
+    tab.flip_method_var = SimpleNamespace(get=lambda: "epipolar")
+    tab.flip_camera_var = SimpleNamespace(get=lambda: "M11139")
+    tab.flip_applied_var = SimpleNamespace(get=lambda: False)
+    tab.flip_figure = _FakeFigure()
+    tab.flip_canvas = _FakeCanvas()
+    tab.flip_details = _FakeText()
+    tab.flip_status_var = SimpleNamespace(set=lambda _value: None)
+    tab.images_root_entry = _FakeEntryField(str(tmp_path))
+    tab.images_root = tmp_path
+    tab.show_images_var = SimpleNamespace(get=lambda: True)
+    tab.flip_masks = {"epipolar": np.zeros((1, 1), dtype=bool)}
+    tab.flip_detail_arrays = {"epipolar": {}}
+    tab._selected_flip_frame_local_idx = lambda: 0
+    tab._reference_projection = lambda *_args, **_kwargs: (None, "none", "#444444")
+
+    requested = []
+    monkeypatch.setattr(
+        pipeline_gui,
+        "resolve_execution_image_path",
+        lambda root, camera_name, frame_number: requested.append((root, camera_name, frame_number)) or None,
+    )
+    drawn_colors = []
+    monkeypatch.setattr(
+        pipeline_gui,
+        "draw_skeleton_2d",
+        lambda _ax, _points, color, *_args, **_kwargs: drawn_colors.append(color),
+    )
+
+    pipeline_gui.CameraToolsTab.render_flip_preview(tab)
+
+    assert requested == [(tmp_path, "M11139", 24)]
+    assert drawn_colors[0] == "#000000"

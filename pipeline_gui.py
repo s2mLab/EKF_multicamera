@@ -921,31 +921,38 @@ def draw_skeleton_3d(ax, frame_points: np.ndarray, color: str, label: str, marke
 
 
 def draw_upper_back_preview(
-    ax, frame_points: np.ndarray, segment_frames: list[tuple[str, np.ndarray, np.ndarray]]
+    ax,
+    frame_points: np.ndarray,
+    segment_frames: list[tuple[str, np.ndarray, np.ndarray]] | None = None,
 ) -> None:
     """Draw the central back line/markers for models that include UPPER_BACK."""
 
     if frame_points is None:
         return
-    segment_map = {
-        str(name): (np.asarray(origin, dtype=float), np.asarray(rotation, dtype=float))
-        for name, origin, rotation in segment_frames
-    }
+    left_hip = np.asarray(frame_points[KP_INDEX["left_hip"]], dtype=float)
+    right_hip = np.asarray(frame_points[KP_INDEX["right_hip"]], dtype=float)
+    left_shoulder = np.asarray(frame_points[KP_INDEX["left_shoulder"]], dtype=float)
+    right_shoulder = np.asarray(frame_points[KP_INDEX["right_shoulder"]], dtype=float)
+    if not (
+        np.all(np.isfinite(left_hip))
+        and np.all(np.isfinite(right_hip))
+        and np.all(np.isfinite(left_shoulder))
+        and np.all(np.isfinite(right_shoulder))
+    ):
+        return
+    segment_map = (
+        {
+            str(name): (np.asarray(origin, dtype=float), np.asarray(rotation, dtype=float))
+            for name, origin, rotation in segment_frames
+        }
+        if segment_frames is not None
+        else {}
+    )
     upper_back_frame = segment_map.get("UPPER_BACK")
-    if upper_back_frame is None:
-        return
     trunk_frame = segment_map.get("TRUNK")
-    lower_center = upper_back_frame[0]
-    upper_center = 0.5 * (
-        np.asarray(frame_points[KP_INDEX["left_shoulder"]], dtype=float)
-        + np.asarray(frame_points[KP_INDEX["right_shoulder"]], dtype=float)
-    )
-    if not (np.all(np.isfinite(lower_center)) and np.all(np.isfinite(upper_center))):
-        return
-    hip_center = 0.5 * (
-        np.asarray(frame_points[KP_INDEX["left_hip"]], dtype=float)
-        + np.asarray(frame_points[KP_INDEX["right_hip"]], dtype=float)
-    )
+    hip_center = 0.5 * (left_hip + right_hip)
+    upper_center = 0.5 * (left_shoulder + right_shoulder)
+    lower_center = upper_back_frame[0] if upper_back_frame is not None else 0.5 * (hip_center + upper_center)
     if trunk_frame is not None:
         trunk_origin, trunk_rotation = trunk_frame
         if np.all(np.isfinite(trunk_origin)) and np.all(np.isfinite(trunk_rotation)):
@@ -1302,6 +1309,52 @@ def camera_layout(n_cameras: int) -> tuple[int, int]:
     return nrows, ncols
 
 
+def square_crop_bounds(
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    width: float,
+    height: float,
+    margin: float,
+) -> np.ndarray:
+    """Return a square crop that preserves the image isoview around visible points."""
+
+    span_x = max(10.0, float(xmax - xmin))
+    span_y = max(10.0, float(ymax - ymin))
+    half_size = 0.5 * max(span_x, span_y) * (1.0 + float(margin))
+    half_size = max(12.0, half_size)
+    center_x = 0.5 * (float(xmin) + float(xmax))
+    center_y = 0.5 * (float(ymin) + float(ymax))
+    x0 = center_x - half_size
+    x1 = center_x + half_size
+    y0 = center_y - half_size
+    y1 = center_y + half_size
+    if x0 < 0.0:
+        x1 = min(float(width), x1 - x0)
+        x0 = 0.0
+    if x1 > float(width):
+        x0 = max(0.0, x0 - (x1 - float(width)))
+        x1 = float(width)
+    if y0 < 0.0:
+        y1 = min(float(height), y1 - y0)
+        y0 = 0.0
+    if y1 > float(height):
+        y0 = max(0.0, y0 - (y1 - float(height)))
+        y1 = float(height)
+    final_size = min(float(x1 - x0), float(y1 - y0))
+    if final_size <= 0.0:
+        return np.array([0.0, float(width), float(height), 0.0], dtype=float)
+    center_x = 0.5 * (x0 + x1)
+    center_y = 0.5 * (y0 + y1)
+    half_final = 0.5 * final_size
+    x0 = max(0.0, center_x - half_final)
+    x1 = min(float(width), center_x + half_final)
+    y0 = max(0.0, center_y - half_final)
+    y1 = min(float(height), center_y + half_final)
+    return np.array([x0, x1, y1, y0], dtype=float)
+
+
 def compute_pose_crop_limits_2d(
     raw_2d: np.ndarray,
     calibrations: dict,
@@ -1322,16 +1375,14 @@ def compute_pose_crop_limits_2d(
             xy = points[valid]
             xmin, ymin = np.min(xy, axis=0)
             xmax, ymax = np.max(xy, axis=0)
-            dx = max(10.0, float(xmax - xmin) * margin)
-            dy = max(10.0, float(ymax - ymin) * margin)
-            camera_limits[frame_idx] = np.array(
-                [
-                    max(0.0, float(xmin - dx)),
-                    min(float(width), float(xmax + dx)),
-                    min(float(height), float(ymax + dy)),
-                    max(0.0, float(ymin - dy)),
-                ],
-                dtype=float,
+            camera_limits[frame_idx] = square_crop_bounds(
+                xmin=xmin,
+                xmax=xmax,
+                ymin=ymin,
+                ymax=ymax,
+                width=width,
+                height=height,
+                margin=margin,
             )
         valid_frames = np.flatnonzero(np.all(np.isfinite(camera_limits), axis=1))
         if valid_frames.size == 0:
@@ -3588,6 +3639,7 @@ class DualAnimationTab(CommandTab):
                 reconstruction_legend_label(self.state, name),
                 marker_size=float(self.marker_size.get()),
             )
+            draw_upper_back_preview(ax, frame_points)
             if self.show_trunk_frames_var.get():
                 origin, rotation = compute_root_frame_from_points(frame_points)
                 if origin is not None and rotation is not None:
@@ -4096,10 +4148,12 @@ class MultiViewTab(CommandTab):
                 continue
             cam_name = camera_names[ax_idx]
             width, height = self.calibrations[cam_name].image_size
+            has_image_background = False
             if self.show_images_var.get():
                 image_path = resolve_execution_image_path(images_root, cam_name, frame_number)
                 if image_path is not None and image_path.exists():
                     ax.imshow(plt.imread(str(image_path)))
+                    has_image_background = True
             apply_2d_axis_limits(
                 ax,
                 crop_mode=crop_mode,
@@ -4109,11 +4163,16 @@ class MultiViewTab(CommandTab):
                 width=width,
                 height=height,
             )
+            ax.set_aspect("equal", adjustable="box")
             ax.set_title(cam_name.replace("Camera", ""))
             ax.grid(alpha=0.15)
             if "raw" in selected:
                 draw_skeleton_2d(
-                    ax, raw_points[ax_idx, frame_idx], "#444444", "Raw", marker_size=float(self.marker_size.get())
+                    ax,
+                    raw_points[ax_idx, frame_idx],
+                    ("white" if has_image_background else "#444444"),
+                    "Raw",
+                    marker_size=float(self.marker_size.get()),
                 )
             for raw_name in selected:
                 mapped = "ekf_2d_acc" if raw_name == "ekf_2d" else raw_name
@@ -4130,9 +4189,7 @@ class MultiViewTab(CommandTab):
                     reconstruction_legend_label(self.state, mapped),
                     marker_size=float(self.marker_size.get()),
                 )
-            if ax_idx >= (nrows - 1) * ncols:
-                ax.set_xlabel("x (px)")
-            ax.set_ylabel("y (px)")
+            ax.tick_params(labelsize=8)
 
         handles, labels = axes[0].get_legend_handles_labels() if axes.size else ([], [])
         if handles:
@@ -4140,9 +4197,14 @@ class MultiViewTab(CommandTab):
             for handle, label in zip(handles, labels):
                 uniq[label] = handle
             self.preview_figure.legend(
-                list(uniq.values()), list(uniq.keys()), loc="upper center", ncol=min(5, len(uniq)), fontsize=8
+                list(uniq.values()),
+                list(uniq.keys()),
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.985),
+                ncol=min(5, len(uniq)),
+                fontsize=8,
             )
-        self.preview_figure.tight_layout()
+        self.preview_figure.subplots_adjust(left=0.035, right=0.995, bottom=0.035, top=0.93, wspace=0.08, hspace=0.18)
         self.preview_canvas.draw_idle()
 
     def _ensure_crop_limits(
@@ -9434,6 +9496,7 @@ class CameraToolsTab(ttk.Frame):
         self.flip_diagnostics: dict[str, dict[str, object]] = {}
         self.flip_detail_arrays: dict[str, dict[str, np.ndarray]] = {}
         self.flip_frame_local_indices: list[int] = []
+        self.images_root: Path | None = None
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
@@ -9583,6 +9646,18 @@ class CameraToolsTab(ttk.Frame):
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
+        image_controls = ttk.Frame(inspector_box)
+        image_controls.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.show_images_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            image_controls,
+            text="Show images",
+            variable=self.show_images_var,
+            command=self.render_flip_preview,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.images_root_entry = LabeledEntry(image_controls, "Images root", "", browse=True, directory=True)
+        self.images_root_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
         inspector_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         frame_panel = ttk.Frame(inspector_body)
@@ -9623,6 +9698,7 @@ class CameraToolsTab(ttk.Frame):
         attach_tooltip(
             self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F."
         )
+        attach_tooltip(self.images_root_entry, "Dossier d'images utilisé comme fond du preview caméra, si disponible.")
         attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
         attach_tooltip(
             self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée."
@@ -9649,6 +9725,8 @@ class CameraToolsTab(ttk.Frame):
         return "break"
 
     def sync_dataset_dir(self) -> None:
+        self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+        self.images_root_entry.var.set("" if self.images_root is None else display_path(self.images_root))
         self.refresh_available_reconstructions()
         self.update_camera_filter_status()
         self.load_resources()
@@ -9952,6 +10030,7 @@ class CameraToolsTab(ttk.Frame):
             self.flip_canvas.draw_idle()
             return
         cam_idx = list(self.base_pose_data.camera_names).index(camera_name)
+        frame_number = int(self.base_pose_data.frames[frame_local_idx])
         raw_points = np.asarray(self.base_pose_data.keypoints[cam_idx, frame_local_idx], dtype=float)
         display_raw_points = swap_left_right_keypoints(raw_points) if self.flip_applied_var.get() else raw_points
         projected_points, projected_label, projected_color = self._reference_projection(camera_name, frame_local_idx)
@@ -9979,10 +10058,19 @@ class CameraToolsTab(ttk.Frame):
             y_limits = (float(height), 0.0)
 
         ax = self.flip_figure.subplots(1, 1)
+        has_image_background = False
+        images_root = (
+            Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
+        )
+        if self.show_images_var.get():
+            image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
+            if image_path is not None and image_path.exists():
+                ax.imshow(plt.imread(str(image_path)))
+                has_image_background = True
         draw_skeleton_2d(
             ax,
             display_raw_points,
-            "#000000",
+            ("white" if has_image_background else "#000000"),
             "Raw 2D",
             marker_size=28.0,
             marker_fill=False,
@@ -10008,7 +10096,6 @@ class CameraToolsTab(ttk.Frame):
             ax.legend(list(uniq.values()), list(uniq.keys()), loc="best", fontsize=8)
         detail_arrays = self.flip_detail_arrays.get(method, {})
         suspect = bool(self.flip_masks.get(method, np.zeros((0, 0), dtype=bool))[cam_idx, frame_local_idx])
-        frame_number = int(self.base_pose_data.frames[frame_local_idx])
         self.flip_figure.suptitle(
             f"{camera_name} | frame {frame_number} | {method} | suspect={'yes' if suspect else 'no'} | "
             f"reference={projected_label if projected_points is not None else 'none'}"
@@ -11072,7 +11159,7 @@ class LauncherApp(tk.Tk):
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill=tk.BOTH, expand=True)
         self.notebook.add(DataExplorer2DTab(self.notebook, state), text="2D analysis")
-        self.notebook.add(CameraToolsTab(self.notebook, state), text="Caméras")
+        self.notebook.add(CameraToolsTab(self.notebook, state), text="Cameras")
         self.notebook.add(ModelTab(self.notebook, state), text="Models")
         self.notebook.add(ProfilesTab(self.notebook, state), text="Profiles")
         self.notebook.add(ReconstructionsTab(self.notebook, state), text="Reconstructions")

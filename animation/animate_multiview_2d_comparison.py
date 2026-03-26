@@ -215,6 +215,52 @@ def camera_layout(n_cameras: int) -> tuple[int, int]:
     return nrows, ncols
 
 
+def square_crop_bounds(
+    xmin: float,
+    xmax: float,
+    ymin: float,
+    ymax: float,
+    width: float,
+    height: float,
+    margin: float,
+) -> np.ndarray:
+    """Return a square crop preserving equal x/y scale around visible points."""
+
+    span_x = max(10.0, float(xmax - xmin))
+    span_y = max(10.0, float(ymax - ymin))
+    half_size = 0.5 * max(span_x, span_y) * (1.0 + float(margin))
+    half_size = max(12.0, half_size)
+    center_x = 0.5 * (float(xmin) + float(xmax))
+    center_y = 0.5 * (float(ymin) + float(ymax))
+    x0 = center_x - half_size
+    x1 = center_x + half_size
+    y0 = center_y - half_size
+    y1 = center_y + half_size
+    if x0 < 0.0:
+        x1 = min(float(width), x1 - x0)
+        x0 = 0.0
+    if x1 > float(width):
+        x0 = max(0.0, x0 - (x1 - float(width)))
+        x1 = float(width)
+    if y0 < 0.0:
+        y1 = min(float(height), y1 - y0)
+        y0 = 0.0
+    if y1 > float(height):
+        y0 = max(0.0, y0 - (y1 - float(height)))
+        y1 = float(height)
+    final_size = min(float(x1 - x0), float(y1 - y0))
+    if final_size <= 0.0:
+        return np.array([0.0, float(width), float(height), 0.0], dtype=float)
+    center_x = 0.5 * (x0 + x1)
+    center_y = 0.5 * (y0 + y1)
+    half_final = 0.5 * final_size
+    x0 = max(0.0, center_x - half_final)
+    x1 = min(float(width), center_x + half_final)
+    y0 = max(0.0, center_y - half_final)
+    y1 = min(float(height), center_y + half_final)
+    return np.array([x0, x1, y1, y0], dtype=float)
+
+
 def layer_style(name: str, marker_size: float) -> dict[str, object]:
     if name == "raw":
         return {
@@ -233,6 +279,15 @@ def layer_style(name: str, marker_size: float) -> dict[str, object]:
         "alpha": 0.9 if name == "pose2sim" else 0.85,
         "marker_size": marker_size,
     }
+
+
+def adapt_raw_style_for_background(style: dict[str, object], has_image_background: bool) -> dict[str, object]:
+    """Switch raw 2D to white when an image is visible underneath."""
+
+    adapted = dict(style)
+    if has_image_background and adapted.get("label") == "Raw 2D":
+        adapted["color"] = "white"
+    return adapted
 
 
 def grouped_points_2d(points: np.ndarray) -> dict[str, np.ndarray]:
@@ -275,16 +330,14 @@ def compute_pose_crop_limits(
             xy = points[valid]
             xmin, ymin = np.min(xy, axis=0)
             xmax, ymax = np.max(xy, axis=0)
-            dx = max(10.0, float(xmax - xmin) * margin)
-            dy = max(10.0, float(ymax - ymin) * margin)
-            camera_limits[frame_idx] = np.array(
-                [
-                    max(0.0, float(xmin - dx)),
-                    min(float(width), float(xmax + dx)),
-                    min(float(height), float(ymax + dy)),
-                    max(0.0, float(ymin - dy)),
-                ],
-                dtype=float,
+            camera_limits[frame_idx] = square_crop_bounds(
+                xmin=xmin,
+                xmax=xmax,
+                ymin=ymin,
+                ymax=ymax,
+                width=width,
+                height=height,
+                margin=margin,
             )
         valid_frames = np.flatnonzero(np.all(np.isfinite(camera_limits), axis=1))
         if valid_frames.size == 0:
@@ -457,7 +510,7 @@ def create_animation(
     n_cameras = len(camera_names)
     n_frames = raw_2d.shape[1]
     nrows, ncols = camera_layout(n_cameras)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.9 * ncols, 4.8 * nrows))
     axes = np.atleast_1d(axes).ravel()
 
     display_names = ([] if "raw" not in show else ["raw"]) + [
@@ -491,9 +544,10 @@ def create_animation(
             width=width,
             height=height,
         )
-        ax.set_aspect("equal")
+        ax.set_aspect("equal", adjustable="box")
         ax.set_title(cam_name)
         ax.grid(alpha=0.15)
+        ax.tick_params(labelsize=8)
         image_artists.append(ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8), visible=False, zorder=0))
         for key in display_names:
             style = styles[key]
@@ -535,8 +589,8 @@ def create_animation(
     fig.legend(
         legend_handles,
         [styles[key]["label"] for key in display_names if artists[key] and artists[key][0] is not None],
-        loc="lower right",
-        bbox_to_anchor=(0.995, 0.02),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
         ncol=1,
         frameon=True,
     )
@@ -559,11 +613,13 @@ def create_animation(
         suspect_labels = []
         for cam_idx in range(n_cameras):
             label = camera_names[cam_idx]
+            has_image_background = False
             if show_images:
                 image_path = resolve_execution_image_path(images_root, label, int(frame_numbers[frame_idx]))
                 if image_path is not None and image_path.exists():
                     image_artists[cam_idx].set_data(plt.imread(str(image_path)))
                     image_artists[cam_idx].set_visible(True)
+                    has_image_background = True
                 else:
                     image_artists[cam_idx].set_visible(False)
             else:
@@ -584,6 +640,11 @@ def create_animation(
                 height=height,
             )
             if "raw" in artists:
+                raw_color = "white" if has_image_background else "black"
+                for scatter in artists["raw"][cam_idx].values():
+                    scatter.set_color(raw_color)
+                for line in line_artists["raw"][cam_idx]:
+                    line.set_color(raw_color)
                 set_offsets(artists["raw"][cam_idx], raw_2d[cam_idx, frame_idx])
                 set_lines(line_artists["raw"][cam_idx], raw_2d[cam_idx, frame_idx])
             for name in display_names:
@@ -677,7 +738,7 @@ def render_frame(
     """Rend une frame PNG de l'animation 2D."""
     n_cameras = len(camera_names)
     nrows, ncols = camera_layout(n_cameras)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.9 * ncols, 4.8 * nrows))
     axes = np.atleast_1d(axes).ravel()
     crop_limits = (
         compute_pose_crop_limits(
@@ -689,18 +750,18 @@ def render_frame(
     display_names = ([] if "raw" not in show else ["raw"]) + [
         name for name in show if name != "raw" and name in layer_2d
     ]
-    styles = {name: layer_style(name, marker_size) for name in display_names}
-
     for ax_idx, ax in enumerate(axes):
         if ax_idx >= n_cameras:
             ax.axis("off")
             continue
         cam_name = camera_names[ax_idx]
         width, height = calibrations[cam_name].image_size
+        has_image_background = False
         if show_images:
             image_path = resolve_execution_image_path(images_root, cam_name, int(frame_numbers[frame_idx]))
             if image_path is not None and image_path.exists():
                 ax.imshow(plt.imread(str(image_path)))
+                has_image_background = True
         apply_2d_axis_limits(
             ax,
             crop_mode=crop_mode,
@@ -710,38 +771,43 @@ def render_frame(
             width=width,
             height=height,
         )
-        ax.set_aspect("equal")
+        ax.set_aspect("equal", adjustable="box")
         if confusion_mask is not None and confusion_mask[ax_idx, frame_idx]:
             ax.set_title(f"{cam_name} | face/dos ?", color="#c44e52")
         else:
             ax.set_title(cam_name)
         ax.grid(alpha=0.15)
+        ax.tick_params(labelsize=8)
 
-        if "raw" in styles:
-            draw_points_and_lines(ax, raw_2d[ax_idx, frame_idx], styles["raw"])
+        if "raw" in display_names:
+            draw_points_and_lines(
+                ax,
+                raw_2d[ax_idx, frame_idx],
+                adapt_raw_style_for_background(layer_style("raw", marker_size), has_image_background),
+            )
         for name in display_names:
             if name == "raw":
                 continue
-            draw_points_and_lines(ax, layer_2d[name][ax_idx, frame_idx], styles[name])
+            draw_points_and_lines(ax, layer_2d[name][ax_idx, frame_idx], layer_style(name, marker_size))
 
     handles = [
         plt.Line2D(
             [],
             [],
-            color=styles[key]["color"],
+            color=adapt_raw_style_for_background(layer_style(key, marker_size), False)["color"],
             marker=scatter_markers(key)["center"],
-            linestyle=styles[key]["linestyle"],
-            linewidth=styles[key]["linewidth"],
-            alpha=styles[key]["alpha"],
-            label=styles[key]["label"],
+            linestyle=layer_style(key, marker_size)["linestyle"],
+            linewidth=layer_style(key, marker_size)["linewidth"],
+            alpha=layer_style(key, marker_size)["alpha"],
+            label=layer_style(key, marker_size)["label"],
         )
         for key in display_names
     ]
     fig.legend(
         handles,
-        [styles[key]["label"] for key in display_names],
-        loc="lower right",
-        bbox_to_anchor=(0.995, 0.02),
+        [layer_style(key, marker_size)["label"] for key in display_names],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
         ncol=1,
         frameon=True,
     )
@@ -751,7 +817,7 @@ def render_frame(
     ]
     warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
     fig.suptitle(f"Frame {int(frame_numbers[frame_idx])} | {phase}{warning}", fontsize=14)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.035, right=0.995, bottom=0.035, top=0.92, wspace=0.08, hspace=0.18)
     fig.savefig(output_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     return output_path
