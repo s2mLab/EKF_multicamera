@@ -37,6 +37,7 @@ from vitpose_ekf_pipeline import (
     sample_frames_uniformly,
     sampson_error_pixels_vectorized,
     smooth_camera_time_series,
+    stack_measurement_blocks,
     support_coherence_method_for_runtime,
     symmetric_epipolar_distance_vectorized,
     triangulation_method_from_coherence_method,
@@ -227,6 +228,26 @@ def test_sequential_measurement_update_matches_batch_update():
     sequential_state, sequential_covariance = sequential
     np.testing.assert_allclose(sequential_state, batch_state, atol=1e-8, rtol=1e-8)
     np.testing.assert_allclose(sequential_covariance, batch_covariance, atol=1e-8, rtol=1e-8)
+
+
+def test_stack_measurement_blocks_concatenates_valid_blocks():
+    z1 = np.array([1.0, 2.0], dtype=float)
+    h1 = np.array([0.1, 0.2], dtype=float)
+    H1 = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float)
+    R1 = np.array([0.5, 0.6], dtype=float)
+    z2 = np.array([3.0], dtype=float)
+    h2 = np.array([0.3], dtype=float)
+    H2 = np.array([[0.4, 0.5]], dtype=float)
+    R2 = np.array([0.7], dtype=float)
+
+    stacked = stack_measurement_blocks([(z1, h1, H1, R1), (z2, h2, H2, R2)], nq=2)
+
+    assert stacked is not None
+    z, h, H_q, R_diag_array = stacked
+    np.testing.assert_allclose(z, np.array([1.0, 2.0, 3.0], dtype=float))
+    np.testing.assert_allclose(h, np.array([0.1, 0.2, 0.3], dtype=float))
+    np.testing.assert_allclose(H_q, np.array([[1.0, 0.0], [0.0, 1.0], [0.4, 0.5]], dtype=float))
+    np.testing.assert_allclose(R_diag_array, np.array([0.5, 0.6, 0.7], dtype=float))
 
 
 def test_weighted_median_prefers_heavily_weighted_values():

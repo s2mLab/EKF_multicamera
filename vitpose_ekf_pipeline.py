@@ -942,6 +942,43 @@ def apply_measurement_update_batch(
     )
 
 
+def stack_measurement_blocks(
+    measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    nq: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Concatenate per-camera/pseudo-observation blocks into one batch update."""
+
+    z_blocks = []
+    h_blocks = []
+    hq_blocks = []
+    r_blocks = []
+    for z, h, H_q, R_diag_array in measurement_blocks:
+        if z.size == 0 or h.size == 0 or H_q.size == 0 or R_diag_array.size == 0:
+            continue
+        z_array = np.asarray(z, dtype=float).reshape(-1)
+        h_array = np.asarray(h, dtype=float).reshape(-1)
+        hq_array = np.asarray(H_q, dtype=float).reshape((-1, nq))
+        r_array = np.asarray(R_diag_array, dtype=float).reshape(-1)
+        if (
+            z_array.shape[0] != h_array.shape[0]
+            or z_array.shape[0] != hq_array.shape[0]
+            or z_array.shape[0] != r_array.shape[0]
+        ):
+            continue
+        z_blocks.append(z_array)
+        h_blocks.append(h_array)
+        hq_blocks.append(hq_array)
+        r_blocks.append(r_array)
+    if not z_blocks:
+        return None
+    return (
+        np.concatenate(z_blocks),
+        np.concatenate(h_blocks),
+        np.vstack(hq_blocks),
+        np.concatenate(r_blocks),
+    )
+
+
 def apply_measurement_update_sequential(
     predicted_state: np.ndarray,
     predicted_covariance: np.ndarray,
@@ -3942,18 +3979,35 @@ class MultiViewKinematicEKF:
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
         pseudo_block = self._upper_back_pseudo_measurement_block(q)
+        zero_prior_blocks = self._upper_back_zero_prior_blocks(q)
+        has_upper_back_priors = pseudo_block is not None or bool(zero_prior_blocks)
         if pseudo_block is not None:
             measurement_blocks.append(pseudo_block)
-        measurement_blocks.extend(self._upper_back_zero_prior_blocks(q))
+        measurement_blocks.extend(zero_prior_blocks)
 
         t_solve = time.perf_counter()
-        update_result = apply_measurement_update_sequential(
-            predicted_state=predicted_state,
-            predicted_covariance=predicted_covariance,
-            measurement_blocks=measurement_blocks,
-            nq=self.nq,
-            identity_x=self.identity_x,
-        )
+        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_upper_back_priors else None
+        update_result = None
+        if stacked_measurements is not None:
+            z_batch, h_batch, hq_batch, r_batch = stacked_measurements
+            update_result = apply_measurement_update_batch(
+                predicted_state=predicted_state,
+                predicted_covariance=predicted_covariance,
+                z=z_batch,
+                h=h_batch,
+                H_q=hq_batch,
+                R_diag_array=r_batch,
+                nq=self.nq,
+                identity_x=self.identity_x,
+            )
+        if update_result is None:
+            update_result = apply_measurement_update_sequential(
+                predicted_state=predicted_state,
+                predicted_covariance=predicted_covariance,
+                measurement_blocks=measurement_blocks,
+                nq=self.nq,
+                identity_x=self.identity_x,
+            )
         if update_result is None:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["solve_s"] += time.perf_counter() - t_solve
