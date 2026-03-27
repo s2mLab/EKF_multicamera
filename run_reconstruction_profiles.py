@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Dossier racine des sorties.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
+    parser.add_argument("--annotations-path", type=Path, default=None)
     parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--fps", type=float, default=120.0)
     parser.add_argument("--triangulation-workers", type=int, default=6)
@@ -94,6 +95,8 @@ def main() -> None:
             python_executable=sys.executable,
             camera_names_override=[name.strip() for name in args.camera_names.split(",") if name.strip()] or None,
         )
+        if args.annotations_path is not None:
+            cmd.extend(["--annotations-path", str(args.annotations_path)])
         cmd.extend(["--fps", str(args.fps), "--triangulation-workers", str(args.triangulation_workers)])
         print(f"\n[PROFILE {profile_idx}/{len(profiles)}] {profile.name}", flush=True)
         print(shlex.join(cmd), flush=True)
@@ -122,6 +125,7 @@ def main() -> None:
                 "dataset_name": dataset_name,
                 "calib": str(args.calib),
                 "keypoints": str(args.keypoints),
+                "annotations_path": None if args.annotations_path is None else str(args.annotations_path),
                 "pose2sim_trc": None if args.pose2sim_trc is None else str(args.pose2sim_trc),
                 "fps": float(args.fps),
                 "triangulation_workers": int(args.triangulation_workers),

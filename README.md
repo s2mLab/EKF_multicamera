@@ -363,6 +363,8 @@ The repository contains a single CI workflow under:
 - Improve hip and knee flexion handling for EKF outputs to distinguish `piked` and `grouped` body shapes more robustly.
 - Compute hip and knee flexion angles directly from triangulated 3D data.
 - Continue developing the execution-error analysis module.
+- Better control the foot position on the trampoline bed: when a foot is in contact with the bed, keep it fixed in the horizontal plane with a high-confidence pseudo-observation during the whole contact phase.
+- Explore a model with `3 DoF` in the back and constrain it with pseudo-observations, for example by tracking hip flexion angles and attracting them toward `0`.
 
 ## Notes
 

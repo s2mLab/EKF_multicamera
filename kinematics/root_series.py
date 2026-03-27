@@ -63,6 +63,7 @@ def root_series_from_points(
     dt: float,
     initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    translation_origin: str = "pelvis",
 ) -> np.ndarray:
     """Build a root q or qdot series directly from geometric 3D points."""
 
@@ -70,6 +71,7 @@ def root_series_from_points(
         np.asarray(points_3d, dtype=float),
         bool(initial_rotation_correction),
         bool(unwrap_rotations),
+        translation_origin=str(translation_origin),
     )
     if quantity == "q":
         return root_q
@@ -86,6 +88,7 @@ def root_series_from_model_markers(
     dt: float,
     initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    translation_origin: str = "pelvis",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build one root series from model markers reconstructed from ``q``.
 
@@ -102,6 +105,7 @@ def root_series_from_model_markers(
         dt=dt,
         initial_rotation_correction=initial_rotation_correction,
         unwrap_rotations=unwrap_rotations,
+        translation_origin=translation_origin,
     )
     return series, marker_points
 

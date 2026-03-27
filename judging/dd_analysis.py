@@ -598,10 +598,15 @@ def analyze_dd_session(
     analysis_start_frame = max(0, int(analysis_start_frame))
     window_frames = max(1, int(round(float(smoothing_window_s) * float(fps))))
     smoothed_height = smooth_signal(height, window_frames=window_frames)
+    threshold_reference = (
+        smoothed_height[analysis_start_frame:] if analysis_start_frame < smoothed_height.shape[0] else smoothed_height
+    )
+    if threshold_reference.size == 0:
+        threshold_reference = smoothed_height
     effective_threshold = (
         float(height_threshold)
         if height_threshold is not None
-        else relative_height_threshold(smoothed_height, ratio=height_threshold_range_ratio)
+        else relative_height_threshold(threshold_reference, ratio=height_threshold_range_ratio)
     )
     airborne_mask = smoothed_height > effective_threshold
     airborne_mask[:analysis_start_frame] = False

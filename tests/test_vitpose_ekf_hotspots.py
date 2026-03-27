@@ -20,6 +20,7 @@ from vitpose_ekf_pipeline import (
     canonical_coherence_method,
     canonical_triangulation_method,
     canonicalize_model_q_rotation_branches,
+    canonicalize_state_q_rotation_branches,
     choose_ekf_prediction_gate_measurements,
     compute_biorbd_kalman_initial_state,
     compute_camera_epipolar_cost,
@@ -31,11 +32,13 @@ from vitpose_ekf_pipeline import (
     compute_epipolar_frame_coherence,
     compute_framewise_epipolar_measurement_weights,
     load_pose_data,
+    once_triangulation_from_best_cameras,
     project_point_with_projection_matrices,
     q_names_from_model,
     sample_frames_uniformly,
     sampson_error_pixels_vectorized,
     smooth_camera_time_series,
+    stack_measurement_blocks,
     support_coherence_method_for_runtime,
     symmetric_epipolar_distance_vectorized,
     triangulation_method_from_coherence_method,
@@ -93,6 +96,44 @@ def test_project_point_with_projection_matrices_matches_camera_projection():
     projected = project_point_with_projection_matrices(np.asarray([camera.P for camera in cameras], dtype=float), point)
     expected = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
     np.testing.assert_allclose(projected, expected, atol=1e-8)
+
+
+def test_once_triangulation_ignores_nan_observations_and_requires_enough_valid_views():
+    point = np.array([0.2, -0.1, 2.0], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0), _make_camera("cam2", -0.8)]
+    observations = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
+    observations[2] = np.array([np.nan, np.nan], dtype=float)
+    confidences = np.array([1.0, 0.8, 0.9], dtype=float)
+
+    triangulated, mean_error, per_view_error, coherence_per_view, excluded_views = once_triangulation_from_best_cameras(
+        [camera.P for camera in cameras],
+        observations,
+        confidences,
+        cameras,
+        error_threshold_px=5.0,
+        min_cameras_for_triangulation=2,
+    )
+
+    np.testing.assert_allclose(triangulated, point, atol=1e-8)
+    assert np.isfinite(mean_error)
+    assert np.isnan(per_view_error[2])
+    assert coherence_per_view[2] == 0.0
+    assert bool(excluded_views[2]) is True
+
+    triangulated, mean_error, per_view_error, coherence_per_view, excluded_views = once_triangulation_from_best_cameras(
+        [camera.P for camera in cameras],
+        observations,
+        confidences,
+        cameras,
+        error_threshold_px=5.0,
+        min_cameras_for_triangulation=3,
+    )
+
+    assert np.all(np.isnan(triangulated))
+    assert np.isnan(mean_error)
+    assert np.all(np.isnan(per_view_error))
+    assert np.all(coherence_per_view == 0.0)
+    assert np.array_equal(excluded_views, np.array([False, False, True]))
 
 
 def test_project_points_and_jacobians_matches_scalar_projection():
@@ -188,6 +229,26 @@ def test_sequential_measurement_update_matches_batch_update():
     sequential_state, sequential_covariance = sequential
     np.testing.assert_allclose(sequential_state, batch_state, atol=1e-8, rtol=1e-8)
     np.testing.assert_allclose(sequential_covariance, batch_covariance, atol=1e-8, rtol=1e-8)
+
+
+def test_stack_measurement_blocks_concatenates_valid_blocks():
+    z1 = np.array([1.0, 2.0], dtype=float)
+    h1 = np.array([0.1, 0.2], dtype=float)
+    H1 = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float)
+    R1 = np.array([0.5, 0.6], dtype=float)
+    z2 = np.array([3.0], dtype=float)
+    h2 = np.array([0.3], dtype=float)
+    H2 = np.array([[0.4, 0.5]], dtype=float)
+    R2 = np.array([0.7], dtype=float)
+
+    stacked = stack_measurement_blocks([(z1, h1, H1, R1), (z2, h2, H2, R2)], nq=2)
+
+    assert stacked is not None
+    z, h, H_q, R_diag_array = stacked
+    np.testing.assert_allclose(z, np.array([1.0, 2.0, 3.0], dtype=float))
+    np.testing.assert_allclose(h, np.array([0.1, 0.2, 0.3], dtype=float))
+    np.testing.assert_allclose(H_q, np.array([[1.0, 0.0], [0.0, 1.0], [0.4, 0.5]], dtype=float))
+    np.testing.assert_allclose(R_diag_array, np.array([0.5, 0.6, 0.7], dtype=float))
 
 
 def test_weighted_median_prefers_heavily_weighted_values():
@@ -564,6 +625,52 @@ def test_load_pose_data_ignores_unselected_json_cameras(tmp_path: Path):
     assert pose_data.keypoints.shape[0] == 2
 
 
+def test_load_pose_data_annotated_overlays_sparse_annotations(tmp_path: Path):
+    keypoints_path = tmp_path / "keypoints.json"
+    annotations_path = tmp_path / "annotations.json"
+    payload = {
+        "Camera1_M11139": {
+            "frames": [0, 1],
+            "keypoints": np.zeros((2, 17, 2), dtype=float).tolist(),
+            "scores": np.ones((2, 17), dtype=float).tolist(),
+        }
+    }
+    keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+    annotations_path.write_text(
+        json.dumps(
+            {
+                "annotations": {
+                    "M11139": {
+                        "1": {
+                            "left_wrist": {
+                                "xy": [123.0, 456.0],
+                                "score": 0.75,
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    calibrations = {"M11139": _make_camera("M11139", 0.0)}
+
+    pose_data = load_pose_data(
+        keypoints_path,
+        calibrations,
+        data_mode="annotated",
+        annotations_path=annotations_path,
+    )
+
+    left_wrist_idx = KP_INDEX["left_wrist"]
+    np.testing.assert_allclose(pose_data.keypoints[0, 1, left_wrist_idx], np.array([123.0, 456.0], dtype=float))
+    assert pose_data.scores[0, 1, left_wrist_idx] == 0.75
+    np.testing.assert_allclose(pose_data.raw_keypoints[0, 1, left_wrist_idx], np.array([0.0, 0.0], dtype=float))
+    np.testing.assert_allclose(
+        pose_data.annotated_keypoints[0, 1, left_wrist_idx], np.array([123.0, 456.0], dtype=float)
+    )
+
+
 def test_vectorized_epipolar_cost_matches_scalar_versions():
     cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
     point = np.array([0.2, -0.1, 2.5], dtype=float)
@@ -710,7 +817,9 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
         vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda _model, _reconstruction: triangulation_state
     )
     monkeypatch.setattr(
-        vitpose_ekf_pipeline, "first_valid_root_pose_from_triangulation", lambda _reconstruction: (12, root_pose)
+        vitpose_ekf_pipeline,
+        "first_valid_root_pose_from_triangulation",
+        lambda _reconstruction, **_kwargs: (12, root_pose),
     )
 
     state, diagnostics = compute_biorbd_kalman_initial_state(
@@ -727,9 +836,9 @@ def test_compute_biorbd_kalman_initial_state_root_pose_zero_rest(monkeypatch):
     assert state[q_names.index("TRUNK:TransX")] == 1.0
     assert state[q_names.index("TRUNK:TransY")] == 2.0
     assert state[q_names.index("TRUNK:TransZ")] == 3.0
-    assert state[q_names.index("TRUNK:RotY")] == 0.4
-    assert state[q_names.index("TRUNK:RotX")] == -0.2
-    assert state[q_names.index("TRUNK:RotZ")] == 1.1
+    assert math.isclose(state[q_names.index("TRUNK:RotY")], 0.4)
+    assert math.isclose(state[q_names.index("TRUNK:RotX")], -0.2)
+    assert math.isclose(state[q_names.index("TRUNK:RotZ")], 1.1)
     assert state[q_names.index("LEFT_UPPER_ARM:RotY")] == 0.0
     assert state[q_names.index("LEFT_THIGH:RotY")] == 0.0
 
@@ -797,6 +906,27 @@ def test_canonicalize_model_q_rotation_branches_reextracts_multi_axis_blocks():
     assert abs(canonical_q[q_names.index("TRUNK:RotZ")]) < abs(root_input[2])
 
 
+def test_canonicalize_state_q_rotation_branches_only_changes_q_block():
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    nq = model.nbQ()
+    state = np.zeros(3 * nq, dtype=float)
+    state[q_names.index("TRUNK:RotY")] = math.pi + 0.4
+    state[q_names.index("TRUNK:RotX")] = -0.2
+    state[q_names.index("TRUNK:RotZ")] = 2.0 * math.pi + 0.3
+    state[nq:] = 7.0
+
+    canonical_state = canonicalize_state_q_rotation_branches(model, state)
+
+    np.testing.assert_allclose(canonical_state[nq:], state[nq:], atol=1e-12)
+    np.testing.assert_allclose(
+        Rotation.from_euler("YXZ", canonical_state[[3, 4, 5]], degrees=False).as_matrix(),
+        Rotation.from_euler("YXZ", state[[3, 4, 5]], degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    assert abs(canonical_state[q_names.index("TRUNK:RotZ")]) < abs(state[q_names.index("TRUNK:RotZ")])
+
+
 def test_initial_state_from_ekf_bootstrap_canonicalizes_rotation_branches(monkeypatch):
     model = _FakeModel()
     q_names = q_names_from_model(model)
@@ -851,6 +981,28 @@ def test_initial_state_from_ekf_bootstrap_canonicalizes_rotation_branches(monkey
         Rotation.from_euler("YXZ", [math.pi + 0.25, -0.15, 2.0 * math.pi + 0.35], degrees=False).as_matrix(),
         atol=1e-12,
     )
+
+
+def test_compute_biorbd_kalman_initial_state_canonicalizes_triangulation_ik(monkeypatch):
+    model = _FakeModel()
+    q_names = q_names_from_model(model)
+    nq = model.nbQ()
+    state = np.zeros(3 * nq, dtype=float)
+    state[q_names.index("TRUNK:RotY")] = math.pi + 0.35
+    state[q_names.index("TRUNK:RotX")] = -0.15
+    state[q_names.index("TRUNK:RotZ")] = 2.0 * math.pi + 0.25
+
+    monkeypatch.setattr(vitpose_ekf_pipeline, "initial_state_from_triangulation", lambda *_args, **_kwargs: state)
+
+    corrected_state, diagnostics = compute_biorbd_kalman_initial_state(model, object(), method="triangulation_ik")
+
+    assert diagnostics["method"] == "triangulation_ik"
+    np.testing.assert_allclose(
+        Rotation.from_euler("YXZ", corrected_state[[3, 4, 5]], degrees=False).as_matrix(),
+        Rotation.from_euler("YXZ", state[[3, 4, 5]], degrees=False).as_matrix(),
+        atol=1e-12,
+    )
+    assert abs(corrected_state[q_names.index("TRUNK:RotZ")]) < abs(state[q_names.index("TRUNK:RotZ")])
 
 
 def test_choose_ekf_prediction_gate_measurements_prefers_swapped_when_prediction_matches():
@@ -945,7 +1097,7 @@ def test_choose_ekf_prediction_gate_measurements_skips_when_error_delta_is_too_s
 def test_upper_back_pseudo_measurement_block_tracks_mean_hip_flexion():
     ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
     ekf.nq = 6
-    ekf.upper_back_rotx_idx = 1
+    ekf.upper_back_sagittal_idx = 1
     ekf.hip_flexion_indices = (3, 4)
     ekf.upper_back_sagittal_gain = 0.2
     ekf.upper_back_pseudo_std_rad = np.deg2rad(10.0)
@@ -960,3 +1112,32 @@ def test_upper_back_pseudo_measurement_block_tracks_mean_hip_flexion():
     np.testing.assert_allclose(h, np.array([0.05], dtype=float))
     np.testing.assert_allclose(h_q, np.array([[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], dtype=float))
     np.testing.assert_allclose(variance, np.array([np.deg2rad(10.0) ** 2], dtype=float))
+
+
+def test_upper_back_zero_prior_blocks_pull_lateral_and_axial_dofs_to_zero():
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.nq = 6
+    ekf.upper_back_zero_prior_indices = (2, 5)
+    ekf.upper_back_pseudo_std_rad = np.deg2rad(8.0)
+
+    reference_q = np.array([0.0, 0.0, 0.2, 0.0, 0.0, -0.15], dtype=float)
+
+    blocks = ekf._upper_back_zero_prior_blocks(reference_q)
+
+    assert len(blocks) == 2
+    first_z, first_h, first_h_q, first_variance = blocks[0]
+    second_z, second_h, second_h_q, second_variance = blocks[1]
+    np.testing.assert_allclose(first_z, np.array([0.0], dtype=float))
+    np.testing.assert_allclose(first_h, np.array([0.2], dtype=float))
+    np.testing.assert_allclose(first_h_q, np.array([[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]], dtype=float))
+    np.testing.assert_allclose(first_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))
+    np.testing.assert_allclose(second_z, np.array([0.0], dtype=float))
+    np.testing.assert_allclose(second_h, np.array([-0.15], dtype=float))
+    np.testing.assert_allclose(second_h_q, np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=float))
+    np.testing.assert_allclose(second_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))
+
+
+def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():
+    q_names = np.asarray(["TRUNK:RotY", "LOWER_TRUNK:RotY", "LEFT_THIGH:RotY", "RIGHT_THIGH:RotY"], dtype=object)
+
+    assert vitpose_ekf_pipeline.back_pseudo_segment_name_for_q_names(q_names) == "LOWER_TRUNK"

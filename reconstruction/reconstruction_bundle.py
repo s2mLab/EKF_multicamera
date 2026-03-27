@@ -24,7 +24,9 @@ from kinematics.root_kinematics import (
     centered_finite_difference,
     extract_root_from_q,
     normalize,
+    normalize_root_unwrap_mode,
     root_z_correction_angle_from_points,
+    stabilize_root_rotations,
     unwrap_with_gaps,
 )
 from reconstruction.reconstruction_dataset import load_trc_root_kinematics_sidecar
@@ -59,10 +61,13 @@ from vitpose_ekf_pipeline import (
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     KP_INDEX,
     CameraCalibration,
     PoseData,
     ReconstructionResult,
+    SegmentLengths,
     apply_left_right_flip_corrections,
     apply_left_right_flip_to_points,
     build_biomod,
@@ -771,7 +776,9 @@ def load_or_build_model_cache(
     initial_rotation_correction: bool,
     lengths_mode: str,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
 ) -> tuple[SegmentLengths, Path, Path, int, float, str]:
+    build_start = time.perf_counter()
     if lengths_mode == "first_frame_only":
         lengths, bootstrap_frame_idx = estimate_segment_lengths_first_frame(reconstruction)
     else:
@@ -785,6 +792,7 @@ def load_or_build_model_cache(
         subject_mass_kg,
         initial_rotation_correction,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
     )
     metadata["lengths_mode"] = lengths_mode
     metadata["bootstrap_frame_idx"] = int(bootstrap_frame_idx)
@@ -795,7 +803,6 @@ def load_or_build_model_cache(
         cached_lengths, _biomod_path, compute_time_s = load_model_stage(cache_path)
         return cached_lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx), float(compute_time_s), "cache"
 
-    build_start = time.perf_counter()
     build_biomod(
         lengths,
         biomod_cache_path,
@@ -803,6 +810,7 @@ def load_or_build_model_cache(
         reconstruction=reconstruction,
         apply_initial_root_rotation_correction=initial_rotation_correction,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
     )
     compute_time_s = time.perf_counter() - build_start
     save_model_stage(cache_path, lengths, biomod_cache_path, metadata, compute_time_s=compute_time_s)
@@ -1006,6 +1014,8 @@ def extract_root_from_points(
     points_3d: np.ndarray,
     apply_initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    unwrap_mode: str | None = None,
+    translation_origin: str = "pelvis",
 ) -> tuple[np.ndarray, bool]:
     correction_angle = root_z_correction_angle_from_points(
         points_3d,
@@ -1020,6 +1030,7 @@ def extract_root_from_points(
         right_hip_idx=KP_INDEX["right_hip"],
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
+        translation_origin=translation_origin,
     )
     correction_detected = abs(correction_angle) > 1e-8
     correction_applied = bool(apply_initial_rotation_correction and correction_detected)
@@ -1037,8 +1048,9 @@ def extract_root_from_points(
             degrees=False,
         )
 
-    if unwrap_rotations:
-        root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
+    effective_unwrap_mode = normalize_root_unwrap_mode(unwrap_mode, legacy_unwrap=unwrap_rotations)
+    if effective_unwrap_mode != "off":
+        root_q[:, ROOT_ROTATION_SLICE] = stabilize_root_rotations(root_q[:, ROOT_ROTATION_SLICE], effective_unwrap_mode)
     return root_q, correction_applied
 
 
@@ -1051,6 +1063,7 @@ def root_kinematics_from_trc(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "single",
 ) -> tuple[np.ndarray, np.ndarray, bool, str]:
     """Resolve root kinematics for one imported TRC file.
 
@@ -1076,7 +1089,13 @@ def root_kinematics_from_trc(
                 "trc_root_kinematics_sidecar",
             )
 
-    q_root, correction_applied = extract_root_from_points(points_3d, initial_rotation_correction, unwrap_root)
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
+    q_root, correction_applied = extract_root_from_points(
+        points_3d,
+        initial_rotation_correction,
+        unwrap_root=(effective_root_unwrap_mode != "off"),
+        unwrap_mode=effective_root_unwrap_mode,
+    )
     qdot_root = centered_finite_difference(q_root, 1.0 / fps)
     return q_root, qdot_root, correction_applied, "geometric_trc_markers"
 
@@ -1391,6 +1410,7 @@ def build_pose_data(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
+    annotations_path: Path | None = None,
 ) -> PoseData:
     return load_pose_data(
         keypoints_path,
@@ -1402,6 +1422,7 @@ def build_pose_data(
         outlier_threshold_ratio=pose_outlier_threshold_ratio,
         lower_percentile=pose_amplitude_lower_percentile,
         upper_percentile=pose_amplitude_upper_percentile,
+        annotations_path=annotations_path,
     )
 
 
@@ -1427,6 +1448,7 @@ def build_pose2sim_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "single",
 ) -> BundleBuildResult:
     print_step(2, 2, "TRC file import + export bundle")
     t0 = time.perf_counter()
@@ -1439,6 +1461,7 @@ def build_pose2sim_bundle(
         fps=fps,
         initial_rotation_correction=initial_rotation_correction,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
     )
     reprojection_errors = compute_points_reprojection_error_per_view(points_3d, frames, calibrations, pose_data)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
@@ -1526,6 +1549,7 @@ def build_triangulation_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "single",
     triangulation_method: str,
     reprojection_threshold_px: float,
     min_cameras_for_triangulation: int,
@@ -1617,8 +1641,12 @@ def build_triangulation_bundle(
         pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
     )
     time_s = reconstruction.frames / float(fps)
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q_root, correction_applied = extract_root_from_points(
-        reconstruction.points_3d, initial_rotation_correction, unwrap_root
+        reconstruction.points_3d,
+        initial_rotation_correction,
+        unwrap_rotations=(effective_root_unwrap_mode != "off"),
+        unwrap_mode=effective_root_unwrap_mode,
     )
     qdot_root = centered_finite_difference(q_root, 1.0 / effective_fps)
     reprojection_errors = reconstruction.reprojection_error_per_view
@@ -1754,6 +1782,7 @@ def build_ekf_3d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "single",
     triangulation_method: str,
     reprojection_threshold_px: float,
     min_cameras_for_triangulation: int,
@@ -1782,6 +1811,7 @@ def build_ekf_3d_bundle(
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -1873,6 +1903,7 @@ def build_ekf_3d_bundle(
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode="full_triangulation",
                 model_variant=model_variant,
+                symmetrize_limbs=symmetrize_limbs,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -1890,12 +1921,18 @@ def build_ekf_3d_bundle(
         noise_factor=biorbd_kalman_noise_factor,
         error_factor=biorbd_kalman_error_factor,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
         initial_state_method=biorbd_kalman_init_method,
     )
     ekf3d_s = time.perf_counter() - ekf3d_start
     result["q_names"] = q_names_from_model(model)
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
-    q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
+    q_root = extract_root_from_q(
+        result["q_names"],
+        result["q"],
+        unwrap_rotations=unwrap_root,
+        unwrap_mode=root_unwrap_mode,
+    )
     qdot_root = extract_root_from_q(
         result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
     )
@@ -1997,6 +2034,7 @@ def build_ekf_3d_bundle(
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
             "error_factor": float(biorbd_kalman_error_factor),
@@ -2063,6 +2101,7 @@ def build_ekf_2d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "single",
     triangulation_method: str,
     reprojection_threshold_px: float,
     min_cameras_for_triangulation: int,
@@ -2098,8 +2137,11 @@ def build_ekf_2d_bundle(
     skip_low_coherence_updates: bool,
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
 ) -> BundleBuildResult:
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2250,6 +2292,7 @@ def build_ekf_2d_bundle(
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode=ekf2d_3d_source,
                 model_variant=model_variant,
+                symmetrize_limbs=symmetrize_limbs,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -2279,6 +2322,8 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2300,6 +2345,7 @@ def build_ekf_2d_bundle(
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
         model=model,
         initial_state=initial_state,
         flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
@@ -2307,10 +2353,17 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
-    q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
+    q_root = extract_root_from_q(
+        result["q_names"],
+        result["q"],
+        unwrap_rotations=unwrap_root,
+        unwrap_mode=root_unwrap_mode,
+    )
     qdot_root = extract_root_from_q(
         result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
     )
@@ -2514,10 +2567,13 @@ def build_ekf_2d_bundle(
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),
             "coherence_confidence_floor": float(coherence_confidence_floor),
+            "upper_back_sagittal_gain": float(upper_back_sagittal_gain),
+            "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),

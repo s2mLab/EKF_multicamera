@@ -18,6 +18,7 @@ ALGORITHM_VERSIONS = {
 
 DEFAULT_MODEL_SUBJECT_MASS_KG = 55.0
 DEFAULT_MODEL_VARIANT = "single_trunk"
+DEFAULT_MODEL_SYMMETRIZE_LIMBS = True
 DEFAULT_POSE_FILTER_WINDOW = 9
 DEFAULT_POSE_OUTLIER_THRESHOLD_RATIO = 0.10
 DEFAULT_POSE_AMPLITUDE_LOWER_PERCENTILE = 5.0
@@ -94,6 +95,7 @@ def default_model_stem(
     triangulation_method: str,
     *,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = DEFAULT_MODEL_SYMMETRIZE_LIMBS,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -108,6 +110,8 @@ def default_model_stem(
     tokens = ["model", "2d", slugify(pose_data_mode), slugify(triangulation_method)]
     if str(model_variant).strip() and str(model_variant).strip() != DEFAULT_MODEL_VARIANT:
         tokens.append(slugify(str(model_variant)))
+    if not bool(symmetrize_limbs):
+        tokens.append("asym")
     if str(pose_correction_mode).strip() not in ("", "none"):
         tokens.append(slugify(str(pose_correction_mode)))
     if initial_rotation_correction:
@@ -143,6 +147,7 @@ def model_output_dir(
     pose_data_mode: str,
     triangulation_method: str,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = DEFAULT_MODEL_SYMMETRIZE_LIMBS,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -158,6 +163,7 @@ def model_output_dir(
         pose_data_mode,
         triangulation_method,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
         pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,
@@ -179,6 +185,7 @@ def model_biomod_path(
     pose_data_mode: str,
     triangulation_method: str,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = DEFAULT_MODEL_SYMMETRIZE_LIMBS,
     pose_correction_mode: str = "none",
     initial_rotation_correction: bool = False,
     max_frames: int | None = None,
@@ -196,6 +203,7 @@ def model_biomod_path(
         pose_data_mode=pose_data_mode,
         triangulation_method=triangulation_method,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
         pose_correction_mode=pose_correction_mode,
         initial_rotation_correction=initial_rotation_correction,
         max_frames=max_frames,

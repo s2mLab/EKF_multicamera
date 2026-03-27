@@ -14,6 +14,7 @@ to claim full FIG compliance yet.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -421,6 +422,24 @@ def _normalize_overlay_token(value: str) -> str:
     return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
 
+def _extract_overlay_frame_number(path: Path) -> int | None:
+    """Extract one frame number from a pragmatic camera-image filename."""
+
+    stem = str(path.stem)
+    patterns = (
+        r"(?:^|[_-])frame[_-]?(\d+)(?:$|[_-])",
+        r"(?:^|[_-])(\d{4,})(?:$|[_-])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, stem, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
 def infer_execution_images_root(keypoints_path: Path | str | None) -> Path | None:
     """Infer the most likely image root for a keypoint file.
 
@@ -468,7 +487,8 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
         f"frame_{frame_number:05d}",
         f"frame_{frame_number:06d}",
     )
-    camera_tokens = {camera_name, camera_name.lower(), _normalize_overlay_token(camera_name)}
+    normalized_camera = _normalize_overlay_token(camera_name)
+    camera_tokens = {camera_name, camera_name.lower(), normalized_camera}
 
     candidate_dirs = [images_root]
     for child in images_root.iterdir():
@@ -484,6 +504,16 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
                 camera_prefixed = directory / f"{camera_name}_{frame_token}{extension}"
                 if camera_prefixed.exists():
                     return camera_prefixed
+        for candidate in directory.iterdir():
+            if not candidate.is_file() or candidate.suffix.lower() not in extensions:
+                continue
+            stem_normalized = _normalize_overlay_token(candidate.stem)
+            if normalized_camera not in stem_normalized:
+                continue
+            candidate_frame = _extract_overlay_frame_number(candidate)
+            if candidate_frame != frame_number:
+                continue
+            return candidate
     return None
 
 

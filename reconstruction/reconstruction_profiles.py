@@ -11,11 +11,13 @@ Ce module permet de:
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
+from kinematics.root_kinematics import SUPPORTED_ROOT_UNWRAP_MODES, normalize_root_unwrap_mode
 from reconstruction.reconstruction_registry import (
     infer_dataset_name,
     reconstruction_output_dir,
@@ -27,8 +29,14 @@ from reconstruction.reconstruction_registry import (
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
-SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
+SUPPORTED_MODEL_VARIANTS = (
+    "single_trunk",
+    "back_flexion_1d",
+    "back_3dof",
+    "upper_root_back_flexion_1d",
+    "upper_root_back_3dof",
+)
+SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned", "annotated")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -66,8 +74,10 @@ class ReconstructionProfile:
     name: str
     family: str
     camera_names: list[str] | None = None
+    use_all_cameras: bool = False
     ekf_model_path: str | None = None
     model_variant: str = "single_trunk"
+    symmetrize_limbs: bool = True
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
@@ -92,12 +102,15 @@ class ReconstructionProfile:
     compare_biorbd_kalman: bool = True
     reuse_triangulation: bool = False
     no_root_unwrap: bool = False
+    root_unwrap_mode: str = "single"
     biorbd_kalman_noise_factor: float = 1e-8
     biorbd_kalman_error_factor: float = 1e-4
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
     coherence_confidence_floor: float = 0.35
+    upper_back_sagittal_gain: float = 0.2
+    upper_back_pseudo_std_deg: float = 10.0
     pose_filter_window: int = 9
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
@@ -110,6 +123,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
     parts = [profile.family]
     if profile.model_variant != "single_trunk":
         parts.append(profile.model_variant)
+    if not bool(profile.symmetrize_limbs):
+        parts.append("asym")
     if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
         parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
@@ -127,6 +142,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
+        if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
+            parts.append(f"ubg{slugify(f'{profile.upper_back_sagittal_gain:.2f}')}")
         if profile.flip:
             if profile.flip_method != "epipolar":
                 parts.append(f"flip_{profile.flip_method}")
@@ -175,9 +192,13 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if profile.root_unwrap_mode != "single":
+        parts.append("no_unwrap" if profile.root_unwrap_mode == "off" else f"unwrap_{profile.root_unwrap_mode}")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
-    if profile.camera_names:
+    if profile.use_all_cameras:
+        parts.append("all_cameras")
+    elif profile.camera_names:
         parts.append("cams")
         parts.extend(str(name) for name in profile.camera_names)
     return slugify("_".join(parts))
@@ -198,6 +219,15 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
+    profile.root_unwrap_mode = normalize_root_unwrap_mode(
+        getattr(profile, "root_unwrap_mode", None),
+        legacy_unwrap=(not bool(getattr(profile, "no_root_unwrap", False))),
+    )
+    profile.no_root_unwrap = profile.root_unwrap_mode == "off"
+    if float(profile.upper_back_sagittal_gain) < 0.0:
+        raise ValueError("upper_back_sagittal_gain must be >= 0.")
+    if float(profile.upper_back_pseudo_std_deg) <= 0.0:
+        raise ValueError("upper_back_pseudo_std_deg must be > 0.")
     profile.frame_stride = int(profile.frame_stride)
     if profile.frame_stride not in SUPPORTED_FRAME_STRIDES:
         raise ValueError(f"Unsupported frame_stride: {profile.frame_stride}")
@@ -211,6 +241,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             seen_camera_names.add(name)
             normalized_camera_names.append(name)
         profile.camera_names = normalized_camera_names or None
+    profile.use_all_cameras = bool(profile.use_all_cameras)
+    if profile.use_all_cameras:
+        profile.camera_names = None
     if profile.ekf_model_path is not None:
         normalized_model_path = str(profile.ekf_model_path).strip()
         profile.ekf_model_path = normalized_model_path or None
@@ -257,6 +290,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
     if profile.family not in ("ekf_2d", "ekf_3d"):
         profile.ekf_model_path = None
         profile.model_variant = "single_trunk"
+        profile.symmetrize_limbs = True
+        profile.upper_back_sagittal_gain = 0.2
+        profile.upper_back_pseudo_std_deg = 10.0
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -285,7 +321,10 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
 
 
 def profile_from_dict(data: dict[str, object]) -> ReconstructionProfile:
-    profile = ReconstructionProfile(**data)
+    payload = dict(data)
+    if "root_unwrap_mode" not in payload and "no_root_unwrap" in payload:
+        payload["root_unwrap_mode"] = "off" if bool(payload.get("no_root_unwrap")) else "single"
+    profile = ReconstructionProfile(**payload)
     return validate_profile(profile)
 
 
@@ -522,17 +561,20 @@ def build_pipeline_command(
     ]
     if pose2sim_trc is not None:
         cmd.extend(["--trc-file", str(pose2sim_trc)])
-    camera_names = profile.camera_names or camera_names_override
+    camera_names = None if profile.use_all_cameras else (profile.camera_names or camera_names_override)
     if camera_names:
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
-    if profile.no_root_unwrap:
-        cmd.append("--no-root-unwrap")
+    cmd.extend(["--root-unwrap-mode", profile.root_unwrap_mode])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
+        cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
+        cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
@@ -550,6 +592,8 @@ def build_pipeline_command(
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")
