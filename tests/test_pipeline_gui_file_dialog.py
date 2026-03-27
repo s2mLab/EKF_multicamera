@@ -35,6 +35,17 @@ class _FakeTree:
     def selection_set(self, selection):
         self._selection = tuple(selection)
 
+    def selection_add(self, selection):
+        if isinstance(selection, str):
+            values = [selection]
+        else:
+            values = list(selection)
+        updated = list(self._selection)
+        for value in values:
+            if value not in updated:
+                updated.append(value)
+        self._selection = tuple(updated)
+
     def selection(self):
         return self._selection
 
@@ -93,6 +104,32 @@ def test_keypoint_preset_names_body_only_removes_face_side_keypoints():
     assert "right_ear" not in body_only
     assert "left_ankle" in body_only
     assert "right_wrist" in body_only
+
+
+def test_annotation_keypoint_order_groups_left_then_right_then_head():
+    assert list(pipeline_gui.ANNOTATION_KEYPOINT_ORDER[:6]) == [
+        "left_shoulder",
+        "left_elbow",
+        "left_wrist",
+        "left_hip",
+        "left_knee",
+        "left_ankle",
+    ]
+    assert list(pipeline_gui.ANNOTATION_KEYPOINT_ORDER[6:12]) == [
+        "right_shoulder",
+        "right_elbow",
+        "right_wrist",
+        "right_hip",
+        "right_knee",
+        "right_ankle",
+    ]
+    assert list(pipeline_gui.ANNOTATION_KEYPOINT_ORDER[12:]) == [
+        "nose",
+        "left_eye",
+        "right_eye",
+        "left_ear",
+        "right_ear",
+    ]
 
 
 def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_state(monkeypatch):
@@ -407,6 +444,14 @@ def test_square_crop_bounds_returns_square_window():
     assert np.isclose(x1 - x0, y1 - y0)
 
 
+def test_camera_layout_is_adaptive_for_small_camera_counts():
+    assert pipeline_gui.camera_layout(1) == (1, 1)
+    assert pipeline_gui.camera_layout(2) == (1, 2)
+    assert pipeline_gui.camera_layout(3) == (2, 2)
+    assert pipeline_gui.camera_layout(4) == (2, 2)
+    assert pipeline_gui.camera_layout(5) == (2, 3)
+
+
 def test_annotation_motion_prior_center_extrapolates_velocity():
     center = pipeline_gui.annotation_motion_prior_center(
         np.array([100.0, 80.0], dtype=float),
@@ -456,6 +501,163 @@ def test_annotation_tab_set_frame_index_saves_before_frame_change():
     assert saved == ["saved"]
     assert tab._current_frame_idx == 2
     assert tab._frame_value == 2
+
+
+def test_annotation_click_advances_marker_without_monoview():
+    saved = []
+    refreshed = []
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int))
+    tab.calibrations = {"cam0": object()}
+    tab.annotation_payload = {}
+    tab._axis_to_camera = {"axis0": "cam0"}
+    tab.advance_marker_var = SimpleNamespace(get=lambda: True)
+    tab.monoview_var = SimpleNamespace(get=lambda: False)
+    tab.save_annotations = lambda: saved.append("saved")
+    tab.refresh_preview = lambda: refreshed.append("refreshed")
+    tab._advance_to_next_keypoint = lambda: setattr(tab, "_advanced", True)
+    tab.selected_keypoint_name = lambda: "left_shoulder"
+    tab.current_frame_number = lambda: 10
+
+    pipeline_gui.AnnotationTab.on_preview_click(
+        tab,
+        SimpleNamespace(inaxes="axis0", xdata=120.0, ydata=240.0, button=1),
+    )
+
+    assert getattr(tab, "_advanced", False) is True
+    assert saved == ["saved"]
+    assert refreshed == ["refreshed"]
+
+
+def test_annotation_delete_nearest_annotation_removes_closest_marker():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_payload = pipeline_gui.empty_annotation_payload()
+    pipeline_gui.set_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="left_shoulder",
+        xy=[100.0, 200.0],
+    )
+    pipeline_gui.set_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="right_shoulder",
+        xy=[300.0, 400.0],
+    )
+    tab._annotation_xy = lambda camera_name, frame_number, keypoint_name: (
+        np.asarray(
+            pipeline_gui.get_annotation_point(
+                tab.annotation_payload,
+                camera_name=camera_name,
+                frame_number=frame_number,
+                keypoint_name=keypoint_name,
+            )[0]
+        )
+        if pipeline_gui.get_annotation_point(
+            tab.annotation_payload,
+            camera_name=camera_name,
+            frame_number=frame_number,
+            keypoint_name=keypoint_name,
+        )[0]
+        is not None
+        else None
+    )
+
+    deleted = pipeline_gui.AnnotationTab._delete_nearest_annotation(
+        tab, "cam0", 10, np.array([108.0, 206.0], dtype=float)
+    )
+
+    assert deleted is True
+    assert (
+        pipeline_gui.get_annotation_point(
+            tab.annotation_payload,
+            camera_name="cam0",
+            frame_number=10,
+            keypoint_name="left_shoulder",
+        )[0]
+        is None
+    )
+    assert (
+        pipeline_gui.get_annotation_point(
+            tab.annotation_payload,
+            camera_name="cam0",
+            frame_number=10,
+            keypoint_name="right_shoulder",
+        )[0]
+        is not None
+    )
+
+
+def test_annotation_ctrl_click_deletes_nearest_marker():
+    saved = []
+    refreshed = []
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int))
+    tab.calibrations = {"cam0": object()}
+    tab.annotation_payload = {}
+    tab._axis_to_camera = {"axis0": "cam0"}
+    tab.advance_marker_var = SimpleNamespace(get=lambda: True)
+    tab.save_annotations = lambda: saved.append("saved")
+    tab.refresh_preview = lambda: refreshed.append("refreshed")
+    tab.selected_keypoint_name = lambda: "left_shoulder"
+    tab.current_frame_number = lambda: 10
+    tab._delete_nearest_annotation = (
+        lambda camera_name, frame_number, xy: setattr(tab, "_deleted", (camera_name, frame_number, tuple(xy))) or True
+    )
+
+    pipeline_gui.AnnotationTab.on_preview_click(
+        tab,
+        SimpleNamespace(inaxes="axis0", xdata=120.0, ydata=240.0, button=1, key="control"),
+    )
+
+    assert tab._deleted == ("cam0", 10, (120.0, 240.0))
+    assert saved == ["saved"]
+    assert refreshed == ["refreshed"]
+
+
+def test_annotation_tab_frame_scale_click_uses_slider_position(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.frame_scale = _FakeScale(from_value=0, to_value=20, width=300)
+    tab.frame_var = SimpleNamespace(set=lambda value: setattr(tab, "_frame_value", value))
+    tab._current_frame_idx = 0
+    tab._dragging_frame_scale = False
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+
+    monkeypatch.setattr(pipeline_gui, "frame_from_slider_click", lambda **_kwargs: 7)
+
+    result = pipeline_gui.AnnotationTab._on_frame_scale_click(tab, SimpleNamespace(x=40))
+
+    assert result == "break"
+    assert tab._dragging_frame_scale is True
+    assert tab.frame_scale.focused is True
+    assert tab._frame_index == 7
+    assert tab._refreshed is True
+
+
+def test_annotation_marker_shape_uses_side_specific_symbols():
+    assert pipeline_gui.annotation_marker_shape("left_wrist") == "+"
+    assert pipeline_gui.annotation_marker_shape("right_wrist") == "x"
+    assert pipeline_gui.annotation_marker_shape("nose") == "+"
+
+
+def test_annotation_tab_frame_scale_release_stops_dragging(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.frame_scale = _FakeScale(from_value=0, to_value=20, width=300)
+    tab._dragging_frame_scale = True
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+
+    monkeypatch.setattr(pipeline_gui, "frame_from_slider_click", lambda **_kwargs: 9)
+
+    result = pipeline_gui.AnnotationTab._on_frame_scale_release(tab, SimpleNamespace(x=75))
+
+    assert result == "break"
+    assert tab._dragging_frame_scale is False
+    assert tab._frame_index == 9
+    assert tab._refreshed is True
 
 
 def test_annotation_triangulated_reprojection_projects_hint_into_target_view():
@@ -951,6 +1153,87 @@ def test_reconstructions_tab_build_command_uses_runtime_profiles_cache(monkeypat
     assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
 
 
+def test_batch_tab_scan_keypoints_files_populates_tree(monkeypatch, tmp_path):
+    keypoints_a = tmp_path / "inputs" / "keypoints" / "trial_a_keypoints.json"
+    keypoints_b = tmp_path / "inputs" / "keypoints" / "trial_b_keypoints.json"
+    keypoints_a.parent.mkdir(parents=True)
+    keypoints_a.write_text("{}", encoding="utf-8")
+    keypoints_b.write_text("{}", encoding="utf-8")
+
+    tab = pipeline_gui.BatchTab.__new__(pipeline_gui.BatchTab)
+    tab.keypoints_glob_entry = _FakeEntryField("inputs/keypoints/*.json")
+    tab.keypoints_tree = _FakeTree()
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "batch_discover_keypoints_files",
+        lambda patterns, root=None: [keypoints_a, keypoints_b],
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "batch_infer_annotations_for_keypoints",
+        lambda path: path.with_name(f"{path.stem.replace('_keypoints', '')}_annotations.json"),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "batch_infer_pose2sim_trc_for_keypoints",
+        lambda path: path.parent.parent / "trc" / f"{path.stem.replace('_keypoints', '')}.trc",
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "infer_dataset_name",
+        lambda **kwargs: Path(kwargs["keypoints_path"]).stem.replace("_keypoints", ""),
+    )
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(Path(path).name))
+
+    pipeline_gui.BatchTab.scan_keypoints_files(tab)
+
+    assert set(tab.keypoints_tree.rows.keys()) == {str(keypoints_a), str(keypoints_b)}
+    assert tab.keypoints_tree.rows[str(keypoints_a)][0] == "trial_a"
+    assert tab.keypoints_tree.rows[str(keypoints_b)][2] == "trial_b_annotations.json"
+
+
+def test_batch_tab_build_command_uses_selected_datasets_and_profiles():
+    tab = pipeline_gui.BatchTab.__new__(pipeline_gui.BatchTab)
+    tab.state = SimpleNamespace(
+        output_root_var=SimpleNamespace(get=lambda: "output"),
+        calib_var=SimpleNamespace(get=lambda: "inputs/calibration/Calib.toml"),
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        workers_var=SimpleNamespace(get=lambda: "6"),
+        notify_reconstructions_updated=lambda: None,
+    )
+    tab.config_path = _FakeEntryField("reconstruction_profiles.json")
+    tab.excel_output_entry = _FakeEntryField("output/batch_summary.xlsx")
+    tab.batch_name_entry = _FakeEntryField("demo_batch")
+    tab.continue_on_error_var = SimpleNamespace(get=lambda: True)
+    tab.export_only_var = SimpleNamespace(get=lambda: False)
+    tab.keypoints_glob_entry = _FakeEntryField("inputs/keypoints/*.json")
+    tab.keypoints_tree = _FakeTree()
+    keypoints_a = "inputs/keypoints/trial_a_keypoints.json"
+    keypoints_b = "inputs/keypoints/trial_b_keypoints.json"
+    tab.keypoints_tree.insert("", "end", iid=keypoints_a, values=("trial_a", keypoints_a, "-", "-"))
+    tab.keypoints_tree.insert("", "end", iid=keypoints_b, values=("trial_b", keypoints_b, "-", "-"))
+    tab.keypoints_tree.selection_set((keypoints_b,))
+    tab.batch_profiles = [
+        pipeline_gui.ReconstructionProfile(name="tri", family="triangulation"),
+        pipeline_gui.ReconstructionProfile(name="ekf", family="ekf_2d"),
+    ]
+    tab.batch_profile_tree = _FakeTree()
+    tab.batch_profile_tree.insert("", "end", iid="0", values=("tri", "triangulation", "cleaned"))
+    tab.batch_profile_tree.insert("", "end", iid="1", values=("ekf", "ekf_2d", "cleaned"))
+    tab.batch_profile_tree.selection_set(("1",))
+
+    cmd = pipeline_gui.BatchTab.build_command(tab)
+
+    assert cmd[:2] == [pipeline_gui.sys.executable, "batch_run.py"]
+    assert cmd[cmd.index("--config") + 1] == "reconstruction_profiles.json"
+    assert cmd[cmd.index("--excel-output") + 1] == "output/batch_summary.xlsx"
+    assert cmd[cmd.index("--batch-name") + 1] == "demo_batch"
+    assert cmd[cmd.index("--keypoints-glob") + 1] == keypoints_b
+    assert cmd[cmd.index("--profile") + 1] == "ekf"
+    assert "--continue-on-error" in cmd
+
+
 def test_reconstructions_tab_export_selected_pseudo_root_from_points_writes_npz(monkeypatch, tmp_path):
     recon_dir = tmp_path / "output" / "trial" / "reconstructions" / "demo"
     recon_dir.mkdir(parents=True)
@@ -1117,6 +1400,27 @@ class _FakeButton:
             self.state = kwargs["state"]
         if "text" in kwargs:
             self.text = kwargs["text"]
+
+
+class _FakeScale:
+    def __init__(self, *, from_value=0, to_value=10, width=200):
+        self._from = from_value
+        self._to = to_value
+        self._width = width
+        self.focused = False
+
+    def winfo_width(self):
+        return self._width
+
+    def cget(self, key):
+        if key == "from":
+            return self._from
+        if key == "to":
+            return self._to
+        raise KeyError(key)
+
+    def focus_set(self):
+        self.focused = True
 
 
 class _FakeAxis:

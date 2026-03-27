@@ -278,6 +278,25 @@ FACE_KEYPOINTS = {
     "right_ear",
 }
 BODY_ONLY_KEYPOINTS = tuple(name for name in COCO17 if name not in FACE_KEYPOINTS)
+ANNOTATION_KEYPOINT_ORDER = (
+    "left_shoulder",
+    "left_elbow",
+    "left_wrist",
+    "left_hip",
+    "left_knee",
+    "left_ankle",
+    "right_shoulder",
+    "right_elbow",
+    "right_wrist",
+    "right_hip",
+    "right_knee",
+    "right_ankle",
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+)
 SUPPORTED_MODEL_PREVIEW_VIEWERS = ("matplotlib", "pyorerun")
 LOWER_LIMB_EDGES = {
     ("left_hip", "left_knee"),
@@ -1514,6 +1533,7 @@ def apply_2d_axis_limits(
 
 
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
+ANNOTATION_DELETE_RADIUS_PX = 18.0
 
 
 def annotation_marker_color(keypoint_name: str) -> tuple[float, float, float, float]:
@@ -1527,10 +1547,10 @@ def annotation_marker_shape(keypoint_name: str) -> str:
     """Return one side-aware marker shape for annotations."""
 
     if str(keypoint_name) in LEFT_KEYPOINTS:
-        return "^"
+        return "+"
     if str(keypoint_name) in RIGHT_KEYPOINTS:
-        return "s"
-    return "o"
+        return "x"
+    return "+"
 
 
 def annotation_motion_prior_center(
@@ -4656,7 +4676,7 @@ class AnnotationTab(ttk.Frame):
         self.annotation_keypoints_list = tk.Listbox(keypoints_body, exportselection=False, height=10)
         self.annotation_keypoints_list.pack(fill=tk.BOTH, expand=True)
         self.annotation_keypoints_list.bind("<<ListboxSelect>>", lambda _event: self.on_keypoint_selection_changed())
-        for keypoint_name in COCO17:
+        for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
             self.annotation_keypoints_list.insert(tk.END, keypoint_name)
         self.annotation_keypoints_list.selection_set(0)
 
@@ -4913,6 +4933,28 @@ class AnnotationTab(ttk.Frame):
         self.annotation_keypoints_list.see(next_index)
         self.on_keypoint_selection_changed()
 
+    def _delete_nearest_annotation(self, camera_name: str, frame_number: int, xy: np.ndarray) -> bool:
+        nearest_name = None
+        nearest_distance = None
+        point = np.asarray(xy, dtype=float).reshape(2)
+        for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
+            annotated_xy = self._annotation_xy(camera_name, frame_number, keypoint_name)
+            if annotated_xy is None:
+                continue
+            distance = float(np.linalg.norm(annotated_xy - point))
+            if nearest_distance is None or distance < nearest_distance:
+                nearest_distance = distance
+                nearest_name = str(keypoint_name)
+        if nearest_name is None or nearest_distance is None or nearest_distance > ANNOTATION_DELETE_RADIUS_PX:
+            return False
+        clear_annotation_point(
+            self.annotation_payload,
+            camera_name=camera_name,
+            frame_number=frame_number,
+            keypoint_name=nearest_name,
+        )
+        return True
+
     def on_preview_click(self, event) -> None:
         if self.pose_data is None or event.inaxes is None or event.xdata is None or event.ydata is None:
             return
@@ -4930,12 +4972,13 @@ class AnnotationTab(ttk.Frame):
             return
         keypoint_name = self.selected_keypoint_name()
         frame_number = self.current_frame_number()
-        if int(getattr(event, "button", 1)) == 3:
-            clear_annotation_point(
-                self.annotation_payload,
-                camera_name=camera_name,
-                frame_number=frame_number,
-                keypoint_name=keypoint_name,
+        event_key = str(getattr(event, "key", "") or "").lower()
+        delete_request = int(getattr(event, "button", 1)) == 3 or ("control" in event_key or "ctrl" in event_key)
+        if delete_request:
+            self._delete_nearest_annotation(
+                camera_name,
+                frame_number,
+                np.array([float(event.xdata), float(event.ydata)], dtype=float),
             )
         else:
             set_annotation_point(
@@ -4945,7 +4988,7 @@ class AnnotationTab(ttk.Frame):
                 keypoint_name=keypoint_name,
                 xy=[float(event.xdata), float(event.ydata)],
             )
-            if self.monoview_var.get():
+            if self.advance_marker_var.get():
                 self._advance_to_next_keypoint()
         self.save_annotations()
         self.refresh_preview()
@@ -5036,14 +5079,14 @@ class AnnotationTab(ttk.Frame):
                 if annotated_xy is None:
                     continue
                 marker_color = annotation_marker_color(keypoint_name)
+                display_color = "black" if keypoint_name == current_marker else marker_color
                 ax.scatter(
                     [annotated_xy[0]],
                     [annotated_xy[1]],
                     s=(95 if keypoint_name == current_marker else 55),
-                    c=[marker_color],
+                    c=[display_color],
                     marker=annotation_marker_shape(keypoint_name),
-                    edgecolors=("black" if keypoint_name == current_marker else marker_color),
-                    linewidths=(1.2 if keypoint_name == current_marker else 0.6),
+                    linewidths=(2.0 if keypoint_name == current_marker else 1.3),
                     zorder=5,
                 )
 
@@ -5103,10 +5146,11 @@ class AnnotationTab(ttk.Frame):
                     ax.scatter(
                         [triangulated_hint[0]],
                         [triangulated_hint[1]],
-                        s=95,
-                        c=[current_color],
-                        marker="x",
-                        linewidths=1.7,
+                        s=90,
+                        facecolors="none",
+                        edgecolors=[current_color],
+                        marker="o",
+                        linewidths=1.9,
                         zorder=6,
                     )
             ax.tick_params(labelsize=8)
