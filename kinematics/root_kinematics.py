@@ -12,6 +12,7 @@ TRUNK_TRANSLATION_NAMES = ["TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ"]
 TRUNK_ROTATION_NAMES = ["TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ"]
 TRUNK_ROOT_ROTATION_SEQUENCE = "yxz"
 TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE = TRUNK_ROOT_ROTATION_SEQUENCE.upper()
+SUPPORTED_ROOT_UNWRAP_MODES = ("off", "single", "double")
 ROOT_Q_NAMES = np.asarray(TRUNK_TRANSLATION_NAMES + TRUNK_ROTATION_NAMES, dtype=object)
 # Shared slices avoid hard-coded root DoF indexing across the codebase.
 ROOT_TRANSLATION_SLICE = slice(0, len(TRUNK_TRANSLATION_NAMES))
@@ -69,6 +70,36 @@ def reextract_euler_with_gaps(rotations: np.ndarray, sequence: str = TRUNK_ROOT_
             rotation_matrix = Rotation.from_euler(scipy_sequence, array[frame_idx], degrees=False).as_matrix()
             reextracted[frame_idx] = Rotation.from_matrix(rotation_matrix).as_euler(scipy_sequence, degrees=False)
     return reextracted
+
+
+def normalize_root_unwrap_mode(mode: str | None, *, legacy_unwrap: bool | None = None) -> str:
+    """Normalize one root-angle stabilization mode with backward compatibility."""
+
+    candidate = "" if mode is None else str(mode).strip().lower()
+    if not candidate:
+        if legacy_unwrap is None:
+            candidate = "single"
+        else:
+            candidate = "single" if bool(legacy_unwrap) else "off"
+    if candidate not in SUPPORTED_ROOT_UNWRAP_MODES:
+        raise ValueError(f"Unsupported root unwrap mode: {mode}")
+    return candidate
+
+
+def stabilize_root_rotations(
+    rotations: np.ndarray, mode: str | None, *, legacy_unwrap: bool | None = None
+) -> np.ndarray:
+    """Apply root Euler reextraction / unwrap stabilization according to one explicit mode."""
+
+    normalized_mode = normalize_root_unwrap_mode(mode, legacy_unwrap=legacy_unwrap)
+    stabilized = np.array(rotations, copy=True)
+    if normalized_mode == "off":
+        return reextract_euler_with_gaps(stabilized, TRUNK_ROOT_ROTATION_SEQUENCE)
+    passes = 1 if normalized_mode == "single" else 2
+    for _ in range(passes):
+        stabilized = reextract_euler_with_gaps(stabilized, TRUNK_ROOT_ROTATION_SEQUENCE)
+        stabilized = unwrap_with_gaps(stabilized)
+    return stabilized
 
 
 def build_root_rotation_matrices(
@@ -185,6 +216,7 @@ def extract_root_from_q(
     q_trajectory: np.ndarray,
     unwrap_rotations: bool = True,
     renormalize_rotations: bool = True,
+    unwrap_mode: str | None = None,
 ) -> np.ndarray:
     """Extract ordered root DoFs from a full generalized-coordinate trajectory."""
 
@@ -195,11 +227,11 @@ def extract_root_from_q(
             root_q[:, out_idx] = q_trajectory[:, name_to_index[str(dof_name)]]
     rotations = np.array(root_q[:, ROOT_ROTATION_SLICE], copy=True)
     if renormalize_rotations or unwrap_rotations:
-        passes = 2 if unwrap_rotations else 1
-        for _ in range(passes):
+        if unwrap_rotations:
+            mode = normalize_root_unwrap_mode(unwrap_mode, legacy_unwrap=True)
+            rotations = stabilize_root_rotations(rotations, mode)
+        else:
             rotations = reextract_euler_with_gaps(rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
-            if unwrap_rotations:
-                rotations = unwrap_with_gaps(rotations)
         root_q[:, ROOT_ROTATION_SLICE] = rotations
     return root_q
 

@@ -78,6 +78,27 @@ def test_build_pipeline_command_omits_camera_names_for_all_cameras_profile():
     assert "--camera-names" not in cmd
 
 
+def test_build_pipeline_command_includes_root_unwrap_mode():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf_single_unwrap",
+            family="ekf_2d",
+            predictor="acc",
+            root_unwrap_mode="single",
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+    assert "--root-unwrap-mode" in cmd
+    assert cmd[cmd.index("--root-unwrap-mode") + 1] == "single"
+
+
 def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
     profile = validate_profile(
         ReconstructionProfile(
