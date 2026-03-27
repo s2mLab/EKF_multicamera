@@ -136,6 +136,41 @@ def test_once_triangulation_ignores_nan_observations_and_requires_enough_valid_v
     assert np.array_equal(excluded_views, np.array([False, False, True]))
 
 
+def test_once_triangulation_none_threshold_keeps_high_reprojection_solution():
+    point = np.array([0.2, -0.1, 2.0], dtype=float)
+    cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 1.0), _make_camera("cam2", -0.8)]
+    observations = np.asarray([camera.project_point(point) for camera in cameras], dtype=float)
+    observations[2] += np.array([80.0, -60.0], dtype=float)
+    confidences = np.array([1.0, 0.9, 0.8], dtype=float)
+
+    triangulated_limited, mean_error_limited, *_ = once_triangulation_from_best_cameras(
+        [camera.P for camera in cameras],
+        observations,
+        confidences,
+        cameras,
+        error_threshold_px=15.0,
+        min_cameras_for_triangulation=2,
+    )
+    assert np.all(np.isnan(triangulated_limited))
+    assert mean_error_limited > 15.0
+
+    triangulated_unbounded, mean_error_unbounded, per_view_error, coherence_per_view, excluded_views = (
+        once_triangulation_from_best_cameras(
+            [camera.P for camera in cameras],
+            observations,
+            confidences,
+            cameras,
+            error_threshold_px=None,
+            min_cameras_for_triangulation=2,
+        )
+    )
+    assert np.all(np.isfinite(triangulated_unbounded))
+    assert mean_error_unbounded > 15.0
+    assert np.count_nonzero(np.isfinite(per_view_error)) == 3
+    assert np.all(coherence_per_view >= 0.0)
+    assert np.array_equal(excluded_views, np.array([False, False, False]))
+
+
 def test_project_points_and_jacobians_matches_scalar_projection():
     camera = _make_camera("cam0", 0.2)
     points = np.array([[0.15, 0.05, 2.5], [0.1, -0.2, 3.0]], dtype=float)
