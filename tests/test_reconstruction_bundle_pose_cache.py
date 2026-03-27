@@ -1,7 +1,20 @@
+import math
+from types import SimpleNamespace
+
 import numpy as np
 
-from reconstruction.reconstruction_bundle import epipolar_cache_metadata, load_or_compute_pose_data_variant_cache
-from vitpose_ekf_pipeline import KP_INDEX, PoseData, apply_left_right_flip_corrections, reconstruction_cache_metadata
+from reconstruction.reconstruction_bundle import (
+    epipolar_cache_metadata,
+    load_or_build_model_cache,
+    load_or_compute_pose_data_variant_cache,
+)
+from vitpose_ekf_pipeline import (
+    KP_INDEX,
+    PoseData,
+    SegmentLengths,
+    apply_left_right_flip_corrections,
+    reconstruction_cache_metadata,
+)
 
 
 def _make_pose_data() -> PoseData:
@@ -177,3 +190,53 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
     right_idx = KP_INDEX["right_shoulder"]
     np.testing.assert_allclose(corrected_a.keypoints[0, 0, left_idx], [20.0, 2.0])
     np.testing.assert_allclose(corrected_b.keypoints[0, 0, right_idx], [10.0, 1.0])
+
+
+def test_load_or_build_model_cache_records_full_model_stage_time(tmp_path, monkeypatch):
+    reconstruction = SimpleNamespace(frames=np.array([0, 1, 2], dtype=int))
+    lengths = SegmentLengths(
+        trunk_height=0.6,
+        head_length=0.2,
+        shoulder_half_width=0.18,
+        hip_half_width=0.12,
+        upper_arm_length=0.3,
+        forearm_length=0.25,
+        thigh_length=0.45,
+        shank_length=0.4,
+        eye_offset_x=0.03,
+        eye_offset_y=0.025,
+        ear_offset_y=0.06,
+    )
+
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.estimate_segment_lengths", lambda *_args, **_kwargs: lengths
+    )
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.build_biomod",
+        lambda _lengths, output_path, **_kwargs: output_path.write_text("version 4", encoding="utf-8"),
+    )
+    perf_counter_values = iter((10.0, 14.5))
+    monkeypatch.setattr("reconstruction.reconstruction_bundle.time.perf_counter", lambda: next(perf_counter_values))
+
+    _cached_lengths, biomod_cache_path, cache_path, bootstrap_frame_idx, compute_time_s, source = (
+        load_or_build_model_cache(
+            output_dir=tmp_path,
+            reconstruction=reconstruction,
+            reconstruction_cache_path=tmp_path / "triangulation_stage.npz",
+            fps=120.0,
+            subject_mass_kg=70.0,
+            initial_rotation_correction=True,
+            lengths_mode="full_triangulation",
+            model_variant="single_trunk",
+            symmetrize_limbs=True,
+        )
+    )
+
+    assert source == "computed_now"
+    assert bootstrap_frame_idx == 0
+    assert biomod_cache_path.exists()
+    assert cache_path.exists()
+    assert math.isclose(compute_time_s, 4.5)
+
+    with np.load(cache_path, allow_pickle=True) as data:
+        assert math.isclose(float(np.asarray(data["compute_time_s"]).item()), 4.5)

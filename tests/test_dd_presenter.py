@@ -48,7 +48,7 @@ def test_jump_list_label_formats_expected_text():
 
 def test_jump_list_label_with_reference_appends_reference_code():
     label = jump_list_label_with_reference(3, make_jump(), "821o")
-    assert label == "S3 | som 2.25 | tw 1.50 | ref 821o"
+    assert label == "S3 | som 2.25 | tw 1.50 | det 82+33 | exp 821o"
 
 
 def test_format_dd_summary_handles_missing_body_shape_and_code():
