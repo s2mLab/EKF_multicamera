@@ -660,6 +660,143 @@ def test_annotation_tab_frame_scale_release_stops_dragging(monkeypatch):
     assert tab._refreshed is True
 
 
+def test_annotation_step_frame_uses_filtered_candidates():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13, 14], dtype=int))
+    tab.frame_var = SimpleNamespace(get=lambda: 1)
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab._navigable_annotation_frame_local_indices = lambda: [1, 4]
+
+    pipeline_gui.AnnotationTab.step_frame(tab, 1)
+
+    assert tab._frame_index == 4
+    assert tab._refreshed is True
+
+
+def test_annotation_flip_frame_filter_uses_selected_cameras(monkeypatch, tmp_path):
+    pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int), camera_names=["cam0", "cam1"])
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = pose_data
+    tab.calibrations = {"cam0": object(), "cam1": object()}
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        calib_var=SimpleNamespace(get=lambda: "inputs/calibration/Calib.toml"),
+        pose_data_mode_var=SimpleNamespace(get=lambda: "cleaned"),
+        pose_filter_window_var=SimpleNamespace(get=lambda: "9"),
+        pose_outlier_ratio_var=SimpleNamespace(get=lambda: "0.1"),
+        pose_p_low_var=SimpleNamespace(get=lambda: "5"),
+        pose_p_high_var=SimpleNamespace(get=lambda: "95"),
+        calibration_correction_var=SimpleNamespace(get=lambda: "flip_epipolar"),
+        flip_improvement_ratio_var=SimpleNamespace(get=lambda: "0.7"),
+        flip_min_gain_px_var=SimpleNamespace(get=lambda: "3.0"),
+        flip_min_other_cameras_var=SimpleNamespace(get=lambda: "2"),
+        flip_restrict_to_outliers_var=SimpleNamespace(get=lambda: True),
+        flip_outlier_percentile_var=SimpleNamespace(get=lambda: "85"),
+        flip_outlier_floor_px_var=SimpleNamespace(get=lambda: "5"),
+        flip_temporal_weight_var=SimpleNamespace(get=lambda: "0.35"),
+        flip_temporal_tau_px_var=SimpleNamespace(get=lambda: "20"),
+    )
+    tab.selected_annotation_camera_names = lambda: ["cam1"]
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", tmp_path)
+    monkeypatch.setattr(
+        pipeline_gui,
+        "get_cached_pose_data",
+        lambda *_args, **_kwargs: (tab.calibrations, pose_data),
+    )
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: tmp_path / "output" / "trial")
+    monkeypatch.setattr(
+        pipeline_gui,
+        "load_or_compute_left_right_flip_cache",
+        lambda **_kwargs: (
+            np.array([[True, False, False], [False, False, True]], dtype=bool),
+            {},
+            0.0,
+            tmp_path / "flip_cache.npz",
+            "cache",
+        ),
+    )
+
+    local_indices = pipeline_gui.AnnotationTab._annotation_flip_frame_local_indices(tab)
+
+    assert local_indices == [2]
+
+
+def test_annotation_worst_reprojection_filter_uses_selected_reconstruction_and_cameras(monkeypatch, tmp_path):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.arange(20, dtype=int), camera_names=["cam0", "cam1"])
+    tab.state = SimpleNamespace(shared_reconstruction_selection=["demo"])
+    tab.selected_annotation_camera_names = lambda: ["cam1"]
+
+    errors = np.ones((20, 17, 2), dtype=float)
+    errors[3, :, 0] = 50.0
+    errors[7, :, 1] = 90.0
+    payload = {
+        "reprojection_error_per_view": errors,
+        "frames": np.arange(20, dtype=int),
+        "camera_names": np.array(["cam0", "cam1"], dtype=object),
+    }
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: tmp_path / "output" / "trial")
+    monkeypatch.setattr(pipeline_gui, "reconstruction_dir_by_name", lambda *_args, **_kwargs: tmp_path / "recon")
+    monkeypatch.setattr(pipeline_gui, "load_bundle_payload", lambda _path: payload)
+
+    local_indices = pipeline_gui.AnnotationTab._annotation_worst_reprojection_frame_local_indices(tab)
+
+    assert local_indices == [7]
+
+
+def test_annotation_on_frame_filter_changed_does_not_scan_images():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int))
+    tab.frame_var = SimpleNamespace(get=lambda: 2)
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab._filtered_annotation_frame_local_indices = lambda: [0, 1]
+    tab._navigable_annotation_frame_local_indices = lambda: (_ for _ in ()).throw(
+        AssertionError("image scan should not run during filter change")
+    )
+
+    pipeline_gui.AnnotationTab.on_frame_filter_changed(tab)
+
+    assert tab._frame_index == 0
+    assert tab._refreshed is True
+
+
+def test_annotation_crop_limits_use_selected_camera_indices(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(
+        camera_names=["cam0", "cam1", "cam2"],
+        raw_keypoints=np.arange(3 * 2 * 17 * 2, dtype=float).reshape(3, 2, 17, 2),
+        keypoints=np.zeros((3, 2, 17, 2), dtype=float),
+    )
+    tab.calibrations = {
+        "cam0": SimpleNamespace(image_size=(100, 100)),
+        "cam1": SimpleNamespace(image_size=(100, 100)),
+        "cam2": SimpleNamespace(image_size=(100, 100)),
+    }
+    tab.crop_limits_cache = {}
+    tab.crop_limits_key = None
+
+    captured = {}
+
+    def fake_compute_pose_crop_limits_2d(raw_2d, calibrations, camera_names, margin):
+        captured["raw_2d"] = np.asarray(raw_2d)
+        captured["camera_names"] = list(camera_names)
+        captured["margin"] = margin
+        return {name: np.zeros((2, 4), dtype=float) for name in camera_names}
+
+    monkeypatch.setattr(pipeline_gui, "compute_pose_crop_limits_2d", fake_compute_pose_crop_limits_2d)
+
+    result = pipeline_gui.AnnotationTab._ensure_crop_limits(tab, ["cam2"])
+
+    assert list(result.keys()) == ["cam2"]
+    assert captured["camera_names"] == ["cam2"]
+    assert captured["margin"] == 0.2
+    np.testing.assert_array_equal(captured["raw_2d"], tab.pose_data.raw_keypoints[[2]])
+
+
 def test_annotation_triangulated_reprojection_projects_hint_into_target_view():
     calibrations = {
         "cam0": CameraCalibration(
@@ -888,6 +1025,11 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     tab._stride = "1"
     tab.triang_method = SimpleNamespace(get=lambda: tab._triang, set=lambda value: setattr(tab, "_triang", value))
     tab._triang = "greedy"
+    tab.reprojection_threshold_var = SimpleNamespace(
+        get=lambda: tab._reproj_threshold,
+        set=lambda value: setattr(tab, "_reproj_threshold", value),
+    )
+    tab._reproj_threshold = "15"
     tab.predictor = SimpleNamespace(get=lambda: tab._predictor, set=lambda value: setattr(tab, "_predictor", value))
     tab._predictor = "acc"
     tab.coherence_method = SimpleNamespace(
@@ -915,11 +1057,6 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
         get=lambda: tab._rotfix, set=lambda value: setattr(tab, "_rotfix", bool(value))
     )
     tab._rotfix = False
-    tab.root_unwrap_mode = SimpleNamespace(
-        get=lambda: tab._root_unwrap_mode,
-        set=lambda value: setattr(tab, "_root_unwrap_mode", value),
-    )
-    tab._root_unwrap_mode = pipeline_gui.root_unwrap_mode_display_name("single")
     tab.biorbd_noise = _FakeEntryField("1e-8")
     tab.biorbd_error = _FakeEntryField("1e-4")
     tab.biorbd_kalman_init_method = SimpleNamespace(
@@ -978,6 +1115,7 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
         pose_data_mode="cleaned",
         frame_stride=3,
         triangulation_method="exhaustive",
+        reprojection_threshold_px=None,
         coherence_method="epipolar_fast_framewise",
         no_root_unwrap=True,
         measurement_noise_scale=2.0,
@@ -1004,6 +1142,7 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     assert tab.profile_name.get() == "ekf_profile"
     assert tab._family == "ekf_2d"
     assert tab._predictor == "dyn"
+    assert tab._reproj_threshold == "none"
     assert tab._flip_method == "ekf_prediction_gate"
     assert tab._flip_label == "EKF prediction gate"
     assert tab._coherence == pipeline_gui.coherence_method_display_name("epipolar_fast_framewise")
@@ -1024,7 +1163,6 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     assert tab._flip_floor == "6"
     assert tab._flip_temp_w == "0.5"
     assert tab._flip_temp_tau == "12"
-    assert tab._root_unwrap_mode == pipeline_gui.root_unwrap_mode_display_name("off")
     assert tab.add_profile_button.state == "normal"
 
 
@@ -1625,9 +1763,9 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     tab.initial_rot_var = SimpleNamespace(get=lambda: False)
     tab.pose_data_mode = SimpleNamespace(get=lambda: "cleaned")
     tab.frame_stride = SimpleNamespace(get=lambda: "1")
-    tab.triang_method = SimpleNamespace(get=lambda: "exhaustive")
+    tab.triang_method = SimpleNamespace(get=lambda: "once")
+    tab.reprojection_threshold_var = SimpleNamespace(get=lambda: "none")
     tab.coherence_method = SimpleNamespace(get=lambda: "Epipolar (precomputed)")
-    tab.root_unwrap_mode = SimpleNamespace(get=lambda: pipeline_gui.root_unwrap_mode_display_name("single"))
     tab.biorbd_noise = SimpleNamespace(get=lambda: "1e-8")
     tab.biorbd_error = SimpleNamespace(get=lambda: "1e-4")
     tab.biorbd_kalman_init_method = SimpleNamespace(get=lambda: "triangulation_ik_root_translation")
@@ -1642,7 +1780,9 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     assert profile.pose_amplitude_lower_percentile == 7.0
     assert profile.pose_amplitude_upper_percentile == 93.0
     assert profile.coherence_method == "epipolar"
-    assert profile.root_unwrap_mode == "single"
+    assert profile.reprojection_threshold_px is None
+    assert profile.root_unwrap_mode == "off"
+    assert profile.no_root_unwrap is True
 
 
 def test_profiles_tab_update_profile_model_info_marks_existing_biomod_as_faster():

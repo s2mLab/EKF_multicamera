@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
-from kinematics.root_kinematics import SUPPORTED_ROOT_UNWRAP_MODES, normalize_root_unwrap_mode
+from kinematics.root_kinematics import normalize_root_unwrap_mode
 from reconstruction.reconstruction_registry import (
     infer_dataset_name,
     reconstruction_output_dir,
@@ -67,6 +67,7 @@ SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
 )
 SUPPORTED_FRAME_STRIDES = (1, 2, 3, 4)
 DEFAULT_POSE2SIM_TRC = Path("inputs/trc/1_partie_0429.trc")
+DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX = 15.0
 
 
 @dataclass
@@ -98,11 +99,12 @@ class ReconstructionProfile:
     initial_rotation_correction: bool = False
     pose_data_mode: str = "cleaned"
     triangulation_method: str = "exhaustive"
+    reprojection_threshold_px: float | None = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
     coherence_method: str = "epipolar"
     compare_biorbd_kalman: bool = True
     reuse_triangulation: bool = False
-    no_root_unwrap: bool = False
-    root_unwrap_mode: str = "single"
+    no_root_unwrap: bool = True
+    root_unwrap_mode: str = "off"
     biorbd_kalman_noise_factor: float = 1e-8
     biorbd_kalman_error_factor: float = 1e-4
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
@@ -173,6 +175,12 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("flip")
         if profile.initial_rotation_correction:
             parts.append("rotfix")
+    if profile.family in ("triangulation", "ekf_2d", "ekf_3d"):
+        if profile.reprojection_threshold_px is None:
+            parts.append("taunone")
+        elif abs(float(profile.reprojection_threshold_px) - DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX) > 1e-9:
+            tau_value = float(profile.reprojection_threshold_px)
+            parts.append(f"tau{int(tau_value) if float(tau_value).is_integer() else slugify(f'{tau_value:g}')}")
     if profile.flip:
         if abs(float(profile.flip_improvement_ratio) - 0.7) > 1e-9:
             parts.append(f"fr{str(float(profile.flip_improvement_ratio)).replace('.', 'p')}")
@@ -192,8 +200,6 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
-    if profile.root_unwrap_mode != "single":
-        parts.append("no_unwrap" if profile.root_unwrap_mode == "off" else f"unwrap_{profile.root_unwrap_mode}")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
     if profile.use_all_cameras:
@@ -211,6 +217,10 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported pose_data_mode: {profile.pose_data_mode}")
     if profile.triangulation_method not in SUPPORTED_TRIANGULATION_METHODS:
         raise ValueError(f"Unsupported triangulation_method: {profile.triangulation_method}")
+    if profile.reprojection_threshold_px is not None and float(profile.reprojection_threshold_px) <= 0.0:
+        raise ValueError("reprojection_threshold_px must be > 0 when provided.")
+    if profile.reprojection_threshold_px is None and profile.triangulation_method != "once":
+        raise ValueError("reprojection_threshold_px=None is only supported when triangulation_method='once'.")
     if profile.coherence_method not in SUPPORTED_COHERENCE_METHODS:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
     if profile.flip_method not in SUPPORTED_FLIP_METHODS:
@@ -260,6 +270,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
     if profile.family == "pose2sim":
         profile.pose_data_mode = "cleaned"
         profile.triangulation_method = "exhaustive"
+        profile.reprojection_threshold_px = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
         profile.frame_stride = 1
     if profile.family == "ekf_2d":
         profile.predictor = profile.predictor or "acc"
@@ -538,6 +549,8 @@ def build_pipeline_command(
         str(profile.frame_stride),
         "--triangulation-method",
         profile.triangulation_method,
+        "--reprojection-threshold-px",
+        ("none" if profile.reprojection_threshold_px is None else str(profile.reprojection_threshold_px)),
         "--coherence-method",
         profile.coherence_method,
         "--pose-filter-window",
@@ -566,7 +579,7 @@ def build_pipeline_command(
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
-    cmd.extend(["--root-unwrap-mode", profile.root_unwrap_mode])
+    cmd.extend(["--root-unwrap-mode", "off"])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])

@@ -2375,7 +2375,7 @@ def once_triangulation_from_best_cameras(
     observations: np.ndarray,
     confidences: np.ndarray,
     calibrations: list[CameraCalibration],
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Triangulate once from all valid cameras without view rejection."""
@@ -2405,9 +2405,14 @@ def once_triangulation_from_best_cameras(
     errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
     mean_error = float(np.mean(errors)) if errors.size else np.nan
     reprojection_error_per_view[included_indices] = errors
+    coherence_threshold_px = (
+        float(DEFAULT_REPROJECTION_THRESHOLD_PX) if error_threshold_px is None else float(error_threshold_px)
+    )
     for i_cam in included_indices:
-        coherence_per_view[i_cam] = multiview_coherence_score(reprojection_error_per_view[i_cam], error_threshold_px)
-    if mean_error > error_threshold_px:
+        coherence_per_view[i_cam] = multiview_coherence_score(
+            reprojection_error_per_view[i_cam], coherence_threshold_px
+        )
+    if error_threshold_px is not None and mean_error > float(error_threshold_px):
         point = np.full(3, np.nan)
     return point, mean_error, reprojection_error_per_view, coherence_per_view, excluded_views
 
@@ -2577,7 +2582,7 @@ def compute_framewise_epipolar_measurement_weights(
 def triangulate_pose2sim_like(
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
-    error_threshold_px: float = DEFAULT_REPROJECTION_THRESHOLD_PX,
+    error_threshold_px: float | None = DEFAULT_REPROJECTION_THRESHOLD_PX,
     min_cameras_for_triangulation: int = DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     coherence_method: str = DEFAULT_COHERENCE_METHOD,
     epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
@@ -4721,7 +4726,7 @@ def run_ekf(
     flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
     flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     unwrap_root: bool = True,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
     debug_label: str | None = None,
     debug_console: bool = False,
     initial_state: np.ndarray | None = None,
@@ -5001,7 +5006,7 @@ def compare_kalman_filters(
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     classic_result: dict[str, np.ndarray] | None = None,
     unwrap_root: bool = True,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
 ) -> ComparisonResult:
     """Compare les `q` du nouvel EKF avec ceux du Kalman `biorbd`."""
     import biorbd
@@ -5049,7 +5054,7 @@ def compare_kalman_filters(
 
 def reconstruction_cache_metadata(
     pose_data: PoseData,
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     triangulation_method: str,
@@ -5066,7 +5071,7 @@ def reconstruction_cache_metadata(
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
         "pose_data_signature": pose_data_signature(pose_data),
-        "reprojection_threshold_px": float(error_threshold_px),
+        "reprojection_threshold_px": None if error_threshold_px is None else float(error_threshold_px),
         "min_cameras_for_triangulation": int(min_cameras_for_triangulation),
         "epipolar_threshold_px": float(epipolar_threshold_px),
         "triangulation_method": triangulation_method,
@@ -5142,6 +5147,10 @@ def metadata_cache_matches(cache_path: Path, expected_metadata: dict[str, object
         return False
     for key, expected_value in expected_metadata.items():
         cached_value = cached_metadata.get(key)
+        if expected_value is None:
+            if cached_value is not None:
+                return False
+            continue
         if cached_value is None:
             return False
         if isinstance(expected_value, float):
@@ -5260,7 +5269,7 @@ def run_biorbd_marker_kalman_with_parameters(
     noise_factor: float,
     error_factor: float,
     unwrap_root: bool = True,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
     initial_state_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> dict[str, np.ndarray]:
     """Version parametree du Kalman `biorbd` pour faciliter le tuning du lissage."""
@@ -5910,7 +5919,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root-unwrap-mode",
         choices=SUPPORTED_ROOT_UNWRAP_MODES,
-        default="single",
+        default="off",
         help="Stabilisation des angles de racine: off, single, ou double (reextract+unwrap).",
     )
     parser.add_argument(

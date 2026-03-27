@@ -58,6 +58,13 @@ from vitpose_ekf_pipeline import (
 )
 
 
+def parse_optional_reprojection_threshold(value: str) -> float | None:
+    raw = str(value).strip().lower()
+    if raw in {"none", "off", ""}:
+        return None
+    return float(raw)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genere un bundle standardise pour une reconstruction.")
     parser.add_argument("--name", required=True, help="Nom stable de la reconstruction.")
@@ -90,7 +97,11 @@ def parse_args() -> argparse.Namespace:
         "--triangulation-method", choices=SUPPORTED_TRIANGULATION_METHODS, default=DEFAULT_TRIANGULATION_METHOD
     )
     parser.add_argument("--triangulation-workers", type=int, default=DEFAULT_TRIANGULATION_WORKERS)
-    parser.add_argument("--reprojection-threshold-px", type=float, default=DEFAULT_REPROJECTION_THRESHOLD_PX)
+    parser.add_argument(
+        "--reprojection-threshold-px",
+        type=parse_optional_reprojection_threshold,
+        default=DEFAULT_REPROJECTION_THRESHOLD_PX,
+    )
     parser.add_argument("--epipolar-threshold-px", type=float, default=DEFAULT_EPIPOLAR_THRESHOLD_PX)
     parser.add_argument("--min-cameras-for-triangulation", type=int, default=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION)
     parser.add_argument("--coherence-method", choices=SUPPORTED_COHERENCE_METHODS, default=DEFAULT_COHERENCE_METHOD)
@@ -158,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-low-coherence-updates", action="store_true")
     parser.add_argument("--flight-height-threshold-m", type=float, default=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M)
     parser.add_argument("--flight-min-consecutive-frames", type=int, default=DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES)
-    parser.add_argument("--root-unwrap-mode", choices=SUPPORTED_ROOT_UNWRAP_MODES, default="single")
+    parser.add_argument("--root-unwrap-mode", choices=SUPPORTED_ROOT_UNWRAP_MODES, default="off")
     parser.add_argument("--no-root-unwrap", action="store_true")
     return parser.parse_args()
 

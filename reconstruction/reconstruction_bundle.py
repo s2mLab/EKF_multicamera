@@ -702,7 +702,7 @@ def load_or_compute_triangulation_cache(
     calibrations: dict[str, CameraCalibration],
     coherence_method: str,
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     triangulation_workers: int,
@@ -823,7 +823,7 @@ def prepare_pose_data_for_reconstruction(
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
     coherence_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     epipolar_threshold_px: float,
     pose_data_mode: str,
     pose_filter_window: int,
@@ -1063,7 +1063,7 @@ def root_kinematics_from_trc(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
 ) -> tuple[np.ndarray, np.ndarray, bool, str]:
     """Resolve root kinematics for one imported TRC file.
 
@@ -1209,6 +1209,28 @@ def summarize_reprojection_errors(errors: np.ndarray, camera_names: list[str]) -
     }
 
 
+def summarize_view_usage(excluded_views: np.ndarray | None, camera_names: list[str]) -> dict[str, object]:
+    if excluded_views is None:
+        return {"included_ratio": None, "excluded_ratio": None, "per_camera": {}}
+    mask = np.asarray(excluded_views, dtype=bool)
+    if mask.ndim != 3 or mask.shape[2] != len(camera_names):
+        return {"included_ratio": None, "excluded_ratio": None, "per_camera": {}}
+    included = ~mask
+    per_camera: dict[str, object] = {}
+    for idx, camera_name in enumerate(camera_names):
+        included_ratio = float(np.mean(included[:, :, idx])) if included[:, :, idx].size else None
+        excluded_ratio = float(np.mean(mask[:, :, idx])) if mask[:, :, idx].size else None
+        per_camera[camera_name] = {
+            "included_ratio": included_ratio,
+            "excluded_ratio": excluded_ratio,
+        }
+    return {
+        "included_ratio": float(np.mean(included)) if included.size else None,
+        "excluded_ratio": float(np.mean(mask)) if mask.size else None,
+        "per_camera": per_camera,
+    }
+
+
 def make_reconstruction_from_points(
     frames: np.ndarray,
     points_3d: np.ndarray,
@@ -1264,6 +1286,7 @@ def build_bundle_payload(
     reprojection_errors: np.ndarray,
     summary: dict[str, object],
     support_points_3d: np.ndarray | None = None,
+    excluded_views: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     if q is None:
         q = np.empty((len(frames), 0), dtype=float)
@@ -1295,6 +1318,8 @@ def build_bundle_payload(
         "reprojection_error_per_camera_std": np.asarray(reprojection_stats["per_camera_std"], dtype=float),
         "bundle_summary_json": np.asarray(json.dumps(summary), dtype=object),
     }
+    if excluded_views is not None:
+        payload["excluded_views"] = np.asarray(excluded_views, dtype=bool)
     if support_points_3d is not None:
         payload["support_points_3d"] = np.asarray(support_points_3d, dtype=float)
     return payload
@@ -1314,7 +1339,7 @@ def save_legacy_triangulation(
     pose_data: PoseData,
     *,
     triangulation_method: str,
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     pose_data_mode: str,
@@ -1448,7 +1473,7 @@ def build_pose2sim_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
 ) -> BundleBuildResult:
     print_step(2, 2, "TRC file import + export bundle")
     t0 = time.perf_counter()
@@ -1534,6 +1559,7 @@ def build_pose2sim_bundle(
         qdot_root=qdot_root,
         reprojection_errors=reprojection_errors,
         summary=summary,
+        excluded_views=reconstruction.excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)
@@ -1549,9 +1575,9 @@ def build_triangulation_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -1651,6 +1677,7 @@ def build_triangulation_bundle(
     qdot_root = centered_finite_difference(q_root, 1.0 / effective_fps)
     reprojection_errors = reconstruction.reprojection_error_per_view
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data.camera_names)
     correction_angle = root_z_correction_angle_from_points(
         reconstruction.points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1719,6 +1746,7 @@ def build_triangulation_bundle(
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "pose_data_mode": pose_data_mode,
         "left_right_flip_diagnostics": flip_diagnostics,
@@ -1733,6 +1761,7 @@ def build_triangulation_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": time.perf_counter() - t0,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -1782,9 +1811,9 @@ def build_ekf_3d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -1947,6 +1976,7 @@ def build_ekf_3d_bundle(
         model_points_3d, reconstruction.frames, calibrations, pose_data_used
     )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data_used.camera_names)
     save_legacy_ekf_3d(output_dir, result, reprojection_stats, model_points_3d)
     print_step(5, 5, "Export bundle EKF 3D")
 
@@ -2025,6 +2055,7 @@ def build_ekf_3d_bundle(
         "pose_data_mode": pose_data_mode,
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": effective_triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -2048,6 +2079,7 @@ def build_ekf_3d_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": triangulation_s,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -2086,6 +2118,7 @@ def build_ekf_3d_bundle(
         reprojection_errors=reprojection_errors,
         summary=summary,
         support_points_3d=reconstruction.points_3d,
+        excluded_views=reconstruction.excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)
@@ -2101,9 +2134,9 @@ def build_ekf_2d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
-    root_unwrap_mode: str = "single",
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -2378,6 +2411,7 @@ def build_ekf_2d_bundle(
         model_points_3d, reconstruction.frames, calibrations, pose_data_used
     )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data_used.camera_names)
     save_legacy_ekf_2d(output_dir, result, predictor, flip_left_right, model_points_3d)
     print_step(5, 5, "Export bundle EKF 2D")
 
@@ -2551,6 +2585,7 @@ def build_ekf_2d_bundle(
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
         "triangulation_method": effective_triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "ekf2d_3d_source": ekf2d_3d_source,
         "ekf2d_initial_state_method": ekf2d_initial_state_method,
@@ -2591,6 +2626,7 @@ def build_ekf_2d_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": triangulation_s,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -2653,6 +2689,7 @@ def build_ekf_2d_bundle(
         reprojection_errors=reprojection_errors,
         summary=summary,
         support_points_3d=reconstruction.points_3d,
+        excluded_views=reconstruction.excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)

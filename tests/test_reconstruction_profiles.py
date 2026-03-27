@@ -78,7 +78,7 @@ def test_build_pipeline_command_omits_camera_names_for_all_cameras_profile():
     assert "--camera-names" not in cmd
 
 
-def test_build_pipeline_command_includes_root_unwrap_mode():
+def test_build_pipeline_command_forces_root_unwrap_off():
     profile = validate_profile(
         ReconstructionProfile(
             name="ekf_single_unwrap",
@@ -96,7 +96,7 @@ def test_build_pipeline_command_includes_root_unwrap_mode():
         python_executable="python",
     )
     assert "--root-unwrap-mode" in cmd
-    assert cmd[cmd.index("--root-unwrap-mode") + 1] == "single"
+    assert cmd[cmd.index("--root-unwrap-mode") + 1] == "off"
 
 
 def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
@@ -321,6 +321,40 @@ def test_build_pipeline_command_includes_frame_stride_for_ekf2d():
     )
     assert "--frame-stride" in cmd
     assert cmd[cmd.index("--frame-stride") + 1] == "4"
+
+
+def test_canonical_profile_name_includes_non_default_reprojection_threshold():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="triangulation",
+            reprojection_threshold_px=10.0,
+        )
+    )
+
+    assert canonical_profile_name(profile) == "triangulation_exhaustive_tau10"
+
+
+def test_build_pipeline_command_supports_none_reprojection_threshold():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="tri_once_none",
+            family="triangulation",
+            triangulation_method="once",
+            reprojection_threshold_px=None,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert cmd[cmd.index("--reprojection-threshold-px") + 1] == "none"
 
 
 def test_validate_profile_pose2sim_forces_frame_stride_to_one():

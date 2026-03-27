@@ -1,18 +1,22 @@
+import json
 import math
 from types import SimpleNamespace
 
 import numpy as np
 
 from reconstruction.reconstruction_bundle import (
+    build_bundle_payload,
     epipolar_cache_metadata,
     load_or_build_model_cache,
     load_or_compute_pose_data_variant_cache,
+    summarize_view_usage,
 )
 from vitpose_ekf_pipeline import (
     KP_INDEX,
     PoseData,
     SegmentLengths,
     apply_left_right_flip_corrections,
+    metadata_cache_matches,
     reconstruction_cache_metadata,
 )
 
@@ -240,3 +244,64 @@ def test_load_or_build_model_cache_records_full_model_stage_time(tmp_path, monke
 
     with np.load(cache_path, allow_pickle=True) as data:
         assert math.isclose(float(np.asarray(data["compute_time_s"]).item()), 4.5)
+
+
+def test_reconstruction_cache_metadata_and_match_support_none_threshold(tmp_path):
+    pose_data = _make_pose_data()
+    metadata = reconstruction_cache_metadata(
+        pose_data,
+        error_threshold_px=None,
+        min_cameras_for_triangulation=2,
+        epipolar_threshold_px=15.0,
+        triangulation_method="once",
+        pose_data_mode="raw",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+    )
+    np.savez(tmp_path / "cache.npz", metadata=np.asarray(json.dumps(metadata), dtype=object))
+
+    assert metadata["reprojection_threshold_px"] is None
+    assert metadata_cache_matches(tmp_path / "cache.npz", metadata)
+
+
+def test_build_bundle_payload_includes_excluded_views():
+    excluded_views = np.ones((1, 17, 1), dtype=bool)
+    excluded_views[0, 0, 0] = False
+    payload = build_bundle_payload(
+        name="demo",
+        family="triangulation",
+        frames=np.array([0], dtype=int),
+        time_s=np.array([0.0], dtype=float),
+        camera_names=["cam0"],
+        points_3d=np.full((1, 17, 3), np.nan, dtype=float),
+        q_names=np.array([], dtype=object),
+        q=None,
+        qdot=None,
+        qddot=None,
+        q_root=np.zeros((1, 6), dtype=float),
+        qdot_root=np.zeros((1, 6), dtype=float),
+        reprojection_errors=np.full((1, 17, 1), np.nan, dtype=float),
+        summary={},
+        excluded_views=excluded_views,
+    )
+
+    np.testing.assert_array_equal(payload["excluded_views"], excluded_views)
+
+
+def test_summarize_view_usage_reports_included_and_excluded_ratios():
+    excluded_views = np.array(
+        [
+            [[False, True], [True, True]],
+            [[False, False], [True, False]],
+        ],
+        dtype=bool,
+    )
+
+    stats = summarize_view_usage(excluded_views, ["cam0", "cam1"])
+
+    assert math.isclose(stats["included_ratio"], 0.5)
+    assert math.isclose(stats["excluded_ratio"], 0.5)
+    assert math.isclose(stats["per_camera"]["cam0"]["included_ratio"], 0.5)
+    assert math.isclose(stats["per_camera"]["cam1"]["excluded_ratio"], 0.5)
