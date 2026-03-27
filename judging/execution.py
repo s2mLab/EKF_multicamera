@@ -35,6 +35,7 @@ EXECUTION_HIP_DOF_NAMES = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
 EXECUTION_KNEE_DOF_NAMES = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 ROOT_TILT_DOF_NAME = "TRUNK:RotX"
 ROOT_TRANSLATION_VELOCITY_NAMES = ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ")
+SUPPORTED_OVERLAY_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
 
 
 @dataclass
@@ -476,7 +477,6 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
 
     frame_number = int(frame_number)
     camera_name = str(camera_name)
-    extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
     frame_tokens = (
         f"{frame_number}",
         f"{frame_number:04d}",
@@ -497,7 +497,7 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
 
     for directory in candidate_dirs:
         for frame_token in frame_tokens:
-            for extension in extensions:
+            for extension in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
                 direct_path = directory / f"{frame_token}{extension}"
                 if direct_path.exists():
                     return direct_path
@@ -505,7 +505,7 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
                 if camera_prefixed.exists():
                     return camera_prefixed
         for candidate in directory.iterdir():
-            if not candidate.is_file() or candidate.suffix.lower() not in extensions:
+            if not candidate.is_file() or candidate.suffix.lower() not in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
                 continue
             stem_normalized = _normalize_overlay_token(candidate.stem)
             if normalized_camera not in stem_normalized:

@@ -162,7 +162,7 @@ def test_resolve_execution_image_path_matches_camera_folder_and_frame(tmp_path):
     images_root = tmp_path / "images"
     camera_dir = images_root / "camA"
     camera_dir.mkdir(parents=True)
-    image_path = camera_dir / "frame_000123.png"
+    image_path = camera_dir / "frame_000123.jpeg"
     image_path.write_bytes(b"fake")
 
     resolved = resolve_execution_image_path(images_root, "camA", 123)
@@ -175,7 +175,7 @@ def test_resolve_execution_image_path_matches_flat_camera_prefixed_frame_pattern
     images_root.mkdir(parents=True)
     wrong_image = images_root / "Camera1_M11139_frame_001623.png"
     wrong_image.write_bytes(b"fake")
-    image_path = images_root / "Camera1_M11139_frame_000123.png"
+    image_path = images_root / "Camera1_M11139_frame_000123.JPG"
     image_path.write_bytes(b"fake")
 
     resolved = resolve_execution_image_path(images_root, "M11139", 123)
