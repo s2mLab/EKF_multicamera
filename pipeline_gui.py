@@ -57,6 +57,13 @@ from annotation.annotation_store import (
     save_annotation_payload,
     set_annotation_point,
 )
+from batch_run import (
+    DEFAULT_EXCEL_OUTPUT,
+    DEFAULT_KEYPOINTS_GLOB,
+)
+from batch_run import discover_keypoints_files as batch_discover_keypoints_files
+from batch_run import infer_annotations_for_keypoints as batch_infer_annotations_for_keypoints
+from batch_run import infer_pose2sim_trc_for_keypoints as batch_infer_pose2sim_trc_for_keypoints
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
 from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session, contiguous_true_regions
@@ -957,7 +964,7 @@ def draw_upper_back_preview(
     frame_points: np.ndarray,
     segment_frames: list[tuple[str, np.ndarray, np.ndarray]] | None = None,
 ) -> None:
-    """Draw the central back line/markers for models that include UPPER_BACK."""
+    """Draw back triangles around the mid-back origin for models with a segmented trunk."""
 
     if frame_points is None:
         return
@@ -981,43 +988,59 @@ def draw_upper_back_preview(
         else {}
     )
     upper_back_frame = segment_map.get("UPPER_BACK") or segment_map.get("LOWER_TRUNK")
-    trunk_frame = segment_map.get("TRUNK")
     hip_center = 0.5 * (left_hip + right_hip)
     upper_center = 0.5 * (left_shoulder + right_shoulder)
-    lower_center = upper_back_frame[0] if upper_back_frame is not None else 0.5 * (hip_center + upper_center)
-    if trunk_frame is not None:
-        trunk_origin, trunk_rotation = trunk_frame
-        if np.all(np.isfinite(trunk_origin)) and np.all(np.isfinite(trunk_rotation)):
-            lower_extent = trunk_origin + trunk_rotation[:, 2] * max(np.linalg.norm(lower_center - trunk_origin), 1e-6)
-            if np.all(np.isfinite(lower_extent)):
-                hip_center = lower_extent
-    if np.all(np.isfinite(hip_center)):
-        ax.plot(
-            [hip_center[0], lower_center[0]],
-            [hip_center[1], lower_center[1]],
-            [hip_center[2], lower_center[2]],
-            color="#1d4e89",
-            linewidth=2.6,
-            alpha=0.9,
-        )
+    mid_back = upper_back_frame[0] if upper_back_frame is not None else 0.5 * (hip_center + upper_center)
+    hip_triangle = np.vstack([right_hip, left_hip, mid_back, right_hip])
+    shoulder_triangle = np.vstack([right_shoulder, left_shoulder, mid_back, right_shoulder])
     ax.plot(
-        [lower_center[0], upper_center[0]],
-        [lower_center[1], upper_center[1]],
-        [lower_center[2], upper_center[2]],
+        hip_triangle[:, 0],
+        hip_triangle[:, 1],
+        hip_triangle[:, 2],
         color="#1d4e89",
-        linewidth=2.6,
+        linewidth=2.4,
         alpha=0.9,
-        label="Back centerline",
+    )
+    ax.plot(
+        shoulder_triangle[:, 0],
+        shoulder_triangle[:, 1],
+        shoulder_triangle[:, 2],
+        color="#1d4e89",
+        linewidth=2.4,
+        alpha=0.9,
     )
     ax.scatter(
-        [lower_center[0], upper_center[0]],
-        [lower_center[1], upper_center[1]],
-        [lower_center[2], upper_center[2]],
-        s=38,
+        [mid_back[0]],
+        [mid_back[1]],
+        [mid_back[2]],
+        s=44,
         c="#1d4e89",
         marker="D",
         depthshade=False,
     )
+
+
+def has_segmented_back_visualization(
+    *,
+    segment_frames: list[tuple[str, np.ndarray, np.ndarray]] | None = None,
+    q_names: list[str] | np.ndarray | None = None,
+    summary: dict[str, object] | None = None,
+) -> bool:
+    """Return whether one model/reconstruction includes a dedicated back segment to visualize."""
+
+    if segment_frames is not None:
+        segment_names = {str(name) for name, _origin, _rotation in segment_frames}
+        if {"UPPER_BACK", "LOWER_TRUNK"} & segment_names:
+            return True
+    if q_names is not None:
+        q_name_set = {str(name) for name in q_names}
+        if any(name.startswith(("UPPER_BACK:", "LOWER_TRUNK:")) for name in q_name_set):
+            return True
+    if summary:
+        model_variant = str(summary.get("model_variant", "") or "")
+        if model_variant in {"back_flexion_1d", "back_3dof", "upper_root_back_flexion_1d", "upper_root_back_3dof"}:
+            return True
+    return False
 
 
 def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -1336,7 +1359,8 @@ def jump_segmentation_height_series(points_3d: np.ndarray | None, root_q: np.nda
 
 
 def camera_layout(n_cameras: int) -> tuple[int, int]:
-    ncols = 4
+    n_cameras = max(int(n_cameras), 1)
+    ncols = min(4, max(1, int(math.ceil(math.sqrt(n_cameras)))))
     nrows = int(math.ceil(n_cameras / ncols))
     return nrows, ncols
 
@@ -3903,7 +3927,10 @@ class DualAnimationTab(CommandTab):
                 reconstruction_legend_label(self.state, name),
                 marker_size=float(self.marker_size.get()),
             )
-            draw_upper_back_preview(ax, frame_points)
+            summary = self.bundle.get("recon_summary", {}).get(name, {})
+            q_names = self.bundle.get("q_names", [])
+            if has_segmented_back_visualization(q_names=q_names, summary=summary):
+                draw_upper_back_preview(ax, frame_points)
             if self.show_trunk_frames_var.get():
                 origin, rotation = compute_root_frame_from_points(frame_points)
                 if origin is not None and rotation is not None:
@@ -4507,13 +4534,14 @@ class AnnotationTab(ttk.Frame):
         self._axis_to_camera: dict[object, str] = {}
         self._current_frame_idx = 0
         self._pan_state: dict[str, object] | None = None
+        self._dragging_frame_scale = False
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
         left = ttk.Frame(body)
         right = ttk.Frame(body)
-        body.add(left, weight=2)
-        body.add(right, weight=6)
+        body.add(left, weight=1)
+        body.add(right, weight=9)
 
         controls = ttk.LabelFrame(left, text="Annotation controls")
         controls.pack(fill=tk.BOTH, expand=True, padx=(0, 8), pady=(0, 8))
@@ -4655,11 +4683,14 @@ class AnnotationTab(ttk.Frame):
 
         self.preview_figure = Figure(figsize=(11, 8))
         self.preview_canvas = FigureCanvasTkAgg(self.preview_figure, master=preview_box)
-        self.preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas_widget = self.preview_canvas.get_tk_widget()
+        self.preview_canvas_widget.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.mpl_connect("button_press_event", self.on_preview_click)
         self.preview_canvas.mpl_connect("scroll_event", self.on_preview_scroll)
         self.preview_canvas.mpl_connect("motion_notify_event", self.on_preview_motion)
         self.preview_canvas.mpl_connect("button_release_event", self.on_preview_release)
+        self._bind_frame_navigation(self.preview_canvas_widget)
+        self._bind_frame_navigation(self.frame_scale)
 
         attach_tooltip(
             self.annotation_keypoints_list,
@@ -4748,6 +4779,47 @@ class AnnotationTab(ttk.Frame):
             self.save_annotations()
         self._current_frame_idx = clamped
         self.frame_var.set(clamped)
+
+    def _bind_frame_navigation(self, widget: tk.Widget) -> None:
+        if widget is self.frame_scale:
+            widget.bind("<Button-1>", self._on_frame_scale_click)
+            widget.bind("<B1-Motion>", self._on_frame_scale_drag)
+            widget.bind("<ButtonRelease-1>", self._on_frame_scale_release)
+        else:
+            widget.bind("<Enter>", lambda _event: widget.focus_set())
+        widget.bind("<Left>", lambda _event: self.step_frame(-1))
+        widget.bind("<Right>", lambda _event: self.step_frame(1))
+
+    def _frame_from_scale_event(self, event) -> int:
+        return frame_from_slider_click(
+            x=event.x,
+            width=self.frame_scale.winfo_width(),
+            from_value=self.frame_scale.cget("from"),
+            to_value=self.frame_scale.cget("to"),
+        )
+
+    def _on_frame_scale_click(self, event) -> str:
+        self._dragging_frame_scale = True
+        self.frame_scale.focus_set()
+        frame = self._frame_from_scale_event(event)
+        self._set_frame_index(frame)
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_drag(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self._set_frame_index(self._frame_from_scale_event(event))
+        self.refresh_preview()
+        return "break"
+
+    def _on_frame_scale_release(self, event) -> str:
+        if not self._dragging_frame_scale:
+            return "break"
+        self._dragging_frame_scale = False
+        self._set_frame_index(self._frame_from_scale_event(event))
+        self.refresh_preview()
+        return "break"
 
     def on_frame_scale_changed(self, _value) -> None:
         self._set_frame_index(int(round(self.frame_var.get())))
@@ -7070,7 +7142,8 @@ class ModelTab(CommandTab):
             draw_skeleton_3d(ax, self.preview_support_points, "#b8c4d6", "Triangulation")
             points_dict["triangulation"] = self.preview_support_points[np.newaxis, :, :]
         draw_skeleton_3d(ax, self.preview_points, "#4c72b0", "Model")
-        draw_upper_back_preview(ax, self.preview_points, self.preview_segment_frames)
+        if has_segmented_back_visualization(segment_frames=self.preview_segment_frames, q_names=self.preview_q_names):
+            draw_upper_back_preview(ax, self.preview_points, self.preview_segment_frames)
         points_dict["model"] = self.preview_points[np.newaxis, :, :]
         valid = self.preview_points[np.all(np.isfinite(self.preview_points), axis=1)]
         if valid.size:
@@ -8228,6 +8301,227 @@ class ProfilesTab(CommandTab):
         if annotations_path and any(profile.pose_data_mode == "annotated" for profile in selected_profiles):
             cmd.extend(["--annotations-path", annotations_path])
         for profile in selected_profiles:
+            cmd.extend(["--profile", profile.name])
+        return cmd
+
+    def on_command_success(self) -> None:
+        self.state.notify_reconstructions_updated()
+
+
+class BatchTab(CommandTab):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master, "Batch", show_command_preview=False, show_output=True)
+        self.state = state
+        self.batch_profiles: list[ReconstructionProfile] = []
+
+        form = ttk.LabelFrame(self.main, text="Batch reconstruction runner")
+        form.pack(fill=tk.BOTH, expand=False, pady=(0, 8), before=self.output)
+
+        paths_box = ttk.Frame(form)
+        paths_box.pack(fill=tk.X, padx=8, pady=(8, 4))
+
+        self.keypoints_glob_entry = LabeledEntry(
+            paths_box,
+            "Source keypoints",
+            DEFAULT_KEYPOINTS_GLOB,
+            label_width=18,
+            entry_width=64,
+        )
+        self.keypoints_glob_entry.pack(fill=tk.X, pady=(0, 4))
+        self.keypoints_glob_entry.set_tooltip("Glob or explicit path for source keypoints JSON files.")
+
+        self.config_path = LabeledEntry(
+            paths_box,
+            "Profiles JSON",
+            state.profiles_config_var.get(),
+            browse=True,
+            label_width=18,
+            entry_width=64,
+            filetypes=(("Profiles JSON", "*_profiles.json"), ("JSON files", "*.json"), ("All files", "*.*")),
+            on_browse_selected=lambda _value: self.load_profiles_from_config(),
+        )
+        self.config_path.pack(fill=tk.X, pady=(0, 4))
+
+        self.excel_output_entry = LabeledEntry(
+            paths_box,
+            "Excel summary",
+            str(DEFAULT_EXCEL_OUTPUT),
+            browse=True,
+            label_width=18,
+            entry_width=64,
+            filetypes=(("Excel workbooks", "*.xlsx"), ("All files", "*.*")),
+        )
+        self.excel_output_entry.pack(fill=tk.X, pady=(0, 4))
+
+        batch_row = ttk.Frame(paths_box)
+        batch_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(batch_row, text="Batch name", width=18).pack(side=tk.LEFT, padx=(0, 6))
+        self.batch_name_entry = ttk.Entry(batch_row, width=32)
+        self.batch_name_entry.pack(side=tk.LEFT)
+        self.continue_on_error_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(batch_row, text="Continue on error", variable=self.continue_on_error_var).pack(
+            side=tk.LEFT, padx=(12, 0)
+        )
+        self.export_only_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(batch_row, text="Export only", variable=self.export_only_var).pack(side=tk.LEFT, padx=(12, 0))
+
+        controls = ttk.Frame(form)
+        controls.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Button(controls, text="Scan keypoints", command=self.scan_keypoints_files).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Reload profiles", command=self.load_profiles_from_config).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+
+        body = ttk.Panedwindow(form, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        keypoints_box = ttk.LabelFrame(body, text="Datasets")
+        profiles_box = ttk.LabelFrame(body, text="Profiles")
+        body.add(keypoints_box, weight=3)
+        body.add(profiles_box, weight=2)
+
+        self.keypoints_tree = ttk.Treeview(
+            keypoints_box,
+            columns=("dataset", "keypoints", "annotations", "trc"),
+            show="headings",
+            height=8,
+            selectmode="extended",
+        )
+        for col, label, width in [
+            ("dataset", "Dataset", 130),
+            ("keypoints", "Keypoints", 280),
+            ("annotations", "Annotations", 180),
+            ("trc", "TRC", 150),
+        ]:
+            self.keypoints_tree.heading(col, text=label)
+            self.keypoints_tree.column(col, width=width, anchor="w")
+        self.keypoints_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        bind_extended_treeview_shortcuts(self.keypoints_tree)
+
+        self.batch_profile_tree = ttk.Treeview(
+            profiles_box,
+            columns=("name", "family", "mode"),
+            show="headings",
+            height=8,
+            selectmode="extended",
+        )
+        for col, label, width in [
+            ("name", "Name", 220),
+            ("family", "Family", 90),
+            ("mode", "2D mode", 90),
+        ]:
+            self.batch_profile_tree.heading(col, text=label)
+            self.batch_profile_tree.column(col, width=width, anchor="w")
+        self.batch_profile_tree.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        bind_extended_treeview_shortcuts(self.batch_profile_tree)
+
+        attach_tooltip(self.keypoints_tree, "Select one or more datasets for the batch run. Empty selection means all.")
+        attach_tooltip(self.batch_profile_tree, "Select one or more profiles. Empty selection means all profiles.")
+
+        self.hide_preview_copy_buttons()
+        self.config_path.entry_widget.bind("<Return>", lambda _event: self.load_profiles_from_config())
+        self.keypoints_glob_entry.entry_widget.bind("<Return>", lambda _event: self.scan_keypoints_files())
+        self.load_profiles_from_config()
+        self.scan_keypoints_files()
+
+    def load_profiles_from_config(self) -> None:
+        raw_path = self.config_path.get()
+        config_path = Path(raw_path)
+        if not config_path.is_absolute():
+            config_path = ROOT / config_path
+        profiles: list[ReconstructionProfile] = []
+        if config_path.exists():
+            try:
+                profiles = load_profiles_json(config_path)
+            except Exception as exc:
+                messagebox.showerror("Batch", f"Unable to load profiles:\n{config_path}\n\n{exc}")
+                profiles = []
+        self.batch_profiles = profiles
+        self.refresh_batch_profile_tree()
+
+    def refresh_batch_profile_tree(self) -> None:
+        previous = set(self.batch_profile_tree.selection())
+        for item in self.batch_profile_tree.get_children():
+            self.batch_profile_tree.delete(item)
+        for idx, profile in enumerate(self.batch_profiles):
+            iid = str(idx)
+            self.batch_profile_tree.insert(
+                "", "end", iid=iid, values=(profile.name, profile.family, profile.pose_data_mode)
+            )
+            if iid in previous:
+                self.batch_profile_tree.selection_add(iid)
+
+    def scan_keypoints_files(self) -> None:
+        raw_pattern = self.keypoints_glob_entry.get().strip()
+        patterns = [part.strip() for part in raw_pattern.split(";") if part.strip()] or [DEFAULT_KEYPOINTS_GLOB]
+        discovered = batch_discover_keypoints_files(patterns, root=ROOT)
+        previous = set(self.keypoints_tree.selection())
+        for item in self.keypoints_tree.get_children():
+            self.keypoints_tree.delete(item)
+        for keypoints_path in discovered:
+            dataset_name = infer_dataset_name(keypoints_path=keypoints_path)
+            iid = str(keypoints_path)
+            annotations_path = batch_infer_annotations_for_keypoints(keypoints_path)
+            trc_path = batch_infer_pose2sim_trc_for_keypoints(keypoints_path)
+            self.keypoints_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    dataset_name,
+                    display_path(keypoints_path),
+                    "-" if annotations_path is None else display_path(annotations_path),
+                    "-" if trc_path is None else display_path(trc_path),
+                ),
+            )
+            if iid in previous:
+                self.keypoints_tree.selection_add(iid)
+
+    def selected_batch_keypoints_paths(self) -> list[Path]:
+        selected = list(self.keypoints_tree.selection())
+        if selected:
+            return [Path(item) for item in selected]
+        return [Path(item) for item in self.keypoints_tree.get_children("")]
+
+    def selected_batch_profiles(self) -> list[ReconstructionProfile]:
+        selected = list(self.batch_profile_tree.selection())
+        if selected:
+            return [self.batch_profiles[int(item)] for item in selected]
+        return list(self.batch_profiles)
+
+    def build_command(self) -> list[str]:
+        cmd = [
+            sys.executable,
+            "batch_run.py",
+            "--config",
+            self.config_path.get(),
+            "--output-root",
+            self.state.output_root_var.get(),
+            "--calib",
+            self.state.calib_var.get(),
+            "--fps",
+            self.state.fps_var.get(),
+            "--triangulation-workers",
+            self.state.workers_var.get(),
+            "--excel-output",
+            self.excel_output_entry.get(),
+        ]
+        batch_name = self.batch_name_entry.get().strip()
+        if batch_name:
+            cmd.extend(["--batch-name", batch_name])
+        if self.continue_on_error_var.get():
+            cmd.append("--continue-on-error")
+        if self.export_only_var.get():
+            cmd.append("--export-only")
+
+        selected_keypoints = self.selected_batch_keypoints_paths()
+        if selected_keypoints:
+            for keypoints_path in selected_keypoints:
+                cmd.extend(["--keypoints-glob", display_path(keypoints_path)])
+        else:
+            cmd.extend(["--keypoints-glob", self.keypoints_glob_entry.get()])
+
+        for profile in self.selected_batch_profiles():
             cmd.extend(["--profile", profile.name])
         return cmd
 
@@ -12037,6 +12331,7 @@ class LauncherApp(tk.Tk):
             ("Models", ModelTab),
             ("Profiles", ProfilesTab),
             ("Reconstructions", ReconstructionsTab),
+            ("Batch", BatchTab),
             ("3D animation", DualAnimationTab),
             ("2D multiview", MultiViewTab),
             ("Execution", ExecutionTab),

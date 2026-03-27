@@ -71,6 +71,8 @@ def test_build_biomod_back_flexion_1d_creates_upper_back_segment(tmp_path: Path)
     upper_back_block = text[upper_back_start:upper_back_end]
     assert "rotations\ty" in upper_back_block.lower()
     assert "parent\tTRUNK" in text
+    assert "marker\tmid_back" in text
+    assert "parent\tUPPER_BACK" in text
     assert "marker\tleft_shoulder" in text
     assert "parent\tUPPER_BACK" in text
     assert "mesh\t0.000000\t-0.120000\t0.000000" in trunk_block
@@ -114,6 +116,8 @@ def test_build_biomod_upper_root_back_flexion_1d_creates_lower_trunk_segment(tmp
     lower_trunk_block = text[lower_trunk_start:lower_trunk_end]
     assert "marker\tleft_shoulder" in text
     assert "parent\tTRUNK" in text
+    assert "marker\tmid_back" in text
+    assert "parent\tLOWER_TRUNK" in text
     assert "marker\tleft_hip" in text
     assert "parent\tLOWER_TRUNK" in text
     assert "rotations\ty" in lower_trunk_block.lower()

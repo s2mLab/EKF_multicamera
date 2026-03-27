@@ -3095,6 +3095,7 @@ def build_biomod(
             )
         )
         lower_trunk = model.segments["LOWER_TRUNK"]
+        lower_trunk.add_marker(MarkerReal(name="mid_back", parent_name="LOWER_TRUNK", position=[0, 0, 0]))
         lower_trunk.add_marker(
             MarkerReal(
                 name="left_hip", parent_name="LOWER_TRUNK", position=[0, lengths.hip_half_width, -lower_back_height]
@@ -3137,6 +3138,9 @@ def build_biomod(
             )
             shoulder_parent_name = "UPPER_BACK"
             shoulder_parent_local_z = upper_back_height
+            model.segments["UPPER_BACK"].add_marker(
+                MarkerReal(name="mid_back", parent_name="UPPER_BACK", position=[0, 0, 0])
+            )
 
     shoulder_parent = model.segments[shoulder_parent_name]
     if not uses_upper_root:

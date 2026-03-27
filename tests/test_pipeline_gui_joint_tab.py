@@ -300,7 +300,7 @@ def test_upper_back_target_series_supports_lower_trunk_variant():
     np.testing.assert_allclose(target, np.array([0.15, 0.06], dtype=float))
 
 
-def test_draw_upper_back_preview_draws_back_centerline():
+def test_draw_upper_back_preview_draws_back_triangles():
     axis = _FakeAxis()
     frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
     frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 0.2, 0.0])
@@ -330,3 +330,10 @@ def test_draw_upper_back_preview_without_segment_frames_uses_mid_back_point():
 
     assert len(axis.plots) >= 2
     assert len(axis.scatters) == 1
+
+
+def test_has_segmented_back_visualization_detects_segment_frames_and_q_names():
+    assert pipeline_gui.has_segmented_back_visualization(segment_frames=[("UPPER_BACK", np.zeros(3), np.eye(3))])
+    assert pipeline_gui.has_segmented_back_visualization(q_names=["UPPER_BACK:RotY"])
+    assert pipeline_gui.has_segmented_back_visualization(summary={"model_variant": "upper_root_back_3dof"})
+    assert not pipeline_gui.has_segmented_back_visualization(q_names=["TRUNK:RotY"])
