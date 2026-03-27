@@ -625,6 +625,52 @@ def test_load_pose_data_ignores_unselected_json_cameras(tmp_path: Path):
     assert pose_data.keypoints.shape[0] == 2
 
 
+def test_load_pose_data_annotated_overlays_sparse_annotations(tmp_path: Path):
+    keypoints_path = tmp_path / "keypoints.json"
+    annotations_path = tmp_path / "annotations.json"
+    payload = {
+        "Camera1_M11139": {
+            "frames": [0, 1],
+            "keypoints": np.zeros((2, 17, 2), dtype=float).tolist(),
+            "scores": np.ones((2, 17), dtype=float).tolist(),
+        }
+    }
+    keypoints_path.write_text(json.dumps(payload), encoding="utf-8")
+    annotations_path.write_text(
+        json.dumps(
+            {
+                "annotations": {
+                    "M11139": {
+                        "1": {
+                            "left_wrist": {
+                                "xy": [123.0, 456.0],
+                                "score": 0.75,
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    calibrations = {"M11139": _make_camera("M11139", 0.0)}
+
+    pose_data = load_pose_data(
+        keypoints_path,
+        calibrations,
+        data_mode="annotated",
+        annotations_path=annotations_path,
+    )
+
+    left_wrist_idx = KP_INDEX["left_wrist"]
+    np.testing.assert_allclose(pose_data.keypoints[0, 1, left_wrist_idx], np.array([123.0, 456.0], dtype=float))
+    assert pose_data.scores[0, 1, left_wrist_idx] == 0.75
+    np.testing.assert_allclose(pose_data.raw_keypoints[0, 1, left_wrist_idx], np.array([0.0, 0.0], dtype=float))
+    np.testing.assert_allclose(
+        pose_data.annotated_keypoints[0, 1, left_wrist_idx], np.array([123.0, 456.0], dtype=float)
+    )
+
+
 def test_vectorized_epipolar_cost_matches_scalar_versions():
     cameras = [_make_camera("cam0", 0.0), _make_camera("cam1", 0.5), _make_camera("cam2", 2.0)]
     point = np.array([0.2, -0.1, 2.5], dtype=float)

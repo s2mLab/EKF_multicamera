@@ -47,6 +47,16 @@ from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from scipy.spatial.transform import Rotation
 
+from annotation.annotation_store import (
+    apply_annotations_to_pose_arrays,
+    clear_annotation_point,
+    default_annotation_path,
+    empty_annotation_payload,
+    get_annotation_point,
+    load_annotation_payload,
+    save_annotation_payload,
+    set_annotation_point,
+)
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
 from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session, contiguous_true_regions
@@ -94,6 +104,7 @@ from kinematics.analysis_3d import (
 )
 from kinematics.root_kinematics import (
     ROOT_Q_NAMES,
+    SUPPORTED_ROOT_UNWRAP_MODES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     TRUNK_ROTATION_NAMES,
     TRUNK_TRANSLATION_NAMES,
@@ -101,6 +112,7 @@ from kinematics.root_kinematics import (
     compute_trunk_dofs_from_points,
     extract_root_from_q,
     normalize,
+    normalize_root_unwrap_mode,
     rotation_unit_label,
     rotation_unit_scale,
 )
@@ -201,6 +213,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     ReconstructionResult,
     apply_left_right_flip_to_points,
+    fundamental_matrix,
     initial_state_from_triangulation,
     load_calibrations,
     load_pose_data,
@@ -209,6 +222,7 @@ from vitpose_ekf_pipeline import (
     reconstruction_cache_metadata,
     swap_left_right_keypoints,
     triangulate_pose2sim_like,
+    weighted_triangulation,
 )
 
 SKELETON_EDGES = [
@@ -1475,6 +1489,154 @@ def apply_2d_axis_limits(
     ax.set_autoscale_on(False)
 
 
+ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
+
+
+def annotation_marker_color(keypoint_name: str) -> tuple[float, float, float, float]:
+    """Return one stable color for a keypoint name."""
+
+    kp_idx = KP_INDEX.get(str(keypoint_name), 0)
+    return ANNOTATION_MARKER_COLORS(int(kp_idx))
+
+
+def annotation_marker_shape(keypoint_name: str) -> str:
+    """Return one side-aware marker shape for annotations."""
+
+    if str(keypoint_name) in LEFT_KEYPOINTS:
+        return "^"
+    if str(keypoint_name) in RIGHT_KEYPOINTS:
+        return "s"
+    return "o"
+
+
+def annotation_motion_prior_center(
+    point_t_minus_1: np.ndarray | None,
+    point_t_minus_2: np.ndarray | None,
+) -> np.ndarray | None:
+    """Predict one simple constant-velocity 2D center from the two previous frames."""
+
+    if point_t_minus_1 is None or point_t_minus_2 is None:
+        return None
+    pt1 = np.asarray(point_t_minus_1, dtype=float).reshape(2)
+    pt2 = np.asarray(point_t_minus_2, dtype=float).reshape(2)
+    if not (np.all(np.isfinite(pt1)) and np.all(np.isfinite(pt2))):
+        return None
+    return pt1 + (pt1 - pt2)
+
+
+def annotation_epipolar_guides(
+    calibrations: dict[str, object],
+    source_camera_name: str,
+    target_camera_name: str,
+    source_point_2d: np.ndarray,
+) -> np.ndarray | None:
+    """Return one image-space epipolar line ``ax + by + c = 0`` for a target camera."""
+
+    point = np.asarray(source_point_2d, dtype=float).reshape(2)
+    if not np.all(np.isfinite(point)):
+        return None
+    if source_camera_name == target_camera_name:
+        return None
+    source_calibration = calibrations.get(str(source_camera_name))
+    target_calibration = calibrations.get(str(target_camera_name))
+    if source_calibration is None or target_calibration is None:
+        return None
+    fundamental = fundamental_matrix(source_calibration, target_calibration)
+    point_h = np.array([point[0], point[1], 1.0], dtype=float)
+    line = fundamental @ point_h
+    if not np.all(np.isfinite(line)) or np.linalg.norm(line[:2]) < 1e-12:
+        return None
+    return line
+
+
+def annotation_triangulated_reprojection(
+    calibrations: dict[str, object],
+    *,
+    target_camera_name: str,
+    source_camera_names: list[str],
+    source_points_2d: list[np.ndarray],
+) -> np.ndarray | None:
+    """Triangulate one 3D point from already placed views and reproject it to a target camera."""
+
+    valid_projections: list[np.ndarray] = []
+    valid_points: list[np.ndarray] = []
+    valid_scores: list[float] = []
+    for camera_name, point_2d in zip(source_camera_names, source_points_2d):
+        point = np.asarray(point_2d, dtype=float).reshape(2)
+        calibration = calibrations.get(str(camera_name))
+        if calibration is None or not np.all(np.isfinite(point)):
+            continue
+        projection_matrix = getattr(calibration, "projection_matrix", None)
+        if projection_matrix is None:
+            projection_matrix = getattr(calibration, "P", None)
+        if projection_matrix is None:
+            continue
+        valid_projections.append(np.asarray(projection_matrix, dtype=float))
+        valid_points.append(point)
+        valid_scores.append(1.0)
+    if len(valid_points) < 2:
+        return None
+    point_3d = weighted_triangulation(valid_projections, np.asarray(valid_points), np.asarray(valid_scores))
+    if not np.all(np.isfinite(point_3d)):
+        return None
+    target_calibration = calibrations.get(str(target_camera_name))
+    if target_calibration is None:
+        return None
+    projected = np.asarray(target_calibration.project_point(point_3d), dtype=float)
+    return projected if np.all(np.isfinite(projected)) else None
+
+
+def annotation_adjust_image(
+    image: np.ndarray,
+    *,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+) -> np.ndarray:
+    """Apply one simple global brightness/contrast adjustment to an RGB(A) image."""
+
+    adjusted = np.asarray(image, dtype=float)
+    if adjusted.size == 0:
+        return adjusted
+    scale = 255.0 if np.nanmax(adjusted) > 1.5 else 1.0
+    adjusted = adjusted / scale
+    rgb = adjusted[..., :3]
+    rgb = (rgb - 0.5) * float(contrast) + 0.5
+    rgb = rgb * float(brightness)
+    adjusted[..., :3] = np.clip(rgb, 0.0, 1.0)
+    if scale > 1.5:
+        adjusted = np.round(adjusted * scale).astype(image.dtype, copy=False)
+    return adjusted
+
+
+def find_annotation_frame_with_images(
+    *,
+    frames: np.ndarray,
+    current_index: int,
+    direction: int,
+    camera_names: list[str],
+    images_root: Path | None,
+) -> int:
+    """Move to the next frame that actually has one image for the selected cameras."""
+
+    frame_array = np.asarray(frames, dtype=int)
+    if frame_array.size == 0:
+        return 0
+    step = -1 if int(direction) < 0 else 1
+    current_index = max(0, min(int(current_index), frame_array.size - 1))
+    fallback_index = max(0, min(frame_array.size - 1, current_index + step))
+    if images_root is None or not camera_names:
+        return fallback_index
+    candidate_index = fallback_index
+    while 0 <= candidate_index < frame_array.size:
+        frame_number = int(frame_array[candidate_index])
+        for camera_name in camera_names:
+            image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
+            if image_path is not None and image_path.exists():
+                return candidate_index
+        candidate_index += step
+    return fallback_index
+
+
 def load_preview_bundle(
     output_dir: Path,
     biomod_path: Path | None,
@@ -1601,8 +1763,10 @@ def get_cached_preview_bundle(
     cached = state.preview_bundle_cache.get(cache_key)
     if cached is not None:
         gui_debug(f"preview bundle cache hit dataset={output_dir}")
+        report_startup_status(state, f"Using cached preview bundle: {output_dir.name}")
         return cached
     gui_debug(f"preview bundle cache miss dataset={output_dir}")
+    report_startup_status(state, f"Loading preview bundle: {output_dir.name}")
     bundle = load_preview_bundle(output_dir, biomod_path, pose2sim_trc, align_root=align_root)
     state.preview_bundle_cache[cache_key] = bundle
     return bundle
@@ -1944,6 +2108,7 @@ def attach_tooltip(widget: tk.Widget, text: str) -> ToolTip:
 class SharedAppState:
     calib_var: tk.StringVar
     keypoints_var: tk.StringVar
+    annotation_path_var: tk.StringVar
     pose2sim_trc_var: tk.StringVar
     fps_var: tk.StringVar
     workers_var: tk.StringVar
@@ -1977,6 +2142,7 @@ class SharedAppState:
     active_reconstruction_consumer: object | None = None
     clean_trial_outputs_callback: callable | None = None
     clean_trial_caches_callback: callable | None = None
+    startup_status_callback: callable | None = None
 
     def set_profiles(self, profiles: list[ReconstructionProfile]) -> None:
         self.profiles = list(profiles)
@@ -2013,6 +2179,20 @@ class SharedAppState:
     def register_shared_reconstruction_selection_listener(self, callback) -> None:
         if callback not in self.shared_reconstruction_selection_listeners:
             self.shared_reconstruction_selection_listeners.append(callback)
+
+
+def report_startup_status(state: SharedAppState | None, message: str) -> None:
+    """Send one startup-status message to the temporary splash, if active."""
+
+    if state is None:
+        return
+    callback = getattr(state, "startup_status_callback", None)
+    if callback is None:
+        return
+    try:
+        callback(str(message))
+    except Exception:
+        pass
 
 
 def current_dataset_name(state: SharedAppState) -> str:
@@ -2299,6 +2479,38 @@ def coherence_method_from_display_name(label: str) -> str:
     return normalized or "epipolar"
 
 
+ROOT_UNWRAP_MODE_DISPLAY_NAMES = {
+    "double": "Double unwrap",
+    "single": "Single unwrap",
+    "off": "Off",
+}
+
+
+def root_unwrap_mode_display_name(mode: str) -> str:
+    """Return a user-facing label for one root-angle stabilization mode."""
+
+    normalized = normalize_root_unwrap_mode(mode)
+    return ROOT_UNWRAP_MODE_DISPLAY_NAMES.get(normalized, normalized)
+
+
+def root_unwrap_mode_from_display_name(label: str) -> str:
+    """Map one UI label back to the canonical root-angle stabilization mode."""
+
+    normalized = str(label).strip()
+    for mode, display_name in ROOT_UNWRAP_MODE_DISPLAY_NAMES.items():
+        if normalized == display_name:
+            return mode
+    return normalize_root_unwrap_mode(normalized or "single")
+
+
+def profile_root_unwrap_mode(profile) -> str:
+    """Resolve one profile root-angle stabilization mode with legacy fallback."""
+
+    if bool(getattr(profile, "no_root_unwrap", False)):
+        return "off"
+    return normalize_root_unwrap_mode(getattr(profile, "root_unwrap_mode", None), legacy_unwrap=True)
+
+
 def write_runtime_profiles_config(state: SharedAppState) -> Path:
     """Persist the in-memory profiles to a cache file used only for command execution."""
 
@@ -2323,7 +2535,9 @@ def pose_data_cache_key(
     outlier_threshold_ratio: float,
     lower_percentile: float,
     upper_percentile: float,
+    annotations_path: Path | None = None,
 ) -> tuple[object, ...]:
+    resolved_annotations = None if annotations_path is None else Path(annotations_path)
     return (
         str(keypoints_path.resolve()),
         str(calib_path.resolve()),
@@ -2335,6 +2549,12 @@ def pose_data_cache_key(
         float(outlier_threshold_ratio),
         float(lower_percentile),
         float(upper_percentile),
+        None if resolved_annotations is None else str(resolved_annotations.resolve()),
+        (
+            None
+            if resolved_annotations is None or not resolved_annotations.exists()
+            else resolved_annotations.stat().st_mtime_ns
+        ),
     )
 
 
@@ -2342,8 +2562,11 @@ def get_cached_calibrations(state: SharedAppState, calib_path: Path) -> dict[str
     key = calibration_cache_key(calib_path)
     cached = state.calibration_cache.get(key)
     if cached is None:
+        report_startup_status(state, f"Loading calibrations: {calib_path.name}")
         cached = load_calibrations(calib_path)
         state.calibration_cache[key] = cached
+    else:
+        report_startup_status(state, f"Using cached calibrations: {calib_path.name}")
     return cached
 
 
@@ -2360,7 +2583,16 @@ def get_cached_pose_data(
     outlier_threshold_ratio: float = 0.10,
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
+    annotations_path: Path | None = None,
 ):
+    resolved_annotations_path = None if annotations_path is None else Path(annotations_path)
+    if resolved_annotations_path is None and str(data_mode) == "annotated":
+        state_annotation_path = getattr(state, "annotation_path_var", None)
+        state_annotation_value = "" if state_annotation_path is None else str(state_annotation_path.get()).strip()
+        if state_annotation_value:
+            resolved_annotations_path = ROOT / state_annotation_value
+        else:
+            resolved_annotations_path = default_annotation_path(keypoints_path)
     cache_key = pose_data_cache_key(
         keypoints_path=keypoints_path,
         calib_path=calib_path,
@@ -2372,12 +2604,15 @@ def get_cached_pose_data(
         outlier_threshold_ratio=outlier_threshold_ratio,
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
+        annotations_path=resolved_annotations_path,
     )
     cached = state.pose_data_cache.get(cache_key)
     if cached is not None:
+        report_startup_status(state, f"Using cached 2D poses: {keypoints_path.name}")
         calibrations = get_cached_calibrations(state, calib_path)
         return calibrations, cached
     calibrations = get_cached_calibrations(state, calib_path)
+    report_startup_status(state, f"Loading 2D pose data: {keypoints_path.name}")
     pose_data = load_pose_data(
         keypoints_path,
         calibrations,
@@ -2389,6 +2624,7 @@ def get_cached_pose_data(
         outlier_threshold_ratio=outlier_threshold_ratio,
         lower_percentile=lower_percentile,
         upper_percentile=upper_percentile,
+        annotations_path=resolved_annotations_path,
     )
     state.pose_data_cache[cache_key] = pose_data
     return calibrations, pose_data
@@ -2946,7 +3182,7 @@ class PipelineTab(CommandTab):
         mode_label.pack(side=tk.LEFT)
         self.pose_data_mode = tk.StringVar(value="cleaned")
         pose_mode_box = ttk.Combobox(
-            row0, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=12, state="readonly"
+            row0, textvariable=self.pose_data_mode, values=["raw", "annotated", "cleaned"], width=12, state="readonly"
         )
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 6))
         self.subject_mass = LabeledEntry(form, "Subject mass", "55")
@@ -3100,7 +3336,7 @@ class PipelineTab(CommandTab):
         checks.pack(fill=tk.X, padx=8, pady=6)
         self.compare_var = tk.BooleanVar(value=True)
         self.flip_acc_var = tk.BooleanVar(value=True)
-        self.no_unwrap_var = tk.BooleanVar(value=False)
+        self.root_unwrap_mode_var = tk.StringVar(value=root_unwrap_mode_display_name("single"))
         self.model_only_var = tk.BooleanVar(value=False)
         self.triang_only_var = tk.BooleanVar(value=False)
         self.reuse_triang_var = tk.BooleanVar(value=False)
@@ -3110,7 +3346,7 @@ class PipelineTab(CommandTab):
         check_tooltips = {
             "compare-biorbd-kalman": "Calcule aussi la comparaison directe avec l'EKF 3D biorbd.",
             "run-ekf-2d-flip-acc": "Lance la variante EKF 2D avec correction gauche/droite et predicteur acceleration.",
-            "no-root-unwrap": "Desactive l'unwrap temporel des angles de racine.",
+            "root-unwrap-mode": "Controle la stabilisation temporelle des angles de racine: off, single, ou double.",
             "model-only": "Construit seulement le modele sans lancer les filtres.",
             "triangulate-only": "S'arrete apres la triangulation 3D.",
             "reuse-triangulation": "Reutilise une triangulation en cache si les options correspondent.",
@@ -3121,7 +3357,6 @@ class PipelineTab(CommandTab):
         for text, var in [
             ("compare-biorbd-kalman", self.compare_var),
             ("run-ekf-2d-flip-acc", self.flip_acc_var),
-            ("no-root-unwrap", self.no_unwrap_var),
             ("model-only", self.model_only_var),
             ("triangulate-only", self.triang_only_var),
             ("reuse-triangulation", self.reuse_triang_var),
@@ -3132,6 +3367,18 @@ class PipelineTab(CommandTab):
             widget = ttk.Checkbutton(checks, text=text, variable=var)
             widget.pack(side=tk.LEFT, padx=(0, 12))
             attach_tooltip(widget, check_tooltips[text])
+        root_unwrap_label = ttk.Label(checks, text="Root unwrap")
+        root_unwrap_label.pack(side=tk.LEFT, padx=(0, 6))
+        root_unwrap_box = ttk.Combobox(
+            checks,
+            textvariable=self.root_unwrap_mode_var,
+            values=[root_unwrap_mode_display_name(mode) for mode in SUPPORTED_ROOT_UNWRAP_MODES],
+            width=14,
+            state="readonly",
+        )
+        root_unwrap_box.pack(side=tk.LEFT, padx=(0, 12))
+        attach_tooltip(root_unwrap_label, check_tooltips["root-unwrap-mode"])
+        attach_tooltip(root_unwrap_box, check_tooltips["root-unwrap-mode"])
 
         self.extra = LabeledEntry(form, "Extra args", "")
         self.extra.pack(fill=tk.X, padx=8, pady=4)
@@ -3240,8 +3487,7 @@ class PipelineTab(CommandTab):
             cmd.append("--compare-biorbd-kalman")
         if self.flip_acc_var.get():
             cmd.append("--run-ekf-2d-flip-acc")
-        if self.no_unwrap_var.get():
-            cmd.append("--no-root-unwrap")
+        cmd.extend(["--root-unwrap-mode", root_unwrap_mode_from_display_name(self.root_unwrap_mode_var.get())])
         if self.model_only_var.get():
             cmd.append("--model-only")
         if self.triang_only_var.get():
@@ -4247,6 +4493,556 @@ class MultiViewTab(CommandTab):
         return self.crop_limits_cache
 
 
+class AnnotationTab(ttk.Frame):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master)
+        self.state = state
+        self.calibrations = None
+        self.pose_data = None
+        self.annotation_payload = empty_annotation_payload()
+        self.annotation_path: Path | None = None
+        self.images_root: Path | None = None
+        self.crop_limits_cache: dict[str, np.ndarray] = {}
+        self.crop_limits_key: tuple[object, ...] | None = None
+        self._axis_to_camera: dict[object, str] = {}
+        self._current_frame_idx = 0
+        self._pan_state: dict[str, object] | None = None
+
+        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True)
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=2)
+        body.add(right, weight=6)
+
+        controls = ttk.LabelFrame(left, text="Annotation controls")
+        controls.pack(fill=tk.BOTH, expand=True, padx=(0, 8), pady=(0, 8))
+
+        row0 = ttk.Frame(controls)
+        row0.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(row0, text="Load data", command=self.load_resources).pack(side=tk.LEFT)
+        ttk.Button(row0, text="Save annotations", command=self.save_annotations).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(row0, text="Refresh frame", command=self.refresh_preview).pack(side=tk.LEFT, padx=(8, 0))
+
+        row1 = ttk.Frame(controls)
+        row1.pack(fill=tk.X, padx=8, pady=4)
+        self.show_images_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="Show images", variable=self.show_images_var, command=self.refresh_preview).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        self.crop_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, text="Crop +20%", variable=self.crop_var, command=self.refresh_preview).pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        self.monoview_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="Monoview ordered", variable=self.monoview_var, command=self.refresh_preview).pack(
+            side=tk.LEFT
+        )
+
+        row2 = ttk.Frame(controls)
+        row2.pack(fill=tk.X, padx=8, pady=4)
+        self.advance_marker_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row2,
+            text="Advance marker on click",
+            variable=self.advance_marker_var,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.show_epipolar_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row2, text="Epipolar guide", variable=self.show_epipolar_var, command=self.refresh_preview
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.show_triangulated_hint_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row2,
+            text="Triangulated reproj",
+            variable=self.show_triangulated_hint_var,
+            command=self.refresh_preview,
+        ).pack(side=tk.LEFT)
+
+        row3 = ttk.Frame(controls)
+        row3.pack(fill=tk.X, padx=8, pady=4)
+        self.show_motion_prior_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row3,
+            text="Velocity prior zone",
+            variable=self.show_motion_prior_var,
+            command=self.refresh_preview,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.motion_prior_diameter = LabeledEntry(row3, "Diameter", "15", label_width=7, entry_width=4)
+        self.motion_prior_diameter.pack(side=tk.LEFT)
+
+        row4 = ttk.Frame(controls)
+        row4.pack(fill=tk.X, padx=8, pady=4)
+        self.image_brightness_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row4, text="Brightness", width=10).pack(side=tk.LEFT)
+        ttk.Scale(
+            row4,
+            from_=0.2,
+            to=2.0,
+            orient=tk.HORIZONTAL,
+            variable=self.image_brightness_var,
+            command=lambda _value: self.refresh_preview(),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.image_contrast_var = tk.DoubleVar(value=1.0)
+        ttk.Label(row4, text="Contrast", width=8).pack(side=tk.LEFT)
+        ttk.Scale(
+            row4,
+            from_=0.2,
+            to=2.0,
+            orient=tk.HORIZONTAL,
+            variable=self.image_contrast_var,
+            command=lambda _value: self.refresh_preview(),
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.images_root_entry = LabeledEntry(controls, "Images root", "", browse=True, directory=True)
+        self.images_root_entry.pack(fill=tk.X, padx=8, pady=4)
+        self.images_root_entry.var.trace_add("write", lambda *_args: self.refresh_preview())
+        self.annotations_path_entry = LabeledEntry(controls, "Annotations", "", browse=True, directory=False)
+        self.annotations_path_entry.pack(fill=tk.X, padx=8, pady=4)
+        self.annotations_path_entry.var = self.state.annotation_path_var
+        self.annotations_path_entry.entry_widget.configure(textvariable=self.state.annotation_path_var)
+        self.annotations_path_entry.on_browse_selected = lambda _value: self.load_resources()
+        self.state.annotation_path_var.trace_add("write", lambda *_args: self.load_resources())
+
+        cameras_box = ttk.LabelFrame(controls, text="Cameras")
+        cameras_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        self.annotation_cameras_summary = tk.StringVar(value="Cameras (n=0/0)")
+        ttk.Label(cameras_box, textvariable=self.annotation_cameras_summary, anchor="w").pack(
+            fill=tk.X, padx=8, pady=(6, 2)
+        )
+        cameras_body = ttk.Frame(cameras_box, height=90)
+        cameras_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        cameras_body.pack_propagate(False)
+        self.annotation_cameras_list = tk.Listbox(cameras_body, selectmode=tk.EXTENDED, exportselection=False, height=5)
+        self.annotation_cameras_list.pack(fill=tk.BOTH, expand=True)
+        bind_extended_listbox_shortcuts(self.annotation_cameras_list)
+        self.annotation_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_camera_selection_changed())
+
+        keypoints_box = ttk.LabelFrame(controls, text="Markers")
+        keypoints_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self.current_marker_var = tk.StringVar(value="")
+        ttk.Label(keypoints_box, textvariable=self.current_marker_var, anchor="w").pack(fill=tk.X, padx=8, pady=(6, 2))
+        keypoints_body = ttk.Frame(keypoints_box, height=200)
+        keypoints_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        keypoints_body.pack_propagate(False)
+        self.annotation_keypoints_list = tk.Listbox(keypoints_body, exportselection=False, height=10)
+        self.annotation_keypoints_list.pack(fill=tk.BOTH, expand=True)
+        self.annotation_keypoints_list.bind("<<ListboxSelect>>", lambda _event: self.on_keypoint_selection_changed())
+        for keypoint_name in COCO17:
+            self.annotation_keypoints_list.insert(tk.END, keypoint_name)
+        self.annotation_keypoints_list.selection_set(0)
+
+        preview_box = ttk.LabelFrame(right, text="Annotation preview")
+        preview_box.pack(fill=tk.BOTH, expand=True)
+        preview_controls = ttk.Frame(preview_box)
+        preview_controls.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(preview_controls, text="Prev frame", command=lambda: self.step_frame(-1)).pack(side=tk.LEFT)
+        ttk.Button(preview_controls, text="Next frame", command=lambda: self.step_frame(1)).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
+        self.frame_var = tk.IntVar(value=0)
+        self.frame_scale = ttk.Scale(
+            preview_controls,
+            from_=0,
+            to=0,
+            orient=tk.HORIZONTAL,
+            variable=self.frame_var,
+            command=self.on_frame_scale_changed,
+        )
+        self.frame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8))
+        self.frame_label = ttk.Label(preview_controls, text="frame 0")
+        self.frame_label.pack(side=tk.LEFT)
+
+        self.preview_figure = Figure(figsize=(11, 8))
+        self.preview_canvas = FigureCanvasTkAgg(self.preview_figure, master=preview_box)
+        self.preview_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas.mpl_connect("button_press_event", self.on_preview_click)
+        self.preview_canvas.mpl_connect("scroll_event", self.on_preview_scroll)
+        self.preview_canvas.mpl_connect("motion_notify_event", self.on_preview_motion)
+        self.preview_canvas.mpl_connect("button_release_event", self.on_preview_release)
+
+        attach_tooltip(
+            self.annotation_keypoints_list,
+            "Liste des marqueurs annotés. En mode monoview ordered, un clic place le point puis passe automatiquement au marqueur suivant.",
+        )
+        attach_tooltip(
+            self.annotation_cameras_list,
+            "Caméras visibles dans l’annotation. En mode monoview, seule la première caméra sélectionnée est affichée.",
+        )
+        self.annotations_path_entry.set_tooltip(
+            "Fichier JSON sparse d’annotations 2D. Par défaut: inputs/annotations/<dataset>_annotations.json"
+        )
+        self.images_root_entry.set_tooltip("Dossier d’images utilisé comme fond des vues 2D pendant l’annotation.")
+        self.motion_prior_diameter.set_tooltip(
+            "Diamètre du cercle de confiance basé sur la vitesse estimée entre t-2 et t-1."
+        )
+        attach_tooltip(
+            self.preview_canvas.get_tk_widget(),
+            "Souris: clic gauche place un point, clic droit efface, molette zoome, clic molette + glisser déplace.",
+        )
+
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
+        self.sync_dataset_defaults()
+
+    def sync_dataset_defaults(self) -> None:
+        keypoints_path = ROOT / self.state.keypoints_var.get()
+        self.annotation_path = default_annotation_path(keypoints_path)
+        self.state.annotation_path_var.set(display_path(self.annotation_path))
+        inferred_images_root = infer_execution_images_root(keypoints_path)
+        self.images_root = inferred_images_root
+        self.images_root_entry.var.set("" if inferred_images_root is None else display_path(inferred_images_root))
+        self.load_resources()
+
+    def selected_annotation_camera_names(self) -> list[str]:
+        if self.pose_data is None:
+            return []
+        all_camera_names = [str(name) for name in self.pose_data.camera_names]
+        indices = [int(index) for index in self.annotation_cameras_list.curselection()]
+        if not indices:
+            return list(all_camera_names)
+        selected = [all_camera_names[index] for index in indices if 0 <= index < len(all_camera_names)]
+        if self.monoview_var.get() and selected:
+            return [selected[0]]
+        return selected
+
+    def update_camera_summary(self) -> None:
+        total_count = self.annotation_cameras_list.size()
+        selected_count = len(self.annotation_cameras_list.curselection()) if total_count else 0
+        if total_count and selected_count == 0:
+            selected_count = total_count
+        if self.monoview_var.get() and selected_count > 1:
+            selected_count = 1
+        self.annotation_cameras_summary.set(f"Cameras (n={selected_count}/{total_count})")
+
+    def on_camera_selection_changed(self) -> None:
+        self.update_camera_summary()
+        self.refresh_preview()
+
+    def selected_keypoint_name(self) -> str:
+        selection = self.annotation_keypoints_list.curselection()
+        index = int(selection[0]) if selection else 0
+        return str(self.annotation_keypoints_list.get(index))
+
+    def on_keypoint_selection_changed(self) -> None:
+        self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
+        self.refresh_preview()
+
+    def current_frame_number(self) -> int:
+        if self.pose_data is None or len(self.pose_data.frames) == 0:
+            return 0
+        frame_idx = max(0, min(len(self.pose_data.frames) - 1, int(round(self.frame_var.get()))))
+        return int(self.pose_data.frames[frame_idx])
+
+    def _current_images_root(self) -> Path | None:
+        images_value = self.images_root_entry.get().strip()
+        if images_value:
+            return ROOT / images_value
+        return self.images_root
+
+    def _set_frame_index(self, frame_idx: int) -> None:
+        clamped = max(0, int(frame_idx))
+        if self.pose_data is not None and len(self.pose_data.frames) > 0:
+            clamped = min(clamped, len(self.pose_data.frames) - 1)
+        if clamped != int(self._current_frame_idx):
+            self.save_annotations()
+        self._current_frame_idx = clamped
+        self.frame_var.set(clamped)
+
+    def on_frame_scale_changed(self, _value) -> None:
+        self._set_frame_index(int(round(self.frame_var.get())))
+        self.refresh_preview()
+
+    def step_frame(self, delta: int) -> None:
+        if self.pose_data is None or len(self.pose_data.frames) == 0:
+            return
+        next_frame = find_annotation_frame_with_images(
+            frames=self.pose_data.frames,
+            current_index=int(round(self.frame_var.get())),
+            direction=int(delta),
+            camera_names=self.selected_annotation_camera_names(),
+            images_root=self._current_images_root(),
+        )
+        self._set_frame_index(next_frame)
+        self.refresh_preview()
+
+    def load_resources(self) -> None:
+        try:
+            keypoints_path = ROOT / self.state.keypoints_var.get()
+            calib_path = ROOT / self.state.calib_var.get()
+            self.calibrations, self.pose_data = get_cached_pose_data(
+                self.state,
+                keypoints_path=keypoints_path,
+                calib_path=calib_path,
+                data_mode="raw",
+                smoothing_window=int(self.state.pose_filter_window_var.get()),
+                outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
+                lower_percentile=float(self.state.pose_p_low_var.get()),
+                upper_percentile=float(self.state.pose_p_high_var.get()),
+            )
+            annotation_path_value = self.annotations_path_entry.get().strip()
+            self.annotation_path = (
+                (ROOT / annotation_path_value) if annotation_path_value else default_annotation_path(keypoints_path)
+            )
+            self.annotation_payload = load_annotation_payload(self.annotation_path, keypoints_path=keypoints_path)
+            self.annotation_cameras_list.delete(0, tk.END)
+            for camera_name in self.pose_data.camera_names:
+                self.annotation_cameras_list.insert(tk.END, str(camera_name))
+                self.annotation_cameras_list.selection_set(tk.END)
+            self.update_camera_summary()
+            self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
+            self.frame_scale.configure(to=max(len(self.pose_data.frames) - 1, 0))
+            self._set_frame_index(min(int(self.frame_var.get()), max(len(self.pose_data.frames) - 1, 0)))
+            self.crop_limits_cache = {}
+            self.crop_limits_key = None
+            self.refresh_preview()
+        except Exception as exc:
+            messagebox.showerror("Annotation", str(exc))
+
+    def save_annotations(self) -> None:
+        if self.annotation_path is None:
+            return
+        save_annotation_payload(self.annotation_path, self.annotation_payload)
+
+    def _ensure_crop_limits(self, camera_names: list[str]) -> dict[str, np.ndarray]:
+        if self.pose_data is None:
+            return {}
+        raw_points = np.asarray(
+            self.pose_data.raw_keypoints if self.pose_data.raw_keypoints is not None else self.pose_data.keypoints,
+            dtype=float,
+        )
+        cache_key = (
+            id(self.pose_data),
+            tuple(camera_names),
+            0.2,
+        )
+        if self.crop_limits_key != cache_key:
+            self.crop_limits_cache = compute_pose_crop_limits_2d(raw_points, self.calibrations, camera_names, 0.2)
+            self.crop_limits_key = cache_key
+        return self.crop_limits_cache
+
+    def _annotation_xy(self, camera_name: str, frame_number: int, keypoint_name: str) -> np.ndarray | None:
+        xy, _score = get_annotation_point(
+            self.annotation_payload,
+            camera_name=camera_name,
+            frame_number=frame_number,
+            keypoint_name=keypoint_name,
+        )
+        return None if xy is None else np.asarray(xy, dtype=float)
+
+    def _advance_to_next_keypoint(self) -> None:
+        if not self.advance_marker_var.get():
+            return
+        selection = self.annotation_keypoints_list.curselection()
+        index = int(selection[0]) if selection else 0
+        next_index = min(self.annotation_keypoints_list.size() - 1, index + 1)
+        self.annotation_keypoints_list.selection_clear(0, tk.END)
+        self.annotation_keypoints_list.selection_set(next_index)
+        self.annotation_keypoints_list.see(next_index)
+        self.on_keypoint_selection_changed()
+
+    def on_preview_click(self, event) -> None:
+        if self.pose_data is None or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        if int(getattr(event, "button", 1)) == 2:
+            self._pan_state = {
+                "axes": event.inaxes,
+                "xdata": float(event.xdata),
+                "ydata": float(event.ydata),
+                "xlim": tuple(event.inaxes.get_xlim()),
+                "ylim": tuple(event.inaxes.get_ylim()),
+            }
+            return
+        camera_name = self._axis_to_camera.get(event.inaxes)
+        if camera_name is None:
+            return
+        keypoint_name = self.selected_keypoint_name()
+        frame_number = self.current_frame_number()
+        if int(getattr(event, "button", 1)) == 3:
+            clear_annotation_point(
+                self.annotation_payload,
+                camera_name=camera_name,
+                frame_number=frame_number,
+                keypoint_name=keypoint_name,
+            )
+        else:
+            set_annotation_point(
+                self.annotation_payload,
+                camera_name=camera_name,
+                frame_number=frame_number,
+                keypoint_name=keypoint_name,
+                xy=[float(event.xdata), float(event.ydata)],
+            )
+            if self.monoview_var.get():
+                self._advance_to_next_keypoint()
+        self.save_annotations()
+        self.refresh_preview()
+
+    def on_preview_scroll(self, event) -> None:
+        if event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        scale = 0.9 if str(getattr(event, "button", "")).lower() == "up" else 1.1
+        x0, x1 = event.inaxes.get_xlim()
+        y0, y1 = event.inaxes.get_ylim()
+        cx = float(event.xdata)
+        cy = float(event.ydata)
+        event.inaxes.set_xlim(cx + (x0 - cx) * scale, cx + (x1 - cx) * scale)
+        event.inaxes.set_ylim(cy + (y0 - cy) * scale, cy + (y1 - cy) * scale)
+        self.preview_canvas.draw_idle()
+
+    def on_preview_motion(self, event) -> None:
+        if self._pan_state is None or event.inaxes is None or event.xdata is None or event.ydata is None:
+            return
+        if event.inaxes is not self._pan_state.get("axes"):
+            return
+        x_press = float(self._pan_state["xdata"])
+        y_press = float(self._pan_state["ydata"])
+        xlim0 = tuple(self._pan_state["xlim"])
+        ylim0 = tuple(self._pan_state["ylim"])
+        dx = float(event.xdata) - x_press
+        dy = float(event.ydata) - y_press
+        event.inaxes.set_xlim(xlim0[0] - dx, xlim0[1] - dx)
+        event.inaxes.set_ylim(ylim0[0] - dy, ylim0[1] - dy)
+        self.preview_canvas.draw_idle()
+
+    def on_preview_release(self, _event) -> None:
+        self._pan_state = None
+
+    def refresh_preview(self) -> None:
+        if self.pose_data is None or self.calibrations is None or len(self.pose_data.frames) == 0:
+            return
+        all_camera_names = [str(name) for name in self.pose_data.camera_names]
+        camera_names = self.selected_annotation_camera_names()
+        if not camera_names:
+            camera_names = list(all_camera_names[:1] if self.monoview_var.get() else all_camera_names)
+        frame_idx = max(0, min(len(self.pose_data.frames) - 1, int(round(self.frame_var.get()))))
+        self._current_frame_idx = frame_idx
+        self.frame_var.set(frame_idx)
+        frame_number = int(self.pose_data.frames[frame_idx])
+        self.frame_label.configure(text=f"frame {frame_idx} | raw {frame_number}")
+        crop_limits = self._ensure_crop_limits(camera_names) if self.crop_var.get() else {}
+        current_marker = self.selected_keypoint_name()
+        current_color = annotation_marker_color(current_marker)
+        self.preview_figure.clear()
+        nrows, ncols = camera_layout(len(camera_names))
+        axes = np.atleast_1d(self.preview_figure.subplots(nrows, ncols)).ravel()
+        self._axis_to_camera = {}
+        images_root = self._current_images_root()
+
+        for ax_idx, ax in enumerate(axes):
+            if ax_idx >= len(camera_names):
+                ax.axis("off")
+                continue
+            camera_name = camera_names[ax_idx]
+            self._axis_to_camera[ax] = camera_name
+            width, height = self.calibrations[camera_name].image_size
+            if self.show_images_var.get():
+                image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
+                if image_path is not None and image_path.exists():
+                    ax.imshow(
+                        annotation_adjust_image(
+                            plt.imread(str(image_path)),
+                            brightness=float(self.image_brightness_var.get()),
+                            contrast=float(self.image_contrast_var.get()),
+                        )
+                    )
+            apply_2d_axis_limits(
+                ax,
+                crop_mode=("pose" if self.crop_var.get() else "full"),
+                crop_limits=crop_limits,
+                cam_name=camera_name,
+                frame_idx=frame_idx,
+                width=width,
+                height=height,
+            )
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_title(camera_name)
+            ax.grid(alpha=0.15)
+
+            for keypoint_name in COCO17:
+                annotated_xy = self._annotation_xy(camera_name, frame_number, keypoint_name)
+                if annotated_xy is None:
+                    continue
+                marker_color = annotation_marker_color(keypoint_name)
+                ax.scatter(
+                    [annotated_xy[0]],
+                    [annotated_xy[1]],
+                    s=(95 if keypoint_name == current_marker else 55),
+                    c=[marker_color],
+                    marker=annotation_marker_shape(keypoint_name),
+                    edgecolors=("black" if keypoint_name == current_marker else marker_color),
+                    linewidths=(1.2 if keypoint_name == current_marker else 0.6),
+                    zorder=5,
+                )
+
+            if self.show_motion_prior_var.get():
+                previous_xy = self._annotation_xy(camera_name, int(frame_number - 1), current_marker)
+                two_back_xy = self._annotation_xy(camera_name, int(frame_number - 2), current_marker)
+                prior_center = annotation_motion_prior_center(previous_xy, two_back_xy)
+                if prior_center is not None:
+                    circle = plt.Circle(
+                        tuple(prior_center),
+                        radius=0.5 * float(self.motion_prior_diameter.get()),
+                        edgecolor=current_color,
+                        facecolor="none",
+                        linestyle="--",
+                        linewidth=1.3,
+                        alpha=0.8,
+                    )
+                    ax.add_patch(circle)
+
+            other_camera_names: list[str] = []
+            other_points: list[np.ndarray] = []
+            for other_camera_name in camera_names:
+                if other_camera_name == camera_name:
+                    continue
+                other_xy = self._annotation_xy(other_camera_name, frame_number, current_marker)
+                if other_xy is None:
+                    continue
+                other_camera_names.append(other_camera_name)
+                other_points.append(other_xy)
+                if self.show_epipolar_var.get():
+                    line = annotation_epipolar_guides(self.calibrations, other_camera_name, camera_name, other_xy)
+                    if line is not None:
+                        x0, x1 = ax.get_xlim()
+                        y0, y1 = ax.get_ylim()
+                        xs = np.array([x0, x1], dtype=float)
+                        if abs(line[1]) > 1e-8:
+                            ys = -(line[0] * xs + line[2]) / line[1]
+                            ax.plot(xs, ys, color=current_color, linewidth=1.0, alpha=0.6, linestyle=":")
+                        elif abs(line[0]) > 1e-8:
+                            x_const = -line[2] / line[0]
+                            ax.plot(
+                                [x_const, x_const],
+                                [y0, y1],
+                                color=current_color,
+                                linewidth=1.0,
+                                alpha=0.6,
+                                linestyle=":",
+                            )
+            if self.show_triangulated_hint_var.get():
+                triangulated_hint = annotation_triangulated_reprojection(
+                    self.calibrations,
+                    target_camera_name=camera_name,
+                    source_camera_names=other_camera_names,
+                    source_points_2d=other_points,
+                )
+                if triangulated_hint is not None:
+                    ax.scatter(
+                        [triangulated_hint[0]],
+                        [triangulated_hint[1]],
+                        s=95,
+                        c=[current_color],
+                        marker="x",
+                        linewidths=1.7,
+                        zorder=6,
+                    )
+            ax.tick_params(labelsize=8)
+
+        self.preview_figure.subplots_adjust(left=0.03, right=0.995, bottom=0.035, top=0.96, wspace=0.05, hspace=0.12)
+        self.preview_canvas.draw_idle()
+
+
 class FiguresTab(CommandTab):
     def __init__(self, master):
         super().__init__(master, "Figures")
@@ -5189,18 +5985,25 @@ class ModelTab(CommandTab):
             state="readonly",
         )
         structure_box.pack(side=tk.LEFT, padx=(0, 8))
+
+        row1b = ttk.Frame(form)
+        row1b.pack(fill=tk.X, padx=8, pady=4)
         self.symmetrize_limbs_var = tk.BooleanVar(value=DEFAULT_MODEL_SYMMETRIZE_LIMBS)
         symmetrize_check = ttk.Checkbutton(
-            row,
+            row1b,
             text="Symmetrize limbs",
             variable=self.symmetrize_limbs_var,
         )
-        symmetrize_check.pack(side=tk.LEFT, padx=(0, 8))
+        symmetrize_check.pack(side=tk.LEFT, padx=(0, 12))
         self.triang_method = tk.StringVar(value="exhaustive")
-        triang_label = ttk.Label(row, text="Triangulation", width=12)
+        triang_label = ttk.Label(row1b, text="Triangulation", width=12)
         triang_label.pack(side=tk.LEFT)
         triang_box = ttk.Combobox(
-            row, textvariable=self.triang_method, values=["once", "greedy", "exhaustive"], width=12, state="readonly"
+            row1b,
+            textvariable=self.triang_method,
+            values=["once", "greedy", "exhaustive"],
+            width=12,
+            state="readonly",
         )
         triang_box.pack(side=tk.LEFT, padx=(0, 8))
 
@@ -5217,13 +6020,13 @@ class ModelTab(CommandTab):
         row2b = ttk.Frame(form)
         row2b.pack(fill=tk.X, padx=8, pady=4)
         default_model_pose_mode = state.pose_data_mode_var.get().strip()
-        if default_model_pose_mode not in ("raw", "cleaned"):
+        if default_model_pose_mode not in ("raw", "annotated", "cleaned"):
             default_model_pose_mode = "cleaned"
         self.pose_data_mode = tk.StringVar(value=default_model_pose_mode)
         pose_mode_label = ttk.Label(row2b, text="2D source", width=10)
         pose_mode_label.pack(side=tk.LEFT)
         pose_mode_box = ttk.Combobox(
-            row2b, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=10, state="readonly"
+            row2b, textvariable=self.pose_data_mode, values=["raw", "annotated", "cleaned"], width=10, state="readonly"
         )
         pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
         default_pose_correction_mode = current_calibration_correction_mode(state)
@@ -6420,7 +7223,7 @@ class ProfilesTab(CommandTab):
         pose_mode_box = ttk.Combobox(
             self.pose_mode_frame,
             textvariable=self.pose_data_mode,
-            values=["raw", "cleaned"],
+            values=["raw", "annotated", "cleaned"],
             width=12,
             state="readonly",
         )
@@ -6441,13 +7244,21 @@ class ProfilesTab(CommandTab):
         self.common_frame = ttk.Frame(form)
         self.common_frame.pack(fill=tk.X, padx=8, pady=4)
         self.initial_rot_var = state.initial_rotation_correction_var
-        self.unwrap_var = tk.BooleanVar(value=False)
+        self.root_unwrap_mode = tk.StringVar(value=root_unwrap_mode_display_name("single"))
         initial_rot_check = ttk.Checkbutton(
             self.common_frame, text="initial-rotation-correction", variable=self.initial_rot_var
         )
         initial_rot_check.pack(side=tk.LEFT, padx=(0, 12))
-        unwrap_check = ttk.Checkbutton(self.common_frame, text="no-root-unwrap", variable=self.unwrap_var)
-        unwrap_check.pack(side=tk.LEFT)
+        unwrap_label = ttk.Label(self.common_frame, text="Root unwrap", width=11)
+        unwrap_label.pack(side=tk.LEFT)
+        unwrap_box = ttk.Combobox(
+            self.common_frame,
+            textvariable=self.root_unwrap_mode,
+            values=[root_unwrap_mode_display_name(mode) for mode in SUPPORTED_ROOT_UNWRAP_MODES],
+            width=14,
+            state="readonly",
+        )
+        unwrap_box.pack(side=tk.LEFT)
 
         self.triang_frame = ttk.Frame(form)
         triang_label = ttk.Label(self.triang_frame, text="Triangulation", width=12)
@@ -6679,7 +7490,14 @@ class ProfilesTab(CommandTab):
             initial_rot_check,
             "Active l'alignement horizontal de la racine autour de Z avant generation du modele ou extraction geometrique.",
         )
-        attach_tooltip(unwrap_check, "Desactive l'unwrap temporel de la racine dans les reconstructions geometriques.")
+        attach_tooltip(
+            unwrap_label,
+            "Controle la stabilisation temporelle des angles de racine: off, single unwrap, ou double unwrap.",
+        )
+        attach_tooltip(
+            unwrap_box,
+            "Double unwrap reproduit le comportement récent. Single unwrap applique une seule passe reextract+unwrap. Off désactive l'unwrap et garde seulement la réextraction Euler.",
+        )
         attach_tooltip(triang_label, "Choisit la variante de triangulation 3D: once, greedy, ou exhaustive.")
         attach_tooltip(
             triang_box,
@@ -6794,6 +7612,7 @@ class ProfilesTab(CommandTab):
         self.flip_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.root_unwrap_mode.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.flip_improvement_ratio_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.flip_min_gain_px_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.state.flip_min_other_cameras_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -7126,7 +7945,8 @@ class ProfilesTab(CommandTab):
             coherence_method=(
                 coherence_method_from_display_name(self.coherence_method.get()) if family == "ekf_2d" else "epipolar"
             ),
-            no_root_unwrap=self.unwrap_var.get(),
+            no_root_unwrap=(root_unwrap_mode_from_display_name(self.root_unwrap_mode.get()) == "off"),
+            root_unwrap_mode=root_unwrap_mode_from_display_name(self.root_unwrap_mode.get()),
             biorbd_kalman_noise_factor=float(self.biorbd_noise.get()),
             biorbd_kalman_error_factor=float(self.biorbd_error.get()),
             biorbd_kalman_init_method=(
@@ -7198,8 +8018,9 @@ class ProfilesTab(CommandTab):
                 flags.append("flip")
             if profile.dof_locking:
                 flags.append("lock")
-            if profile.no_root_unwrap:
-                flags.append("no_unwrap")
+            root_unwrap_mode = profile_root_unwrap_mode(profile)
+            if root_unwrap_mode != "single":
+                flags.append(f"unwrap:{root_unwrap_mode}")
             if getattr(profile, "use_all_cameras", False):
                 flags.append("cams[all]")
             elif getattr(profile, "camera_names", None):
@@ -7275,7 +8096,7 @@ class ProfilesTab(CommandTab):
             self.on_flip_method_changed()
             self.lock_var.set(bool(getattr(profile, "dof_locking", False)))
             self.initial_rot_var.set(bool(getattr(profile, "initial_rotation_correction", False)))
-            self.unwrap_var.set(bool(getattr(profile, "no_root_unwrap", False)))
+            self.root_unwrap_mode.set(root_unwrap_mode_display_name(profile_root_unwrap_mode(profile)))
             self.state.pose_filter_window_var.set(str(int(getattr(profile, "pose_filter_window", 9))))
             self.state.pose_outlier_ratio_var.set(f"{float(getattr(profile, 'pose_outlier_threshold_ratio', 0.10)):g}")
             self.state.pose_p_low_var.set(f"{float(getattr(profile, 'pose_amplitude_lower_percentile', 5.0)):g}")
@@ -7377,6 +8198,7 @@ class ProfilesTab(CommandTab):
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
+        selected_profiles = self.selected_profiles()
         runtime_config_path = write_runtime_profiles_config(self.state)
         cmd = [
             sys.executable,
@@ -7401,7 +8223,11 @@ class ProfilesTab(CommandTab):
             cmd.extend(["--camera-names", ",".join(selected_cameras)])
         if self.state.pose2sim_trc_var.get().strip():
             cmd.extend(["--trc-file", self.state.pose2sim_trc_var.get()])
-        for profile in self.selected_profiles():
+        annotation_var = getattr(self.state, "annotation_path_var", None)
+        annotations_path = "" if annotation_var is None else str(annotation_var.get()).strip()
+        if annotations_path and any(profile.pose_data_mode == "annotated" for profile in selected_profiles):
+            cmd.extend(["--annotations-path", annotations_path])
+        for profile in selected_profiles:
             cmd.extend(["--profile", profile.name])
         return cmd
 
@@ -7748,6 +8574,7 @@ class ReconstructionsTab(CommandTab):
         return [self.state.profiles[int(item)] for item in selected]
 
     def build_command(self) -> list[str]:
+        selected_profiles = self.selected_profiles()
         runtime_config_path = write_runtime_profiles_config(self.state)
         cmd = [
             sys.executable,
@@ -7769,7 +8596,11 @@ class ReconstructionsTab(CommandTab):
         ]
         if self.state.pose2sim_trc_var.get().strip():
             cmd.extend(["--trc-file", self.state.pose2sim_trc_var.get()])
-        for profile in self.selected_profiles():
+        annotation_var = getattr(self.state, "annotation_path_var", None)
+        annotations_path = "" if annotation_var is None else str(annotation_var.get()).strip()
+        if annotations_path and any(profile.pose_data_mode == "annotated" for profile in selected_profiles):
+            cmd.extend(["--annotations-path", annotations_path])
+        for profile in selected_profiles:
             cmd.extend(["--profile", profile.name])
         return cmd
 
@@ -11163,15 +11994,74 @@ class DDTab(ttk.Frame):
         gui_debug("DD refresh_plot done " f"selected_jump={jump_idx + 1 if selected_jump is not None else 0}")
 
 
+class StartupStatusWindow(tk.Toplevel):
+    """Small splash window shown while the main GUI is being prepared."""
+
+    def __init__(self, master: tk.Tk):
+        super().__init__(master)
+        self.title("Starting GUI")
+        self.resizable(False, False)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        self.status_var = tk.StringVar(value="Starting...")
+        self.progress_var = tk.DoubleVar(value=0.0)
+
+        body = ttk.Frame(self, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text="Preparing VitPose / EKF launcher", font=("", 14, "bold")).pack(anchor="w")
+        ttk.Label(body, text="Please wait while the GUI loads caches and initial data.").pack(anchor="w", pady=(6, 10))
+        ttk.Label(body, textvariable=self.status_var, wraplength=420).pack(anchor="w")
+        self.progress = ttk.Progressbar(body, mode="determinate", length=420, maximum=1.0, variable=self.progress_var)
+        self.progress.pack(fill=tk.X, pady=(12, 0))
+        self.geometry("470x150")
+
+    def set_status(self, message: str, progress_ratio: float | None = None) -> None:
+        self.status_var.set(str(message))
+        if progress_ratio is not None:
+            self.progress_var.set(float(np.clip(progress_ratio, 0.0, 1.0)))
+        self.update_idletasks()
+
+
 class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.withdraw()
         self.title("VitPose / EKF launcher")
         self.geometry("1450x950")
+        self.startup_window = StartupStatusWindow(self)
+        tab_specs = [
+            ("2D analysis", DataExplorer2DTab),
+            ("Cameras", CameraToolsTab),
+            ("Annotation", AnnotationTab),
+            ("Models", ModelTab),
+            ("Profiles", ProfilesTab),
+            ("Reconstructions", ReconstructionsTab),
+            ("3D animation", DualAnimationTab),
+            ("2D multiview", MultiViewTab),
+            ("Execution", ExecutionTab),
+            ("DD", DDTab),
+            ("Toile", TrampolineTab),
+            ("Racine", RootKinematicsTab),
+            ("Autres DoF", JointKinematicsTab),
+            ("3D analysis", Analysis3DTab),
+            ("Observabilité", ObservabilityTab),
+        ]
+        self._startup_total_steps = 4 + len(tab_specs) + 1
+        self._startup_step = 0
+
+        def advance_startup(message: str) -> None:
+            self._startup_step += 1
+            self._set_startup_status(message, progress_ratio=self._startup_step / self._startup_total_steps)
+
+        advance_startup("Creating shared application state")
 
         state = SharedAppState(
             calib_var=tk.StringVar(value=DEFAULT_GUI_CALIB_PATH),
             keypoints_var=tk.StringVar(value=DEFAULT_GUI_KEYPOINTS_PATH),
+            annotation_path_var=tk.StringVar(
+                value=display_path(default_annotation_path(ROOT / DEFAULT_GUI_KEYPOINTS_PATH))
+            ),
             pose2sim_trc_var=tk.StringVar(value=DEFAULT_GUI_TRC_PATH),
             fps_var=tk.StringVar(value="120"),
             workers_var=tk.StringVar(value="6"),
@@ -11194,7 +12084,9 @@ class LauncherApp(tk.Tk):
             output_root_var=tk.StringVar(value="output"),
             profiles_config_var=tk.StringVar(value=DEFAULT_GUI_PROFILES_CONFIG),
         )
+        state.startup_status_callback = self._set_startup_status
         state.output_root_var.set(display_path(normalize_output_root(state.output_root_var.get())))
+        advance_startup("Loading saved reconstruction profiles")
         profiles_path = ROOT / state.profiles_config_var.get()
         if profiles_path.exists():
             try:
@@ -11206,31 +12098,38 @@ class LauncherApp(tk.Tk):
         synchronize_profiles_initial_rotation_correction(state)
         self.state = state
 
+        advance_startup("Building main window layout")
         container = ttk.Frame(self)
         container.pack(fill=tk.BOTH, expand=True)
 
+        advance_startup("Preparing shared reconstruction selector")
         self.shared_reconstruction_panel = SharedReconstructionPanel(container, state, tooltip_fn=attach_tooltip)
         self.shared_reconstruction_panel.pack(fill=tk.X, padx=10, pady=(10, 0))
         self.state.shared_reconstruction_panel = self.shared_reconstruction_panel
 
         self.notebook = ttk.Notebook(container)
         self.notebook.pack(fill=tk.BOTH, expand=True)
-        self.notebook.add(DataExplorer2DTab(self.notebook, state), text="2D analysis")
-        self.notebook.add(CameraToolsTab(self.notebook, state), text="Cameras")
-        self.notebook.add(ModelTab(self.notebook, state), text="Models")
-        self.notebook.add(ProfilesTab(self.notebook, state), text="Profiles")
-        self.notebook.add(ReconstructionsTab(self.notebook, state), text="Reconstructions")
-        self.notebook.add(DualAnimationTab(self.notebook, state), text="3D animation")
-        self.notebook.add(MultiViewTab(self.notebook, state), text="2D multiview")
-        self.notebook.add(ExecutionTab(self.notebook, state), text="Execution")
-        self.notebook.add(DDTab(self.notebook, state), text="DD")
-        self.notebook.add(TrampolineTab(self.notebook, state), text="Toile")
-        self.notebook.add(RootKinematicsTab(self.notebook, state), text="Racine")
-        self.notebook.add(JointKinematicsTab(self.notebook, state), text="Autres DoF")
-        self.notebook.add(Analysis3DTab(self.notebook, state), text="3D analysis")
-        self.notebook.add(ObservabilityTab(self.notebook, state), text="Observabilité")
+        for tab_label, tab_cls in tab_specs:
+            advance_startup(f"Preparing {tab_label} tab")
+            self.notebook.add(tab_cls(self.notebook, state), text=tab_label)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        advance_startup("Finalizing GUI")
         self.after_idle(self._refresh_active_reconstruction_panel)
+        self.after_idle(self._finish_startup)
+
+    def _set_startup_status(self, message: str, progress_ratio: float | None = None) -> None:
+        startup_window = getattr(self, "startup_window", None)
+        if startup_window is None or not startup_window.winfo_exists():
+            return
+        startup_window.set_status(message, progress_ratio=progress_ratio)
+        self.update_idletasks()
+
+    def _finish_startup(self) -> None:
+        self.state.startup_status_callback = None
+        startup_window = getattr(self, "startup_window", None)
+        if startup_window is not None and startup_window.winfo_exists():
+            startup_window.destroy()
+        self.deiconify()
 
     def _refresh_active_reconstruction_panel(self) -> None:
         """Bind the top reconstruction selector to the active tab when supported."""

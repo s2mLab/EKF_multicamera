@@ -6,6 +6,7 @@ import numpy as np
 import pipeline_gui
 from preview.dataset_preview_state import DatasetPreviewState
 from preview.shared_reconstruction_panel import SharedReconstructionPanel
+from vitpose_ekf_pipeline import CameraCalibration
 
 
 class _FakeTree:
@@ -118,6 +119,57 @@ def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_sta
     assert output_dir == Path("outputs/demo")
     assert loaded_bundle is bundle
     assert loaded_preview_state is preview_state
+
+
+def test_get_cached_calibrations_reports_startup_status(monkeypatch, tmp_path):
+    messages = []
+    state = SimpleNamespace(calibration_cache={}, startup_status_callback=messages.append)
+    calib_path = tmp_path / "Calib.toml"
+    calib_path.write_text("")
+
+    monkeypatch.setattr(pipeline_gui, "load_calibrations", lambda _path: {"cam0": object()})
+
+    calibrations = pipeline_gui.get_cached_calibrations(state, calib_path)
+
+    assert "Loading calibrations: Calib.toml" in messages
+    assert calibrations.keys() == {"cam0"}
+
+
+def test_get_cached_pose_data_reports_cached_status(monkeypatch, tmp_path):
+    messages = []
+    keypoints_path = tmp_path / "trial_keypoints.json"
+    keypoints_path.write_text("{}")
+    calib_path = tmp_path / "Calib.toml"
+    calib_path.write_text("")
+    cache_key = pipeline_gui.pose_data_cache_key(
+        keypoints_path=keypoints_path,
+        calib_path=calib_path,
+        max_frames=None,
+        frame_start=None,
+        frame_end=None,
+        data_mode="cleaned",
+        smoothing_window=9,
+        outlier_threshold_ratio=0.1,
+        lower_percentile=5.0,
+        upper_percentile=95.0,
+    )
+    cached_pose_data = object()
+    state = SimpleNamespace(
+        calibration_cache={pipeline_gui.calibration_cache_key(calib_path): {"cam0": object()}},
+        pose_data_cache={cache_key: cached_pose_data},
+        startup_status_callback=messages.append,
+    )
+
+    calibrations, pose_data = pipeline_gui.get_cached_pose_data(
+        state,
+        keypoints_path=keypoints_path,
+        calib_path=calib_path,
+    )
+
+    assert "Using cached 2D poses: trial_keypoints.json" in messages
+    assert "Using cached calibrations: Calib.toml" in messages
+    assert calibrations.keys() == {"cam0"}
+    assert pose_data is cached_pose_data
 
 
 def test_reconstruction_legend_label_uses_shared_panel_order():
@@ -355,6 +407,103 @@ def test_square_crop_bounds_returns_square_window():
     assert np.isclose(x1 - x0, y1 - y0)
 
 
+def test_annotation_motion_prior_center_extrapolates_velocity():
+    center = pipeline_gui.annotation_motion_prior_center(
+        np.array([100.0, 80.0], dtype=float),
+        np.array([92.0, 74.0], dtype=float),
+    )
+
+    np.testing.assert_allclose(center, np.array([108.0, 86.0], dtype=float))
+
+
+def test_annotation_adjust_image_changes_brightness_and_contrast():
+    image = np.array([[[0.25, 0.5, 0.75], [0.4, 0.5, 0.6]]], dtype=float)
+
+    adjusted = pipeline_gui.annotation_adjust_image(image, brightness=1.2, contrast=0.5)
+
+    assert adjusted.shape == image.shape
+    assert np.all(np.isfinite(adjusted))
+    assert not np.allclose(adjusted, image)
+
+
+def test_find_annotation_frame_with_images_skips_missing_frames(tmp_path):
+    images_root = tmp_path / "images"
+    images_root.mkdir(parents=True)
+    target_image = images_root / "Camera1_M11139_frame_00005.jpg"
+    target_image.write_bytes(b"test")
+
+    frame_idx = pipeline_gui.find_annotation_frame_with_images(
+        frames=np.array([3, 4, 5, 6], dtype=int),
+        current_index=0,
+        direction=1,
+        camera_names=["M11139"],
+        images_root=images_root,
+    )
+
+    assert frame_idx == 2
+
+
+def test_annotation_tab_set_frame_index_saves_before_frame_change():
+    saved = []
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int))
+    tab._current_frame_idx = 0
+    tab.frame_var = SimpleNamespace(set=lambda value: setattr(tab, "_frame_value", value))
+    tab.save_annotations = lambda: saved.append("saved")
+
+    pipeline_gui.AnnotationTab._set_frame_index(tab, 2)
+
+    assert saved == ["saved"]
+    assert tab._current_frame_idx == 2
+    assert tab._frame_value == 2
+
+
+def test_annotation_triangulated_reprojection_projects_hint_into_target_view():
+    calibrations = {
+        "cam0": CameraCalibration(
+            name="cam0",
+            image_size=(1920, 1080),
+            K=np.eye(3, dtype=float),
+            dist=np.zeros(5, dtype=float),
+            rvec=np.zeros(3, dtype=float),
+            tvec=np.array([[0.0], [0.0], [0.0]], dtype=float),
+            R=np.eye(3, dtype=float),
+            P=np.hstack((np.eye(3, dtype=float), np.array([[0.0], [0.0], [0.0]], dtype=float))),
+        ),
+        "cam1": CameraCalibration(
+            name="cam1",
+            image_size=(1920, 1080),
+            K=np.eye(3, dtype=float),
+            dist=np.zeros(5, dtype=float),
+            rvec=np.zeros(3, dtype=float),
+            tvec=np.array([[1.0], [0.0], [0.0]], dtype=float),
+            R=np.eye(3, dtype=float),
+            P=np.hstack((np.eye(3, dtype=float), np.array([[1.0], [0.0], [0.0]], dtype=float))),
+        ),
+        "cam2": CameraCalibration(
+            name="cam2",
+            image_size=(1920, 1080),
+            K=np.eye(3, dtype=float),
+            dist=np.zeros(5, dtype=float),
+            rvec=np.zeros(3, dtype=float),
+            tvec=np.array([[-0.5], [0.0], [0.0]], dtype=float),
+            R=np.eye(3, dtype=float),
+            P=np.hstack((np.eye(3, dtype=float), np.array([[-0.5], [0.0], [0.0]], dtype=float))),
+        ),
+    }
+    point_3d = np.array([0.2, -0.1, 2.0], dtype=float)
+    source_points = [calibrations["cam0"].project_point(point_3d), calibrations["cam1"].project_point(point_3d)]
+
+    hint = pipeline_gui.annotation_triangulated_reprojection(
+        calibrations,
+        target_camera_name="cam2",
+        source_camera_names=["cam0", "cam1"],
+        source_points_2d=source_points,
+    )
+
+    np.testing.assert_allclose(hint, calibrations["cam2"].project_point(point_3d), atol=1e-8)
+
+
 def test_preview_pose_frame_indices_aligns_sparse_bundle_frames():
     pose_frames = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8], dtype=int)
     target_frames = np.array([0, 3, 6], dtype=int)
@@ -564,8 +713,11 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
         get=lambda: tab._rotfix, set=lambda value: setattr(tab, "_rotfix", bool(value))
     )
     tab._rotfix = False
-    tab.unwrap_var = SimpleNamespace(get=lambda: tab._unwrap, set=lambda value: setattr(tab, "_unwrap", bool(value)))
-    tab._unwrap = False
+    tab.root_unwrap_mode = SimpleNamespace(
+        get=lambda: tab._root_unwrap_mode,
+        set=lambda value: setattr(tab, "_root_unwrap_mode", value),
+    )
+    tab._root_unwrap_mode = pipeline_gui.root_unwrap_mode_display_name("single")
     tab.biorbd_noise = _FakeEntryField("1e-8")
     tab.biorbd_error = _FakeEntryField("1e-4")
     tab.biorbd_kalman_init_method = SimpleNamespace(
@@ -670,6 +822,7 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     assert tab._flip_floor == "6"
     assert tab._flip_temp_w == "0.5"
     assert tab._flip_temp_tau == "12"
+    assert tab._root_unwrap_mode == pipeline_gui.root_unwrap_mode_display_name("off")
     assert tab.add_profile_button.state == "normal"
 
 
@@ -744,6 +897,34 @@ def test_profiles_tab_build_command_uses_runtime_profiles_cache(monkeypatch):
     cmd = pipeline_gui.ProfilesTab.build_command(tab)
 
     assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
+
+
+def test_profiles_tab_build_command_passes_annotations_path_for_annotated_profiles(monkeypatch):
+    tab = pipeline_gui.ProfilesTab.__new__(pipeline_gui.ProfilesTab)
+    annotated_profile = pipeline_gui.ReconstructionProfile(
+        name="annotated", family="ekf_2d", pose_data_mode="annotated"
+    )
+    tab.state = SimpleNamespace(
+        output_root_var=SimpleNamespace(get=lambda: "output"),
+        calib_var=SimpleNamespace(get=lambda: "inputs/calibration/Calib.toml"),
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        annotation_path_var=SimpleNamespace(get=lambda: "inputs/annotations/trial_annotations.json"),
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        workers_var=SimpleNamespace(get=lambda: "6"),
+        pose2sim_trc_var=SimpleNamespace(get=lambda: ""),
+    )
+    tab.selected_profiles = lambda: [annotated_profile]
+
+    monkeypatch.setattr(
+        pipeline_gui, "write_runtime_profiles_config", lambda _state: Path(".cache/runtime_profiles.json")
+    )
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui, "current_dataset_name", lambda _state: "trial")
+    monkeypatch.setattr(pipeline_gui, "current_selected_camera_names", lambda _state: [])
+
+    cmd = pipeline_gui.ProfilesTab.build_command(tab)
+
+    assert cmd[cmd.index("--annotations-path") + 1] == "inputs/annotations/trial_annotations.json"
 
 
 def test_reconstructions_tab_build_command_uses_runtime_profiles_cache(monkeypatch):
@@ -1142,7 +1323,7 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     tab.frame_stride = SimpleNamespace(get=lambda: "1")
     tab.triang_method = SimpleNamespace(get=lambda: "exhaustive")
     tab.coherence_method = SimpleNamespace(get=lambda: "Epipolar (precomputed)")
-    tab.unwrap_var = SimpleNamespace(get=lambda: False)
+    tab.root_unwrap_mode = SimpleNamespace(get=lambda: pipeline_gui.root_unwrap_mode_display_name("single"))
     tab.biorbd_noise = SimpleNamespace(get=lambda: "1e-8")
     tab.biorbd_error = SimpleNamespace(get=lambda: "1e-4")
     tab.biorbd_kalman_init_method = SimpleNamespace(get=lambda: "triangulation_ik_root_translation")
@@ -1157,6 +1338,7 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     assert profile.pose_amplitude_lower_percentile == 7.0
     assert profile.pose_amplitude_upper_percentile == 93.0
     assert profile.coherence_method == "epipolar"
+    assert profile.root_unwrap_mode == "single"
 
 
 def test_profiles_tab_update_profile_model_info_marks_existing_biomod_as_faster():

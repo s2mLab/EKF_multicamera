@@ -17,6 +17,7 @@ from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
+from kinematics.root_kinematics import SUPPORTED_ROOT_UNWRAP_MODES, normalize_root_unwrap_mode
 from reconstruction.reconstruction_registry import (
     infer_dataset_name,
     reconstruction_output_dir,
@@ -35,7 +36,7 @@ SUPPORTED_MODEL_VARIANTS = (
     "upper_root_back_flexion_1d",
     "upper_root_back_3dof",
 )
-SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
+SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned", "annotated")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -101,6 +102,7 @@ class ReconstructionProfile:
     compare_biorbd_kalman: bool = True
     reuse_triangulation: bool = False
     no_root_unwrap: bool = False
+    root_unwrap_mode: str = "single"
     biorbd_kalman_noise_factor: float = 1e-8
     biorbd_kalman_error_factor: float = 1e-4
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
@@ -190,6 +192,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if profile.root_unwrap_mode != "single":
+        parts.append("no_unwrap" if profile.root_unwrap_mode == "off" else f"unwrap_{profile.root_unwrap_mode}")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
     if profile.use_all_cameras:
@@ -215,6 +219,11 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
+    profile.root_unwrap_mode = normalize_root_unwrap_mode(
+        getattr(profile, "root_unwrap_mode", None),
+        legacy_unwrap=(not bool(getattr(profile, "no_root_unwrap", False))),
+    )
+    profile.no_root_unwrap = profile.root_unwrap_mode == "off"
     if float(profile.upper_back_sagittal_gain) < 0.0:
         raise ValueError("upper_back_sagittal_gain must be >= 0.")
     if float(profile.upper_back_pseudo_std_deg) <= 0.0:
@@ -312,7 +321,10 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
 
 
 def profile_from_dict(data: dict[str, object]) -> ReconstructionProfile:
-    profile = ReconstructionProfile(**data)
+    payload = dict(data)
+    if "root_unwrap_mode" not in payload and "no_root_unwrap" in payload:
+        payload["root_unwrap_mode"] = "off" if bool(payload.get("no_root_unwrap")) else "single"
+    profile = ReconstructionProfile(**payload)
     return validate_profile(profile)
 
 
@@ -554,8 +566,7 @@ def build_pipeline_command(
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
-    if profile.no_root_unwrap:
-        cmd.append("--no-root-unwrap")
+    cmd.extend(["--root-unwrap-mode", profile.root_unwrap_mode])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])

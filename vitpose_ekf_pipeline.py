@@ -31,13 +31,20 @@ from typing import Iterable
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from annotation.annotation_store import (
+    apply_annotations_to_pose_arrays,
+    default_annotation_path,
+    load_annotation_payload,
+)
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations
 from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
+    SUPPORTED_ROOT_UNWRAP_MODES,
     TRUNK_ROOT_ROTATION_SEQUENCE,
     compute_trunk_dofs_from_points,
-    reextract_euler_with_gaps,
+    normalize_root_unwrap_mode,
     root_z_correction_angle_from_points,
+    stabilize_root_rotations,
 )
 
 try:
@@ -285,6 +292,8 @@ class PoseData:
     frame_stride: int = 1
     raw_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
     filtered_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
+    annotated_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
+    annotated_scores: np.ndarray | None = None  # (n_cam, n_frames, 17)
 
 
 @dataclass
@@ -632,6 +641,7 @@ def load_pose_data(
     outlier_threshold_ratio: float = 0.10,
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
+    annotations_path: Path | None = None,
 ) -> PoseData:
     """Charge les keypoints 2D et les aligne camera par camera.
 
@@ -709,6 +719,22 @@ def load_pose_data(
 
     raw_keypoints = np.array(keypoints, copy=True)
     raw_scores = np.array(scores, copy=True)
+    resolved_annotations_path = None if annotations_path is None else Path(annotations_path)
+    if data_mode == "annotated" and resolved_annotations_path is None:
+        resolved_annotations_path = default_annotation_path(keypoints_path)
+    annotation_payload = (
+        load_annotation_payload(resolved_annotations_path, keypoints_path=keypoints_path)
+        if resolved_annotations_path is not None and resolved_annotations_path.exists()
+        else None
+    )
+    annotated_keypoints, annotated_scores = apply_annotations_to_pose_arrays(
+        keypoints=raw_keypoints,
+        scores=raw_scores,
+        camera_names=[name for name, _ in ordered_items],
+        frames=frames,
+        keypoint_names=COCO17,
+        payload=annotation_payload,
+    )
     cleaned_keypoints, cleaned_scores, filtered_keypoints = filter_pose_keypoints(
         keypoints,
         scores,
@@ -730,6 +756,9 @@ def load_pose_data(
     elif data_mode == "cleaned":
         selected_keypoints = cleaned_keypoints
         selected_scores = cleaned_scores
+    elif data_mode == "annotated":
+        selected_keypoints = annotated_keypoints
+        selected_scores = annotated_scores
     else:
         raise ValueError(f"Unsupported pose data mode: {data_mode}")
 
@@ -741,6 +770,8 @@ def load_pose_data(
         frame_stride=frame_stride,
         raw_keypoints=raw_keypoints,
         filtered_keypoints=filtered_keypoints,
+        annotated_keypoints=annotated_keypoints,
+        annotated_scores=annotated_scores,
     )
 
 
@@ -3369,7 +3400,11 @@ def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
     return unwrapped[:, 0] if squeeze else unwrapped
 
 
-def unwrap_root_rotations(q: np.ndarray, q_names: np.ndarray | list[str]) -> np.ndarray:
+def unwrap_root_rotations(
+    q: np.ndarray,
+    q_names: np.ndarray | list[str],
+    mode: str | None = "single",
+) -> np.ndarray:
     """Applique un unwrap temporel aux trois rotations de la racine.
 
     Le but est d'eviter des sauts artificiels de type `+-2pi` sur les trois
@@ -3380,13 +3415,10 @@ def unwrap_root_rotations(q: np.ndarray, q_names: np.ndarray | list[str]) -> np.
     root_rotation_names = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
     root_rotation_indices = [name_to_index[dof_name] for dof_name in root_rotation_names if dof_name in name_to_index]
     if root_rotation_indices:
-        stabilized_rotations = np.array(q_unwrapped[:, root_rotation_indices], copy=True)
-        # A second reextract+unwrap pass makes the root angles more robust to
-        # residual Euler branch discontinuities left by the first unwrap.
-        for _ in range(2):
-            stabilized_rotations = reextract_euler_with_gaps(stabilized_rotations, TRUNK_ROOT_ROTATION_SEQUENCE)
-            stabilized_rotations = unwrap_with_gaps(stabilized_rotations)
-        q_unwrapped[:, root_rotation_indices] = stabilized_rotations
+        q_unwrapped[:, root_rotation_indices] = stabilize_root_rotations(
+            q_unwrapped[:, root_rotation_indices],
+            mode,
+        )
     return q_unwrapped
 
 
@@ -4685,6 +4717,7 @@ def run_ekf(
     flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
     flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "single",
     debug_label: str | None = None,
     debug_console: bool = False,
     initial_state: np.ndarray | None = None,
@@ -4771,9 +4804,10 @@ def run_ekf(
         update_status_per_frame.append(update_status)
     timings["loop_s"] = time.perf_counter() - t_loop
     timings.update({key: float(value) for key, value in ekf.profiling.items()})
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q = (
-        unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names)
-        if unwrap_root
+        unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names, mode=effective_root_unwrap_mode)
+        if effective_root_unwrap_mode != "off"
         else np.array(states[:, : ekf.nq], copy=True)
     )
     return (
@@ -4963,6 +4997,7 @@ def compare_kalman_filters(
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     classic_result: dict[str, np.ndarray] | None = None,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "single",
 ) -> ComparisonResult:
     """Compare les `q` du nouvel EKF avec ceux du Kalman `biorbd`."""
     import biorbd
@@ -4976,6 +5011,7 @@ def compare_kalman_filters(
             noise_factor=biorbd_kalman_noise_factor,
             error_factor=biorbd_kalman_error_factor,
             unwrap_root=unwrap_root,
+            root_unwrap_mode=root_unwrap_mode,
             initial_state_method=biorbd_kalman_init_method,
         )
     else:
@@ -5220,6 +5256,7 @@ def run_biorbd_marker_kalman_with_parameters(
     noise_factor: float,
     error_factor: float,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "single",
     initial_state_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> dict[str, np.ndarray]:
     """Version parametree du Kalman `biorbd` pour faciliter le tuning du lissage."""
@@ -5258,7 +5295,12 @@ def run_biorbd_marker_kalman_with_parameters(
         qddot_all[frame_idx, :] = qddot.to_array()
 
     q_names = q_names_from_model(model)
-    q_all = unwrap_root_rotations(q_all, q_names) if unwrap_root else q_all
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
+    q_all = (
+        unwrap_root_rotations(q_all, q_names, mode=effective_root_unwrap_mode)
+        if effective_root_unwrap_mode != "off"
+        else q_all
+    )
 
     return {
         "q": q_all,
@@ -5586,7 +5628,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose-data-mode",
-        choices=("raw", "filtered", "cleaned"),
+        choices=("raw", "filtered", "cleaned", "annotated"),
         default="cleaned",
         help="Source 2D utilisee apres chargement: brut, filtre lisse, ou nettoye avec rejet des outliers.",
     )
@@ -5862,6 +5904,12 @@ def parse_args() -> argparse.Namespace:
         help="Strategie de warm-start du Kalman marqueurs `biorbd` via setInitState.",
     )
     parser.add_argument(
+        "--root-unwrap-mode",
+        choices=SUPPORTED_ROOT_UNWRAP_MODES,
+        default="single",
+        help="Stabilisation des angles de racine: off, single, ou double (reextract+unwrap).",
+    )
+    parser.add_argument(
         "--no-root-unwrap",
         action="store_true",
         help="Desactive l'unwrap temporel des trois rotations de la racine dans EKF 2D et EKF 3D.",
@@ -5881,6 +5929,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Point d'entree CLI."""
     args = parse_args()
+    root_unwrap_mode = normalize_root_unwrap_mode(
+        ("off" if args.no_root_unwrap else args.root_unwrap_mode),
+    )
     stage_timings_s: dict[str, float] = {}
     calibrations = load_calibrations(args.calib)
     selected_camera_names = parse_camera_names(args.camera_names)
@@ -6216,7 +6267,8 @@ def main() -> None:
         root_flight_dynamics=False,
         flight_height_threshold_m=args.flight_height_threshold_m,
         flight_min_consecutive_frames=args.flight_min_consecutive_frames,
-        unwrap_root=not args.no_root_unwrap,
+        unwrap_root=(root_unwrap_mode != "off"),
+        root_unwrap_mode=root_unwrap_mode,
         initial_state=shared_initial_state,
         model=shared_biorbd_model,
     )
@@ -6267,7 +6319,8 @@ def main() -> None:
             root_flight_dynamics=False,
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
             initial_state=shared_initial_state_flip_acc,
             model=shared_biorbd_model,
         )
@@ -6310,7 +6363,8 @@ def main() -> None:
                 args.fps,
                 noise_factor=args.biorbd_kalman_noise_factor,
                 error_factor=args.biorbd_kalman_error_factor,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
                 initial_state_method=args.biorbd_kalman_init_method,
             )
             save_biorbd_kalman_cache(biorbd_kalman_cache_path, classic_result, biorbd_metadata)
@@ -6327,7 +6381,8 @@ def main() -> None:
             biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
             classic_result=classic_result,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
         )
         if ekf_result_dyn is not None:
             comparison_dyn = compare_kalman_filters(
@@ -6340,7 +6395,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
         if ekf_result_flip_acc is not None:
             comparison_flip_acc = compare_kalman_filters(
@@ -6353,7 +6409,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
         if ekf_result_flip_dyn is not None:
             comparison_flip_dyn = compare_kalman_filters(
@@ -6366,7 +6423,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
     animation_target = (
         try_export_pyorerun_animation(biomod_path, ekf_result_acc["q"], args.fps, args.output_dir)
