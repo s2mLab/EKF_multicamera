@@ -835,6 +835,39 @@ def test_annotation_worst_reprojection_filter_uses_selected_reconstruction_and_c
     assert local_indices == [7]
 
 
+def test_annotation_configure_shared_reconstruction_panel_uses_shared_selection():
+    configured = {}
+    published = {}
+
+    class _FakePanel:
+        def configure_for_consumer(self, **kwargs):
+            configured.update(kwargs)
+
+        def set_rows(self, rows, defaults):
+            published["rows"] = rows
+            published["defaults"] = defaults
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.uses_shared_reconstruction_panel = True
+    tab.shared_reconstruction_selectmode = "browse"
+    tab.state = SimpleNamespace(
+        shared_reconstruction_selection=["demo"],
+        shared_reconstruction_panel=_FakePanel(),
+        active_reconstruction_consumer=tab,
+    )
+    tab.on_frame_filter_changed = lambda: published.setdefault("selection_changed", True)
+    tab.refresh_available_reconstructions = lambda: published.setdefault("refreshed", True)
+
+    pipeline_gui.AnnotationTab.configure_shared_reconstruction_panel(tab, tab.state.shared_reconstruction_panel)
+    configured["selection_callback"]()
+
+    assert configured["title"] == "Reconstructions | Annotation"
+    assert configured["selectmode"] == "browse"
+    assert published["refreshed"] is True
+    assert published["selection_changed"] is True
+    assert tab.uses_shared_reconstruction_panel is True
+
+
 def test_annotation_on_frame_filter_changed_does_not_scan_images():
     tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
     tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int))

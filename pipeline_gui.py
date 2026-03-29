@@ -4833,6 +4833,8 @@ class AnnotationTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
         self.state = state
+        self.uses_shared_reconstruction_panel = True
+        self.shared_reconstruction_selectmode = "browse"
         self.calibrations = None
         self.pose_data = None
         self.annotation_payload = empty_annotation_payload()
@@ -5041,7 +5043,44 @@ class AnnotationTab(ttk.Frame):
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.frame_filter_var.trace_add("write", lambda *_args: self.on_frame_filter_changed())
+        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
         self.sync_dataset_defaults()
+        self.after_idle(self.refresh_available_reconstructions)
+
+    def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
+        panel.configure_for_consumer(
+            title="Reconstructions | Annotation",
+            refresh_callback=self.refresh_available_reconstructions,
+            selection_callback=self._on_reconstruction_selection_changed,
+            selectmode=self.shared_reconstruction_selectmode,
+        )
+        self.refresh_available_reconstructions()
+
+    def selected_reconstruction_names(self) -> list[str]:
+        return list(self.state.shared_reconstruction_selection)
+
+    def _publish_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        panel = self.state.shared_reconstruction_panel
+        if panel is not None and self.state.active_reconstruction_consumer is self:
+            panel.set_rows(rows, defaults)
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        self.on_frame_filter_changed()
+
+    def refresh_available_reconstructions(self) -> None:
+        try:
+            _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["triangulation", "ekf_2d", "ekf_3d"],
+                fallback_count=3,
+                include_3d=True,
+                include_q=False,
+                include_q_root=False,
+            )
+            self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
+        except Exception as exc:
+            gui_debug(f"Annotation refresh_available_reconstructions error: {exc}")
+            self._publish_reconstruction_rows([], [])
 
     def sync_dataset_defaults(self) -> None:
         keypoints_path = ROOT / self.state.keypoints_var.get()
