@@ -461,6 +461,45 @@ def test_annotation_motion_prior_center_extrapolates_velocity():
     np.testing.assert_allclose(center, np.array([108.0, 86.0], dtype=float))
 
 
+def test_interpolate_short_nan_runs_fills_only_short_interior_gaps():
+    values = np.array(
+        [
+            [0.0, 10.0],
+            [np.nan, np.nan],
+            [2.0, 14.0],
+            [np.nan, np.nan],
+            [np.nan, np.nan],
+            [5.0, 20.0],
+        ],
+        dtype=float,
+    )
+
+    interpolated = pipeline_gui.interpolate_short_nan_runs(values, max_gap_frames=1)
+
+    np.testing.assert_allclose(interpolated[1], np.array([1.0, 12.0]))
+    assert np.all(np.isnan(interpolated[3:5]))
+
+
+def test_interpolate_short_nan_runs_keeps_edge_nans():
+    values = np.array([np.nan, 1.0, np.nan, 3.0, np.nan], dtype=float)
+
+    interpolated = pipeline_gui.interpolate_short_nan_runs(values, max_gap_frames=2)
+
+    assert np.isnan(interpolated[0])
+    np.testing.assert_allclose(interpolated[2], 2.0)
+    assert np.isnan(interpolated[4])
+
+
+def test_fill_short_edge_nan_runs_fills_only_short_edges():
+    values = np.array([np.nan, np.nan, 2.0, 4.0, np.nan, np.nan, np.nan], dtype=float)
+
+    filled = pipeline_gui.fill_short_edge_nan_runs(values, max_gap_frames=2)
+
+    np.testing.assert_allclose(filled[:2], np.array([2.0, 2.0]))
+    np.testing.assert_allclose(filled[2:4], np.array([2.0, 4.0]))
+    assert np.all(np.isnan(filled[4:]))
+
+
 def test_annotation_adjust_image_changes_brightness_and_contrast():
     image = np.array([[[0.25, 0.5, 0.75], [0.4, 0.5, 0.6]]], dtype=float)
 
@@ -1412,6 +1451,82 @@ def test_reconstructions_tab_export_selected_pseudo_root_from_points_writes_npz(
     assert exported["qddot"].shape == (3, 6)
     assert exported["q_names"].tolist() == pipeline_gui.ROOT_Q_NAMES.tolist()
     assert info_messages
+
+
+def test_reconstructions_tab_export_selected_pseudo_root_interpolates_short_nan_gap(monkeypatch, tmp_path):
+    recon_dir = tmp_path / "output" / "trial" / "reconstructions" / "demo"
+    recon_dir.mkdir(parents=True)
+    points_3d = np.zeros((5, 17, 3), dtype=float)
+    for frame_idx in range(points_3d.shape[0]):
+        z_offset = 1.0 + 0.1 * frame_idx
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_hip"]] = (-0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_hip"]] = (0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_shoulder"]] = (-0.25, 0.0, z_offset + 0.5)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_shoulder"]] = (0.25, 0.0, z_offset + 0.5)
+    points_3d[2, pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([np.nan, np.nan, np.nan], dtype=float)
+    bundle_path = recon_dir / "reconstruction_bundle.npz"
+    np.savez(
+        bundle_path,
+        points_3d=points_3d,
+        frames=np.arange(5, dtype=int),
+        time_s=np.arange(5, dtype=float) / 120.0,
+    )
+
+    info_messages = []
+    tab = pipeline_gui.ReconstructionsTab.__new__(pipeline_gui.ReconstructionsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        initial_rotation_correction_var=SimpleNamespace(get=lambda: True),
+    )
+    tab.status_summaries = {"demo": {"initial_rotation_correction_applied": True}}
+    tab._selected_reconstruction_dir = lambda: recon_dir
+    monkeypatch.setattr(
+        pipeline_gui.messagebox, "showinfo", lambda title, message: info_messages.append((title, message))
+    )
+
+    pipeline_gui.ReconstructionsTab.export_selected_pseudo_root_from_points(tab)
+
+    exported = np.load(recon_dir / "demo_pseudo_root_q.npz", allow_pickle=True)
+    assert np.all(np.isfinite(exported["q"][2]))
+    assert np.all(np.isfinite(exported["qdot"][2]))
+    assert info_messages
+
+
+def test_reconstructions_tab_export_selected_pseudo_root_fills_short_edge_gaps(monkeypatch, tmp_path):
+    recon_dir = tmp_path / "output" / "trial" / "reconstructions" / "demo"
+    recon_dir.mkdir(parents=True)
+    points_3d = np.zeros((5, 17, 3), dtype=float)
+    for frame_idx in range(points_3d.shape[0]):
+        z_offset = 1.0 + 0.1 * frame_idx
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_hip"]] = (-0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_hip"]] = (0.2, 0.0, z_offset)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["left_shoulder"]] = (-0.25, 0.0, z_offset + 0.5)
+        points_3d[frame_idx, pipeline_gui.KP_INDEX["right_shoulder"]] = (0.25, 0.0, z_offset + 0.5)
+    points_3d[0, pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([np.nan, np.nan, np.nan], dtype=float)
+    points_3d[-1, pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([np.nan, np.nan, np.nan], dtype=float)
+    np.savez(
+        recon_dir / "reconstruction_bundle.npz",
+        points_3d=points_3d,
+        frames=np.arange(5, dtype=int),
+        time_s=np.arange(5, dtype=float) / 120.0,
+    )
+
+    tab = pipeline_gui.ReconstructionsTab.__new__(pipeline_gui.ReconstructionsTab)
+    tab.state = SimpleNamespace(
+        fps_var=SimpleNamespace(get=lambda: "120"),
+        initial_rotation_correction_var=SimpleNamespace(get=lambda: True),
+    )
+    tab.status_summaries = {"demo": {"initial_rotation_correction_applied": True}}
+    tab._selected_reconstruction_dir = lambda: recon_dir
+    monkeypatch.setattr(pipeline_gui.messagebox, "showinfo", lambda *_args, **_kwargs: None)
+
+    pipeline_gui.ReconstructionsTab.export_selected_pseudo_root_from_points(tab)
+
+    exported = np.load(recon_dir / "demo_pseudo_root_q.npz", allow_pickle=True)
+    assert np.all(np.isfinite(exported["q"][0]))
+    assert np.all(np.isfinite(exported["q"][-1]))
+    assert np.all(np.isfinite(exported["qdot"][0]))
+    assert np.all(np.isfinite(exported["qdot"][-1]))
 
 
 def test_multiview_tab_build_command_uses_selected_cameras_and_images_root(monkeypatch):

@@ -124,6 +124,7 @@ from kinematics.root_kinematics import (
     rotation_unit_scale,
 )
 from kinematics.root_series import (
+    interpolate_trunk_marker_gaps_for_root,
     quantity_unit_label,
     root_axis_display_labels,
     root_ordered_names,
@@ -744,6 +745,68 @@ def resample_points(points: np.ndarray, source_time: np.ndarray, target_time: np
                 target_time, source_time[valid], values[valid], left=np.nan, right=np.nan
             )
     return out
+
+
+def interpolate_short_nan_runs(values: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    """Linearly fill only short interior NaN runs along time for each column."""
+
+    data = np.asarray(values, dtype=float)
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+        squeeze = True
+    else:
+        squeeze = False
+    if data.shape[0] == 0 or max_gap_frames <= 0:
+        return np.asarray(values, dtype=float)
+
+    result = np.array(data, copy=True)
+    for col_idx in range(result.shape[1]):
+        column = result[:, col_idx]
+        finite_idx = np.flatnonzero(np.isfinite(column))
+        if finite_idx.size < 2:
+            continue
+        for left_idx, right_idx in zip(finite_idx[:-1], finite_idx[1:]):
+            gap_start = int(left_idx) + 1
+            gap_end = int(right_idx)
+            gap_len = gap_end - gap_start
+            if gap_len <= 0 or gap_len > int(max_gap_frames):
+                continue
+            if np.any(np.isfinite(column[gap_start:gap_end])):
+                continue
+            result[gap_start:gap_end, col_idx] = np.interp(
+                np.arange(gap_start, gap_end, dtype=float),
+                np.array([left_idx, right_idx], dtype=float),
+                np.array([column[left_idx], column[right_idx]], dtype=float),
+            )
+    return result[:, 0] if squeeze else result
+
+
+def fill_short_edge_nan_runs(values: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    """Fill short leading/trailing NaN runs with the nearest finite value."""
+
+    data = np.asarray(values, dtype=float)
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+        squeeze = True
+    else:
+        squeeze = False
+    if data.shape[0] == 0 or max_gap_frames <= 0:
+        return np.asarray(values, dtype=float)
+
+    result = np.array(data, copy=True)
+    for col_idx in range(result.shape[1]):
+        column = result[:, col_idx]
+        finite_idx = np.flatnonzero(np.isfinite(column))
+        if finite_idx.size == 0:
+            continue
+        first_finite = int(finite_idx[0])
+        if 0 < first_finite <= int(max_gap_frames) and not np.any(np.isfinite(column[:first_finite])):
+            result[:first_finite, col_idx] = column[first_finite]
+        last_finite = int(finite_idx[-1])
+        trailing_len = int(column.shape[0] - last_finite - 1)
+        if 0 < trailing_len <= int(max_gap_frames) and not np.any(np.isfinite(column[last_finite + 1 :])):
+            result[last_finite + 1 :, col_idx] = column[last_finite]
+    return result[:, 0] if squeeze else result
 
 
 def biorbd_markers_from_q(biomod_path: Path, q_series: np.ndarray) -> np.ndarray:
@@ -9179,8 +9242,20 @@ class ReconstructionsTab(CommandTab):
                 summary.get("initial_rotation_correction_requested", self.state.initial_rotation_correction_var.get()),
             )
         )
+        max_interp_gap_frames = max(1, int(round(0.1 * float(fps))))
+        trunk_points = np.array(points_3d, copy=True)
+        trunk_marker_indices = [
+            KP_INDEX["left_hip"],
+            KP_INDEX["right_hip"],
+            KP_INDEX["left_shoulder"],
+            KP_INDEX["right_shoulder"],
+        ]
+        trunk_marker_values = trunk_points[:, trunk_marker_indices, :].reshape(points_3d.shape[0], -1)
+        trunk_marker_values = interpolate_short_nan_runs(trunk_marker_values, max_interp_gap_frames)
+        trunk_marker_values = fill_short_edge_nan_runs(trunk_marker_values, max_interp_gap_frames)
+        trunk_points[:, trunk_marker_indices, :] = trunk_marker_values.reshape(points_3d.shape[0], 4, 3)
         q_root, correction_applied = extract_root_from_points(
-            points_3d,
+            trunk_points,
             initial_rotation_correction,
             False,
         )
@@ -9350,6 +9425,7 @@ class RootKinematicsTab(ttk.Frame):
         self.fd_qdot_var = tk.BooleanVar(value=True)
         self.matrix_ignore_alpha_var = tk.BooleanVar(value=False)
         self.common_geometric_root_var = tk.BooleanVar(value=False)
+        self.interpolate_root_var = tk.BooleanVar(value=False)
         reextract_check = ttk.Checkbutton(
             row2, text="recalcul matrice + re-extraction Euler", variable=self.reextract_var
         )
@@ -9366,6 +9442,8 @@ class RootKinematicsTab(ttk.Frame):
             variable=self.common_geometric_root_var,
         )
         common_geometric_root_check.pack(side=tk.LEFT, padx=(12, 0))
+        interpolate_root_check = ttk.Checkbutton(row2, text="Interpolation", variable=self.interpolate_root_var)
+        interpolate_root_check.pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(row2, text="Load / refresh", command=self.refresh_plot).pack(side=tk.LEFT, padx=(12, 0))
 
         attach_tooltip(family_label, "Choisit si l'on compare les translations ou les rotations de la racine.")
@@ -9405,6 +9483,10 @@ class RootKinematicsTab(ttk.Frame):
             common_geometric_root_check,
             "Pour les reconstructions basées sur q, reconstruit d'abord les marqueurs du modèle puis ré-extrait la racine géométrique avec la même méthode que triangulation/TRC file.",
         )
+        attach_tooltip(
+            interpolate_root_check,
+            "En affichage seulement, interpole les trous courts de NaN jusqu'à environ 0.1 s (0.1 * fps).",
+        )
 
         plot_box = ttk.LabelFrame(self, text="Comparaison racine")
         plot_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -9423,6 +9505,7 @@ class RootKinematicsTab(ttk.Frame):
         self.fd_qdot_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.matrix_ignore_alpha_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.common_geometric_root_var.trace_add("write", lambda *_args: self.refresh_plot())
+        self.interpolate_root_var.trace_add("write", lambda *_args: self.refresh_plot())
         self.after_idle(self.refresh_available_reconstructions)
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
@@ -9523,6 +9606,8 @@ class RootKinematicsTab(ttk.Frame):
             recon_summary = self.bundle.get("recon_summary", {})
             q_names = self.bundle["q_names"]
             dt = 1.0 / float(self.state.fps_var.get())
+            max_interp_gap_frames = max(1, int(round(0.1 * float(self.state.fps_var.get()))))
+            apply_interpolation = bool(self.interpolate_root_var.get())
             family_is_translation = self.family.get() == "translations"
             matrix_mode = (not family_is_translation) and self.rotation_plot_mode.get() == "matrix"
             root_unwrap_mode = (
@@ -9550,6 +9635,7 @@ class RootKinematicsTab(ttk.Frame):
 
             for name in selected_names:
                 series = None
+                interpolation_applied_before_extraction = False
                 summary = recon_summary.get(name, {}) if isinstance(recon_summary, dict) else {}
                 summary_family = str(summary.get("family", ""))
                 geometric_family = summary_family in {"pose2sim", "triangulation"}
@@ -9584,7 +9670,9 @@ class RootKinematicsTab(ttk.Frame):
                             unwrap_rotations=apply_root_unwrap,
                             unwrap_mode=root_unwrap_mode,
                             translation_origin=root_translation_origin,
+                            interpolate_gap_frames=(max_interp_gap_frames if apply_interpolation else None),
                         )
+                        interpolation_applied_before_extraction = bool(apply_interpolation)
                         geometric_family = True
                 if series is None and geometric_family and name in recon_3d:
                     model_biomod_path = resolve_reconstruction_biomod(current_dataset_dir(self.state), name)
@@ -9600,7 +9688,9 @@ class RootKinematicsTab(ttk.Frame):
                             if infer_model_variant_from_biomod(model_biomod_path).startswith("upper_root_")
                             else "pelvis"
                         ),
+                        interpolate_gap_frames=(max_interp_gap_frames if apply_interpolation else None),
                     )
+                    interpolation_applied_before_extraction = bool(apply_interpolation)
                 elif series is None and name in recon_q:
                     series = root_series_from_q(
                         q_names,
@@ -9627,7 +9717,9 @@ class RootKinematicsTab(ttk.Frame):
                             if infer_model_variant_from_biomod(model_biomod_path).startswith("upper_root_")
                             else "pelvis"
                         ),
+                        interpolate_gap_frames=(max_interp_gap_frames if apply_interpolation else None),
                     )
+                    interpolation_applied_before_extraction = bool(apply_interpolation)
                 elif series is None and name in recon_q_root and not geometric_rotfix_mismatch:
                     series = root_series_from_precomputed(
                         np.asarray(recon_q_root[name], dtype=float),
@@ -9638,10 +9730,14 @@ class RootKinematicsTab(ttk.Frame):
                     )
                 if series is None:
                     continue
+                series_array = np.asarray(series, dtype=float)
+                if apply_interpolation and not interpolation_applied_before_extraction:
+                    series_array = interpolate_short_nan_runs(series_array, max_interp_gap_frames)
+                    series_array = fill_short_edge_nan_runs(series_array, max_interp_gap_frames)
                 frame_slice = analysis_frame_slice(np.asarray(series).shape[0])
-                if frame_slice.start >= np.asarray(series).shape[0]:
+                if frame_slice.start >= series_array.shape[0]:
                     continue
-                frame_indices = np.arange(np.asarray(series).shape[0], dtype=float)[frame_slice]
+                frame_indices = np.arange(series_array.shape[0], dtype=float)[frame_slice]
                 t = frame_indices * dt
                 if matrix_mode:
                     if model_marker_points is not None:
@@ -9653,8 +9749,11 @@ class RootKinematicsTab(ttk.Frame):
                             ),
                         )
                     elif geometric_family and name in recon_3d:
+                        matrix_points = np.asarray(recon_3d[name], dtype=float)
+                        if apply_interpolation:
+                            matrix_points = interpolate_trunk_marker_gaps_for_root(matrix_points, max_interp_gap_frames)
                         matrices = root_rotation_matrices_from_points(
-                            np.asarray(recon_3d[name], dtype=float),
+                            matrix_points,
                             initial_rotation_correction=(
                                 bool(self.state.initial_rotation_correction_var.get())
                                 and not bool(self.matrix_ignore_alpha_var.get())
@@ -9671,9 +9770,14 @@ class RootKinematicsTab(ttk.Frame):
                             except (TypeError, ValueError):
                                 initial_rotation_correction_angle_rad = 0.0
                         matrices = root_rotation_matrices_from_series(
-                            np.asarray(series, dtype=float),
+                            series_array,
                             initial_rotation_correction_angle_rad=initial_rotation_correction_angle_rad,
                         )
+                    if apply_interpolation:
+                        matrices = interpolate_short_nan_runs(
+                            np.asarray(matrices, dtype=float).reshape(matrices.shape[0], -1),
+                            max_interp_gap_frames,
+                        ).reshape(matrices.shape)
                     matrices = matrices[frame_slice]
                     for row_idx in range(3):
                         for col_idx in range(3):
@@ -9688,9 +9792,9 @@ class RootKinematicsTab(ttk.Frame):
                             ax.set_title(component_labels[row_idx][col_idx], fontsize=9)
                             ax.grid(alpha=0.25)
                 else:
-                    series_to_plot = scale_root_series_rotations(
-                        np.asarray(series, dtype=float), family_is_translation, rotation_unit
-                    )[frame_slice]
+                    series_to_plot = scale_root_series_rotations(series_array, family_is_translation, rotation_unit)[
+                        frame_slice
+                    ]
                     for axis_idx, ax in enumerate(axes):
                         ax.plot(
                             t,

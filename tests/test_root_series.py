@@ -3,11 +3,13 @@ from scipy.spatial.transform import Rotation
 
 from kinematics.root_kinematics import TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE
 from kinematics.root_series import (
+    interpolate_trunk_marker_gaps_for_root,
     quantity_unit_label,
     root_axis_labels,
     root_rotation_matrices_from_points,
     root_rotation_matrices_from_series,
     root_series_from_model_markers,
+    root_series_from_points,
     root_series_from_precomputed,
     root_series_from_q,
     scale_root_series_rotations,
@@ -143,3 +145,42 @@ def test_root_series_from_model_markers_reuses_geometric_extraction():
 
     np.testing.assert_allclose(marker_points, points, atol=1e-12)
     np.testing.assert_allclose(series[:, :3], 0.5 * (points[:, 11] + points[:, 12]), atol=1e-12)
+
+
+def test_interpolate_trunk_marker_gaps_for_root_fills_short_edge_gaps():
+    points = np.full((5, 17, 3), np.nan, dtype=float)
+    for frame_idx in range(points.shape[0]):
+        z = 1.0 + 0.1 * frame_idx
+        points[frame_idx, 11] = [-0.2, 0.0, z]
+        points[frame_idx, 12] = [0.2, 0.0, z]
+        points[frame_idx, 5] = [-0.25, 0.0, z + 0.5]
+        points[frame_idx, 6] = [0.25, 0.0, z + 0.5]
+    points[0, 5] = [np.nan, np.nan, np.nan]
+    points[-1, 6] = [np.nan, np.nan, np.nan]
+
+    filled = interpolate_trunk_marker_gaps_for_root(points, max_gap_frames=2)
+
+    assert np.all(np.isfinite(filled[0, 5]))
+    assert np.all(np.isfinite(filled[-1, 6]))
+
+
+def test_root_series_from_points_interpolates_before_root_extraction():
+    points = np.full((5, 17, 3), np.nan, dtype=float)
+    for frame_idx in range(points.shape[0]):
+        z = 1.0 + 0.1 * frame_idx
+        points[frame_idx, 11] = [-0.2, 0.0, z]
+        points[frame_idx, 12] = [0.2, 0.0, z]
+        points[frame_idx, 5] = [-0.25, 0.0, z + 0.5]
+        points[frame_idx, 6] = [0.25, 0.0, z + 0.5]
+    points[0, 5] = [np.nan, np.nan, np.nan]
+
+    series = root_series_from_points(
+        points,
+        quantity="q",
+        dt=1.0 / 120.0,
+        initial_rotation_correction=False,
+        unwrap_rotations=True,
+        interpolate_gap_frames=2,
+    )
+
+    assert np.all(np.isfinite(series[0]))

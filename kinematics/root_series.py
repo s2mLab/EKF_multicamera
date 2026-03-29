@@ -24,6 +24,86 @@ from kinematics.root_kinematics import (
     rotation_unit_scale,
 )
 from reconstruction.reconstruction_bundle import extract_root_from_points
+from vitpose_ekf_pipeline import KP_INDEX
+
+
+def _interpolate_short_nan_runs(values: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    data = np.asarray(values, dtype=float)
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+        squeeze = True
+    else:
+        squeeze = False
+    if data.shape[0] == 0 or max_gap_frames <= 0:
+        return np.asarray(values, dtype=float)
+
+    result = np.array(data, copy=True)
+    for col_idx in range(result.shape[1]):
+        column = result[:, col_idx]
+        finite_idx = np.flatnonzero(np.isfinite(column))
+        if finite_idx.size < 2:
+            continue
+        for left_idx, right_idx in zip(finite_idx[:-1], finite_idx[1:]):
+            gap_start = int(left_idx) + 1
+            gap_end = int(right_idx)
+            gap_len = gap_end - gap_start
+            if gap_len <= 0 or gap_len > int(max_gap_frames):
+                continue
+            if np.any(np.isfinite(column[gap_start:gap_end])):
+                continue
+            result[gap_start:gap_end, col_idx] = np.interp(
+                np.arange(gap_start, gap_end, dtype=float),
+                np.array([left_idx, right_idx], dtype=float),
+                np.array([column[left_idx], column[right_idx]], dtype=float),
+            )
+    return result[:, 0] if squeeze else result
+
+
+def _fill_short_edge_nan_runs(values: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    data = np.asarray(values, dtype=float)
+    if data.ndim == 1:
+        data = data[:, np.newaxis]
+        squeeze = True
+    else:
+        squeeze = False
+    if data.shape[0] == 0 or max_gap_frames <= 0:
+        return np.asarray(values, dtype=float)
+
+    result = np.array(data, copy=True)
+    for col_idx in range(result.shape[1]):
+        column = result[:, col_idx]
+        finite_idx = np.flatnonzero(np.isfinite(column))
+        if finite_idx.size == 0:
+            continue
+        first_finite = int(finite_idx[0])
+        if 0 < first_finite <= int(max_gap_frames) and not np.any(np.isfinite(column[:first_finite])):
+            result[:first_finite, col_idx] = column[first_finite]
+        last_finite = int(finite_idx[-1])
+        trailing_len = int(column.shape[0] - last_finite - 1)
+        if 0 < trailing_len <= int(max_gap_frames) and not np.any(np.isfinite(column[last_finite + 1 :])):
+            result[last_finite + 1 :, col_idx] = column[last_finite]
+    return result[:, 0] if squeeze else result
+
+
+def interpolate_trunk_marker_gaps_for_root(points_3d: np.ndarray, max_gap_frames: int) -> np.ndarray:
+    """Fill short gaps on trunk markers before root extraction / unwrap."""
+
+    points_3d = np.asarray(points_3d, dtype=float)
+    if points_3d.ndim != 3 or points_3d.shape[0] == 0 or max_gap_frames <= 0:
+        return np.array(points_3d, copy=True)
+
+    trunk_points = np.array(points_3d, copy=True)
+    trunk_marker_indices = [
+        KP_INDEX["left_hip"],
+        KP_INDEX["right_hip"],
+        KP_INDEX["left_shoulder"],
+        KP_INDEX["right_shoulder"],
+    ]
+    trunk_marker_values = trunk_points[:, trunk_marker_indices, :].reshape(points_3d.shape[0], -1)
+    trunk_marker_values = _interpolate_short_nan_runs(trunk_marker_values, max_gap_frames)
+    trunk_marker_values = _fill_short_edge_nan_runs(trunk_marker_values, max_gap_frames)
+    trunk_points[:, trunk_marker_indices, :] = trunk_marker_values.reshape(points_3d.shape[0], 4, 3)
+    return trunk_points
 
 
 def quantity_unit_label(quantity: str, family_is_translation: bool, rotation_unit: str) -> str:
@@ -63,14 +143,21 @@ def root_series_from_points(
     dt: float,
     initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    unwrap_mode: str | None = None,
     translation_origin: str = "pelvis",
+    interpolate_gap_frames: int | None = None,
 ) -> np.ndarray:
     """Build a root q or qdot series directly from geometric 3D points."""
 
+    points_3d = np.asarray(points_3d, dtype=float)
+    if interpolate_gap_frames is not None and int(interpolate_gap_frames) > 0:
+        points_3d = interpolate_trunk_marker_gaps_for_root(points_3d, int(interpolate_gap_frames))
+
     root_q, _ = extract_root_from_points(
-        np.asarray(points_3d, dtype=float),
+        points_3d,
         bool(initial_rotation_correction),
         bool(unwrap_rotations),
+        unwrap_mode=unwrap_mode,
         translation_origin=str(translation_origin),
     )
     if quantity == "q":
@@ -88,7 +175,9 @@ def root_series_from_model_markers(
     dt: float,
     initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    unwrap_mode: str | None = None,
     translation_origin: str = "pelvis",
+    interpolate_gap_frames: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build one root series from model markers reconstructed from ``q``.
 
@@ -99,13 +188,17 @@ def root_series_from_model_markers(
     if marker_points is None:
         marker_points = marker_builder(Path(biomod_path), np.asarray(q_series, dtype=float))
     marker_points = np.asarray(marker_points, dtype=float)
+    if interpolate_gap_frames is not None and int(interpolate_gap_frames) > 0:
+        marker_points = interpolate_trunk_marker_gaps_for_root(marker_points, int(interpolate_gap_frames))
     series = root_series_from_points(
         marker_points,
         quantity=quantity,
         dt=dt,
         initial_rotation_correction=initial_rotation_correction,
         unwrap_rotations=unwrap_rotations,
+        unwrap_mode=unwrap_mode,
         translation_origin=translation_origin,
+        interpolate_gap_frames=None,
     )
     return series, marker_points
 
@@ -120,6 +213,7 @@ def root_series_from_q(
     fd_qdot: bool = False,
     unwrap_rotations: bool = True,
     renormalize_rotations: bool = True,
+    unwrap_mode: str | None = None,
 ) -> np.ndarray:
     """Build a root q or qdot series from generalized coordinates."""
 
@@ -128,6 +222,7 @@ def root_series_from_q(
         np.asarray(q, dtype=float),
         unwrap_rotations=bool(unwrap_rotations),
         renormalize_rotations=bool(renormalize_rotations),
+        unwrap_mode=unwrap_mode,
     )
     if quantity == "q":
         return root_q
