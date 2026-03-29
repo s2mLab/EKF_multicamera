@@ -332,6 +332,38 @@ def test_draw_upper_back_preview_without_segment_frames_uses_mid_back_point():
     assert len(axis.scatters) == 1
 
 
+def test_segmented_back_frame_geometry_returns_mid_back_and_triangles():
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 1.0, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -1.0, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 1.5, 2.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -1.5, 2.0])
+    segment_frames = [("UPPER_BACK", np.array([0.3, 0.0, 1.0]), np.eye(3))]
+
+    geometry = pipeline_gui.segmented_back_frame_geometry(frame_points, segment_frames)
+
+    assert geometry is not None
+    mid_back, hip_triangle, shoulder_triangle = geometry
+    np.testing.assert_allclose(mid_back, np.array([0.3, 0.0, 1.0]))
+    np.testing.assert_allclose(hip_triangle[2], mid_back)
+    np.testing.assert_allclose(shoulder_triangle[2], mid_back)
+
+
+def test_draw_upper_back_overlay_2d_draws_two_triangles_and_mid_back():
+    axis = _FakeAxis()
+
+    pipeline_gui.draw_upper_back_overlay_2d(
+        axis,
+        hip_triangle_2d=np.array([[10.0, 20.0], [20.0, 20.0], [15.0, 15.0], [10.0, 20.0]], dtype=float),
+        shoulder_triangle_2d=np.array([[11.0, 10.0], [19.0, 10.0], [15.0, 15.0], [11.0, 10.0]], dtype=float),
+        mid_back_2d=np.array([15.0, 15.0], dtype=float),
+        color="#123456",
+    )
+
+    assert len(axis.plots) == 2
+    assert len(axis.scatters) == 1
+
+
 def test_has_segmented_back_visualization_detects_segment_frames_and_q_names():
     assert pipeline_gui.has_segmented_back_visualization(segment_frames=[("UPPER_BACK", np.zeros(3), np.eye(3))])
     assert pipeline_gui.has_segmented_back_visualization(q_names=["UPPER_BACK:RotY"])

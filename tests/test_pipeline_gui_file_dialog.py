@@ -444,6 +444,27 @@ def test_square_crop_bounds_returns_square_window():
     assert np.isclose(x1 - x0, y1 - y0)
 
 
+def test_draw_2d_background_image_uses_pixel_extent():
+    ax = _FakeAxis()
+    image = np.zeros((1080, 1920, 3), dtype=float)
+
+    pipeline_gui.draw_2d_background_image(ax, image, 1920.0, 1080.0)
+
+    assert len(ax.images) == 1
+    _image, kwargs = ax.images[0]
+    assert kwargs["extent"] == (0.0, 1920.0, 1080.0, 0.0)
+    assert kwargs["origin"] == "upper"
+
+
+def test_hide_2d_axes_removes_pixel_ticks():
+    ax = _FakeAxis()
+
+    pipeline_gui.hide_2d_axes(ax)
+
+    assert ax.xticks == []
+    assert ax.yticks == []
+
+
 def test_camera_layout_is_adaptive_for_small_camera_counts():
     assert pipeline_gui.camera_layout(1) == (1, 1)
     assert pipeline_gui.camera_layout(2) == (1, 2)
@@ -713,6 +734,34 @@ def test_annotation_step_frame_uses_filtered_candidates():
     assert tab._refreshed is True
 
 
+def test_annotation_step_frame_wraps_within_filtered_candidates():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13, 14], dtype=int))
+    tab.frame_var = SimpleNamespace(get=lambda: 4)
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab._navigable_annotation_frame_local_indices = lambda: [1, 4]
+
+    pipeline_gui.AnnotationTab.step_frame(tab, 1)
+
+    assert tab._frame_index == 1
+    assert tab._refreshed is True
+
+
+def test_annotation_step_frame_wraps_within_worst_reprojection_set():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.arange(20, dtype=int))
+    tab.frame_var = SimpleNamespace(get=lambda: 12)
+    tab._set_frame_index = lambda value: setattr(tab, "_frame_index", value)
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab._navigable_annotation_frame_local_indices = lambda: [3, 7, 12]
+
+    pipeline_gui.AnnotationTab.step_frame(tab, 1)
+
+    assert tab._frame_index == 3
+    assert tab._refreshed is True
+
+
 def test_annotation_flip_frame_filter_uses_selected_cameras(monkeypatch, tmp_path):
     pose_data = SimpleNamespace(frames=np.array([10, 11, 12], dtype=int), camera_names=["cam0", "cam1"])
     tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
@@ -801,6 +850,32 @@ def test_annotation_on_frame_filter_changed_does_not_scan_images():
 
     assert tab._frame_index == 0
     assert tab._refreshed is True
+
+
+def test_annotation_navigable_frames_use_indexed_image_availability(monkeypatch, tmp_path):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13], dtype=int))
+    tab._filtered_annotation_frame_local_indices = lambda: [0, 1, 2, 3]
+    tab.selected_annotation_camera_names = lambda: ["cam0", "cam1"]
+    tab._current_images_root = lambda: tmp_path
+    tab._navigable_frame_cache = {}
+
+    calls = []
+    monkeypatch.setattr(
+        pipeline_gui,
+        "available_execution_image_frames",
+        lambda root, camera_names: calls.append((root, tuple(camera_names))) or {"cam0": {11}, "cam1": {13}},
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "resolve_execution_image_path",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not resolve image paths here")),
+    )
+
+    local_indices = pipeline_gui.AnnotationTab._navigable_annotation_frame_local_indices(tab)
+
+    assert local_indices == [1, 3]
+    assert calls == [(tmp_path, ("cam0", "cam1"))]
 
 
 def test_annotation_crop_limits_use_selected_camera_indices(monkeypatch):
@@ -1679,9 +1754,15 @@ class _FakeScale:
 class _FakeAxis:
     def __init__(self):
         self.images = []
+        self.xticks = None
+        self.yticks = None
+        self.tick_kwargs = None
+        self.spines = {
+            name: SimpleNamespace(set_visible=lambda _visible: None) for name in ("left", "right", "top", "bottom")
+        }
 
-    def imshow(self, image):
-        self.images.append(image)
+    def imshow(self, image, **kwargs):
+        self.images.append((image, kwargs))
 
     def set_xlim(self, *_args, **_kwargs):
         return None
@@ -1704,6 +1785,12 @@ class _FakeAxis:
     def set_ylabel(self, *_args, **_kwargs):
         return None
 
+    def set_xticks(self, ticks):
+        self.xticks = ticks
+
+    def set_yticks(self, ticks):
+        self.yticks = ticks
+
     def get_legend_handles_labels(self):
         return [], []
 
@@ -1715,6 +1802,9 @@ class _FakeAxis:
 
     def set_axis_off(self):
         return None
+
+    def tick_params(self, **kwargs):
+        self.tick_kwargs = kwargs
 
 
 class _FakeFigure:

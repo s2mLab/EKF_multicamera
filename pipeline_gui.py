@@ -85,6 +85,7 @@ from judging.execution import (
     ExecutionOverlayFrame,
     ExecutionSessionAnalysis,
     analyze_execution_session,
+    available_execution_image_frames,
     build_execution_overlay_frame,
     execution_focus_frame,
     infer_execution_images_root,
@@ -1048,33 +1049,10 @@ def draw_upper_back_preview(
 ) -> None:
     """Draw back triangles around the mid-back origin for models with a segmented trunk."""
 
-    if frame_points is None:
+    geometry = segmented_back_frame_geometry(frame_points, segment_frames)
+    if geometry is None:
         return
-    left_hip = np.asarray(frame_points[KP_INDEX["left_hip"]], dtype=float)
-    right_hip = np.asarray(frame_points[KP_INDEX["right_hip"]], dtype=float)
-    left_shoulder = np.asarray(frame_points[KP_INDEX["left_shoulder"]], dtype=float)
-    right_shoulder = np.asarray(frame_points[KP_INDEX["right_shoulder"]], dtype=float)
-    if not (
-        np.all(np.isfinite(left_hip))
-        and np.all(np.isfinite(right_hip))
-        and np.all(np.isfinite(left_shoulder))
-        and np.all(np.isfinite(right_shoulder))
-    ):
-        return
-    segment_map = (
-        {
-            str(name): (np.asarray(origin, dtype=float), np.asarray(rotation, dtype=float))
-            for name, origin, rotation in segment_frames
-        }
-        if segment_frames is not None
-        else {}
-    )
-    upper_back_frame = segment_map.get("UPPER_BACK") or segment_map.get("LOWER_TRUNK")
-    hip_center = 0.5 * (left_hip + right_hip)
-    upper_center = 0.5 * (left_shoulder + right_shoulder)
-    mid_back = upper_back_frame[0] if upper_back_frame is not None else 0.5 * (hip_center + upper_center)
-    hip_triangle = np.vstack([right_hip, left_hip, mid_back, right_hip])
-    shoulder_triangle = np.vstack([right_shoulder, left_shoulder, mid_back, right_shoulder])
+    mid_back, hip_triangle, shoulder_triangle = geometry
     ax.plot(
         hip_triangle[:, 0],
         hip_triangle[:, 1],
@@ -1100,6 +1078,129 @@ def draw_upper_back_preview(
         marker="D",
         depthshade=False,
     )
+
+
+def segmented_back_frame_geometry(
+    frame_points: np.ndarray,
+    segment_frames: list[tuple[str, np.ndarray, np.ndarray]] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Return mid-back and both segmented-back triangles for one 3D frame."""
+
+    if frame_points is None:
+        return None
+    left_hip = np.asarray(frame_points[KP_INDEX["left_hip"]], dtype=float)
+    right_hip = np.asarray(frame_points[KP_INDEX["right_hip"]], dtype=float)
+    left_shoulder = np.asarray(frame_points[KP_INDEX["left_shoulder"]], dtype=float)
+    right_shoulder = np.asarray(frame_points[KP_INDEX["right_shoulder"]], dtype=float)
+    if not (
+        np.all(np.isfinite(left_hip))
+        and np.all(np.isfinite(right_hip))
+        and np.all(np.isfinite(left_shoulder))
+        and np.all(np.isfinite(right_shoulder))
+    ):
+        return None
+    segment_map = (
+        {
+            str(name): (np.asarray(origin, dtype=float), np.asarray(rotation, dtype=float))
+            for name, origin, rotation in segment_frames
+        }
+        if segment_frames is not None
+        else {}
+    )
+    upper_back_frame = segment_map.get("UPPER_BACK") or segment_map.get("LOWER_TRUNK")
+    hip_center = 0.5 * (left_hip + right_hip)
+    upper_center = 0.5 * (left_shoulder + right_shoulder)
+    mid_back = upper_back_frame[0] if upper_back_frame is not None else 0.5 * (hip_center + upper_center)
+    hip_triangle = np.vstack([right_hip, left_hip, mid_back, right_hip])
+    shoulder_triangle = np.vstack([right_shoulder, left_shoulder, mid_back, right_shoulder])
+    return mid_back, hip_triangle, shoulder_triangle
+
+
+def draw_upper_back_overlay_2d(
+    ax,
+    *,
+    hip_triangle_2d: np.ndarray | None,
+    shoulder_triangle_2d: np.ndarray | None,
+    mid_back_2d: np.ndarray | None,
+    color: str,
+) -> None:
+    """Draw the segmented-back overlay in a 2D camera view."""
+
+    if hip_triangle_2d is not None:
+        hip_triangle_2d = np.asarray(hip_triangle_2d, dtype=float)
+        if np.all(np.isfinite(hip_triangle_2d)):
+            ax.plot(hip_triangle_2d[:, 0], hip_triangle_2d[:, 1], color=color, linewidth=1.9, alpha=0.9)
+    if shoulder_triangle_2d is not None:
+        shoulder_triangle_2d = np.asarray(shoulder_triangle_2d, dtype=float)
+        if np.all(np.isfinite(shoulder_triangle_2d)):
+            ax.plot(
+                shoulder_triangle_2d[:, 0],
+                shoulder_triangle_2d[:, 1],
+                color=color,
+                linewidth=1.9,
+                alpha=0.9,
+            )
+    if mid_back_2d is not None:
+        mid_back_2d = np.asarray(mid_back_2d, dtype=float)
+        if np.all(np.isfinite(mid_back_2d)):
+            ax.scatter(
+                [mid_back_2d[0]],
+                [mid_back_2d[1]],
+                s=34,
+                facecolors="none",
+                edgecolors=color,
+                linewidths=1.5,
+                marker="D",
+                alpha=0.95,
+            )
+
+
+def segmented_back_overlay_from_q(
+    biomod_path: Path | str | None,
+    q_series: np.ndarray,
+) -> dict[str, np.ndarray] | None:
+    """Compute 3D overlay trajectories for segmented-back models."""
+
+    biomod_path = resolve_biomod_path(biomod_path)
+    if biomod_path is None or not biomod_path.exists():
+        return None
+    if infer_model_variant_from_biomod(biomod_path) not in {
+        "back_flexion_1d",
+        "back_3dof",
+        "upper_root_back_flexion_1d",
+        "upper_root_back_3dof",
+    }:
+        return None
+
+    import biorbd
+
+    q_series = np.asarray(q_series, dtype=float)
+    if q_series.ndim != 2 or q_series.size == 0:
+        return None
+    model = biorbd.Model(str(biomod_path))
+    marker_names = [name.to_string() for name in model.markerNames()]
+    required_marker_names = {"left_hip", "right_hip", "left_shoulder", "right_shoulder"}
+    if not required_marker_names.issubset(set(marker_names)):
+        return None
+
+    n_frames = q_series.shape[0]
+    mid_back = np.full((n_frames, 1, 3), np.nan, dtype=float)
+    hip_triangle = np.full((n_frames, 4, 3), np.nan, dtype=float)
+    shoulder_triangle = np.full((n_frames, 4, 3), np.nan, dtype=float)
+    for frame_idx, q_values in enumerate(q_series):
+        marker_points = np.full((len(COCO17), 3), np.nan, dtype=float)
+        for marker_name, marker in zip(marker_names, model.markers(q_values)):
+            kp_idx = KP_INDEX.get(marker_name)
+            if kp_idx is not None:
+                marker_points[kp_idx, :] = marker.to_array()
+        geometry = segmented_back_frame_geometry(marker_points, biorbd_segment_frames_from_q(model, q_values))
+        if geometry is None:
+            continue
+        mid_back_point, hip_triangle_points, shoulder_triangle_points = geometry
+        mid_back[frame_idx, 0, :] = mid_back_point
+        hip_triangle[frame_idx, :, :] = hip_triangle_points
+        shoulder_triangle[frame_idx, :, :] = shoulder_triangle_points
+    return {"mid_back": mid_back, "hip_triangle": hip_triangle, "shoulder_triangle": shoulder_triangle}
 
 
 def has_segmented_back_visualization(
@@ -1593,6 +1694,29 @@ def apply_2d_axis_limits(
         ax.set_xlim(0, width)
         ax.set_ylim(height, 0)
     ax.set_autoscale_on(False)
+
+
+def draw_2d_background_image(ax, image: np.ndarray, width: float, height: float) -> None:
+    """Display a 2D image in the same pixel coordinate system as the keypoints."""
+
+    ax.imshow(
+        image,
+        extent=(0.0, float(width), float(height), 0.0),
+        origin="upper",
+        interpolation="none",
+        zorder=0,
+    )
+
+
+def hide_2d_axes(ax) -> None:
+    """Hide pixel axes while preserving the title and data coordinates."""
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
 
 
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
@@ -4067,6 +4191,7 @@ class MultiViewTab(CommandTab):
         self.calibrations = None
         self.preview_bundle = None
         self.projected_layers: dict[str, np.ndarray] = {}
+        self.segmented_back_projected_layers: dict[str, dict[str, np.ndarray]] = {}
         self.reconstruction_payloads: dict[str, dict[str, np.ndarray]] = {}
         self.preview_frame_numbers = np.array([], dtype=int)
         self.preview_raw_points = None
@@ -4461,12 +4586,22 @@ class MultiViewTab(CommandTab):
             )
             camera_names = list(self.pose_data.camera_names)
             self.projected_layers = {}
+            self.segmented_back_projected_layers = {}
             self.reconstruction_payloads = {}
             for name, points_3d in self.preview_bundle["recon_3d"].items():
                 self.projected_layers[name] = project_points_all_cameras(points_3d, self.calibrations, camera_names)
                 recon_dir = reconstruction_dir_by_name(output_dir, name)
                 if recon_dir is not None:
                     self.reconstruction_payloads[name] = load_bundle_payload(recon_dir)
+                q_series = self.preview_bundle.get("recon_q", {}).get(name)
+                biomod_path = resolve_reconstruction_biomod(output_dir, name)
+                if q_series is not None and biomod_path is not None and biomod_path.exists():
+                    overlay_3d = segmented_back_overlay_from_q(biomod_path, np.asarray(q_series, dtype=float))
+                    if overlay_3d:
+                        self.segmented_back_projected_layers[name] = {
+                            overlay_name: project_points_all_cameras(points, self.calibrations, camera_names)
+                            for overlay_name, points in overlay_3d.items()
+                        }
             self.crop_limits_cache = {}
             self.crop_limits_key = None
             n_frames = min(
@@ -4522,7 +4657,11 @@ class MultiViewTab(CommandTab):
         crop_points = compose_multiview_crop_points(pose_points, projected_layers, selected)
         crop_mode = "pose" if self.crop_var.get() else "full"
         crop_margin = 0.1
-        crop_limits = self._ensure_crop_limits(crop_points, camera_names, crop_margin) if crop_mode == "pose" else {}
+        crop_limits = (
+            self._ensure_crop_limits(crop_points, camera_names, crop_margin, tuple(selected))
+            if crop_mode == "pose"
+            else {}
+        )
         frame_number = int(self.preview_frame_numbers[frame_idx]) if self.preview_frame_numbers.size else int(frame_idx)
         images_root = (
             Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
@@ -4538,7 +4677,7 @@ class MultiViewTab(CommandTab):
             if self.show_images_var.get():
                 image_path = resolve_execution_image_path(images_root, cam_name, frame_number)
                 if image_path is not None and image_path.exists():
-                    ax.imshow(plt.imread(str(image_path)))
+                    draw_2d_background_image(ax, plt.imread(str(image_path)), width, height)
                     has_image_background = True
             apply_2d_axis_limits(
                 ax,
@@ -4551,7 +4690,7 @@ class MultiViewTab(CommandTab):
             )
             ax.set_aspect("equal", adjustable="box")
             ax.set_title(cam_name.replace("Camera", ""))
-            ax.grid(alpha=0.15)
+            hide_2d_axes(ax)
             if "raw" in selected:
                 draw_skeleton_2d(
                     ax,
@@ -4575,6 +4714,26 @@ class MultiViewTab(CommandTab):
                     reconstruction_legend_label(self.state, mapped),
                     marker_size=float(self.marker_size.get()),
                 )
+                segmented_back_layers = self.segmented_back_projected_layers.get(mapped, {})
+                draw_upper_back_overlay_2d(
+                    ax,
+                    hip_triangle_2d=(
+                        segmented_back_layers.get("hip_triangle", np.empty((0, 0, 0)))[ax_idx, frame_idx]
+                        if "hip_triangle" in segmented_back_layers
+                        else None
+                    ),
+                    shoulder_triangle_2d=(
+                        segmented_back_layers.get("shoulder_triangle", np.empty((0, 0, 0)))[ax_idx, frame_idx]
+                        if "shoulder_triangle" in segmented_back_layers
+                        else None
+                    ),
+                    mid_back_2d=(
+                        segmented_back_layers.get("mid_back", np.empty((0, 0, 0)))[ax_idx, frame_idx, 0]
+                        if "mid_back" in segmented_back_layers
+                        else None
+                    ),
+                    color=reconstruction_display_color(self.state, mapped),
+                )
                 self._draw_excluded_reprojection_points(
                     ax=ax,
                     reconstruction_name=mapped,
@@ -4582,7 +4741,7 @@ class MultiViewTab(CommandTab):
                     frame_number=frame_number,
                     points_2d=points_2d,
                 )
-            ax.tick_params(labelsize=8)
+            ax.tick_params(labelsize=8, length=0)
 
         handles, labels = axes[0].get_legend_handles_labels() if axes.size else ([], [])
         if handles:
@@ -4601,14 +4760,17 @@ class MultiViewTab(CommandTab):
         self.preview_canvas.draw_idle()
 
     def _ensure_crop_limits(
-        self, crop_points: np.ndarray, camera_names: list[str], crop_margin: float
+        self, crop_points: np.ndarray, camera_names: list[str], crop_margin: float, selected_layers: tuple[str, ...]
     ) -> dict[str, np.ndarray]:
         cache_key = (
             id(self.pose_data),
             id(self.calibrations),
             tuple(camera_names),
+            tuple(selected_layers),
             tuple(crop_points.shape),
             float(crop_margin),
+            float(np.nanmin(crop_points)) if np.any(np.isfinite(crop_points)) else np.nan,
+            float(np.nanmax(crop_points)) if np.any(np.isfinite(crop_points)) else np.nan,
         )
         if self.crop_limits_key != cache_key:
             gui_debug(
@@ -4996,12 +5158,17 @@ class AnnotationTab(ttk.Frame):
         current_index = int(round(self.frame_var.get()))
         candidates = self._navigable_annotation_frame_local_indices()
         if candidates:
-            if int(delta) < 0:
+            candidates = sorted(int(idx) for idx in candidates)
+            if current_index in candidates:
+                current_pos = candidates.index(current_index)
+                next_pos = (current_pos + (-1 if int(delta) < 0 else 1)) % len(candidates)
+                next_frame = candidates[next_pos]
+            elif int(delta) < 0:
                 previous = [idx for idx in candidates if idx < current_index]
-                next_frame = previous[-1] if previous else candidates[0]
+                next_frame = previous[-1] if previous else candidates[-1]
             else:
                 following = [idx for idx in candidates if idx > current_index]
-                next_frame = following[0] if following else candidates[-1]
+                next_frame = following[0] if following else candidates[0]
         else:
             next_frame = find_annotation_frame_with_images(
                 frames=self.pose_data.frames,
@@ -5223,15 +5390,19 @@ class AnnotationTab(ttk.Frame):
             filtered = list(range(len(self.pose_data.frames)))
         return filtered if filtered else list(range(len(self.pose_data.frames)))
 
-    def _frame_has_annotation_image(self, local_idx: int, camera_names: list[str], images_root: Path | None) -> bool:
+    def _frame_has_annotation_image(
+        self,
+        local_idx: int,
+        camera_names: list[str],
+        images_root: Path | None,
+        available_by_camera: dict[str, set[int]] | None = None,
+    ) -> bool:
         if self.pose_data is None or images_root is None or not camera_names:
             return False
         frame_number = int(self.pose_data.frames[int(local_idx)])
-        for camera_name in camera_names:
-            image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
-            if image_path is not None and image_path.exists():
-                return True
-        return False
+        if available_by_camera is None:
+            available_by_camera = available_execution_image_frames(images_root, camera_names)
+        return any(frame_number in available_by_camera.get(str(camera_name), set()) for camera_name in camera_names)
 
     def _navigable_annotation_frame_local_indices(self) -> list[int]:
         if self.pose_data is None:
@@ -5249,7 +5420,12 @@ class AnnotationTab(ttk.Frame):
         cached = self._navigable_frame_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        with_images = [idx for idx in filtered if self._frame_has_annotation_image(idx, camera_names, images_root)]
+        available_by_camera = available_execution_image_frames(images_root, camera_names)
+        with_images = [
+            idx
+            for idx in filtered
+            if self._frame_has_annotation_image(idx, camera_names, images_root, available_by_camera)
+        ]
         resolved = with_images or filtered
         self._navigable_frame_cache[cache_key] = list(resolved)
         return resolved

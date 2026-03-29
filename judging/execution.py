@@ -14,6 +14,7 @@ to claim full FIG compliance yet.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ EXECUTION_KNEE_DOF_NAMES = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 ROOT_TILT_DOF_NAME = "TRUNK:RotX"
 ROOT_TRANSLATION_VELOCITY_NAMES = ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ")
 SUPPORTED_OVERLAY_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+_EXECUTION_IMAGE_INDEX_CACHE: dict[str, tuple[float, dict[tuple[str, int], Path], dict[str, set[int]]]] = {}
 
 
 @dataclass
@@ -441,6 +443,85 @@ def _extract_overlay_frame_number(path: Path) -> int | None:
     return None
 
 
+def _overlay_camera_tokens(path: Path, *, directory_token: str | None = None) -> set[str]:
+    tokens: set[str] = set()
+    if directory_token:
+        tokens.add(directory_token)
+    for match in re.findall(r"M\d{4,}", path.stem, flags=re.IGNORECASE):
+        tokens.add(_normalize_overlay_token(match))
+    return tokens
+
+
+def _execution_image_index(
+    images_root: Path | str | None,
+) -> tuple[dict[tuple[str, int], Path], dict[str, set[int]]]:
+    """Index execution images once per root to avoid repeated directory scans."""
+
+    if images_root is None:
+        return {}, {}
+    root = Path(images_root)
+    if not root.exists() or not root.is_dir():
+        return {}, {}
+
+    cache_key = str(root.resolve())
+    try:
+        root_mtime = float(root.stat().st_mtime_ns)
+    except OSError:
+        root_mtime = -1.0
+    cached = _EXECUTION_IMAGE_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] == root_mtime:
+        return cached[1], cached[2]
+
+    paths_by_camera_frame: dict[tuple[str, int], Path] = {}
+    frames_by_camera: dict[str, set[int]] = {}
+
+    candidate_directories: list[tuple[Path, str | None]] = [(root, None)]
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    candidate_directories.append((Path(entry.path), _normalize_overlay_token(entry.name)))
+    except OSError:
+        pass
+
+    for directory, directory_token in candidate_directories:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    path = Path(entry.path)
+                    if path.suffix.lower() not in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
+                        continue
+                    frame_number = _extract_overlay_frame_number(path)
+                    if frame_number is None:
+                        continue
+                    for token in _overlay_camera_tokens(path, directory_token=directory_token):
+                        frames_by_camera.setdefault(token, set()).add(frame_number)
+                        paths_by_camera_frame.setdefault((token, frame_number), path)
+        except OSError:
+            continue
+
+    _EXECUTION_IMAGE_INDEX_CACHE[cache_key] = (root_mtime, paths_by_camera_frame, frames_by_camera)
+    return paths_by_camera_frame, frames_by_camera
+
+
+def available_execution_image_frames(
+    images_root: Path | str | None,
+    camera_names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, set[int]]:
+    """Return available frame ids per camera without rescanning the disk repeatedly."""
+
+    _paths_by_camera_frame, frames_by_camera = _execution_image_index(images_root)
+    if camera_names is None:
+        return {camera: set(frames) for camera, frames in frames_by_camera.items()}
+    available: dict[str, set[int]] = {}
+    for camera_name in camera_names:
+        token = _normalize_overlay_token(str(camera_name))
+        available[str(camera_name)] = set(frames_by_camera.get(token, set()))
+    return available
+
+
 def infer_execution_images_root(keypoints_path: Path | str | None) -> Path | None:
     """Infer the most likely image root for a keypoint file.
 
@@ -477,6 +558,12 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
 
     frame_number = int(frame_number)
     camera_name = str(camera_name)
+    normalized_camera = _normalize_overlay_token(camera_name)
+    indexed_paths, _frames_by_camera = _execution_image_index(images_root)
+    indexed = indexed_paths.get((normalized_camera, frame_number))
+    if indexed is not None and indexed.exists():
+        return indexed
+
     frame_tokens = (
         f"{frame_number}",
         f"{frame_number:04d}",
@@ -487,7 +574,6 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
         f"frame_{frame_number:05d}",
         f"frame_{frame_number:06d}",
     )
-    normalized_camera = _normalize_overlay_token(camera_name)
     camera_tokens = {camera_name, camera_name.lower(), normalized_camera}
 
     candidate_dirs = [images_root]

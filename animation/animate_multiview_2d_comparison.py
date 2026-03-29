@@ -397,6 +397,29 @@ def apply_2d_axis_limits(
     ax.set_autoscale_on(False)
 
 
+def draw_2d_background_image(ax, image: np.ndarray, width: float, height: float) -> None:
+    """Display a 2D image in the same pixel coordinates as the plotted keypoints."""
+
+    ax.imshow(
+        image,
+        extent=(0.0, float(width), float(height), 0.0),
+        origin="upper",
+        interpolation="none",
+        zorder=0,
+    )
+
+
+def hide_2d_axes(ax) -> None:
+    """Hide pixel axes while keeping titles and plotted data visible."""
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_xlabel("")
+    ax.set_ylabel("")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
 def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
     """Construit l'hypothese alternative face/dos via un swap gauche/droite global."""
     swapped = np.array(points_2d, copy=True)
@@ -760,7 +783,7 @@ def render_frame(
         if show_images:
             image_path = resolve_execution_image_path(images_root, cam_name, int(frame_numbers[frame_idx]))
             if image_path is not None and image_path.exists():
-                ax.imshow(plt.imread(str(image_path)))
+                draw_2d_background_image(ax, plt.imread(str(image_path)), width, height)
                 has_image_background = True
         apply_2d_axis_limits(
             ax,
@@ -776,8 +799,8 @@ def render_frame(
             ax.set_title(f"{cam_name} | face/dos ?", color="#c44e52")
         else:
             ax.set_title(cam_name)
-        ax.grid(alpha=0.15)
-        ax.tick_params(labelsize=8)
+        hide_2d_axes(ax)
+        ax.tick_params(labelsize=8, length=0)
 
         if "raw" in display_names:
             draw_points_and_lines(
