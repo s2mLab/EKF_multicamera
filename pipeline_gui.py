@@ -58,6 +58,14 @@ from annotation.annotation_store import (
     save_annotation_payload,
     set_annotation_point,
 )
+from annotation.kinematic_assist import (
+    annotation_blend_q_by_relevance,
+    annotation_reconstruction_from_points,
+    annotation_state_from_q,
+    normalize_annotation_kinematic_state,
+    propagate_annotation_kinematic_state,
+    refine_annotation_q_with_local_ekf,
+)
 from batch_run import (
     DEFAULT_EXCEL_OUTPUT,
     DEFAULT_KEYPOINTS_GLOB,
@@ -208,7 +216,6 @@ from reconstruction.reconstruction_timings import (
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_METHOD,
-    DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
@@ -224,8 +231,8 @@ from vitpose_ekf_pipeline import (
     PoseData,
     ReconstructionResult,
     apply_left_right_flip_to_points,
+    canonicalize_model_q_rotation_branches,
     fundamental_matrix,
-    initial_state_from_ekf_bootstrap,
     initial_state_from_triangulation,
     load_calibrations,
     load_pose_data,
@@ -1126,13 +1133,26 @@ def draw_upper_back_overlay_2d(
     shoulder_triangle_2d: np.ndarray | None,
     mid_back_2d: np.ndarray | None,
     color: str,
+    line_width: float = 1.9,
+    line_alpha: float = 0.9,
+    line_style: str = "-",
+    marker_size: float = 34.0,
+    marker_line_width: float = 1.5,
+    marker_alpha: float = 0.95,
 ) -> None:
     """Draw the segmented-back overlay in a 2D camera view."""
 
     if hip_triangle_2d is not None:
         hip_triangle_2d = np.asarray(hip_triangle_2d, dtype=float)
         if np.all(np.isfinite(hip_triangle_2d)):
-            ax.plot(hip_triangle_2d[:, 0], hip_triangle_2d[:, 1], color=color, linewidth=1.9, alpha=0.9)
+            ax.plot(
+                hip_triangle_2d[:, 0],
+                hip_triangle_2d[:, 1],
+                color=color,
+                linewidth=line_width,
+                alpha=line_alpha,
+                linestyle=line_style,
+            )
     if shoulder_triangle_2d is not None:
         shoulder_triangle_2d = np.asarray(shoulder_triangle_2d, dtype=float)
         if np.all(np.isfinite(shoulder_triangle_2d)):
@@ -1140,8 +1160,9 @@ def draw_upper_back_overlay_2d(
                 shoulder_triangle_2d[:, 0],
                 shoulder_triangle_2d[:, 1],
                 color=color,
-                linewidth=1.9,
-                alpha=0.9,
+                linewidth=line_width,
+                alpha=line_alpha,
+                linestyle=line_style,
             )
     if mid_back_2d is not None:
         mid_back_2d = np.asarray(mid_back_2d, dtype=float)
@@ -1149,12 +1170,12 @@ def draw_upper_back_overlay_2d(
             ax.scatter(
                 [mid_back_2d[0]],
                 [mid_back_2d[1]],
-                s=34,
+                s=marker_size,
                 facecolors="none",
                 edgecolors=color,
-                linewidths=1.5,
+                linewidths=marker_line_width,
                 marker="D",
-                alpha=0.95,
+                alpha=marker_alpha,
             )
 
 
@@ -1727,6 +1748,8 @@ def hide_2d_axes(ax) -> None:
 
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
 ANNOTATION_DELETE_RADIUS_PX = 18.0
+ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
+ANNOTATION_KINEMATIC_CLICK_PASSES = 3
 ANNOTATION_FRAME_FILTER_OPTIONS = {
     "all": "All frames",
     "flipped": "Flipped L/R",
@@ -1764,51 +1787,6 @@ def annotation_motion_prior_center(
     if not (np.all(np.isfinite(pt1)) and np.all(np.isfinite(pt2))):
         return None
     return pt1 + (pt1 - pt2)
-
-
-def annotation_relevant_q_prefixes(keypoint_name: str) -> tuple[str, ...]:
-    """Return the segment prefixes most relevant to one annotated keypoint."""
-
-    name = str(keypoint_name)
-    prefixes = ["TRUNK", "LOWER_TRUNK", "UPPER_BACK"]
-    if name.startswith("left_"):
-        prefixes.extend(
-            ["LEFT_UPPER_ARM", "LEFT_LOWER_ARM"]
-            if "shoulder" in name or "elbow" in name or "wrist" in name
-            else ["LEFT_THIGH", "LEFT_SHANK"]
-        )
-    elif name.startswith("right_"):
-        prefixes.extend(
-            ["RIGHT_UPPER_ARM", "RIGHT_LOWER_ARM"]
-            if "shoulder" in name or "elbow" in name or "wrist" in name
-            else ["RIGHT_THIGH", "RIGHT_SHANK"]
-        )
-    else:
-        prefixes.append("HEAD")
-    return tuple(prefixes)
-
-
-def annotation_blend_q_by_relevance(
-    q_names: list[str] | np.ndarray,
-    previous_q: np.ndarray | None,
-    estimated_q: np.ndarray,
-    keypoint_name: str,
-) -> np.ndarray:
-    """Keep unrelated DoFs from the previous state and update only the relevant subtree."""
-
-    estimated_q = np.asarray(estimated_q, dtype=float).reshape(-1)
-    if previous_q is None:
-        return estimated_q
-    previous_q = np.asarray(previous_q, dtype=float).reshape(-1)
-    if previous_q.shape != estimated_q.shape:
-        return estimated_q
-    prefixes = annotation_relevant_q_prefixes(keypoint_name)
-    blended = np.array(previous_q, copy=True)
-    for idx, q_name in enumerate(q_names):
-        q_name = str(q_name)
-        if any(q_name.startswith(f"{prefix}:") for prefix in prefixes):
-            blended[idx] = estimated_q[idx]
-    return blended
 
 
 def annotation_epipolar_guides(
@@ -1959,26 +1937,6 @@ def annotation_pose_data_for_frame(
         raw_keypoints=np.array(keypoints, copy=True),
         annotated_keypoints=np.array(keypoints, copy=True),
         annotated_scores=np.array(scores, copy=True),
-    )
-
-
-def annotation_reconstruction_from_points(
-    points_3d: np.ndarray, frame_number: int, n_cameras: int
-) -> ReconstructionResult:
-    """Wrap one triangulated annotation frame into a minimal ReconstructionResult."""
-
-    points_3d = np.asarray(points_3d, dtype=float).reshape(1, len(COCO17), 3)
-    return ReconstructionResult(
-        frames=np.asarray([int(frame_number)], dtype=int),
-        points_3d=points_3d,
-        mean_confidence=np.full((1, len(COCO17)), np.nan, dtype=float),
-        reprojection_error=np.full((1, len(COCO17)), np.nan, dtype=float),
-        reprojection_error_per_view=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
-        multiview_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
-        epipolar_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
-        triangulation_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
-        excluded_views=np.ones((1, len(COCO17), int(n_cameras)), dtype=bool),
-        coherence_method="annotation",
     )
 
 
@@ -5040,6 +4998,7 @@ class AnnotationTab(ttk.Frame):
         self.kinematic_model_choices: dict[str, Path] = {}
         self.kinematic_frame_states: dict[tuple[str, int], np.ndarray] = {}
         self.kinematic_q_current: np.ndarray | None = None
+        self.kinematic_state_current: np.ndarray | None = None
         self.kinematic_q_names: list[str] = []
         self.kinematic_projected_points: np.ndarray | None = None
         self.kinematic_segmented_back_projected: dict[str, np.ndarray] = {}
@@ -5204,6 +5163,8 @@ class AnnotationTab(ttk.Frame):
         self.annotation_keypoints_list = tk.Listbox(keypoints_body, exportselection=False, height=8, width=14)
         self.annotation_keypoints_list.pack(fill=tk.BOTH, expand=True)
         self.annotation_keypoints_list.bind("<<ListboxSelect>>", lambda _event: self.on_keypoint_selection_changed())
+        self.annotation_keypoints_list.bind("<Up>", lambda event: self._step_annotation_keypoint(-1, event))
+        self.annotation_keypoints_list.bind("<Down>", lambda event: self._step_annotation_keypoint(1, event))
         for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
             self.annotation_keypoints_list.insert(tk.END, keypoint_name)
         self.annotation_keypoints_list.selection_set(0)
@@ -5376,6 +5337,23 @@ class AnnotationTab(ttk.Frame):
         self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
         self.refresh_preview()
 
+    def _step_annotation_keypoint(self, delta: int, event=None) -> str:
+        if not hasattr(self, "annotation_keypoints_list"):
+            return "break"
+        size = int(self.annotation_keypoints_list.size())
+        if size <= 0:
+            return "break"
+        selection = self.annotation_keypoints_list.curselection()
+        current_index = int(selection[0]) if selection else 0
+        next_index = max(0, min(size - 1, current_index + int(delta)))
+        if next_index != current_index or not selection:
+            self.annotation_keypoints_list.selection_clear(0, tk.END)
+            self.annotation_keypoints_list.selection_set(next_index)
+            self.annotation_keypoints_list.activate(next_index)
+            self.annotation_keypoints_list.see(next_index)
+            self.on_keypoint_selection_changed()
+        return "break"
+
     def _cancel_pending_reprojection_from_tk_event(self, event) -> None:
         if not self._pending_reprojection_points:
             return
@@ -5524,6 +5502,7 @@ class AnnotationTab(ttk.Frame):
         if self.pose_data is None or len(self.pose_data.frames) == 0:
             return
         current_index = int(round(self.frame_var.get()))
+        current_frame_number = int(self.pose_data.frames[current_index])
         candidates = self._navigable_annotation_frame_local_indices()
         if candidates:
             candidates = sorted(int(idx) for idx in candidates)
@@ -5545,6 +5524,32 @@ class AnnotationTab(ttk.Frame):
                 camera_names=self.selected_annotation_camera_names(),
                 images_root=self._current_images_root(),
             )
+        if (
+            self.pose_data is not None
+            and bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
+            and next_frame != current_index
+        ):
+            biomod_path = self._selected_kinematic_biomod_path()
+            if biomod_path is not None and biomod_path.exists():
+                try:
+                    import biorbd
+
+                    model = biorbd.Model(str(biomod_path))
+                    current_state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(
+                        current_frame_number, model
+                    )
+                    if current_state is not None:
+                        next_frame_number = int(self.pose_data.frames[int(next_frame)])
+                        frame_delta = int(next_frame_number) - int(current_frame_number)
+                        propagated_state = propagate_annotation_kinematic_state(
+                            model,
+                            current_state,
+                            dt=1.0 / float(self.state.fps_var.get()),
+                            frame_delta=frame_delta,
+                        )
+                        self.kinematic_frame_states[self._kinematic_state_key(next_frame_number)] = propagated_state
+                except Exception:
+                    pass
         self._set_frame_index(next_frame)
         self.refresh_preview()
 
@@ -5593,6 +5598,7 @@ class AnnotationTab(ttk.Frame):
 
     def _clear_kinematic_assist_preview(self) -> None:
         self.kinematic_q_current = None
+        self.kinematic_state_current = None
         self.kinematic_q_names = []
         self.kinematic_projected_points = None
         self.kinematic_segmented_back_projected = {}
@@ -5601,7 +5607,7 @@ class AnnotationTab(ttk.Frame):
         return (str(self.kinematic_model_var.get()).strip(), int(frame_number))
 
     def _selected_or_nearest_kinematic_state_info(
-        self, frame_number: int
+        self, frame_number: int, model
     ) -> tuple[np.ndarray | None, int | None, bool]:
         model_label = str(self.kinematic_model_var.get()).strip()
         if not model_label:
@@ -5609,26 +5615,33 @@ class AnnotationTab(ttk.Frame):
         frame_states = getattr(self, "kinematic_frame_states", {})
         exact = frame_states.get((model_label, int(frame_number)))
         if exact is not None:
-            return np.asarray(exact, dtype=float), int(frame_number), True
+            normalized = normalize_annotation_kinematic_state(model, exact)
+            return normalized, int(frame_number), normalized is not None
         candidates = [
-            (abs(int(saved_frame) - int(frame_number)), int(saved_frame), np.asarray(saved_q, dtype=float))
-            for (saved_model, saved_frame), saved_q in frame_states.items()
+            (
+                abs(int(saved_frame) - int(frame_number)),
+                int(saved_frame),
+                normalize_annotation_kinematic_state(model, saved_state),
+            )
+            for (saved_model, saved_frame), saved_state in frame_states.items()
             if str(saved_model) == model_label
         ]
+        candidates = [item for item in candidates if item[2] is not None]
         if not candidates:
             return None, None, False
         candidates.sort(key=lambda item: item[0])
-        _distance, source_frame, source_q = candidates[0]
-        return np.asarray(source_q, dtype=float), int(source_frame), False
+        _distance, source_frame, source_state = candidates[0]
+        return np.asarray(source_state, dtype=float), int(source_frame), False
 
-    def _selected_or_nearest_kinematic_state(self, frame_number: int) -> np.ndarray | None:
-        state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
+    def _selected_or_nearest_kinematic_state(self, frame_number: int, model) -> np.ndarray | None:
+        state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number, model)
         return state
 
     def _set_kinematic_preview_from_q(self, biomod_path: Path, camera_names: list[str], q_values: np.ndarray) -> None:
         q_values = np.asarray(q_values, dtype=float).reshape(-1)
         q_series = q_values.reshape(1, -1)
         self.kinematic_q_current = q_values
+        self.kinematic_state_current = None
         self.kinematic_projected_points = project_points_all_cameras(
             biorbd_markers_from_q(biomod_path, q_series), self.calibrations, camera_names
         )
@@ -5654,33 +5667,46 @@ class AnnotationTab(ttk.Frame):
         if not camera_names:
             raise ValueError("Select at least one camera.")
         frame_number = self.current_frame_number()
-        triangulated_points = triangulate_annotation_frame_points(
-            self.calibrations,
-            camera_names=camera_names,
-            frame_number=frame_number,
-            annotation_payload=self.annotation_payload,
-        )
-        n_triangulated = int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))
-        if n_triangulated < 2:
-            raise ValueError("Not enough triangulated annotated markers to estimate q.")
-        reconstruction = annotation_reconstruction_from_points(
-            triangulated_points, frame_number=frame_number, n_cameras=len(camera_names)
-        )
         import biorbd
 
         model = biorbd.Model(str(biomod_path))
-        triangulation_state = initial_state_from_triangulation(model, reconstruction)
         self.kinematic_q_names = biorbd_q_names(model)
-        previous_q, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
-        estimated_q = np.asarray(triangulation_state[: model.nbQ()], dtype=float)
+        previous_state, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number, model)
+        previous_q = None if previous_state is None else np.asarray(previous_state[: model.nbQ()], dtype=float)
+        seed_source = "nearest state"
+        estimated_state = None
+        n_triangulated = 0
+        if previous_state is not None:
+            estimated_state = np.array(previous_state, copy=True)
+            seed_source = "current state" if is_exact else f"nearest frame {source_frame}"
+        else:
+            triangulated_points = triangulate_annotation_frame_points(
+                self.calibrations,
+                camera_names=camera_names,
+                frame_number=frame_number,
+                annotation_payload=self.annotation_payload,
+            )
+            n_triangulated = int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))
+            if n_triangulated < 2:
+                raise ValueError("Not enough annotated support to initialize q. Add points on more views first.")
+            reconstruction = annotation_reconstruction_from_points(
+                triangulated_points, frame_number=frame_number, n_cameras=len(camera_names)
+            )
+            triangulation_state = initial_state_from_triangulation(model, reconstruction)
+            estimated_state = annotation_state_from_q(
+                model, np.asarray(triangulation_state[: model.nbQ()], dtype=float)
+            )
+            seed_source = f"triangulation ({n_triangulated} markers)"
         if keypoint_name is not None:
-            estimated_q = annotation_blend_q_by_relevance(
+            blended_q = annotation_blend_q_by_relevance(
                 self.kinematic_q_names,
                 previous_q,
-                estimated_q,
+                estimated_state[: model.nbQ()],
                 keypoint_name,
             )
-        bootstrap_summary = " | bootstrap fallback"
+            estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
+            estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
+        bootstrap_summary = " | local ekf skipped"
         try:
             annotation_pose_data = annotation_pose_data_for_frame(
                 self.pose_data,
@@ -5689,55 +5715,60 @@ class AnnotationTab(ttk.Frame):
                 annotation_payload=self.annotation_payload,
             )
             valid_measurements = int(np.sum(np.asarray(annotation_pose_data.scores) > 0.0))
-            if valid_measurements >= 4:
-                seed_state = np.concatenate((estimated_q, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
-                bootstrap_passes = max(2, int(DEFAULT_EKF2D_BOOTSTRAP_PASSES))
-                refined_state, bootstrap_diagnostics = initial_state_from_ekf_bootstrap(
+            min_measurements = 1 if previous_state is not None else 2
+            if valid_measurements >= min_measurements:
+                passes = (
+                    ANNOTATION_KINEMATIC_CLICK_PASSES
+                    if keypoint_name is not None
+                    else ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES
+                )
+                refined_state, bootstrap_diagnostics = refine_annotation_q_with_local_ekf(
                     model=model,
-                    calibrations={name: self.calibrations[name] for name in annotation_pose_data.camera_names},
+                    calibrations=self.calibrations,
                     pose_data=annotation_pose_data,
-                    reconstruction=reconstruction,
+                    frame_number=frame_number,
+                    seed_state=estimated_state,
                     fps=float(self.state.fps_var.get()),
+                    passes=passes,
                     measurement_noise_scale=1.0,
                     process_noise_scale=1.0,
-                    min_frame_coherence_for_update=0.0,
-                    skip_low_coherence_updates=False,
-                    coherence_confidence_floor=0.0,
                     epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
-                    enable_dof_locking=False,
-                    passes=bootstrap_passes,
-                    initial_state=seed_state,
                 )
-                estimated_q = np.asarray(refined_state[: model.nbQ()], dtype=float)
+                estimated_state = np.asarray(refined_state, dtype=float)
                 if keypoint_name is not None:
-                    estimated_q = annotation_blend_q_by_relevance(
+                    blended_q = annotation_blend_q_by_relevance(
                         self.kinematic_q_names,
                         previous_q,
-                        estimated_q,
+                        estimated_state[: model.nbQ()],
                         keypoint_name,
                     )
-                bootstrap_summary = (
-                    f" | bootstrap {int(bootstrap_diagnostics.get('completed_passes', 0))}/{bootstrap_passes}"
-                )
+                    estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
+                    estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
+                bootstrap_summary = f" | local ekf {int(bootstrap_diagnostics.get('completed_passes', 0))}/" f"{passes}"
+                if bool(bootstrap_diagnostics.get("used_fallback")):
+                    bootstrap_summary += " fallback"
             else:
-                bootstrap_summary = " | bootstrap skipped"
+                bootstrap_summary = f" | local ekf skipped ({valid_measurements} meas)"
         except Exception:
-            bootstrap_summary = " | bootstrap fallback"
+            bootstrap_summary = " | local ekf fallback"
         if not hasattr(self, "kinematic_frame_states") or self.kinematic_frame_states is None:
             self.kinematic_frame_states = {}
-        self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_q, dtype=float)
-        self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_q)
+        estimated_state = normalize_annotation_kinematic_state(model, estimated_state)
+        self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_state, dtype=float)
+        self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
+        self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_state[: model.nbQ()])
+        self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
         if keypoint_name is None:
-            self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers{bootstrap_summary}.")
+            self.kinematic_status_var.set(f"Estimated q from {seed_source}{bootstrap_summary}.")
         else:
             warm_start_text = ""
-            if previous_q is not None and source_frame is not None:
+            if previous_state is not None and source_frame is not None:
                 warm_start_text = " current frame" if is_exact else f" nearest frame {source_frame}"
                 warm_start_text = f" from{warm_start_text}"
             self.kinematic_status_var.set(
-                f"Updated model after {keypoint_name} using {n_triangulated} triangulated markers{warm_start_text}{bootstrap_summary}."
+                f"Updated model after {keypoint_name} using {seed_source}{warm_start_text}{bootstrap_summary}."
             )
-        return estimated_q
+        return np.asarray(estimated_state[: model.nbQ()], dtype=float)
 
     def estimate_kinematic_assist_state(self) -> None:
         if self.pose_data is None or self.calibrations is None:
@@ -6131,8 +6162,9 @@ class AnnotationTab(ttk.Frame):
         if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
             try:
                 self._estimate_kinematic_q(keypoint_name=None if delete_request else keypoint_name)
-            except Exception:
+            except Exception as exc:
                 self._clear_kinematic_assist_preview()
+                self.kinematic_status_var.set(f"Kinematic assist update skipped: {exc}")
         self.save_annotations()
         self.refresh_preview()
 
@@ -6200,10 +6232,18 @@ class AnnotationTab(ttk.Frame):
             and self.kinematic_projected_points is None
         ):
             biomod_path = self._selected_kinematic_biomod_path()
-            cached_q, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
-            if biomod_path is not None and cached_q is not None:
+            if biomod_path is not None and biomod_path.exists():
                 try:
-                    self._set_kinematic_preview_from_q(biomod_path, camera_names, cached_q)
+                    import biorbd
+
+                    model = biorbd.Model(str(biomod_path))
+                    cached_state, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(
+                        frame_number, model
+                    )
+                    if cached_state is None:
+                        raise ValueError("No cached state")
+                    self._set_kinematic_preview_from_q(biomod_path, camera_names, cached_state[: model.nbQ()])
+                    self.kinematic_state_current = np.asarray(cached_state, dtype=float)
                     if is_exact:
                         self.kinematic_status_var.set(f"Using saved q for frame {frame_number}.")
                     elif source_frame is not None:
@@ -6289,7 +6329,12 @@ class AnnotationTab(ttk.Frame):
                     projected_points,
                     "#00b8d9",
                     "Model reproj",
-                    marker_size=5.0,
+                    marker_size=3.2,
+                    marker_fill=False,
+                    marker_edge_width=0.8,
+                    line_alpha=0.32,
+                    line_style="--",
+                    line_width_scale=0.62,
                 )
                 for keypoint_name in COCO17:
                     projected_xy = np.asarray(projected_points[KP_INDEX[keypoint_name]], dtype=float)
@@ -6320,6 +6365,12 @@ class AnnotationTab(ttk.Frame):
                         else None
                     ),
                     color="#00b8d9",
+                    line_width=1.0,
+                    line_alpha=0.32,
+                    line_style="--",
+                    marker_size=18.0,
+                    marker_line_width=0.9,
+                    marker_alpha=0.38,
                 )
 
             for (pending_camera, pending_frame, keypoint_name), pending_xy in self._pending_reprojection_points.items():
