@@ -2882,6 +2882,33 @@ def get_cached_pose_data(
     return calibrations, pose_data
 
 
+def existing_annotation_path_for_keypoints(state: SharedAppState, keypoints_path: Path) -> Path | None:
+    """Return the annotation file to use for a keypoints file when it exists."""
+
+    state_annotation_path = getattr(state, "annotation_path_var", None)
+    state_annotation_value = "" if state_annotation_path is None else str(state_annotation_path.get()).strip()
+    candidates: list[Path] = []
+    if state_annotation_value:
+        candidates.append(ROOT / state_annotation_value)
+    candidates.append(default_annotation_path(keypoints_path))
+    for candidate in candidates:
+        try:
+            if Path(candidate).exists():
+                return Path(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def available_model_pose_modes(state: SharedAppState, keypoints_path: Path) -> list[str]:
+    """Return the 2D source modes available in the Models tab."""
+
+    modes = ["raw", "cleaned"]
+    if existing_annotation_path_for_keypoints(state, keypoints_path) is not None:
+        modes.insert(1, "annotated")
+    return modes
+
+
 def get_pose_data_with_correction(
     state: SharedAppState,
     *,
@@ -4848,6 +4875,7 @@ class AnnotationTab(ttk.Frame):
         self._pan_state: dict[str, object] | None = None
         self._dragging_frame_scale = False
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
+        self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -4864,6 +4892,10 @@ class AnnotationTab(ttk.Frame):
         ttk.Button(row0, text="Load data", command=self.load_resources).pack(side=tk.LEFT)
         ttk.Button(row0, text="Save annotations", command=self.save_annotations).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(row0, text="Refresh frame", command=self.refresh_preview).pack(side=tk.LEFT, padx=(8, 0))
+        self.reproject_button_var = tk.StringVar(value="Reproject")
+        ttk.Button(row0, textvariable=self.reproject_button_var, command=self.on_reproject_button).pack(
+            side=tk.LEFT, padx=(8, 0)
+        )
 
         row1 = ttk.Frame(controls)
         row1.pack(fill=tk.X, padx=8, pady=4)
@@ -4874,10 +4906,6 @@ class AnnotationTab(ttk.Frame):
         self.crop_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row1, text="Crop +20%", variable=self.crop_var, command=self.refresh_preview).pack(
             side=tk.LEFT, padx=(0, 8)
-        )
-        self.monoview_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row1, text="Monoview ordered", variable=self.monoview_var, command=self.refresh_preview).pack(
-            side=tk.LEFT
         )
 
         row2 = ttk.Frame(controls)
@@ -4912,22 +4940,25 @@ class AnnotationTab(ttk.Frame):
             state="readonly",
         )
         self.frame_filter_box.pack(side=tk.LEFT, padx=(0, 10))
+
+        row4 = ttk.Frame(controls)
+        row4.pack(fill=tk.X, padx=8, pady=4)
         self.show_motion_prior_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            row3,
+            row4,
             text="Velocity prior zone",
             variable=self.show_motion_prior_var,
             command=self.refresh_preview,
         ).pack(side=tk.LEFT, padx=(0, 8))
-        self.motion_prior_diameter = LabeledEntry(row3, "Diameter", "15", label_width=7, entry_width=4)
+        self.motion_prior_diameter = LabeledEntry(row4, "Diameter", "15", label_width=7, entry_width=4)
         self.motion_prior_diameter.pack(side=tk.LEFT)
 
-        row4 = ttk.Frame(controls)
-        row4.pack(fill=tk.X, padx=8, pady=4)
+        row5 = ttk.Frame(controls)
+        row5.pack(fill=tk.X, padx=8, pady=4)
         self.image_brightness_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row4, text="Brightness", width=10).pack(side=tk.LEFT)
+        ttk.Label(row5, text="Brightness", width=10).pack(side=tk.LEFT)
         ttk.Scale(
-            row4,
+            row5,
             from_=0.2,
             to=2.0,
             orient=tk.HORIZONTAL,
@@ -4935,9 +4966,9 @@ class AnnotationTab(ttk.Frame):
             command=lambda _value: self.refresh_preview(),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.image_contrast_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row4, text="Contrast", width=8).pack(side=tk.LEFT)
+        ttk.Label(row5, text="Contrast", width=8).pack(side=tk.LEFT)
         ttk.Scale(
-            row4,
+            row5,
             from_=0.2,
             to=2.0,
             orient=tk.HORIZONTAL,
@@ -4955,28 +4986,33 @@ class AnnotationTab(ttk.Frame):
         self.annotations_path_entry.on_browse_selected = lambda _value: self.load_resources()
         self.state.annotation_path_var.trace_add("write", lambda *_args: self.load_resources())
 
-        cameras_box = ttk.LabelFrame(controls, text="Cameras")
-        cameras_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+        lists_row = ttk.Frame(controls)
+        lists_row.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
+
+        cameras_box = ttk.LabelFrame(lists_row, text="Cameras")
+        cameras_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
         self.annotation_cameras_summary = tk.StringVar(value="Cameras (n=0/0)")
         ttk.Label(cameras_box, textvariable=self.annotation_cameras_summary, anchor="w").pack(
-            fill=tk.X, padx=8, pady=(6, 2)
+            fill=tk.X, padx=6, pady=(6, 2)
         )
-        cameras_body = ttk.Frame(cameras_box, height=90)
-        cameras_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        cameras_body = ttk.Frame(cameras_box, height=145, width=145)
+        cameras_body.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
         cameras_body.pack_propagate(False)
-        self.annotation_cameras_list = tk.Listbox(cameras_body, selectmode=tk.EXTENDED, exportselection=False, height=5)
+        self.annotation_cameras_list = tk.Listbox(
+            cameras_body, selectmode=tk.EXTENDED, exportselection=False, height=8, width=12
+        )
         self.annotation_cameras_list.pack(fill=tk.BOTH, expand=True)
         bind_extended_listbox_shortcuts(self.annotation_cameras_list)
         self.annotation_cameras_list.bind("<<ListboxSelect>>", lambda _event: self.on_camera_selection_changed())
 
-        keypoints_box = ttk.LabelFrame(controls, text="Markers")
-        keypoints_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        keypoints_box = ttk.LabelFrame(lists_row, text="Markers")
+        keypoints_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
         self.current_marker_var = tk.StringVar(value="")
-        ttk.Label(keypoints_box, textvariable=self.current_marker_var, anchor="w").pack(fill=tk.X, padx=8, pady=(6, 2))
-        keypoints_body = ttk.Frame(keypoints_box, height=200)
-        keypoints_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        ttk.Label(keypoints_box, textvariable=self.current_marker_var, anchor="w").pack(fill=tk.X, padx=6, pady=(6, 2))
+        keypoints_body = ttk.Frame(keypoints_box, height=145, width=155)
+        keypoints_body.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
         keypoints_body.pack_propagate(False)
-        self.annotation_keypoints_list = tk.Listbox(keypoints_body, exportselection=False, height=10)
+        self.annotation_keypoints_list = tk.Listbox(keypoints_body, exportselection=False, height=8, width=14)
         self.annotation_keypoints_list.pack(fill=tk.BOTH, expand=True)
         self.annotation_keypoints_list.bind("<<ListboxSelect>>", lambda _event: self.on_keypoint_selection_changed())
         for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
@@ -5098,21 +5134,17 @@ class AnnotationTab(ttk.Frame):
         indices = [int(index) for index in self.annotation_cameras_list.curselection()]
         if not indices:
             return list(all_camera_names)
-        selected = [all_camera_names[index] for index in indices if 0 <= index < len(all_camera_names)]
-        if self.monoview_var.get() and selected:
-            return [selected[0]]
-        return selected
+        return [all_camera_names[index] for index in indices if 0 <= index < len(all_camera_names)]
 
     def update_camera_summary(self) -> None:
         total_count = self.annotation_cameras_list.size()
         selected_count = len(self.annotation_cameras_list.curselection()) if total_count else 0
         if total_count and selected_count == 0:
             selected_count = total_count
-        if self.monoview_var.get() and selected_count > 1:
-            selected_count = 1
         self.annotation_cameras_summary.set(f"Cameras (n={selected_count}/{total_count})")
 
     def on_camera_selection_changed(self) -> None:
+        self._clear_pending_reprojection()
         self.update_camera_summary()
         self.refresh_preview()
 
@@ -5122,6 +5154,7 @@ class AnnotationTab(ttk.Frame):
         return str(self.annotation_keypoints_list.get(index))
 
     def on_keypoint_selection_changed(self) -> None:
+        self._clear_pending_reprojection()
         self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
         self.refresh_preview()
 
@@ -5143,6 +5176,7 @@ class AnnotationTab(ttk.Frame):
             clamped = min(clamped, len(self.pose_data.frames) - 1)
         if clamped != int(self._current_frame_idx):
             self.save_annotations()
+            self._clear_pending_reprojection()
         self._current_frame_idx = clamped
         self.frame_var.set(clamped)
 
@@ -5189,6 +5223,66 @@ class AnnotationTab(ttk.Frame):
 
     def on_frame_scale_changed(self, _value) -> None:
         self._set_frame_index(int(round(self.frame_var.get())))
+        self.refresh_preview()
+
+    def _clear_pending_reprojection(self) -> None:
+        self._pending_reprojection_points = {}
+        if hasattr(self, "reproject_button_var"):
+            self.reproject_button_var.set("Reproject")
+
+    def _compute_pending_reprojection_points(self) -> dict[tuple[str, int, str], np.ndarray]:
+        if self.pose_data is None or self.calibrations is None:
+            return {}
+        frame_number = self.current_frame_number()
+        camera_names = self.selected_annotation_camera_names()
+        pending: dict[tuple[str, int, str], np.ndarray] = {}
+        for target_camera_name in camera_names:
+            for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
+                existing_xy = self._annotation_xy(target_camera_name, frame_number, keypoint_name)
+                if existing_xy is None:
+                    continue
+                source_camera_names: list[str] = []
+                source_points_2d: list[np.ndarray] = []
+                for source_camera_name in camera_names:
+                    if source_camera_name == target_camera_name:
+                        continue
+                    source_xy = self._annotation_xy(source_camera_name, frame_number, keypoint_name)
+                    if source_xy is None:
+                        continue
+                    source_camera_names.append(source_camera_name)
+                    source_points_2d.append(source_xy)
+                reprojection_xy = annotation_triangulated_reprojection(
+                    self.calibrations,
+                    target_camera_name=target_camera_name,
+                    source_camera_names=source_camera_names,
+                    source_points_2d=source_points_2d,
+                )
+                if reprojection_xy is None or not np.all(np.isfinite(reprojection_xy)):
+                    continue
+                pending[(str(target_camera_name), int(frame_number), str(keypoint_name))] = np.asarray(
+                    reprojection_xy, dtype=float
+                )
+        return pending
+
+    def _confirm_pending_reprojection(self) -> None:
+        for (camera_name, frame_number, keypoint_name), xy in self._pending_reprojection_points.items():
+            set_annotation_point(
+                self.annotation_payload,
+                camera_name=camera_name,
+                frame_number=int(frame_number),
+                keypoint_name=keypoint_name,
+                xy=[float(xy[0]), float(xy[1])],
+            )
+        self.save_annotations()
+        self._clear_pending_reprojection()
+
+    def on_reproject_button(self) -> None:
+        if self._pending_reprojection_points:
+            self._confirm_pending_reprojection()
+            self.refresh_preview()
+            return
+        self._pending_reprojection_points = self._compute_pending_reprojection_points()
+        self.reproject_button_var.set("Confirm" if self._pending_reprojection_points else "Reproject")
         self.refresh_preview()
 
     def step_frame(self, delta: int) -> None:
@@ -5249,6 +5343,7 @@ class AnnotationTab(ttk.Frame):
             self.crop_limits_cache = {}
             self.crop_limits_key = None
             self._navigable_frame_cache = {}
+            self._clear_pending_reprojection()
             self.on_frame_filter_changed()
             self.refresh_preview()
         except Exception as exc:
@@ -5472,6 +5567,7 @@ class AnnotationTab(ttk.Frame):
     def on_frame_filter_changed(self) -> None:
         if self.pose_data is None or len(self.pose_data.frames) == 0:
             return
+        self._clear_pending_reprojection()
         candidates = self._filtered_annotation_frame_local_indices()
         if candidates:
             current_idx = int(round(self.frame_var.get()))
@@ -5544,6 +5640,10 @@ class AnnotationTab(ttk.Frame):
         return True
 
     def on_preview_click(self, event) -> None:
+        if self._pending_reprojection_points and (event.inaxes is None or event.xdata is None or event.ydata is None):
+            self._clear_pending_reprojection()
+            self.refresh_preview()
+            return
         if self.pose_data is None or event.inaxes is None or event.xdata is None or event.ydata is None:
             return
         if int(getattr(event, "button", 1)) == 2:
@@ -5620,7 +5720,7 @@ class AnnotationTab(ttk.Frame):
         all_camera_names = [str(name) for name in self.pose_data.camera_names]
         camera_names = self.selected_annotation_camera_names()
         if not camera_names:
-            camera_names = list(all_camera_names[:1] if self.monoview_var.get() else all_camera_names)
+            camera_names = list(all_camera_names)
         frame_idx = max(0, min(len(self.pose_data.frames) - 1, int(round(self.frame_var.get()))))
         self._current_frame_idx = frame_idx
         self.frame_var.set(frame_idx)
@@ -5657,12 +5757,15 @@ class AnnotationTab(ttk.Frame):
             if self.show_images_var.get():
                 image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
                 if image_path is not None and image_path.exists():
-                    ax.imshow(
+                    draw_2d_background_image(
+                        ax,
                         annotation_adjust_image(
                             plt.imread(str(image_path)),
                             brightness=float(self.image_brightness_var.get()),
                             contrast=float(self.image_contrast_var.get()),
-                        )
+                        ),
+                        width=width,
+                        height=height,
                     )
             apply_2d_axis_limits(
                 ax,
@@ -5676,10 +5779,7 @@ class AnnotationTab(ttk.Frame):
             ax.set_aspect("equal", adjustable="box")
             ax.set_title(camera_name)
             ax.grid(False)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            for spine in ax.spines.values():
-                spine.set_visible(False)
+            hide_2d_axes(ax)
 
             for keypoint_name in COCO17:
                 annotated_xy = self._annotation_xy(camera_name, frame_number, keypoint_name)
@@ -5695,6 +5795,21 @@ class AnnotationTab(ttk.Frame):
                     marker=annotation_marker_shape(keypoint_name),
                     linewidths=(2.0 if keypoint_name == current_marker else 1.3),
                     zorder=5,
+                )
+
+            for (pending_camera, pending_frame, keypoint_name), pending_xy in self._pending_reprojection_points.items():
+                if pending_camera != str(camera_name) or int(pending_frame) != int(frame_number):
+                    continue
+                ax.scatter(
+                    [pending_xy[0]],
+                    [pending_xy[1]],
+                    s=72,
+                    facecolors="none",
+                    edgecolors=[annotation_marker_color(keypoint_name)],
+                    marker="o",
+                    linewidths=1.7,
+                    alpha=0.95,
+                    zorder=6,
                 )
 
             if self.show_motion_prior_var.get():
@@ -6743,13 +6858,14 @@ class ModelTab(CommandTab):
         default_model_pose_mode = state.pose_data_mode_var.get().strip()
         if default_model_pose_mode not in ("raw", "annotated", "cleaned"):
             default_model_pose_mode = "cleaned"
+        self.pose_mode_box = None
         self.pose_data_mode = tk.StringVar(value=default_model_pose_mode)
         pose_mode_label = ttk.Label(row2b, text="2D source", width=10)
         pose_mode_label.pack(side=tk.LEFT)
-        pose_mode_box = ttk.Combobox(
-            row2b, textvariable=self.pose_data_mode, values=["raw", "annotated", "cleaned"], width=10, state="readonly"
+        self.pose_mode_box = ttk.Combobox(
+            row2b, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=10, state="readonly"
         )
-        pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
+        self.pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
         default_pose_correction_mode = current_calibration_correction_mode(state)
         self.pose_correction_mode = tk.StringVar(value=default_pose_correction_mode)
         pose_correction_label = ttk.Label(row2b, text="L/R corr", width=8)
@@ -6817,11 +6933,11 @@ class ModelTab(CommandTab):
         )
         attach_tooltip(
             pose_mode_label,
-            "Choix de la version de base des 2D utilisées pour construire le modèle: raw ou cleaned.",
+            "Choix de la version de base des 2D utilisées pour construire le modèle: raw, cleaned, ou annotated si un fichier d'annotations existe.",
         )
         attach_tooltip(
-            pose_mode_box,
-            "Choix de la version de base des 2D utilisées pour construire le modèle. `cleaned` applique le rejet des points aberrants.",
+            self.pose_mode_box,
+            "Choix de la version de base des 2D utilisées pour construire le modèle. `annotated` n'est proposé que si un fichier d'annotations existe pour l'essai courant.",
         )
         attach_tooltip(
             pose_correction_label, "Correction optionnelle des labels gauche/droite avant la triangulation du modèle."
@@ -6842,6 +6958,7 @@ class ModelTab(CommandTab):
 
         self.state.calib_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
+        self.state.annotation_path_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_paths_from_state())
         self.state.register_reconstruction_listener(self.refresh_existing_models)
         self.model_variant.trace_add("write", lambda *_args: self.update_details())
@@ -6998,6 +7115,21 @@ class ModelTab(CommandTab):
     def current_pose_correction_mode(self) -> str:
         return normalize_pose_correction_mode(self.pose_correction_mode.get())
 
+    def _available_model_pose_modes(self) -> list[str]:
+        keypoints_value = str(self.state.keypoints_var.get()).strip()
+        if not keypoints_value:
+            return ["raw", "cleaned"]
+        return available_model_pose_modes(self.state, ROOT / keypoints_value)
+
+    def _sync_available_pose_modes(self) -> None:
+        modes = self._available_model_pose_modes()
+        if hasattr(self, "pose_mode_box") and self.pose_mode_box is not None:
+            self.pose_mode_box.configure(values=modes)
+        current = str(self.pose_data_mode.get()).strip()
+        if current not in modes:
+            fallback = "annotated" if "annotated" in modes else ("cleaned" if "cleaned" in modes else modes[0])
+            self.pose_data_mode.set(fallback)
+
     def current_pose_source_label(self) -> str:
         correction_mode = self.current_pose_correction_mode()
         if correction_mode == "none":
@@ -7077,6 +7209,7 @@ class ModelTab(CommandTab):
             self._syncing_frame_defaults = False
 
     def sync_paths_from_state(self) -> None:
+        self._sync_available_pose_modes()
         self._sync_frame_range_defaults()
         try:
             subject_mass_kg = float(self.subject_mass.get())

@@ -572,7 +572,7 @@ def test_annotation_click_advances_marker_without_monoview():
     tab.annotation_payload = {}
     tab._axis_to_camera = {"axis0": "cam0"}
     tab.advance_marker_var = SimpleNamespace(get=lambda: True)
-    tab.monoview_var = SimpleNamespace(get=lambda: False)
+    tab._pending_reprojection_points = {}
     tab.save_annotations = lambda: saved.append("saved")
     tab.refresh_preview = lambda: refreshed.append("refreshed")
     tab._advance_to_next_keypoint = lambda: setattr(tab, "_advanced", True)
@@ -659,6 +659,7 @@ def test_annotation_ctrl_click_deletes_nearest_marker():
     tab.annotation_payload = {}
     tab._axis_to_camera = {"axis0": "cam0"}
     tab.advance_marker_var = SimpleNamespace(get=lambda: True)
+    tab._pending_reprojection_points = {}
     tab.save_annotations = lambda: saved.append("saved")
     tab.refresh_preview = lambda: refreshed.append("refreshed")
     tab.selected_keypoint_name = lambda: "left_shoulder"
@@ -988,6 +989,81 @@ def test_annotation_triangulated_reprojection_projects_hint_into_target_view():
     )
 
     np.testing.assert_allclose(hint, calibrations["cam2"].project_point(point_3d), atol=1e-8)
+
+
+def test_annotation_compute_pending_reprojection_points_updates_only_existing_annotations(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int), camera_names=["cam0", "cam1", "cam2"])
+    tab.calibrations = {"cam0": object(), "cam1": object(), "cam2": object()}
+    tab.current_frame_number = lambda: 10
+    tab.selected_annotation_camera_names = lambda: ["cam0", "cam1", "cam2"]
+    points = {
+        ("cam0", 10, "left_shoulder"): np.array([100.0, 200.0], dtype=float),
+        ("cam1", 10, "left_shoulder"): np.array([105.0, 205.0], dtype=float),
+        ("cam2", 10, "left_shoulder"): np.array([110.0, 210.0], dtype=float),
+        ("cam0", 10, "nose"): np.array([120.0, 220.0], dtype=float),
+        ("cam1", 10, "nose"): np.array([125.0, 225.0], dtype=float),
+    }
+    tab._annotation_xy = lambda camera_name, frame_number, keypoint_name: points.get(
+        (camera_name, frame_number, keypoint_name)
+    )
+
+    def fake_reproject(_calibrations, *, target_camera_name, source_camera_names, source_points_2d):
+        return np.array([len(source_camera_names), float(np.sum(np.asarray(source_points_2d)))], dtype=float)
+
+    monkeypatch.setattr(pipeline_gui, "annotation_triangulated_reprojection", fake_reproject)
+
+    pending = pipeline_gui.AnnotationTab._compute_pending_reprojection_points(tab)
+
+    assert ("cam2", 10, "nose") not in pending
+    assert ("cam0", 10, "left_shoulder") in pending
+    assert ("cam2", 10, "left_shoulder") in pending
+    assert ("cam0", 10, "nose") in pending
+
+
+def test_annotation_reproject_button_toggles_to_confirm_and_applies_updates():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab._pending_reprojection_points = {}
+    tab.reproject_button_var = SimpleNamespace(set=lambda value: setattr(tab, "_button_text", value))
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", getattr(tab, "_refreshed", 0) + 1)
+    tab.save_annotations = lambda: setattr(tab, "_saved", getattr(tab, "_saved", 0) + 1)
+    tab.annotation_payload = {}
+    tab._compute_pending_reprojection_points = lambda: {
+        ("cam0", 10, "left_shoulder"): np.array([111.0, 222.0], dtype=float)
+    }
+
+    pipeline_gui.AnnotationTab.on_reproject_button(tab)
+
+    assert tab._button_text == "Confirm"
+    assert len(tab._pending_reprojection_points) == 1
+
+    pipeline_gui.AnnotationTab.on_reproject_button(tab)
+
+    xy, _score = pipeline_gui.get_annotation_point(
+        tab.annotation_payload, camera_name="cam0", frame_number=10, keypoint_name="left_shoulder"
+    )
+    np.testing.assert_allclose(np.asarray(xy, dtype=float), np.array([111.0, 222.0]))
+    assert tab._saved == 1
+    assert tab._button_text == "Reproject"
+    assert tab._pending_reprojection_points == {}
+
+
+def test_annotation_click_outside_cancels_pending_reprojection():
+    refreshed = []
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab._pending_reprojection_points = {("cam0", 10, "left_shoulder"): np.array([1.0, 2.0], dtype=float)}
+    tab.reproject_button_var = SimpleNamespace(set=lambda value: setattr(tab, "_button_text", value))
+    tab.refresh_preview = lambda: refreshed.append("refreshed")
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int))
+
+    pipeline_gui.AnnotationTab.on_preview_click(
+        tab,
+        SimpleNamespace(inaxes=None, xdata=None, ydata=None, button=1),
+    )
+
+    assert tab._pending_reprojection_points == {}
+    assert tab._button_text == "Reproject"
+    assert refreshed == ["refreshed"]
 
 
 def test_preview_pose_frame_indices_aligns_sparse_bundle_frames():
@@ -1763,6 +1839,15 @@ class _FakeButton:
             self.text = kwargs["text"]
 
 
+class _FakeCombobox:
+    def __init__(self):
+        self.values = None
+
+    def configure(self, **kwargs):
+        if "values" in kwargs:
+            self.values = list(kwargs["values"])
+
+
 class _FakeScale:
     def __init__(self, *, from_value=0, to_value=10, width=200):
         self._from = from_value
@@ -1910,6 +1995,58 @@ def test_model_tab_on_command_success_refreshes_existing_models():
     pipeline_gui.ModelTab.on_command_success(tab)
 
     assert calls == ["refresh"]
+
+
+def test_available_model_pose_modes_include_annotated_when_annotations_exist(monkeypatch, tmp_path):
+    root = tmp_path / "workspace"
+    keypoints_path = root / "inputs" / "keypoints" / "trial_keypoints.json"
+    annotations_path = root / "inputs" / "annotations" / "trial_annotations.json"
+    keypoints_path.parent.mkdir(parents=True)
+    annotations_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}", encoding="utf-8")
+    annotations_path.write_text("{}", encoding="utf-8")
+    state = SimpleNamespace(
+        annotation_path_var=SimpleNamespace(get=lambda: "inputs/annotations/trial_annotations.json")
+    )
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", root)
+
+    modes = pipeline_gui.available_model_pose_modes(state, keypoints_path)
+
+    assert modes == ["raw", "annotated", "cleaned"]
+
+
+def test_model_tab_sync_available_pose_modes_drops_annotated_when_missing(monkeypatch, tmp_path):
+    root = tmp_path / "workspace"
+    keypoints_path = root / "inputs" / "keypoints" / "trial_keypoints.json"
+    keypoints_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}", encoding="utf-8")
+
+    tab = pipeline_gui.ModelTab.__new__(pipeline_gui.ModelTab)
+
+    class _Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        annotation_path_var=SimpleNamespace(get=lambda: "inputs/annotations/trial_annotations.json"),
+    )
+    tab.pose_mode_box = _FakeCombobox()
+    tab.pose_data_mode = _Var("annotated")
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", root)
+
+    pipeline_gui.ModelTab._sync_available_pose_modes(tab)
+
+    assert tab.pose_mode_box.values == ["raw", "cleaned"]
+    assert tab.pose_data_mode.get() == "cleaned"
 
 
 def test_profiles_tab_refresh_profile_model_choices_populates_existing_models(monkeypatch):
