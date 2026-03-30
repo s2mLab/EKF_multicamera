@@ -1544,6 +1544,7 @@ def build_pose2sim_bundle(
         },
     }
     summary = with_version_info(summary, "triangulation")
+    excluded_views = np.zeros((len(frames), len(COCO17), len(pose_data.camera_names)), dtype=bool)
     payload = build_bundle_payload(
         name=name,
         family="pose2sim",
@@ -1559,7 +1560,7 @@ def build_pose2sim_bundle(
         qdot_root=qdot_root,
         reprojection_errors=reprojection_errors,
         summary=summary,
-        excluded_views=reconstruction.excluded_views,
+        excluded_views=excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)
