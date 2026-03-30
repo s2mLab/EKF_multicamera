@@ -1760,6 +1760,51 @@ def annotation_motion_prior_center(
     return pt1 + (pt1 - pt2)
 
 
+def annotation_relevant_q_prefixes(keypoint_name: str) -> tuple[str, ...]:
+    """Return the segment prefixes most relevant to one annotated keypoint."""
+
+    name = str(keypoint_name)
+    prefixes = ["TRUNK", "LOWER_TRUNK", "UPPER_BACK"]
+    if name.startswith("left_"):
+        prefixes.extend(
+            ["LEFT_UPPER_ARM", "LEFT_LOWER_ARM"]
+            if "shoulder" in name or "elbow" in name or "wrist" in name
+            else ["LEFT_THIGH", "LEFT_SHANK"]
+        )
+    elif name.startswith("right_"):
+        prefixes.extend(
+            ["RIGHT_UPPER_ARM", "RIGHT_LOWER_ARM"]
+            if "shoulder" in name or "elbow" in name or "wrist" in name
+            else ["RIGHT_THIGH", "RIGHT_SHANK"]
+        )
+    else:
+        prefixes.append("HEAD")
+    return tuple(prefixes)
+
+
+def annotation_blend_q_by_relevance(
+    q_names: list[str] | np.ndarray,
+    previous_q: np.ndarray | None,
+    estimated_q: np.ndarray,
+    keypoint_name: str,
+) -> np.ndarray:
+    """Keep unrelated DoFs from the previous state and update only the relevant subtree."""
+
+    estimated_q = np.asarray(estimated_q, dtype=float).reshape(-1)
+    if previous_q is None:
+        return estimated_q
+    previous_q = np.asarray(previous_q, dtype=float).reshape(-1)
+    if previous_q.shape != estimated_q.shape:
+        return estimated_q
+    prefixes = annotation_relevant_q_prefixes(keypoint_name)
+    blended = np.array(previous_q, copy=True)
+    for idx, q_name in enumerate(q_names):
+        q_name = str(q_name)
+        if any(q_name.startswith(f"{prefix}:") for prefix in prefixes):
+            blended[idx] = estimated_q[idx]
+    return blended
+
+
 def annotation_epipolar_guides(
     calibrations: dict[str, object],
     source_camera_name: str,
@@ -4942,6 +4987,7 @@ class AnnotationTab(ttk.Frame):
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
         self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
         self.kinematic_model_choices: dict[str, Path] = {}
+        self.kinematic_frame_states: dict[tuple[str, int], np.ndarray] = {}
         self.kinematic_q_current: np.ndarray | None = None
         self.kinematic_q_names: list[str] = []
         self.kinematic_projected_points: np.ndarray | None = None
@@ -4963,9 +5009,10 @@ class AnnotationTab(ttk.Frame):
         ttk.Button(row0, text="Save annotations", command=self.save_annotations).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(row0, text="Refresh frame", command=self.refresh_preview).pack(side=tk.LEFT, padx=(8, 0))
         self.reproject_button_var = tk.StringVar(value="Reproject")
-        ttk.Button(row0, textvariable=self.reproject_button_var, command=self.on_reproject_button).pack(
-            side=tk.LEFT, padx=(8, 0)
+        self.reproject_button = ttk.Button(
+            row0, textvariable=self.reproject_button_var, command=self.on_reproject_button
         )
+        self.reproject_button.pack(side=tk.LEFT, padx=(8, 0))
 
         row1 = ttk.Frame(controls)
         row1.pack(fill=tk.X, padx=8, pady=4)
@@ -5068,6 +5115,9 @@ class AnnotationTab(ttk.Frame):
             kinematic_row, textvariable=self.kinematic_model_var, values=[], width=28, state="readonly"
         )
         self.kinematic_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.kinematic_model_var.trace_add(
+            "write", lambda *_args: (self._clear_kinematic_assist_preview(), self.refresh_preview())
+        )
         ttk.Button(kinematic_row, text="Estimate q", command=self.estimate_kinematic_assist_state).pack(side=tk.LEFT)
         self.kinematic_status_var = tk.StringVar(value="")
         ttk.Label(controls, textvariable=self.kinematic_status_var, anchor="w", foreground="#4f5b66").pack(
@@ -5138,15 +5188,18 @@ class AnnotationTab(ttk.Frame):
         self.preview_canvas.mpl_connect("motion_notify_event", self.on_preview_motion)
         self.preview_canvas.mpl_connect("button_release_event", self.on_preview_release)
         self._bind_frame_navigation(self.preview_canvas_widget)
+        self._bind_cancel_pending_reprojection(controls)
+        for clickable_parent in (self, body, left, right, preview_box, preview_controls):
+            clickable_parent.bind("<Button-1>", self._cancel_pending_reprojection_from_tk_event, add="+")
         self._bind_frame_navigation(self.frame_scale)
 
         attach_tooltip(
             self.annotation_keypoints_list,
-            "Liste des marqueurs annotés. En mode monoview ordered, un clic place le point puis passe automatiquement au marqueur suivant.",
+            "Liste des marqueurs annotés. Si l’avance automatique est activée, un clic place le point puis passe au suivant.",
         )
         attach_tooltip(
             self.annotation_cameras_list,
-            "Caméras visibles dans l’annotation. En mode monoview, seule la première caméra sélectionnée est affichée.",
+            "Caméras visibles dans l’annotation. Les vues sélectionnées sont affichées simultanément.",
         )
         self.annotations_path_entry.set_tooltip(
             "Fichier JSON sparse d’annotations 2D. Par défaut: inputs/annotations/<dataset>_annotations.json"
@@ -5271,6 +5324,22 @@ class AnnotationTab(ttk.Frame):
         self._clear_pending_reprojection()
         self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
         self.refresh_preview()
+
+    def _cancel_pending_reprojection_from_tk_event(self, event) -> None:
+        if not self._pending_reprojection_points:
+            return
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return
+        if hasattr(self, "reproject_button") and widget is self.reproject_button:
+            return
+        self._clear_pending_reprojection()
+        self.refresh_preview()
+
+    def _bind_cancel_pending_reprojection(self, widget) -> None:
+        widget.bind("<Button-1>", self._cancel_pending_reprojection_from_tk_event, add="+")
+        for child in widget.winfo_children():
+            self._bind_cancel_pending_reprojection(child)
 
     def current_frame_number(self) -> int:
         if self.pose_data is None or len(self.pose_data.frames) == 0:
@@ -5477,54 +5546,94 @@ class AnnotationTab(ttk.Frame):
         self.kinematic_projected_points = None
         self.kinematic_segmented_back_projected = {}
 
+    def _kinematic_state_key(self, frame_number: int) -> tuple[str, int]:
+        return (str(self.kinematic_model_var.get()).strip(), int(frame_number))
+
+    def _selected_or_nearest_kinematic_state(self, frame_number: int) -> np.ndarray | None:
+        model_label = str(self.kinematic_model_var.get()).strip()
+        if not model_label:
+            return None
+        frame_states = getattr(self, "kinematic_frame_states", {})
+        exact = frame_states.get((model_label, int(frame_number)))
+        if exact is not None:
+            return np.asarray(exact, dtype=float)
+        candidates = [
+            (abs(int(saved_frame) - int(frame_number)), np.asarray(saved_q, dtype=float))
+            for (saved_model, saved_frame), saved_q in frame_states.items()
+            if str(saved_model) == model_label
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0])
+        return np.asarray(candidates[0][1], dtype=float)
+
+    def _set_kinematic_preview_from_q(self, biomod_path: Path, camera_names: list[str], q_values: np.ndarray) -> None:
+        q_values = np.asarray(q_values, dtype=float).reshape(-1)
+        q_series = q_values.reshape(1, -1)
+        self.kinematic_q_current = q_values
+        self.kinematic_projected_points = project_points_all_cameras(
+            biorbd_markers_from_q(biomod_path, q_series), self.calibrations, camera_names
+        )
+        segmented_overlay = segmented_back_overlay_from_q(biomod_path, q_series)
+        self.kinematic_segmented_back_projected = (
+            {
+                overlay_name: project_points_all_cameras(points, self.calibrations, camera_names)
+                for overlay_name, points in segmented_overlay.items()
+            }
+            if segmented_overlay
+            else {}
+        )
+
+    def _estimate_kinematic_q(
+        self,
+        *,
+        keypoint_name: str | None = None,
+    ) -> np.ndarray:
+        biomod_path = self._selected_kinematic_biomod_path()
+        if biomod_path is None or not biomod_path.exists():
+            raise ValueError("Choose an existing bioMod first.")
+        camera_names = self.selected_annotation_camera_names()
+        if not camera_names:
+            raise ValueError("Select at least one camera.")
+        frame_number = self.current_frame_number()
+        triangulated_points = triangulate_annotation_frame_points(
+            self.calibrations,
+            camera_names=camera_names,
+            frame_number=frame_number,
+            annotation_payload=self.annotation_payload,
+        )
+        n_triangulated = int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))
+        if n_triangulated < 2:
+            raise ValueError("Not enough triangulated annotated markers to estimate q.")
+        reconstruction = annotation_reconstruction_from_points(
+            triangulated_points, frame_number=frame_number, n_cameras=len(camera_names)
+        )
+        import biorbd
+
+        model = biorbd.Model(str(biomod_path))
+        state = initial_state_from_triangulation(model, reconstruction)
+        estimated_q = np.asarray(state[: model.nbQ()], dtype=float)
+        self.kinematic_q_names = biorbd_q_names(model)
+        previous_q = self._selected_or_nearest_kinematic_state(frame_number)
+        if keypoint_name is not None:
+            estimated_q = annotation_blend_q_by_relevance(
+                self.kinematic_q_names,
+                previous_q,
+                estimated_q,
+                keypoint_name,
+            )
+        if not hasattr(self, "kinematic_frame_states") or self.kinematic_frame_states is None:
+            self.kinematic_frame_states = {}
+        self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_q, dtype=float)
+        self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_q)
+        self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers.")
+        return estimated_q
+
     def estimate_kinematic_assist_state(self) -> None:
         if self.pose_data is None or self.calibrations is None:
             return
-        biomod_path = self._selected_kinematic_biomod_path()
-        if biomod_path is None or not biomod_path.exists():
-            messagebox.showinfo("Annotation", "Choose an existing bioMod first.")
-            return
-        camera_names = self.selected_annotation_camera_names()
-        if not camera_names:
-            messagebox.showinfo("Annotation", "Select at least one camera.")
-            return
-        frame_number = self.current_frame_number()
         try:
-            triangulated_points = triangulate_annotation_frame_points(
-                self.calibrations,
-                camera_names=camera_names,
-                frame_number=frame_number,
-                annotation_payload=self.annotation_payload,
-            )
-            if np.sum(np.all(np.isfinite(triangulated_points), axis=1)) < 2:
-                raise ValueError("Not enough triangulated annotated markers to estimate q.")
-            reconstruction = annotation_reconstruction_from_points(
-                triangulated_points, frame_number=frame_number, n_cameras=len(camera_names)
-            )
-            import biorbd
-
-            model = biorbd.Model(str(biomod_path))
-            state = initial_state_from_triangulation(model, reconstruction)
-            q_values = np.asarray(state[: model.nbQ()], dtype=float)
-            q_series = q_values.reshape(1, -1)
-            model_points_3d = biorbd_markers_from_q(biomod_path, q_series)
-            self.kinematic_q_current = q_values
-            self.kinematic_q_names = biorbd_q_names(model)
-            self.kinematic_projected_points = project_points_all_cameras(
-                model_points_3d, self.calibrations, camera_names
-            )
-            segmented_overlay = segmented_back_overlay_from_q(biomod_path, q_series)
-            self.kinematic_segmented_back_projected = (
-                {
-                    overlay_name: project_points_all_cameras(points, self.calibrations, camera_names)
-                    for overlay_name, points in segmented_overlay.items()
-                }
-                if segmented_overlay
-                else {}
-            )
-            self.kinematic_status_var.set(
-                f"Estimated q from {int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))} triangulated markers."
-            )
+            self._estimate_kinematic_q()
             self.refresh_preview()
         except Exception as exc:
             self._clear_kinematic_assist_preview()
@@ -5856,6 +5965,11 @@ class AnnotationTab(ttk.Frame):
             if self.advance_marker_var.get():
                 self._advance_to_next_keypoint()
         self._clear_kinematic_assist_preview()
+        if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
+            try:
+                self._estimate_kinematic_q(keypoint_name=None if delete_request else keypoint_name)
+            except Exception:
+                self._clear_kinematic_assist_preview()
         self.save_annotations()
         self.refresh_preview()
 
@@ -5918,6 +6032,17 @@ class AnnotationTab(ttk.Frame):
         crop_limits = self._ensure_crop_limits(camera_names) if self.crop_var.get() else {}
         current_marker = self.selected_keypoint_name()
         current_color = annotation_marker_color(current_marker)
+        if (
+            bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
+            and self.kinematic_projected_points is None
+        ):
+            biomod_path = self._selected_kinematic_biomod_path()
+            cached_q = self._selected_or_nearest_kinematic_state(frame_number)
+            if biomod_path is not None and cached_q is not None:
+                try:
+                    self._set_kinematic_preview_from_q(biomod_path, camera_names, cached_q)
+                except Exception:
+                    self._clear_kinematic_assist_preview()
         self.preview_figure.clear()
         self._cursor_artists = {}
         nrows, ncols = camera_layout(len(camera_names))
@@ -5968,15 +6093,15 @@ class AnnotationTab(ttk.Frame):
                 ax.scatter(
                     [annotated_xy[0]],
                     [annotated_xy[1]],
-                    s=(95 if keypoint_name == current_marker else 55),
+                    s=(72 if keypoint_name == current_marker else 34),
                     c=[display_color],
                     marker=annotation_marker_shape(keypoint_name),
-                    linewidths=(2.0 if keypoint_name == current_marker else 1.3),
+                    linewidths=(1.7 if keypoint_name == current_marker else 1.0),
                     zorder=5,
                 )
 
             if (
-                self.kinematic_assist_var.get()
+                bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
                 and self.kinematic_projected_points is not None
                 and ax_idx < self.kinematic_projected_points.shape[0]
             ):
@@ -7013,9 +7138,13 @@ class ModelTab(CommandTab):
         self._auto_frame_range: tuple[str, str] | None = None
         self._syncing_frame_defaults = False
         self.set_run_button_text("Generate model")
+        self.content_pane = ttk.Panedwindow(self.main, orient=tk.HORIZONTAL)
+        self.left_panel = ttk.Frame(self.content_pane)
+        self.right_panel = ttk.Frame(self.content_pane)
+        self.content_pane.add(self.left_panel, weight=1)
+        self.content_pane.add(self.right_panel, weight=2)
 
-        form = ttk.LabelFrame(self.main, text="Construction du modèle")
-        form.pack(fill=tk.X, pady=(0, 8))
+        form = ttk.LabelFrame(self.left_panel, text="Construction du modèle")
 
         row = ttk.Frame(form)
         row.pack(fill=tk.X, padx=8, pady=4)
@@ -7077,12 +7206,15 @@ class ModelTab(CommandTab):
             row2b, textvariable=self.pose_data_mode, values=["raw", "cleaned"], width=10, state="readonly"
         )
         self.pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
+
+        row2c = ttk.Frame(form)
+        row2c.pack(fill=tk.X, padx=8, pady=4)
         default_pose_correction_mode = current_calibration_correction_mode(state)
         self.pose_correction_mode = tk.StringVar(value=default_pose_correction_mode)
-        pose_correction_label = ttk.Label(row2b, text="L/R corr", width=8)
+        pose_correction_label = ttk.Label(row2c, text="L/R corr", width=8)
         pose_correction_label.pack(side=tk.LEFT)
         pose_correction_box = ttk.Combobox(
-            row2b,
+            row2c,
             textvariable=self.pose_correction_mode,
             values=[
                 "none",
@@ -7092,12 +7224,12 @@ class ModelTab(CommandTab):
                 "flip_epipolar_fast_viterbi",
                 "flip_triangulation",
             ],
-            width=24,
+            width=17,
             state="readonly",
         )
         pose_correction_box.pack(side=tk.LEFT, padx=(0, 8))
         self.model_info_var = tk.StringVar(value="")
-        ttk.Label(row2b, textvariable=self.model_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(row2c, textvariable=self.model_info_var, foreground="#4f5b66").pack(side=tk.LEFT, padx=(6, 0))
 
         row3 = ttk.Frame(form)
         row3.pack(fill=tk.X, padx=8, pady=4)
@@ -7197,19 +7329,7 @@ class ModelTab(CommandTab):
         # Layout: controls and model list on the left, preview on the right.
         self.hide_preview_copy_buttons()
 
-        form.pack_forget()
-        if self.buttons_frame is not None:
-            self.buttons_frame.pack_forget()
-        if self.progress_row is not None:
-            self.progress_row.pack_forget()
-        form.grid(row=0, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        if self.buttons_frame is not None:
-            self.buttons_frame.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-        if self.progress_row is not None:
-            self.progress_row.grid(row=2, column=0, sticky="ew", padx=(0, 10), pady=(0, 8))
-
-        existing_box = ttk.LabelFrame(self.main, text="Existing models")
-        existing_box.grid(row=3, column=0, sticky="nsew", padx=(0, 10), pady=(0, 8))
+        existing_box = ttk.LabelFrame(self.left_panel, text="Existing models")
         existing_controls = ttk.Frame(existing_box)
         existing_controls.pack(fill=tk.X, padx=8, pady=(8, 0))
         ttk.Button(existing_controls, text="Refresh models", command=self.refresh_existing_models).pack(side=tk.LEFT)
@@ -7228,8 +7348,7 @@ class ModelTab(CommandTab):
             "Liste des modeles detectes pour le trial courant. La colonne Match indique s'ils correspondent aux options 2D courantes.",
         )
 
-        preview_box = ttk.LabelFrame(self.main, text="Première frame triangulée / modèle")
-        preview_box.grid(row=0, column=1, rowspan=4, sticky="nsew", pady=(0, 8))
+        preview_box = ttk.LabelFrame(self.right_panel, text="Première frame triangulée / modèle")
         preview_controls_top = ttk.Frame(preview_box)
         preview_controls_top.pack(fill=tk.X, padx=8, pady=(8, 2))
         self.show_triangulation_var = tk.BooleanVar(value=False)
@@ -7314,9 +7433,10 @@ class ModelTab(CommandTab):
         self.extra = LabeledEntry(form, "Extra args", "")
         self.extra.pack(fill=tk.X, padx=8, pady=4)
 
-        self.main.grid_columnconfigure(0, weight=1, uniform="modeltab")
-        self.main.grid_columnconfigure(1, weight=2, uniform="modeltab")
-        self.main.grid_rowconfigure(3, weight=1)
+        form.pack(fill=tk.X, pady=(0, 8))
+        existing_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+        self.content_pane.pack(fill=tk.BOTH, expand=True)
 
         self.update_details()
         self.sync_paths_from_state()

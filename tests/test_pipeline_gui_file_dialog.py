@@ -573,6 +573,7 @@ def test_annotation_click_advances_marker_without_monoview():
     tab._axis_to_camera = {"axis0": "cam0"}
     tab.advance_marker_var = SimpleNamespace(get=lambda: True)
     tab._pending_reprojection_points = {}
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
     tab.save_annotations = lambda: saved.append("saved")
     tab.refresh_preview = lambda: refreshed.append("refreshed")
     tab._advance_to_next_keypoint = lambda: setattr(tab, "_advanced", True)
@@ -660,6 +661,7 @@ def test_annotation_ctrl_click_deletes_nearest_marker():
     tab._axis_to_camera = {"axis0": "cam0"}
     tab.advance_marker_var = SimpleNamespace(get=lambda: True)
     tab._pending_reprojection_points = {}
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
     tab.save_annotations = lambda: saved.append("saved")
     tab.refresh_preview = lambda: refreshed.append("refreshed")
     tab.selected_keypoint_name = lambda: "left_shoulder"
@@ -702,6 +704,16 @@ def test_annotation_marker_shape_uses_side_specific_symbols():
     assert pipeline_gui.annotation_marker_shape("left_wrist") == "+"
     assert pipeline_gui.annotation_marker_shape("right_wrist") == "x"
     assert pipeline_gui.annotation_marker_shape("nose") == "+"
+
+
+def test_annotation_blend_q_by_relevance_updates_only_selected_subtree():
+    q_names = ["TRUNK:RotY", "LEFT_UPPER_ARM:RotY", "RIGHT_UPPER_ARM:RotY", "LEFT_THIGH:RotY"]
+    previous_q = np.array([0.0, 1.0, 2.0, 3.0], dtype=float)
+    estimated_q = np.array([10.0, 11.0, 12.0, 13.0], dtype=float)
+
+    blended = pipeline_gui.annotation_blend_q_by_relevance(q_names, previous_q, estimated_q, "left_wrist")
+
+    np.testing.assert_allclose(blended, np.array([10.0, 11.0, 2.0, 3.0], dtype=float))
 
 
 def test_annotation_tab_frame_scale_release_stops_dragging(monkeypatch):
@@ -1057,6 +1069,7 @@ def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monke
     tab.annotation_payload = {}
     tab.kinematic_model_choices = {"demo": biomod_path}
     tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {}
     tab.selected_annotation_camera_names = lambda: ["cam0", "cam1"]
     tab.current_frame_number = lambda: 10
     tab.kinematic_status_var = SimpleNamespace(set=lambda value: setattr(tab, "_kin_status", value))
@@ -1086,6 +1099,11 @@ def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monke
         ),
     )
     monkeypatch.setattr(pipeline_gui, "segmented_back_overlay_from_q", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showerror",
+        lambda *_args, **_kwargs: pytest.fail("estimate_kinematic_assist_state unexpectedly called showerror"),
+    )
 
     pipeline_gui.AnnotationTab.estimate_kinematic_assist_state(tab)
 
@@ -1168,6 +1186,21 @@ def test_annotation_click_outside_cancels_pending_reprojection():
     assert tab._pending_reprojection_points == {}
     assert tab._button_text == "Reproject"
     assert refreshed == ["refreshed"]
+
+
+def test_annotation_cancel_pending_reprojection_from_tk_event_ignores_reproject_button():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab._pending_reprojection_points = {("cam0", 10, "left_shoulder"): np.array([1.0, 2.0], dtype=float)}
+    tab.reproject_button = object()
+    tab.reproject_button_var = SimpleNamespace(set=lambda value: setattr(tab, "_button_text", value))
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+
+    pipeline_gui.AnnotationTab._cancel_pending_reprojection_from_tk_event(
+        tab, SimpleNamespace(widget=tab.reproject_button)
+    )
+
+    assert tab._pending_reprojection_points
+    assert not hasattr(tab, "_refreshed")
 
 
 def test_preview_pose_frame_indices_aligns_sparse_bundle_frames():
