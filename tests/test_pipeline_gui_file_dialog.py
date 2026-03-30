@@ -1490,6 +1490,80 @@ def test_annotation_estimate_kinematic_q_click_uses_single_measurement_when_stat
     assert "local ekf 1/" in tab._kin_status
 
 
+def test_annotation_estimate_kinematic_q_click_uses_direct_fit_when_local_ekf_is_insufficient(monkeypatch, tmp_path):
+    biomod_path = tmp_path / "demo.bioMod"
+    biomod_path.write_text("demo", encoding="utf-8")
+
+    class _FakeBiorbdModel:
+        def __init__(self, _path):
+            pass
+
+        def nbQ(self):
+            return 2
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "biorbd", SimpleNamespace(Model=_FakeBiorbdModel))
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = pipeline_gui.PoseData(
+        camera_names=["cam0"],
+        frames=np.array([10], dtype=int),
+        keypoints=np.full((1, 1, len(pipeline_gui.COCO17), 2), np.nan, dtype=float),
+        scores=np.zeros((1, 1, len(pipeline_gui.COCO17)), dtype=float),
+    )
+    tab.calibrations = {"cam0": object()}
+    tab.annotation_payload = pipeline_gui.empty_annotation_payload()
+    pipeline_gui.set_annotation_point(
+        tab.annotation_payload, camera_name="cam0", frame_number=10, keypoint_name="left_wrist", xy=[1.0, 2.0]
+    )
+    tab.kinematic_model_choices = {"demo": biomod_path}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {("demo", 10): np.array([1.0, 2.0, 0.0, 0.0, 0.0, 0.0], dtype=float)}
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab.current_frame_number = lambda: 10
+    tab.kinematic_status_var = SimpleNamespace(set=lambda value: setattr(tab, "_kin_status", value))
+    tab.state = SimpleNamespace(fps_var=SimpleNamespace(get=lambda: "120"))
+
+    monkeypatch.setattr(pipeline_gui, "canonicalize_model_q_rotation_branches", lambda _model, q: np.asarray(q))
+    monkeypatch.setattr(pipeline_gui, "biorbd_q_names", lambda _model: ["TRUNK:RotY", "LEFT_LOWER_ARM:RotY"])
+    monkeypatch.setattr(
+        pipeline_gui,
+        "biorbd_markers_from_q",
+        lambda _biomod_path, q_series: np.zeros((q_series.shape[0], len(pipeline_gui.COCO17), 3), dtype=float),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "project_points_all_cameras",
+        lambda points_3d, calibrations, camera_names: np.zeros(
+            (len(camera_names), points_3d.shape[0], len(pipeline_gui.COCO17), 2), dtype=float
+        ),
+    )
+    monkeypatch.setattr(pipeline_gui, "segmented_back_overlay_from_q", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        pipeline_gui,
+        "refine_annotation_q_with_local_ekf",
+        lambda **kwargs: (
+            np.array([1.0, 2.0, 0.0, 0.0, 0.0, 0.0], dtype=float),
+            {"completed_passes": 3, "used_fallback": True},
+        ),
+    )
+
+    direct_calls = {}
+
+    def fake_direct_fit(**kwargs):
+        direct_calls.update(kwargs)
+        return np.array([3.0, 4.0, 0.5, 0.6, 0.7, 0.8], dtype=float), {"completed_passes": 1, "used_fallback": False}
+
+    monkeypatch.setattr(pipeline_gui, "refine_annotation_q_with_direct_measurements", fake_direct_fit)
+
+    estimated_q = pipeline_gui.AnnotationTab._estimate_kinematic_q(tab, keypoint_name="left_wrist")
+
+    np.testing.assert_allclose(estimated_q, np.array([3.0, 4.0], dtype=float))
+    assert direct_calls["passes"] == pipeline_gui.ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES
+    assert "direct fit 1/" in tab._kin_status
+
+
 def test_annotation_step_frame_propagates_state_with_frame_delta(monkeypatch, tmp_path):
     biomod_path = tmp_path / "demo.bioMod"
     biomod_path.write_text("demo", encoding="utf-8")

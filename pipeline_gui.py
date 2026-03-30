@@ -58,13 +58,22 @@ from annotation.annotation_store import (
     save_annotation_payload,
     set_annotation_point,
 )
+from annotation.frame_navigation import (
+    clamp_index_to_subset,
+    fallback_annotation_filtered_indices,
+    navigable_annotation_frame_local_indices,
+    resolve_annotation_frame_filter_mode,
+    step_frame_index_within_subset,
+)
 from annotation.kinematic_assist import (
     annotation_blend_q_by_relevance,
     annotation_reconstruction_from_points,
     annotation_state_from_q,
-    normalize_annotation_kinematic_state,
     propagate_annotation_kinematic_state,
+    refine_annotation_q_with_direct_measurements,
     refine_annotation_q_with_local_ekf,
+    resolve_annotation_kinematic_state_info,
+    store_annotation_kinematic_state,
 )
 from batch_run import (
     DEFAULT_EXCEL_OUTPUT,
@@ -1750,6 +1759,7 @@ ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
 ANNOTATION_DELETE_RADIUS_PX = 18.0
 ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
 ANNOTATION_KINEMATIC_CLICK_PASSES = 3
+ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES = 1
 ANNOTATION_FRAME_FILTER_OPTIONS = {
     "all": "All frames",
     "flipped": "Flipped L/R",
@@ -5505,17 +5515,7 @@ class AnnotationTab(ttk.Frame):
         current_frame_number = int(self.pose_data.frames[current_index])
         candidates = self._navigable_annotation_frame_local_indices()
         if candidates:
-            candidates = sorted(int(idx) for idx in candidates)
-            if current_index in candidates:
-                current_pos = candidates.index(current_index)
-                next_pos = (current_pos + (-1 if int(delta) < 0 else 1)) % len(candidates)
-                next_frame = candidates[next_pos]
-            elif int(delta) < 0:
-                previous = [idx for idx in candidates if idx < current_index]
-                next_frame = previous[-1] if previous else candidates[-1]
-            else:
-                following = [idx for idx in candidates if idx > current_index]
-                next_frame = following[0] if following else candidates[0]
+            next_frame = step_frame_index_within_subset(current_index, int(delta), candidates)
         else:
             next_frame = find_annotation_frame_with_images(
                 frames=self.pose_data.frames,
@@ -5524,6 +5524,8 @@ class AnnotationTab(ttk.Frame):
                 camera_names=self.selected_annotation_camera_names(),
                 images_root=self._current_images_root(),
             )
+        if next_frame is None:
+            return
         if (
             self.pose_data is not None
             and bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
@@ -5610,28 +5612,13 @@ class AnnotationTab(ttk.Frame):
         self, frame_number: int, model
     ) -> tuple[np.ndarray | None, int | None, bool]:
         model_label = str(self.kinematic_model_var.get()).strip()
-        if not model_label:
-            return None, None, False
-        frame_states = getattr(self, "kinematic_frame_states", {})
-        exact = frame_states.get((model_label, int(frame_number)))
-        if exact is not None:
-            normalized = normalize_annotation_kinematic_state(model, exact)
-            return normalized, int(frame_number), normalized is not None
-        candidates = [
-            (
-                abs(int(saved_frame) - int(frame_number)),
-                int(saved_frame),
-                normalize_annotation_kinematic_state(model, saved_state),
-            )
-            for (saved_model, saved_frame), saved_state in frame_states.items()
-            if str(saved_model) == model_label
-        ]
-        candidates = [item for item in candidates if item[2] is not None]
-        if not candidates:
-            return None, None, False
-        candidates.sort(key=lambda item: item[0])
-        _distance, source_frame, source_state = candidates[0]
-        return np.asarray(source_state, dtype=float), int(source_frame), False
+        info = resolve_annotation_kinematic_state_info(
+            getattr(self, "kinematic_frame_states", {}),
+            model_label=model_label,
+            frame_number=int(frame_number),
+            model=model,
+        )
+        return info.state, info.source_frame, info.is_exact
 
     def _selected_or_nearest_kinematic_state(self, frame_number: int, model) -> np.ndarray | None:
         state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number, model)
@@ -5707,6 +5694,8 @@ class AnnotationTab(ttk.Frame):
             estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
             estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
         bootstrap_summary = " | local ekf skipped"
+        direct_summary = ""
+        annotation_pose_data = None
         try:
             annotation_pose_data = annotation_pose_data_for_frame(
                 self.pose_data,
@@ -5751,10 +5740,43 @@ class AnnotationTab(ttk.Frame):
                 bootstrap_summary = f" | local ekf skipped ({valid_measurements} meas)"
         except Exception:
             bootstrap_summary = " | local ekf fallback"
+        if keypoint_name is not None and annotation_pose_data is not None:
+            try:
+                direct_state, direct_diagnostics = refine_annotation_q_with_direct_measurements(
+                    model=model,
+                    calibrations=self.calibrations,
+                    pose_data=annotation_pose_data,
+                    seed_state=estimated_state,
+                    passes=ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES,
+                    measurement_std_px=2.0,
+                )
+                if not bool(direct_diagnostics.get("used_fallback")):
+                    estimated_state = np.asarray(direct_state, dtype=float)
+                    blended_q = annotation_blend_q_by_relevance(
+                        self.kinematic_q_names,
+                        previous_q,
+                        estimated_state[: model.nbQ()],
+                        keypoint_name,
+                    )
+                    estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
+                    estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
+                    direct_summary = (
+                        f" | direct fit {int(direct_diagnostics.get('completed_passes', 0))}/"
+                        f"{ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES}"
+                    )
+                else:
+                    direct_summary = " | direct fit fallback"
+            except Exception:
+                direct_summary = " | direct fit fallback"
         if not hasattr(self, "kinematic_frame_states") or self.kinematic_frame_states is None:
             self.kinematic_frame_states = {}
-        estimated_state = normalize_annotation_kinematic_state(model, estimated_state)
-        self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_state, dtype=float)
+        estimated_state = store_annotation_kinematic_state(
+            self.kinematic_frame_states,
+            model_label=str(self.kinematic_model_var.get()).strip(),
+            frame_number=frame_number,
+            model=model,
+            state=estimated_state,
+        )
         self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
         self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_state[: model.nbQ()])
         self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
@@ -5766,7 +5788,8 @@ class AnnotationTab(ttk.Frame):
                 warm_start_text = " current frame" if is_exact else f" nearest frame {source_frame}"
                 warm_start_text = f" from{warm_start_text}"
             self.kinematic_status_var.set(
-                f"Updated model after {keypoint_name} using {seed_source}{warm_start_text}{bootstrap_summary}."
+                f"Updated model after {keypoint_name} using {seed_source}{warm_start_text}{bootstrap_summary}"
+                f"{direct_summary}."
             )
         return np.asarray(estimated_state[: model.nbQ()], dtype=float)
 
@@ -5829,11 +5852,7 @@ class AnnotationTab(ttk.Frame):
         return str(selected[-1]) if selected else None
 
     def _frame_filter_mode(self) -> str:
-        selected_label = str(self.frame_filter_var.get() or "").strip()
-        for mode, label in ANNOTATION_FRAME_FILTER_OPTIONS.items():
-            if selected_label == label or selected_label == mode:
-                return mode
-        return "all"
+        return resolve_annotation_frame_filter_mode(self.frame_filter_var.get(), ANNOTATION_FRAME_FILTER_OPTIONS)
 
     def _pose_data_mode_for_annotation_filters(self) -> str:
         value = str(self.state.pose_data_mode_var.get()).strip().lower()
@@ -5949,21 +5968,7 @@ class AnnotationTab(ttk.Frame):
             filtered = self._annotation_worst_reprojection_frame_local_indices()
         else:
             filtered = list(range(len(self.pose_data.frames)))
-        return filtered if filtered else list(range(len(self.pose_data.frames)))
-
-    def _frame_has_annotation_image(
-        self,
-        local_idx: int,
-        camera_names: list[str],
-        images_root: Path | None,
-        available_by_camera: dict[str, set[int]] | None = None,
-    ) -> bool:
-        if self.pose_data is None or images_root is None or not camera_names:
-            return False
-        frame_number = int(self.pose_data.frames[int(local_idx)])
-        if available_by_camera is None:
-            available_by_camera = available_execution_image_frames(images_root, camera_names)
-        return any(frame_number in available_by_camera.get(str(camera_name), set()) for camera_name in camera_names)
+        return fallback_annotation_filtered_indices(len(self.pose_data.frames), filtered)
 
     def _navigable_annotation_frame_local_indices(self) -> list[int]:
         if self.pose_data is None:
@@ -5981,13 +5986,12 @@ class AnnotationTab(ttk.Frame):
         cached = self._navigable_frame_cache.get(cache_key)
         if cached is not None:
             return list(cached)
-        available_by_camera = available_execution_image_frames(images_root, camera_names)
-        with_images = [
-            idx
-            for idx in filtered
-            if self._frame_has_annotation_image(idx, camera_names, images_root, available_by_camera)
-        ]
-        resolved = with_images or filtered
+        resolved = navigable_annotation_frame_local_indices(
+            np.asarray(self.pose_data.frames, dtype=int),
+            filtered,
+            camera_names,
+            images_root,
+        )
         self._navigable_frame_cache[cache_key] = list(resolved)
         return resolved
 
@@ -5996,10 +6000,9 @@ class AnnotationTab(ttk.Frame):
             return
         self._clear_pending_reprojection()
         candidates = self._filtered_annotation_frame_local_indices()
-        if candidates:
-            current_idx = int(round(self.frame_var.get()))
-            if current_idx not in candidates:
-                self._set_frame_index(candidates[0])
+        clamped_index = clamp_index_to_subset(int(round(self.frame_var.get())), candidates)
+        if clamped_index is not None and clamped_index != int(round(self.frame_var.get())):
+            self._set_frame_index(clamped_index)
         self.refresh_preview()
 
     def _ensure_cursor_artists(self, ax) -> tuple[object, ...]:

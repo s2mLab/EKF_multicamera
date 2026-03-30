@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from vitpose_ekf_pipeline import (
@@ -8,8 +10,17 @@ from vitpose_ekf_pipeline import (
     MultiViewKinematicEKF,
     PoseData,
     ReconstructionResult,
+    apply_measurement_update_batch,
     canonicalize_model_q_rotation_branches,
+    stack_measurement_blocks,
 )
+
+
+@dataclass(frozen=True)
+class AnnotationKinematicStateInfo:
+    state: np.ndarray | None
+    source_frame: int | None
+    is_exact: bool
 
 
 def _canonicalize_annotation_q(model, q_values: np.ndarray) -> np.ndarray:
@@ -22,6 +33,67 @@ def _canonicalize_annotation_q(model, q_values: np.ndarray) -> np.ndarray:
         return canonicalize_model_q_rotation_branches(model, q_values)
     except Exception:
         return np.array(q_values, copy=True)
+
+
+def resolve_annotation_kinematic_state_info(
+    frame_states: dict[tuple[str, int], np.ndarray] | None,
+    *,
+    model_label: str,
+    frame_number: int,
+    model,
+) -> AnnotationKinematicStateInfo:
+    """Return the normalized exact or nearest saved state for one model/frame."""
+
+    model_label = str(model_label).strip()
+    if not model_label:
+        return AnnotationKinematicStateInfo(state=None, source_frame=None, is_exact=False)
+    frame_states = frame_states or {}
+    exact = frame_states.get((model_label, int(frame_number)))
+    if exact is not None:
+        normalized = normalize_annotation_kinematic_state(model, exact)
+        return AnnotationKinematicStateInfo(
+            state=normalized,
+            source_frame=int(frame_number) if normalized is not None else None,
+            is_exact=normalized is not None,
+        )
+    candidates = [
+        (
+            abs(int(saved_frame) - int(frame_number)),
+            int(saved_frame),
+            normalize_annotation_kinematic_state(model, saved_state),
+        )
+        for (saved_model, saved_frame), saved_state in frame_states.items()
+        if str(saved_model) == model_label
+    ]
+    candidates = [item for item in candidates if item[2] is not None]
+    if not candidates:
+        return AnnotationKinematicStateInfo(state=None, source_frame=None, is_exact=False)
+    candidates.sort(key=lambda item: item[0])
+    _distance, source_frame, source_state = candidates[0]
+    return AnnotationKinematicStateInfo(
+        state=np.asarray(source_state, dtype=float),
+        source_frame=int(source_frame),
+        is_exact=False,
+    )
+
+
+def store_annotation_kinematic_state(
+    frame_states: dict[tuple[str, int], np.ndarray] | None,
+    *,
+    model_label: str,
+    frame_number: int,
+    model,
+    state: np.ndarray,
+) -> np.ndarray:
+    """Normalize one state, store it in-place, and return the stored value."""
+
+    normalized_state = normalize_annotation_kinematic_state(model, state)
+    if normalized_state is None:
+        raise ValueError("Invalid kinematic state.")
+    if frame_states is None:
+        raise ValueError("frame_states must be initialized before storing.")
+    frame_states[(str(model_label).strip(), int(frame_number))] = np.asarray(normalized_state, dtype=float)
+    return np.asarray(normalized_state, dtype=float)
 
 
 def annotation_relevant_q_prefixes(keypoint_name: str) -> tuple[str, ...]:
@@ -189,7 +261,7 @@ def refine_annotation_q_with_local_ekf(
     }
     for _pass_idx in range(max(1, int(passes))):
         state_iter = np.array(state, copy=True)
-        state_iter[:nq] = canonicalize_model_q_rotation_branches(model, state_iter[:nq])
+        state_iter[:nq] = _canonicalize_annotation_q(model, state_iter[:nq])
         predicted_state, predicted_covariance = ekf.predict(state_iter, covariance, 0)
         corrected_state, corrected_covariance, update_status = ekf.update(predicted_state, predicted_covariance, 0)
         diagnostics["update_statuses"].append(str(update_status))
@@ -207,4 +279,141 @@ def refine_annotation_q_with_local_ekf(
         if q_delta_norm <= 1e-6:
             diagnostics["converged"] = True
             break
+    return np.array(state, copy=True), diagnostics
+
+
+def refine_annotation_q_with_direct_measurements(
+    *,
+    model,
+    calibrations: dict[str, object],
+    pose_data: PoseData,
+    seed_state: np.ndarray,
+    passes: int,
+    measurement_std_px: float = 2.0,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Apply a direct image-space correction from sparse annotated 2D points.
+
+    This is a lightweight fallback/polish pass for annotation clicks when the
+    regular local EKF path is too conservative or rejects the update.
+    """
+
+    nq = int(model.nbQ())
+    nx = 3 * nq
+    seed_state = np.asarray(seed_state, dtype=float).reshape(-1)
+    if seed_state.size == nq:
+        seed_state = np.concatenate((seed_state, np.zeros(nq, dtype=float), np.zeros(nq, dtype=float)))
+    elif seed_state.size != nx:
+        raise ValueError("seed_state must contain either q or [q, qdot, qddot].")
+    marker_pairs = [
+        (marker_idx, KP_INDEX[marker_name.to_string()])
+        for marker_idx, marker_name in enumerate(model.markerNames())
+        if marker_name.to_string() in KP_INDEX
+    ]
+    marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in marker_pairs], dtype=int)
+    if marker_pair_keypoint_indices.size == 0:
+        return np.array(seed_state, copy=True), {
+            "method": "annotation_direct_measurements",
+            "requested_passes": int(max(1, passes)),
+            "completed_passes": 0,
+            "used_fallback": True,
+            "reason": "no_marker_pairs",
+        }
+
+    state = np.array(seed_state, copy=True)
+    state[:nq] = _canonicalize_annotation_q(model, state[:nq])
+    covariance = np.eye(nx) * 1e-2
+    identity_x = np.eye(nx)
+    diagnostics: dict[str, object] = {
+        "method": "annotation_direct_measurements",
+        "requested_passes": int(max(1, passes)),
+        "completed_passes": 0,
+        "used_fallback": False,
+        "converged": False,
+    }
+
+    for _pass_idx in range(max(1, int(passes))):
+        q = state[:nq]
+        marker_positions_all = model.markers(q)
+        marker_jacobians_all = model.markersJacobian(q)
+        marker_points = [marker_positions_all[marker_idx].to_array() for marker_idx, _ in marker_pairs]
+        marker_jacobians = [marker_jacobians_all[marker_idx].to_array() for marker_idx, _ in marker_pairs]
+        marker_points_array = np.asarray(marker_points, dtype=float)
+        marker_jacobians_array = np.asarray(marker_jacobians, dtype=float)
+        finite_marker_points = np.all(np.isfinite(marker_points_array), axis=1)
+        measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+
+        for cam_idx, camera_name in enumerate(pose_data.camera_names):
+            calibration = calibrations.get(str(camera_name))
+            if calibration is None:
+                continue
+            frame_keypoints = np.asarray(pose_data.keypoints[cam_idx, 0], dtype=float)
+            frame_scores = np.asarray(pose_data.scores[cam_idx, 0], dtype=float)
+            valid_keypoints = (
+                np.all(np.isfinite(frame_keypoints), axis=1) & np.isfinite(frame_scores) & (frame_scores > 0)
+            )
+            if not np.any(valid_keypoints):
+                continue
+            valid_pairs = finite_marker_points & valid_keypoints[marker_pair_keypoint_indices]
+            if not np.any(valid_pairs):
+                continue
+            pair_indices = np.flatnonzero(valid_pairs)
+            keypoint_indices = marker_pair_keypoint_indices[pair_indices]
+            projected_uv, projected_jac = calibration.project_points_and_jacobians(marker_points_array[pair_indices])
+            H_q_blocks = np.einsum("mab,mbq->maq", projected_jac, marker_jacobians_array[pair_indices], optimize=True)
+            finite_pairs = np.all(np.isfinite(projected_uv), axis=1) & np.all(
+                np.isfinite(H_q_blocks.reshape(H_q_blocks.shape[0], -1)), axis=1
+            )
+            if not np.any(finite_pairs):
+                continue
+            keypoint_indices = keypoint_indices[finite_pairs]
+            projected_uv = projected_uv[finite_pairs]
+            H_q_blocks = H_q_blocks[finite_pairs]
+            measured_points = frame_keypoints[keypoint_indices]
+            measured_scores = frame_scores[keypoint_indices]
+            selected_mask = (
+                np.all(np.isfinite(measured_points), axis=1) & np.isfinite(measured_scores) & (measured_scores > 0)
+            )
+            if not np.any(selected_mask):
+                continue
+            selected_scores = np.maximum(measured_scores[selected_mask], 1e-3)
+            variances = np.repeat((float(measurement_std_px) / selected_scores) ** 2, 2).astype(float, copy=False)
+            measurement_blocks.append(
+                (
+                    measured_points[selected_mask].reshape(-1),
+                    projected_uv[selected_mask].reshape(-1),
+                    H_q_blocks[selected_mask].reshape(-1, nq),
+                    variances,
+                )
+            )
+
+        stacked = stack_measurement_blocks(measurement_blocks, nq)
+        if stacked is None:
+            diagnostics["used_fallback"] = True
+            diagnostics["reason"] = "no_measurement"
+            return np.array(seed_state, copy=True), diagnostics
+        update_result = apply_measurement_update_batch(
+            predicted_state=state,
+            predicted_covariance=covariance,
+            z=stacked[0],
+            h=stacked[1],
+            H_q=stacked[2],
+            R_diag_array=stacked[3],
+            nq=nq,
+            identity_x=identity_x,
+        )
+        if update_result is None:
+            diagnostics["used_fallback"] = True
+            diagnostics["reason"] = "singular_gain"
+            return np.array(seed_state, copy=True), diagnostics
+        updated_state, covariance = update_result
+        updated_state = np.asarray(updated_state, dtype=float).reshape(nx)
+        updated_state[:nq] = _canonicalize_annotation_q(model, updated_state[:nq])
+        q_delta_norm = float(np.linalg.norm(updated_state[:nq] - state[:nq]))
+        diagnostics.setdefault("q_delta_norms", []).append(q_delta_norm)
+        diagnostics["completed_passes"] = int(diagnostics["completed_passes"]) + 1
+        state = updated_state
+        if q_delta_norm <= 1e-7:
+            diagnostics["converged"] = True
+            break
+
     return np.array(state, copy=True), diagnostics
