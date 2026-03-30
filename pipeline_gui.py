@@ -208,6 +208,7 @@ from reconstruction.reconstruction_timings import (
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_COHERENCE_METHOD,
+    DEFAULT_EKF2D_BOOTSTRAP_PASSES,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
@@ -220,9 +221,11 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MODEL_VARIANT,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
+    PoseData,
     ReconstructionResult,
     apply_left_right_flip_to_points,
     fundamental_matrix,
+    initial_state_from_ekf_bootstrap,
     initial_state_from_triangulation,
     load_calibrations,
     load_pose_data,
@@ -1285,14 +1288,17 @@ def draw_skeleton_2d(
     ax,
     frame_points: np.ndarray,
     color: str,
-    label: str,
+    label: str | None = None,
     marker_size: float = 12.0,
     marker_fill: bool = True,
     marker_edge_width: float = 1.4,
     line_alpha: float = 0.85,
     line_style: str = "-",
     line_width_scale: float = 1.0,
+    legend_label: str | None = None,
 ) -> None:
+    if label is None:
+        label = legend_label or ""
     grouped = keypoint_groups(frame_points)
     facecolors = color if marker_fill else "none"
     edgecolors = color
@@ -1910,6 +1916,50 @@ def triangulate_annotation_frame_points(
         if np.all(np.isfinite(point_3d)):
             points_3d[KP_INDEX[keypoint_name], :] = point_3d
     return points_3d
+
+
+def annotation_pose_data_for_frame(
+    base_pose_data: PoseData,
+    *,
+    camera_names: list[str],
+    frame_number: int,
+    annotation_payload: dict[str, object],
+) -> PoseData:
+    """Build one-frame PoseData from sparse annotations only."""
+
+    base_camera_names = [str(name) for name in base_pose_data.camera_names]
+    selected_camera_names = [str(name) for name in camera_names if str(name) in base_camera_names]
+    if not selected_camera_names:
+        raise ValueError("No selected cameras are available in the current pose data.")
+    frames = np.asarray([int(frame_number)], dtype=int)
+    keypoints = np.full((len(selected_camera_names), 1, len(COCO17), 2), np.nan, dtype=float)
+    scores = np.zeros((len(selected_camera_names), 1, len(COCO17)), dtype=float)
+    for cam_idx, camera_name in enumerate(selected_camera_names):
+        for keypoint_name in COCO17:
+            point_xy, _score = get_annotation_point(
+                annotation_payload,
+                camera_name=camera_name,
+                frame_number=frame_number,
+                keypoint_name=keypoint_name,
+            )
+            if point_xy is None:
+                continue
+            point = np.asarray(point_xy, dtype=float).reshape(2)
+            if not np.all(np.isfinite(point)):
+                continue
+            kp_idx = KP_INDEX[str(keypoint_name)]
+            keypoints[cam_idx, 0, kp_idx] = point
+            scores[cam_idx, 0, kp_idx] = 1.0
+    return PoseData(
+        camera_names=selected_camera_names,
+        frames=frames,
+        keypoints=keypoints,
+        scores=scores,
+        frame_stride=int(getattr(base_pose_data, "frame_stride", 1) or 1),
+        raw_keypoints=np.array(keypoints, copy=True),
+        annotated_keypoints=np.array(keypoints, copy=True),
+        annotated_scores=np.array(scores, copy=True),
+    )
 
 
 def annotation_reconstruction_from_points(
@@ -4985,6 +5035,7 @@ class AnnotationTab(ttk.Frame):
         self._pan_state: dict[str, object] | None = None
         self._dragging_frame_scale = False
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
+        self._annotation_hover_entries: dict[object, list[dict[str, object]]] = {}
         self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
         self.kinematic_model_choices: dict[str, Path] = {}
         self.kinematic_frame_states: dict[tuple[str, int], np.ndarray] = {}
@@ -5618,10 +5669,10 @@ class AnnotationTab(ttk.Frame):
         import biorbd
 
         model = biorbd.Model(str(biomod_path))
-        state = initial_state_from_triangulation(model, reconstruction)
-        estimated_q = np.asarray(state[: model.nbQ()], dtype=float)
+        triangulation_state = initial_state_from_triangulation(model, reconstruction)
         self.kinematic_q_names = biorbd_q_names(model)
         previous_q, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
+        estimated_q = np.asarray(triangulation_state[: model.nbQ()], dtype=float)
         if keypoint_name is not None:
             estimated_q = annotation_blend_q_by_relevance(
                 self.kinematic_q_names,
@@ -5629,19 +5680,62 @@ class AnnotationTab(ttk.Frame):
                 estimated_q,
                 keypoint_name,
             )
+        bootstrap_summary = " | bootstrap fallback"
+        try:
+            annotation_pose_data = annotation_pose_data_for_frame(
+                self.pose_data,
+                camera_names=camera_names,
+                frame_number=frame_number,
+                annotation_payload=self.annotation_payload,
+            )
+            valid_measurements = int(np.sum(np.asarray(annotation_pose_data.scores) > 0.0))
+            if valid_measurements >= 4:
+                seed_state = np.concatenate((estimated_q, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
+                bootstrap_passes = max(2, int(DEFAULT_EKF2D_BOOTSTRAP_PASSES))
+                refined_state, bootstrap_diagnostics = initial_state_from_ekf_bootstrap(
+                    model=model,
+                    calibrations={name: self.calibrations[name] for name in annotation_pose_data.camera_names},
+                    pose_data=annotation_pose_data,
+                    reconstruction=reconstruction,
+                    fps=float(self.state.fps_var.get()),
+                    measurement_noise_scale=1.0,
+                    process_noise_scale=1.0,
+                    min_frame_coherence_for_update=0.0,
+                    skip_low_coherence_updates=False,
+                    coherence_confidence_floor=0.0,
+                    epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
+                    enable_dof_locking=False,
+                    passes=bootstrap_passes,
+                    initial_state=seed_state,
+                )
+                estimated_q = np.asarray(refined_state[: model.nbQ()], dtype=float)
+                if keypoint_name is not None:
+                    estimated_q = annotation_blend_q_by_relevance(
+                        self.kinematic_q_names,
+                        previous_q,
+                        estimated_q,
+                        keypoint_name,
+                    )
+                bootstrap_summary = (
+                    f" | bootstrap {int(bootstrap_diagnostics.get('completed_passes', 0))}/{bootstrap_passes}"
+                )
+            else:
+                bootstrap_summary = " | bootstrap skipped"
+        except Exception:
+            bootstrap_summary = " | bootstrap fallback"
         if not hasattr(self, "kinematic_frame_states") or self.kinematic_frame_states is None:
             self.kinematic_frame_states = {}
         self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_q, dtype=float)
         self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_q)
         if keypoint_name is None:
-            self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers.")
+            self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers{bootstrap_summary}.")
         else:
             warm_start_text = ""
             if previous_q is not None and source_frame is not None:
                 warm_start_text = " current frame" if is_exact else f" nearest frame {source_frame}"
                 warm_start_text = f" from{warm_start_text}"
             self.kinematic_status_var.set(
-                f"Updated model after {keypoint_name} using {n_triangulated} triangulated markers{warm_start_text}."
+                f"Updated model after {keypoint_name} using {n_triangulated} triangulated markers{warm_start_text}{bootstrap_summary}."
             )
         return estimated_q
 
@@ -5887,8 +5981,50 @@ class AnnotationTab(ttk.Frame):
             line.set_path_effects([path_effects.Stroke(linewidth=2.6, foreground="black"), path_effects.Normal()])
             line.set_visible(False)
             artists.append(line)
+        hover_text = ax.text(
+            0.02,
+            0.98,
+            "",
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            color="#111111",
+            zorder=31,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "#fff8dc", "edgecolor": "#333333", "alpha": 0.92},
+        )
+        hover_text.set_visible(False)
+        artists.append(hover_text)
         self._cursor_artists[ax] = tuple(artists)
         return self._cursor_artists[ax]
+
+    def _nearest_annotation_hover_entry(self, ax, x: float, y: float) -> dict[str, object] | None:
+        entries = self._annotation_hover_entries.get(ax, [])
+        best_entry = None
+        best_distance = None
+        for entry in entries:
+            point = np.asarray(entry.get("xy"), dtype=float).reshape(2)
+            if not np.all(np.isfinite(point)):
+                continue
+            distance = float(np.linalg.norm(point - np.array([x, y], dtype=float)))
+            if best_distance is None or distance < best_distance:
+                best_distance = distance
+                best_entry = entry
+        if best_entry is None or best_distance is None or best_distance > ANNOTATION_DELETE_RADIUS_PX:
+            return None
+        return best_entry
+
+    def _annotation_hover_label(self, entry: dict[str, object]) -> str:
+        keypoint_name = str(entry.get("keypoint_name", ""))
+        source = str(entry.get("source", "")).strip()
+        try:
+            selected_keypoint = self.selected_keypoint_name()
+        except Exception:
+            selected_keypoint = ""
+        current_suffix = " | current" if keypoint_name == selected_keypoint else ""
+        if source:
+            return f"{keypoint_name} | {source}{current_suffix}"
+        return f"{keypoint_name}{current_suffix}"
 
     def _update_preview_cursor(self, event) -> None:
         if not hasattr(self, "preview_canvas_widget"):
@@ -5898,9 +6034,11 @@ class AnnotationTab(ttk.Frame):
         self.preview_canvas_widget.configure(cursor=("crosshair" if has_position else "arrow"))
         for ax, artists in list(self._cursor_artists.items()):
             visible = has_position and ax is active_ax
+            hover_text = artists[4] if len(artists) >= 5 else None
             if not visible:
                 for artist in artists:
-                    artist.set_visible(False)
+                    if artist is not None:
+                        artist.set_visible(False)
                 continue
             x0, x1 = ax.get_xlim()
             y0, y1 = ax.get_ylim()
@@ -5914,9 +6052,18 @@ class AnnotationTab(ttk.Frame):
                 ([x, x], [y0, y - gap_y]),
                 ([x, x], [y + gap_y, y1]),
             )
-            for artist, (xs, ys) in zip(artists, segments):
+            for artist, (xs, ys) in zip(artists[:4], segments):
+                if artist is None:
+                    continue
                 artist.set_data(xs, ys)
                 artist.set_visible(True)
+            if hover_text is not None:
+                hover_entry = self._nearest_annotation_hover_entry(ax, x, y)
+                if hover_entry is None:
+                    hover_text.set_visible(False)
+                else:
+                    hover_text.set_text(self._annotation_hover_label(hover_entry))
+                    hover_text.set_visible(True)
         self.preview_canvas.draw_idle()
 
     def _delete_nearest_annotation(self, camera_name: str, frame_number: int, xy: np.ndarray) -> bool:
@@ -6067,6 +6214,7 @@ class AnnotationTab(ttk.Frame):
                     self._clear_kinematic_assist_preview()
         self.preview_figure.clear()
         self._cursor_artists = {}
+        self._annotation_hover_entries = {}
         nrows, ncols = camera_layout(len(camera_names))
         axes = np.atleast_1d(self.preview_figure.subplots(nrows, ncols)).ravel()
         self._axis_to_camera = {}
@@ -6078,6 +6226,7 @@ class AnnotationTab(ttk.Frame):
                 continue
             camera_name = camera_names[ax_idx]
             self._axis_to_camera[ax] = camera_name
+            self._annotation_hover_entries[ax] = []
             width, height = self.calibrations[camera_name].image_size
             if self.show_images_var.get():
                 image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
@@ -6121,6 +6270,13 @@ class AnnotationTab(ttk.Frame):
                     linewidths=(1.7 if keypoint_name == current_marker else 1.0),
                     zorder=5,
                 )
+                self._annotation_hover_entries[ax].append(
+                    {
+                        "xy": np.asarray(annotated_xy, dtype=float),
+                        "keypoint_name": str(keypoint_name),
+                        "source": "annotated",
+                    }
+                )
 
             if (
                 bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
@@ -6132,9 +6288,20 @@ class AnnotationTab(ttk.Frame):
                     ax,
                     projected_points,
                     "#00b8d9",
-                    legend_label="Model reproj",
+                    "Model reproj",
                     marker_size=5.0,
                 )
+                for keypoint_name in COCO17:
+                    projected_xy = np.asarray(projected_points[KP_INDEX[keypoint_name]], dtype=float)
+                    if not np.all(np.isfinite(projected_xy)):
+                        continue
+                    self._annotation_hover_entries[ax].append(
+                        {
+                            "xy": projected_xy,
+                            "keypoint_name": str(keypoint_name),
+                            "source": "model reproj",
+                        }
+                    )
                 draw_upper_back_overlay_2d(
                     ax,
                     hip_triangle_2d=(
@@ -6168,6 +6335,13 @@ class AnnotationTab(ttk.Frame):
                     linewidths=1.7,
                     alpha=0.95,
                     zorder=6,
+                )
+                self._annotation_hover_entries[ax].append(
+                    {
+                        "xy": np.asarray(pending_xy, dtype=float),
+                        "keypoint_name": str(keypoint_name),
+                        "source": "pending reproj",
+                    }
                 )
 
             if self.show_motion_prior_var.get():
@@ -7489,6 +7663,13 @@ class ModelTab(CommandTab):
             return self.pose_data_mode.get()
         return f"{self.pose_data_mode.get()} + {correction_mode}"
 
+    def _model_min_cameras_for_triangulation(self) -> int:
+        """Allow sparse annotated frames to bootstrap model creation with two views."""
+
+        if str(self.pose_data_mode.get()).strip() == "annotated":
+            return 2
+        return DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION
+
     def update_details(self) -> None:
         max_frames = self.max_frames.get() or "all"
         frame_start = self.frame_start.get() or "-"
@@ -7905,6 +8086,9 @@ class ModelTab(CommandTab):
             cmd.extend(["--max-frames", self.max_frames.get()])
         if self.initial_rot_var.get():
             cmd.append("--initial-rotation-correction")
+        min_cameras = self._model_min_cameras_for_triangulation()
+        if min_cameras != DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION:
+            cmd.extend(["--min-cameras-for-triangulation", str(min_cameras)])
         cmd.extend(self.parse_extra_args(self.extra.get()))
         return cmd
 
@@ -8011,7 +8195,7 @@ class ModelTab(CommandTab):
         metadata = reconstruction_cache_metadata(
             pose_data=pose_data,
             error_threshold_px=DEFAULT_REPROJECTION_THRESHOLD_PX,
-            min_cameras_for_triangulation=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
+            min_cameras_for_triangulation=self._model_min_cameras_for_triangulation(),
             epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
             triangulation_method=self.triang_method.get(),
             pose_data_mode=self.pose_data_mode.get(),
@@ -8041,7 +8225,7 @@ class ModelTab(CommandTab):
                     coherence_method=DEFAULT_COHERENCE_METHOD,
                     triangulation_method=self.triang_method.get(),
                     reprojection_threshold_px=DEFAULT_REPROJECTION_THRESHOLD_PX,
-                    min_cameras_for_triangulation=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
+                    min_cameras_for_triangulation=self._model_min_cameras_for_triangulation(),
                     epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
                     triangulation_workers=max(1, int(self.state.workers_var.get() or "1")),
                     pose_data_mode=self.pose_data_mode.get(),
