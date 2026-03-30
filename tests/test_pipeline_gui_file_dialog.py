@@ -1113,6 +1113,126 @@ def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monke
     assert tab._refreshed is True
 
 
+def test_annotation_estimate_kinematic_q_with_keypoint_reports_local_update(monkeypatch, tmp_path):
+    biomod_path = tmp_path / "demo.bioMod"
+    biomod_path.write_text("demo", encoding="utf-8")
+
+    class _FakeBiorbdModel:
+        def __init__(self, _path):
+            pass
+
+        def nbQ(self):
+            return 2
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "biorbd", SimpleNamespace(Model=_FakeBiorbdModel))
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int))
+    tab.calibrations = {"cam0": object(), "cam1": object()}
+    tab.annotation_payload = {}
+    tab.kinematic_model_choices = {"demo": biomod_path}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {("demo", 10): np.array([1.0, 2.0], dtype=float)}
+    tab.selected_annotation_camera_names = lambda: ["cam0", "cam1"]
+    tab.current_frame_number = lambda: 10
+    tab.kinematic_status_var = SimpleNamespace(set=lambda value: setattr(tab, "_kin_status", value))
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "triangulate_annotation_frame_points",
+        lambda *_args, **_kwargs: np.pad(np.ones((2, 3), dtype=float), ((0, 15), (0, 0)), constant_values=np.nan),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "initial_state_from_triangulation",
+        lambda model, reconstruction: np.array([0.1, -0.2, 0.0, 0.0, 0.0, 0.0], dtype=float),
+    )
+    monkeypatch.setattr(pipeline_gui, "biorbd_q_names", lambda _model: ["TRUNK:RotY", "LEFT_LOWER_ARM:RotY"])
+    monkeypatch.setattr(
+        pipeline_gui,
+        "biorbd_markers_from_q",
+        lambda _biomod_path, q_series: np.zeros((q_series.shape[0], len(pipeline_gui.COCO17), 3), dtype=float),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "project_points_all_cameras",
+        lambda points_3d, calibrations, camera_names: np.zeros(
+            (len(camera_names), points_3d.shape[0], len(pipeline_gui.COCO17), 2), dtype=float
+        ),
+    )
+    monkeypatch.setattr(pipeline_gui, "segmented_back_overlay_from_q", lambda *_args, **_kwargs: None)
+
+    estimated_q = pipeline_gui.AnnotationTab._estimate_kinematic_q(tab, keypoint_name="left_wrist")
+
+    np.testing.assert_allclose(estimated_q, np.array([0.1, -0.2], dtype=float))
+    assert tab._kin_status == "Updated model after left_wrist using 2 triangulated markers from current frame."
+
+
+def test_annotation_refresh_preview_restores_nearest_saved_kinematic_state(monkeypatch, tmp_path):
+    biomod_path = tmp_path / "demo.bioMod"
+    biomod_path.write_text("demo", encoding="utf-8")
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(
+        frames=np.array([10, 11, 12], dtype=int),
+        camera_names=["cam0"],
+        raw_keypoints=np.zeros((1, 3, len(pipeline_gui.COCO17), 2), dtype=float),
+    )
+    tab.calibrations = {"cam0": SimpleNamespace(image_size=(640, 480))}
+    tab.kinematic_model_choices = {"demo": biomod_path}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {("demo", 10): np.array([1.0, 2.0], dtype=float)}
+    tab.kinematic_status_var = SimpleNamespace(set=lambda value: setattr(tab, "_kin_status", value))
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: True)
+    tab.kinematic_projected_points = None
+    tab.kinematic_segmented_back_projected = {}
+    tab._current_frame_idx = 2
+    tab.frame_var = SimpleNamespace(get=lambda: 2, set=lambda value: setattr(tab, "_frame_index", value))
+    tab.frame_label = SimpleNamespace(configure=lambda **kwargs: setattr(tab, "_frame_label_text", kwargs["text"]))
+    tab.frame_filter_var = SimpleNamespace(get=lambda: pipeline_gui.ANNOTATION_FRAME_FILTER_OPTIONS["all"])
+    tab.crop_var = SimpleNamespace(get=lambda: False)
+    tab.selected_keypoint_name = lambda: "nose"
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab.show_images_var = SimpleNamespace(get=lambda: False)
+    tab._current_images_root = lambda: None
+    tab.preview_figure = pipeline_gui.Figure(figsize=(4, 4))
+    tab.preview_canvas = SimpleNamespace(draw_idle=lambda: None)
+    tab.motion_prior_diameter = SimpleNamespace(get=lambda: "15")
+    tab.show_motion_prior_var = SimpleNamespace(get=lambda: False)
+    tab.show_epipolar_var = SimpleNamespace(get=lambda: False)
+    tab.show_triangulated_hint_var = SimpleNamespace(get=lambda: False)
+    tab._pending_reprojection_points = {}
+    tab.annotation_payload = {}
+    tab._annotation_xy = lambda *_args, **_kwargs: None
+    tab._axis_to_camera = {}
+    tab._cursor_artists = {}
+    tab.image_brightness_var = SimpleNamespace(get=lambda: 1.0)
+    tab.image_contrast_var = SimpleNamespace(get=lambda: 1.0)
+    tab.preview_canvas_widget = SimpleNamespace()
+
+    monkeypatch.setattr(pipeline_gui, "camera_layout", lambda _n: (1, 1))
+    monkeypatch.setattr(pipeline_gui, "apply_2d_axis_limits", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "hide_2d_axes", lambda ax: None)
+    monkeypatch.setattr(pipeline_gui, "draw_skeleton_2d", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "draw_upper_back_overlay_2d", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "resolve_execution_image_path", lambda *_args, **_kwargs: None)
+
+    def fake_set_preview(_biomod_path, _camera_names, q_values):
+        tab.kinematic_q_current = np.asarray(q_values, dtype=float)
+        tab.kinematic_projected_points = np.zeros((1, 1, len(pipeline_gui.COCO17), 2), dtype=float)
+        tab.kinematic_segmented_back_projected = {}
+
+    tab._set_kinematic_preview_from_q = fake_set_preview
+    tab._ensure_crop_limits = lambda _camera_names: {}
+
+    pipeline_gui.AnnotationTab.refresh_preview(tab)
+
+    np.testing.assert_allclose(tab.kinematic_q_current, np.array([1.0, 2.0], dtype=float))
+    assert tab._kin_status == "Using nearest saved q from frame 10 for frame 12."
+
+
 def test_annotation_compute_pending_reprojection_points_updates_only_existing_annotations(monkeypatch):
     tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
     tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int), camera_names=["cam0", "cam1", "cam2"])

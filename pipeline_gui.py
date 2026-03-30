@@ -5549,23 +5549,30 @@ class AnnotationTab(ttk.Frame):
     def _kinematic_state_key(self, frame_number: int) -> tuple[str, int]:
         return (str(self.kinematic_model_var.get()).strip(), int(frame_number))
 
-    def _selected_or_nearest_kinematic_state(self, frame_number: int) -> np.ndarray | None:
+    def _selected_or_nearest_kinematic_state_info(
+        self, frame_number: int
+    ) -> tuple[np.ndarray | None, int | None, bool]:
         model_label = str(self.kinematic_model_var.get()).strip()
         if not model_label:
-            return None
+            return None, None, False
         frame_states = getattr(self, "kinematic_frame_states", {})
         exact = frame_states.get((model_label, int(frame_number)))
         if exact is not None:
-            return np.asarray(exact, dtype=float)
+            return np.asarray(exact, dtype=float), int(frame_number), True
         candidates = [
-            (abs(int(saved_frame) - int(frame_number)), np.asarray(saved_q, dtype=float))
+            (abs(int(saved_frame) - int(frame_number)), int(saved_frame), np.asarray(saved_q, dtype=float))
             for (saved_model, saved_frame), saved_q in frame_states.items()
             if str(saved_model) == model_label
         ]
         if not candidates:
-            return None
+            return None, None, False
         candidates.sort(key=lambda item: item[0])
-        return np.asarray(candidates[0][1], dtype=float)
+        _distance, source_frame, source_q = candidates[0]
+        return np.asarray(source_q, dtype=float), int(source_frame), False
+
+    def _selected_or_nearest_kinematic_state(self, frame_number: int) -> np.ndarray | None:
+        state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
+        return state
 
     def _set_kinematic_preview_from_q(self, biomod_path: Path, camera_names: list[str], q_values: np.ndarray) -> None:
         q_values = np.asarray(q_values, dtype=float).reshape(-1)
@@ -5614,7 +5621,7 @@ class AnnotationTab(ttk.Frame):
         state = initial_state_from_triangulation(model, reconstruction)
         estimated_q = np.asarray(state[: model.nbQ()], dtype=float)
         self.kinematic_q_names = biorbd_q_names(model)
-        previous_q = self._selected_or_nearest_kinematic_state(frame_number)
+        previous_q, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
         if keypoint_name is not None:
             estimated_q = annotation_blend_q_by_relevance(
                 self.kinematic_q_names,
@@ -5626,7 +5633,16 @@ class AnnotationTab(ttk.Frame):
             self.kinematic_frame_states = {}
         self.kinematic_frame_states[self._kinematic_state_key(frame_number)] = np.asarray(estimated_q, dtype=float)
         self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_q)
-        self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers.")
+        if keypoint_name is None:
+            self.kinematic_status_var.set(f"Estimated q from {n_triangulated} triangulated markers.")
+        else:
+            warm_start_text = ""
+            if previous_q is not None and source_frame is not None:
+                warm_start_text = " current frame" if is_exact else f" nearest frame {source_frame}"
+                warm_start_text = f" from{warm_start_text}"
+            self.kinematic_status_var.set(
+                f"Updated model after {keypoint_name} using {n_triangulated} triangulated markers{warm_start_text}."
+            )
         return estimated_q
 
     def estimate_kinematic_assist_state(self) -> None:
@@ -6037,10 +6053,16 @@ class AnnotationTab(ttk.Frame):
             and self.kinematic_projected_points is None
         ):
             biomod_path = self._selected_kinematic_biomod_path()
-            cached_q = self._selected_or_nearest_kinematic_state(frame_number)
+            cached_q, source_frame, is_exact = self._selected_or_nearest_kinematic_state_info(frame_number)
             if biomod_path is not None and cached_q is not None:
                 try:
                     self._set_kinematic_preview_from_q(biomod_path, camera_names, cached_q)
+                    if is_exact:
+                        self.kinematic_status_var.set(f"Using saved q for frame {frame_number}.")
+                    elif source_frame is not None:
+                        self.kinematic_status_var.set(
+                            f"Using nearest saved q from frame {source_frame} for frame {frame_number}."
+                        )
                 except Exception:
                     self._clear_kinematic_assist_preview()
         self.preview_figure.clear()
