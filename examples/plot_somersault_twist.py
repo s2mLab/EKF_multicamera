@@ -17,11 +17,10 @@ selected_indices = [1, 2, 5, 6, 7, 8, 9]
 folders = [all_dirs[i - 1] for i in selected_indices]
 
 colors = plt.cm.tab10.colors
-linestyles = ["-", "--", "-.", ":", "-", "--","-"]
-markers = ["o", "s", "^", "d", "x", "+","."]
+linestyles = ["-", "--", "-.", ":", "-", "--", "-"]
+markers = ["o", "s", "^", "d", "x", "+", "."]
 
 fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
-
 
 for i, folder_path in enumerate(folders):
     print(folder_path)
@@ -69,8 +68,6 @@ for i, folder_path in enumerate(folders):
             indices = np.arange(len(qi))
             valid_mask = ~nan_mask
             qi[nan_mask] = np.interp(indices[nan_mask], indices[valid_mask], qi[valid_mask])
-
-
 
     style = dict(
         color=colors[i % len(colors)],
