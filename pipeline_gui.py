@@ -1822,6 +1822,71 @@ def annotation_triangulated_reprojection(
     return projected if np.all(np.isfinite(projected)) else None
 
 
+def triangulate_annotation_frame_points(
+    calibrations: dict[str, object],
+    *,
+    camera_names: list[str],
+    frame_number: int,
+    annotation_payload: dict[str, object],
+) -> np.ndarray:
+    """Triangulate all currently annotated keypoints for one frame."""
+
+    points_3d = np.full((len(COCO17), 3), np.nan, dtype=float)
+    for keypoint_name in COCO17:
+        valid_projections: list[np.ndarray] = []
+        valid_points: list[np.ndarray] = []
+        valid_scores: list[float] = []
+        for camera_name in camera_names:
+            point_xy, _score = get_annotation_point(
+                annotation_payload,
+                camera_name=camera_name,
+                frame_number=frame_number,
+                keypoint_name=keypoint_name,
+            )
+            if point_xy is None:
+                continue
+            calibration = calibrations.get(str(camera_name))
+            if calibration is None:
+                continue
+            projection_matrix = getattr(calibration, "projection_matrix", None)
+            if projection_matrix is None:
+                projection_matrix = getattr(calibration, "P", None)
+            if projection_matrix is None:
+                continue
+            point = np.asarray(point_xy, dtype=float).reshape(2)
+            if not np.all(np.isfinite(point)):
+                continue
+            valid_projections.append(np.asarray(projection_matrix, dtype=float))
+            valid_points.append(point)
+            valid_scores.append(1.0)
+        if len(valid_points) < 2:
+            continue
+        point_3d = weighted_triangulation(valid_projections, np.asarray(valid_points), np.asarray(valid_scores))
+        if np.all(np.isfinite(point_3d)):
+            points_3d[KP_INDEX[keypoint_name], :] = point_3d
+    return points_3d
+
+
+def annotation_reconstruction_from_points(
+    points_3d: np.ndarray, frame_number: int, n_cameras: int
+) -> ReconstructionResult:
+    """Wrap one triangulated annotation frame into a minimal ReconstructionResult."""
+
+    points_3d = np.asarray(points_3d, dtype=float).reshape(1, len(COCO17), 3)
+    return ReconstructionResult(
+        frames=np.asarray([int(frame_number)], dtype=int),
+        points_3d=points_3d,
+        mean_confidence=np.full((1, len(COCO17)), np.nan, dtype=float),
+        reprojection_error=np.full((1, len(COCO17)), np.nan, dtype=float),
+        reprojection_error_per_view=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
+        multiview_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
+        epipolar_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
+        triangulation_coherence=np.full((1, len(COCO17), int(n_cameras)), np.nan, dtype=float),
+        excluded_views=np.ones((1, len(COCO17), int(n_cameras)), dtype=bool),
+        coherence_method="annotation",
+    )
+
+
 def annotation_adjust_image(
     image: np.ndarray,
     *,
@@ -4876,6 +4941,11 @@ class AnnotationTab(ttk.Frame):
         self._dragging_frame_scale = False
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
         self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
+        self.kinematic_model_choices: dict[str, Path] = {}
+        self.kinematic_q_current: np.ndarray | None = None
+        self.kinematic_q_names: list[str] = []
+        self.kinematic_projected_points: np.ndarray | None = None
+        self.kinematic_segmented_back_projected: dict[str, np.ndarray] = {}
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -4985,6 +5055,24 @@ class AnnotationTab(ttk.Frame):
         self.annotations_path_entry.entry_widget.configure(textvariable=self.state.annotation_path_var)
         self.annotations_path_entry.on_browse_selected = lambda _value: self.load_resources()
         self.state.annotation_path_var.trace_add("write", lambda *_args: self.load_resources())
+
+        kinematic_row = ttk.Frame(controls)
+        kinematic_row.pack(fill=tk.X, padx=8, pady=4)
+        self.kinematic_assist_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            kinematic_row, text="Kinematic assist", variable=self.kinematic_assist_var, command=self.refresh_preview
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(kinematic_row, text="Model", width=6).pack(side=tk.LEFT)
+        self.kinematic_model_var = tk.StringVar(value="")
+        self.kinematic_model_box = ttk.Combobox(
+            kinematic_row, textvariable=self.kinematic_model_var, values=[], width=28, state="readonly"
+        )
+        self.kinematic_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Button(kinematic_row, text="Estimate q", command=self.estimate_kinematic_assist_state).pack(side=tk.LEFT)
+        self.kinematic_status_var = tk.StringVar(value="")
+        ttk.Label(controls, textvariable=self.kinematic_status_var, anchor="w", foreground="#4f5b66").pack(
+            fill=tk.X, padx=8, pady=(0, 4)
+        )
 
         lists_row = ttk.Frame(controls)
         lists_row.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 8))
@@ -5125,7 +5213,32 @@ class AnnotationTab(ttk.Frame):
         inferred_images_root = infer_execution_images_root(keypoints_path)
         self.images_root = inferred_images_root
         self.images_root_entry.var.set("" if inferred_images_root is None else display_path(inferred_images_root))
+        self.refresh_kinematic_model_choices()
         self.load_resources()
+
+    def refresh_kinematic_model_choices(self) -> None:
+        dataset_dir = current_dataset_dir(self.state)
+        biomod_paths: list[Path] = []
+        for model_dir in scan_model_dirs(dataset_dir):
+            biomod_paths.extend(sorted(model_dir.glob("*.bioMod")))
+        choices: dict[str, Path] = {}
+        labels: list[str] = []
+        for biomod_path in biomod_paths:
+            label = display_path(biomod_path)
+            if label in choices:
+                continue
+            choices[label] = biomod_path
+            labels.append(label)
+        self.kinematic_model_choices = choices
+        self.kinematic_model_box.configure(values=labels)
+        current = str(self.kinematic_model_var.get()).strip()
+        if current not in choices:
+            self.kinematic_model_var.set(labels[0] if labels else "")
+        self.kinematic_status_var.set("" if labels else "No existing bioMod available for kinematic assist.")
+
+    def _selected_kinematic_biomod_path(self) -> Path | None:
+        label = str(self.kinematic_model_var.get()).strip()
+        return self.kinematic_model_choices.get(label)
 
     def selected_annotation_camera_names(self) -> list[str]:
         if self.pose_data is None:
@@ -5145,6 +5258,7 @@ class AnnotationTab(ttk.Frame):
 
     def on_camera_selection_changed(self) -> None:
         self._clear_pending_reprojection()
+        self._clear_kinematic_assist_preview()
         self.update_camera_summary()
         self.refresh_preview()
 
@@ -5177,6 +5291,7 @@ class AnnotationTab(ttk.Frame):
         if clamped != int(self._current_frame_idx):
             self.save_annotations()
             self._clear_pending_reprojection()
+            self._clear_kinematic_assist_preview()
         self._current_frame_idx = clamped
         self.frame_var.set(clamped)
 
@@ -5332,6 +5447,7 @@ class AnnotationTab(ttk.Frame):
                 (ROOT / annotation_path_value) if annotation_path_value else default_annotation_path(keypoints_path)
             )
             self.annotation_payload = load_annotation_payload(self.annotation_path, keypoints_path=keypoints_path)
+            self.refresh_kinematic_model_choices()
             self.annotation_cameras_list.delete(0, tk.END)
             for camera_name in self.pose_data.camera_names:
                 self.annotation_cameras_list.insert(tk.END, str(camera_name))
@@ -5343,6 +5459,7 @@ class AnnotationTab(ttk.Frame):
             self.crop_limits_cache = {}
             self.crop_limits_key = None
             self._navigable_frame_cache = {}
+            self._clear_kinematic_assist_preview()
             self._clear_pending_reprojection()
             self.on_frame_filter_changed()
             self.refresh_preview()
@@ -5353,6 +5470,66 @@ class AnnotationTab(ttk.Frame):
         if self.annotation_path is None:
             return
         save_annotation_payload(self.annotation_path, self.annotation_payload)
+
+    def _clear_kinematic_assist_preview(self) -> None:
+        self.kinematic_q_current = None
+        self.kinematic_q_names = []
+        self.kinematic_projected_points = None
+        self.kinematic_segmented_back_projected = {}
+
+    def estimate_kinematic_assist_state(self) -> None:
+        if self.pose_data is None or self.calibrations is None:
+            return
+        biomod_path = self._selected_kinematic_biomod_path()
+        if biomod_path is None or not biomod_path.exists():
+            messagebox.showinfo("Annotation", "Choose an existing bioMod first.")
+            return
+        camera_names = self.selected_annotation_camera_names()
+        if not camera_names:
+            messagebox.showinfo("Annotation", "Select at least one camera.")
+            return
+        frame_number = self.current_frame_number()
+        try:
+            triangulated_points = triangulate_annotation_frame_points(
+                self.calibrations,
+                camera_names=camera_names,
+                frame_number=frame_number,
+                annotation_payload=self.annotation_payload,
+            )
+            if np.sum(np.all(np.isfinite(triangulated_points), axis=1)) < 2:
+                raise ValueError("Not enough triangulated annotated markers to estimate q.")
+            reconstruction = annotation_reconstruction_from_points(
+                triangulated_points, frame_number=frame_number, n_cameras=len(camera_names)
+            )
+            import biorbd
+
+            model = biorbd.Model(str(biomod_path))
+            state = initial_state_from_triangulation(model, reconstruction)
+            q_values = np.asarray(state[: model.nbQ()], dtype=float)
+            q_series = q_values.reshape(1, -1)
+            model_points_3d = biorbd_markers_from_q(biomod_path, q_series)
+            self.kinematic_q_current = q_values
+            self.kinematic_q_names = biorbd_q_names(model)
+            self.kinematic_projected_points = project_points_all_cameras(
+                model_points_3d, self.calibrations, camera_names
+            )
+            segmented_overlay = segmented_back_overlay_from_q(biomod_path, q_series)
+            self.kinematic_segmented_back_projected = (
+                {
+                    overlay_name: project_points_all_cameras(points, self.calibrations, camera_names)
+                    for overlay_name, points in segmented_overlay.items()
+                }
+                if segmented_overlay
+                else {}
+            )
+            self.kinematic_status_var.set(
+                f"Estimated q from {int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))} triangulated markers."
+            )
+            self.refresh_preview()
+        except Exception as exc:
+            self._clear_kinematic_assist_preview()
+            self.kinematic_status_var.set("")
+            messagebox.showerror("Annotation", str(exc))
 
     def _ensure_crop_limits(self, camera_names: list[str]) -> dict[str, np.ndarray]:
         if self.pose_data is None:
@@ -5678,6 +5855,7 @@ class AnnotationTab(ttk.Frame):
             )
             if self.advance_marker_var.get():
                 self._advance_to_next_keypoint()
+        self._clear_kinematic_assist_preview()
         self.save_annotations()
         self.refresh_preview()
 
@@ -5795,6 +5973,39 @@ class AnnotationTab(ttk.Frame):
                     marker=annotation_marker_shape(keypoint_name),
                     linewidths=(2.0 if keypoint_name == current_marker else 1.3),
                     zorder=5,
+                )
+
+            if (
+                self.kinematic_assist_var.get()
+                and self.kinematic_projected_points is not None
+                and ax_idx < self.kinematic_projected_points.shape[0]
+            ):
+                projected_points = np.asarray(self.kinematic_projected_points[ax_idx, 0], dtype=float)
+                draw_skeleton_2d(
+                    ax,
+                    projected_points,
+                    "#00b8d9",
+                    legend_label="Model reproj",
+                    marker_size=5.0,
+                )
+                draw_upper_back_overlay_2d(
+                    ax,
+                    hip_triangle_2d=(
+                        self.kinematic_segmented_back_projected.get("hip_triangle", np.empty((0, 0, 0)))[ax_idx, 0]
+                        if "hip_triangle" in self.kinematic_segmented_back_projected
+                        else None
+                    ),
+                    shoulder_triangle_2d=(
+                        self.kinematic_segmented_back_projected.get("shoulder_triangle", np.empty((0, 0, 0)))[ax_idx, 0]
+                        if "shoulder_triangle" in self.kinematic_segmented_back_projected
+                        else None
+                    ),
+                    mid_back_2d=(
+                        self.kinematic_segmented_back_projected.get("mid_back", np.empty((0, 0, 0)))[ax_idx, 0, 0]
+                        if "mid_back" in self.kinematic_segmented_back_projected
+                        else None
+                    ),
+                    color="#00b8d9",
                 )
 
             for (pending_camera, pending_frame, keypoint_name), pending_xy in self._pending_reprojection_points.items():
