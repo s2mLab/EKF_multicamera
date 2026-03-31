@@ -5105,6 +5105,7 @@ class AnnotationTab(ttk.Frame):
         self.preview_canvas.mpl_connect("motion_notify_event", self.on_preview_motion)
         self.preview_canvas.mpl_connect("button_release_event", self.on_preview_release)
         self._bind_frame_navigation(self.preview_canvas_widget)
+        self._bind_annotation_keypoint_navigation(self)
         self._bind_cancel_pending_reprojection(controls)
         for clickable_parent in (self, body, left, right, preview_box, preview_controls):
             clickable_parent.bind("<Button-1>", self._cancel_pending_reprojection_from_tk_event, add="+")
@@ -5289,7 +5290,7 @@ class AnnotationTab(ttk.Frame):
             return "break"
         selection = self.annotation_keypoints_list.curselection()
         current_index = int(selection[0]) if selection else 0
-        next_index = max(0, min(size - 1, current_index + int(delta)))
+        next_index = int((current_index + int(delta)) % size)
         if next_index != current_index or not selection:
             self.annotation_keypoints_list.selection_clear(0, tk.END)
             self.annotation_keypoints_list.selection_set(next_index)
@@ -5297,6 +5298,12 @@ class AnnotationTab(ttk.Frame):
             self.annotation_keypoints_list.see(next_index)
             self.on_keypoint_selection_changed()
         return "break"
+
+    def _bind_annotation_keypoint_navigation(self, widget) -> None:
+        widget.bind("<Up>", lambda event: self._step_annotation_keypoint(-1, event), add="+")
+        widget.bind("<Down>", lambda event: self._step_annotation_keypoint(1, event), add="+")
+        for child in widget.winfo_children():
+            self._bind_annotation_keypoint_navigation(child)
 
     def _cancel_pending_reprojection_from_tk_event(self, event) -> None:
         if not self._pending_reprojection_points:
@@ -5785,11 +5792,15 @@ class AnnotationTab(ttk.Frame):
     def _advance_to_next_keypoint(self) -> None:
         if not self.advance_marker_var.get():
             return
+        size = int(self.annotation_keypoints_list.size())
+        if size <= 0:
+            return
         selection = self.annotation_keypoints_list.curselection()
         index = int(selection[0]) if selection else 0
-        next_index = min(self.annotation_keypoints_list.size() - 1, index + 1)
+        next_index = int((index + 1) % size)
         self.annotation_keypoints_list.selection_clear(0, tk.END)
         self.annotation_keypoints_list.selection_set(next_index)
+        self.annotation_keypoints_list.activate(next_index)
         self.annotation_keypoints_list.see(next_index)
         self.on_keypoint_selection_changed()
 

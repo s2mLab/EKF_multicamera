@@ -1266,8 +1266,25 @@ def test_annotation_step_keypoint_up_clamps_at_first_item():
     result = pipeline_gui.AnnotationTab._step_annotation_keypoint(tab, -1)
 
     assert result == "break"
+    assert tab.annotation_keypoints_list.curselection() == (2,)
+    assert tab.annotation_keypoints_list._active == 2
+    assert tab._selection_changed is True
+
+
+def test_annotation_advance_to_next_keypoint_wraps_to_start():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_keypoints_list = _FakeListbox()
+    for keypoint_name in pipeline_gui.ANNOTATION_KEYPOINT_ORDER[:3]:
+        tab.annotation_keypoints_list.insert("end", keypoint_name)
+    tab.annotation_keypoints_list.selection_set(2)
+    tab.advance_marker_var = SimpleNamespace(get=lambda: True)
+    tab.on_keypoint_selection_changed = lambda: setattr(tab, "_selection_changed", True)
+
+    pipeline_gui.AnnotationTab._advance_to_next_keypoint(tab)
+
     assert tab.annotation_keypoints_list.curselection() == (0,)
-    assert not hasattr(tab, "_selection_changed")
+    assert tab.annotation_keypoints_list._active == 0
+    assert tab._selection_changed is True
 
 
 def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monkeypatch, tmp_path):
