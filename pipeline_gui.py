@@ -75,6 +75,10 @@ from annotation.kinematic_assist import (
     resolve_annotation_kinematic_state_info,
     store_annotation_kinematic_state,
 )
+from annotation.preview_render import (
+    annotation_frame_label_text,
+    render_annotation_camera_view,
+)
 from batch_run import (
     DEFAULT_EXCEL_OUTPUT,
     DEFAULT_KEYPOINTS_GLOB,
@@ -6217,16 +6221,15 @@ class AnnotationTab(ttk.Frame):
         frame_number = int(self.pose_data.frames[frame_idx])
         mode = self._frame_filter_mode()
         filtered_indices = self._filtered_annotation_frame_local_indices()
-        if mode == "all":
-            self.frame_label.configure(text=f"frame {frame_idx} | raw {frame_number}")
-        else:
-            filtered_position = filtered_indices.index(frame_idx) + 1 if frame_idx in filtered_indices else 0
-            self.frame_label.configure(
-                text=(
-                    f"frame {frame_idx} | raw {frame_number} | "
-                    f"{ANNOTATION_FRAME_FILTER_OPTIONS[mode]} {filtered_position}/{len(filtered_indices)}"
-                )
+        self.frame_label.configure(
+            text=annotation_frame_label_text(
+                frame_idx=frame_idx,
+                frame_number=frame_number,
+                mode=mode,
+                filtered_indices=filtered_indices,
+                mode_labels=ANNOTATION_FRAME_FILTER_OPTIONS,
             )
+        )
         crop_limits = self._ensure_crop_limits(camera_names) if self.crop_var.get() else {}
         current_marker = self.selected_keypoint_name()
         current_color = annotation_marker_color(current_marker)
@@ -6269,150 +6272,50 @@ class AnnotationTab(ttk.Frame):
                 continue
             camera_name = camera_names[ax_idx]
             self._axis_to_camera[ax] = camera_name
-            self._annotation_hover_entries[ax] = []
             width, height = self.calibrations[camera_name].image_size
+            background_image = None
             if self.show_images_var.get():
                 image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
                 if image_path is not None and image_path.exists():
-                    draw_2d_background_image(
-                        ax,
-                        annotation_adjust_image(
-                            plt.imread(str(image_path)),
-                            brightness=float(self.image_brightness_var.get()),
-                            contrast=float(self.image_contrast_var.get()),
-                        ),
-                        width=width,
-                        height=height,
+                    background_image = annotation_adjust_image(
+                        plt.imread(str(image_path)),
+                        brightness=float(self.image_brightness_var.get()),
+                        contrast=float(self.image_contrast_var.get()),
                     )
-            apply_2d_axis_limits(
+            self._annotation_hover_entries[ax] = render_annotation_camera_view(
                 ax,
-                crop_mode=("pose" if self.crop_var.get() else "full"),
-                crop_limits=crop_limits,
-                cam_name=camera_name,
+                ax_idx=ax_idx,
+                camera_name=camera_name,
                 frame_idx=frame_idx,
+                frame_number=frame_number,
                 width=width,
                 height=height,
+                crop_mode=("pose" if self.crop_var.get() else "full"),
+                crop_limits=crop_limits,
+                background_image=background_image,
+                current_marker=current_marker,
+                current_color=current_color,
+                keypoint_names=COCO17,
+                kp_index=KP_INDEX,
+                annotation_xy_getter=self._annotation_xy,
+                pending_reprojection_points=self._pending_reprojection_points,
+                marker_color_getter=annotation_marker_color,
+                marker_shape_getter=annotation_marker_shape,
+                draw_background_fn=draw_2d_background_image,
+                apply_axis_limits_fn=apply_2d_axis_limits,
+                hide_axes_fn=hide_2d_axes,
+                draw_skeleton_fn=draw_skeleton_2d,
+                draw_upper_back_fn=draw_upper_back_overlay_2d,
+                kinematic_projected_points=(
+                    self.kinematic_projected_points
+                    if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
+                    else None
+                ),
+                kinematic_segmented_back_projected=self.kinematic_segmented_back_projected,
+                motion_prior_enabled=bool(self.show_motion_prior_var.get()),
+                motion_prior_diameter=float(self.motion_prior_diameter.get()),
+                motion_prior_center_fn=annotation_motion_prior_center,
             )
-            ax.set_aspect("equal", adjustable="box")
-            ax.set_title(camera_name)
-            ax.grid(False)
-            hide_2d_axes(ax)
-
-            for keypoint_name in COCO17:
-                annotated_xy = self._annotation_xy(camera_name, frame_number, keypoint_name)
-                if annotated_xy is None:
-                    continue
-                marker_color = annotation_marker_color(keypoint_name)
-                display_color = "black" if keypoint_name == current_marker else marker_color
-                ax.scatter(
-                    [annotated_xy[0]],
-                    [annotated_xy[1]],
-                    s=(72 if keypoint_name == current_marker else 34),
-                    c=[display_color],
-                    marker=annotation_marker_shape(keypoint_name),
-                    linewidths=(1.7 if keypoint_name == current_marker else 1.0),
-                    zorder=5,
-                )
-                self._annotation_hover_entries[ax].append(
-                    {
-                        "xy": np.asarray(annotated_xy, dtype=float),
-                        "keypoint_name": str(keypoint_name),
-                        "source": "annotated",
-                    }
-                )
-
-            if (
-                bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get())
-                and self.kinematic_projected_points is not None
-                and ax_idx < self.kinematic_projected_points.shape[0]
-            ):
-                projected_points = np.asarray(self.kinematic_projected_points[ax_idx, 0], dtype=float)
-                draw_skeleton_2d(
-                    ax,
-                    projected_points,
-                    "#00b8d9",
-                    "Model reproj",
-                    marker_size=3.2,
-                    marker_fill=False,
-                    marker_edge_width=0.8,
-                    line_alpha=0.32,
-                    line_style="--",
-                    line_width_scale=0.62,
-                )
-                for keypoint_name in COCO17:
-                    projected_xy = np.asarray(projected_points[KP_INDEX[keypoint_name]], dtype=float)
-                    if not np.all(np.isfinite(projected_xy)):
-                        continue
-                    self._annotation_hover_entries[ax].append(
-                        {
-                            "xy": projected_xy,
-                            "keypoint_name": str(keypoint_name),
-                            "source": "model reproj",
-                        }
-                    )
-                draw_upper_back_overlay_2d(
-                    ax,
-                    hip_triangle_2d=(
-                        self.kinematic_segmented_back_projected.get("hip_triangle", np.empty((0, 0, 0)))[ax_idx, 0]
-                        if "hip_triangle" in self.kinematic_segmented_back_projected
-                        else None
-                    ),
-                    shoulder_triangle_2d=(
-                        self.kinematic_segmented_back_projected.get("shoulder_triangle", np.empty((0, 0, 0)))[ax_idx, 0]
-                        if "shoulder_triangle" in self.kinematic_segmented_back_projected
-                        else None
-                    ),
-                    mid_back_2d=(
-                        self.kinematic_segmented_back_projected.get("mid_back", np.empty((0, 0, 0)))[ax_idx, 0, 0]
-                        if "mid_back" in self.kinematic_segmented_back_projected
-                        else None
-                    ),
-                    color="#00b8d9",
-                    line_width=1.0,
-                    line_alpha=0.32,
-                    line_style="--",
-                    marker_size=18.0,
-                    marker_line_width=0.9,
-                    marker_alpha=0.38,
-                )
-
-            for (pending_camera, pending_frame, keypoint_name), pending_xy in self._pending_reprojection_points.items():
-                if pending_camera != str(camera_name) or int(pending_frame) != int(frame_number):
-                    continue
-                ax.scatter(
-                    [pending_xy[0]],
-                    [pending_xy[1]],
-                    s=72,
-                    facecolors="none",
-                    edgecolors=[annotation_marker_color(keypoint_name)],
-                    marker="o",
-                    linewidths=1.7,
-                    alpha=0.95,
-                    zorder=6,
-                )
-                self._annotation_hover_entries[ax].append(
-                    {
-                        "xy": np.asarray(pending_xy, dtype=float),
-                        "keypoint_name": str(keypoint_name),
-                        "source": "pending reproj",
-                    }
-                )
-
-            if self.show_motion_prior_var.get():
-                previous_xy = self._annotation_xy(camera_name, int(frame_number - 1), current_marker)
-                two_back_xy = self._annotation_xy(camera_name, int(frame_number - 2), current_marker)
-                prior_center = annotation_motion_prior_center(previous_xy, two_back_xy)
-                if prior_center is not None:
-                    circle = plt.Circle(
-                        tuple(prior_center),
-                        radius=0.5 * float(self.motion_prior_diameter.get()),
-                        edgecolor=current_color,
-                        facecolor="none",
-                        linestyle="--",
-                        linewidth=1.3,
-                        alpha=0.8,
-                    )
-                    ax.add_patch(circle)
 
             other_camera_names: list[str] = []
             other_points: list[np.ndarray] = []
