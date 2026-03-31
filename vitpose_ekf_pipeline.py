@@ -60,8 +60,9 @@ except ImportError:  # pragma: no cover - optional but useful for distortion-awa
 
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
-LOCAL_BIOBUDDY = Path("/Users/mickaelbegon/Documents/GIT/biobuddy")
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+ROOT = Path(__file__).resolve().parent
+LOCAL_BIOBUDDY = Path(os.environ.get("BIOBUDDY_ROOT", ROOT.parent / "biobuddy"))
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 DEFAULT_CAMERA_FPS = 120.0
