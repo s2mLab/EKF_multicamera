@@ -86,6 +86,7 @@ from batch_run import (
 from batch_run import discover_keypoints_files as batch_discover_keypoints_files
 from batch_run import infer_annotations_for_keypoints as batch_infer_annotations_for_keypoints
 from batch_run import infer_pose2sim_trc_for_keypoints as batch_infer_pose2sim_trc_for_keypoints
+from calibration_qc import compute_calibration_qc, frame_camera_epipolar_errors
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
 from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session, contiguous_true_regions
@@ -11950,6 +11951,441 @@ class ExecutionTab(ttk.Frame):
         self.canvas.draw_idle()
 
 
+class CalibrationTab(ttk.Frame):
+    def __init__(self, master, state: SharedAppState):
+        super().__init__(master)
+        self.state = state
+        self.pose_data = None
+        self.calibrations = None
+        self.qc = None
+        self.current_reconstruction_name = None
+        self.current_reconstruction_payload: dict[str, np.ndarray] = {}
+        self.uses_shared_reconstruction_panel = True
+        self.shared_reconstruction_selectmode = "browse"
+
+        controls = ttk.LabelFrame(self, text="Calibration QA")
+        controls.pack(fill=tk.X, padx=10, pady=10)
+        row = ttk.Frame(controls)
+        row.pack(fill=tk.X, padx=8, pady=4)
+        source_label = ttk.Label(row, text="2D source", width=10)
+        source_label.pack(side=tk.LEFT)
+        default_pose_mode = state.pose_data_mode_var.get().strip()
+        if default_pose_mode not in ("raw", "annotated", "cleaned"):
+            default_pose_mode = "cleaned"
+        self.pose_data_mode = tk.StringVar(value=default_pose_mode)
+        self.pose_mode_box = ttk.Combobox(
+            row,
+            textvariable=self.pose_data_mode,
+            values=["raw", "cleaned"],
+            width=10,
+            state="readonly",
+        )
+        self.pose_mode_box.pack(side=tk.LEFT, padx=(0, 8))
+        trim_label = ttk.Label(row, text="Trim worst 2D %", width=16)
+        trim_label.pack(side=tk.LEFT)
+        self.trim_fraction_var = tk.StringVar(value="15")
+        self.trim_fraction_box = ttk.Combobox(
+            row,
+            textvariable=self.trim_fraction_var,
+            values=["0", "5", "10", "15", "20"],
+            width=6,
+            state="readonly",
+        )
+        self.trim_fraction_box.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(row, text="Analyze / refresh", command=self.refresh_analysis).pack(side=tk.LEFT)
+        self.status_var = tk.StringVar(
+            value="2D: pairwise epipolar error after trimming the worst samples. 3D: reprojection + spatial uniformity."
+        )
+        ttk.Label(controls, textvariable=self.status_var, foreground="#4f5b66", justify=tk.LEFT).pack(
+            fill=tk.X, padx=8, pady=(0, 4)
+        )
+
+        body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=1)
+        body.add(right, weight=2)
+
+        summary_box = ttk.LabelFrame(left, text="Summary")
+        summary_box.pack(fill=tk.BOTH, expand=True)
+        self.summary = ScrolledText(summary_box, height=24, wrap=tk.WORD)
+        self.summary.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        worst_box = ttk.LabelFrame(left, text="Worst frames")
+        worst_box.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        ttk.Button(worst_box, text="Open in Cameras", command=self.open_selected_frame_in_cameras).pack(
+            anchor="w", padx=6, pady=(6, 4)
+        )
+        self.worst_frame_list = tk.Listbox(worst_box, exportselection=False, height=10)
+        self.worst_frame_list.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        figure_box = ttk.LabelFrame(right, text="2D / 3D calibration quality")
+        figure_box.pack(fill=tk.BOTH, expand=True)
+        self.figure = Figure(figsize=(11, 7))
+        self.canvas = FigureCanvasTkAgg(self.figure, master=figure_box)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, figure_box, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(fill=tk.X)
+
+        attach_tooltip(
+            source_label,
+            "Version of the 2D observations used for calibration analysis: raw, cleaned, or annotated when available.",
+        )
+        attach_tooltip(
+            self.pose_mode_box,
+            "Version of the 2D observations used for calibration analysis. `annotated` is available only when an annotation file exists for the current trial.",
+        )
+        attach_tooltip(
+            trim_label,
+            "Globally exclude the worst pairwise 2D epipolar samples before summarizing calibration quality.",
+        )
+        attach_tooltip(
+            self.trim_fraction_box,
+            "Globally exclude the worst pairwise 2D epipolar samples before summarizing calibration quality.",
+        )
+        attach_tooltip(
+            self.summary,
+            "Compact synthesis of pairwise epipolar consistency, worst frames, reprojection quality, and spatial non-uniformity.",
+        )
+        attach_tooltip(
+            self.worst_frame_list,
+            "Frames most likely to reveal calibration problems. Double-click to inspect them in Cameras.",
+        )
+
+        self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.load_resources())
+        self.pose_data_mode.trace_add("write", lambda *_args: self.load_resources())
+        self.trim_fraction_var.trace_add("write", lambda *_args: self.refresh_analysis())
+        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.state.register_shared_reconstruction_selection_listener(self._on_reconstruction_selection_changed)
+        self.worst_frame_list.bind("<Double-Button-1>", lambda _event: self.open_selected_frame_in_cameras())
+        self.sync_dataset_dir()
+
+    def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
+        panel.configure_for_consumer(
+            title="Reconstructions | Calibration",
+            refresh_callback=self.refresh_available_reconstructions,
+            selection_callback=self.refresh_analysis,
+            selectmode=self.shared_reconstruction_selectmode,
+        )
+        self.refresh_available_reconstructions()
+
+    def _publish_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
+        panel = self.state.shared_reconstruction_panel
+        if panel is not None and self.state.active_reconstruction_consumer is self:
+            panel.set_rows(rows, defaults)
+
+    def _on_reconstruction_selection_changed(self) -> None:
+        self.refresh_analysis()
+
+    def _selected_reconstruction(self) -> str | None:
+        selected = list(self.state.shared_reconstruction_selection)
+        return selected[-1] if selected else None
+
+    def sync_dataset_dir(self) -> None:
+        self.refresh_pose_mode_choices()
+        self.refresh_available_reconstructions()
+        self.load_resources()
+
+    def _available_pose_modes(self) -> list[str]:
+        keypoints_value = self.state.keypoints_var.get().strip()
+        if not keypoints_value:
+            return ["raw", "cleaned"]
+        return available_model_pose_modes(self.state, ROOT / keypoints_value)
+
+    def refresh_pose_mode_choices(self) -> None:
+        modes = self._available_pose_modes()
+        self.pose_mode_box.configure(values=modes)
+        current = str(self.pose_data_mode.get()).strip()
+        if current not in modes:
+            fallback = "annotated" if "annotated" in modes else ("cleaned" if "cleaned" in modes else modes[0])
+            self.pose_data_mode.set(fallback)
+
+    def refresh_available_reconstructions(self) -> None:
+        try:
+            _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
+                self.state,
+                preferred_names=["triangulation_exhaustive", "triangulation_greedy", "ekf_3d", "ekf_2d_acc"],
+                fallback_count=4,
+                include_3d=True,
+                include_q=True,
+                include_q_root=True,
+            )
+            self._publish_reconstruction_rows(preview_state.rows, preview_state.defaults[:1])
+        except Exception:
+            pass
+
+    def load_resources(self) -> None:
+        try:
+            self.refresh_pose_mode_choices()
+            self.calibrations, self.pose_data = get_cached_pose_data(
+                self.state,
+                keypoints_path=ROOT / self.state.keypoints_var.get(),
+                calib_path=ROOT / self.state.calib_var.get(),
+                **shared_pose_data_kwargs(self.state, data_mode=self.pose_data_mode.get()),
+            )
+            self.refresh_analysis()
+        except Exception as exc:
+            messagebox.showerror("Calibration", str(exc))
+
+    def refresh_analysis(self) -> None:
+        if self.pose_data is None or self.calibrations is None:
+            return
+        self.current_reconstruction_name = self._selected_reconstruction()
+        payload = {}
+        if self.current_reconstruction_name:
+            recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), self.current_reconstruction_name)
+            payload = {} if recon_dir is None else load_bundle_payload(recon_dir)
+        self.current_reconstruction_payload = payload
+        trim_fraction = max(0.0, float(self.trim_fraction_var.get() or "0")) / 100.0
+        self.qc = compute_calibration_qc(
+            self.pose_data,
+            self.calibrations,
+            reconstruction_payload=payload or None,
+            trim_fraction=trim_fraction,
+            spatial_bins=3,
+        )
+        self.status_var.set(
+            f"Source: {self.pose_data_mode.get()} | 2D trim: "
+            f"{int(round(self.qc.two_d.trim_fraction * 100.0))}% | Reconstruction: "
+            f"{self.current_reconstruction_name or 'none selected'}"
+        )
+        self.render_summary()
+        self.refresh_worst_frame_list()
+        self.refresh_plot()
+
+    def refresh_worst_frame_list(self) -> None:
+        self.worst_frame_list.delete(0, tk.END)
+        if self.qc is None or self.pose_data is None:
+            return
+        for frame_number, value in self._worst_frames(self.qc.two_d.per_frame_mean_px, count=5):
+            self.worst_frame_list.insert(tk.END, f"2D | frame {frame_number} | {value:.2f} px")
+        if self.qc.three_d is not None:
+            for frame_number, value in self._worst_frames(self.qc.three_d.per_frame_mean_px, count=5):
+                self.worst_frame_list.insert(tk.END, f"3D | frame {frame_number} | {value:.2f} px")
+
+    def _selected_worst_frame(self) -> tuple[str, int] | None:
+        selection = self.worst_frame_list.curselection()
+        if not selection:
+            return None
+        text = str(self.worst_frame_list.get(selection[0]))
+        match = re.search(r"^(2D|3D)\s+\|\s+frame\s+(\d+)", text)
+        if match is None:
+            return None
+        return match.group(1), int(match.group(2))
+
+    def open_selected_frame_in_cameras(self) -> None:
+        selected = self._selected_worst_frame()
+        if selected is None or self.pose_data is None:
+            return
+        metric_kind, frame_number = selected
+        camera_name = self._worst_camera_for_frame(metric_kind, frame_number)
+        notebook = self.master if isinstance(self.master, ttk.Notebook) else None
+        if notebook is None:
+            return
+        target_tab = None
+        for tab_id in notebook.tabs():
+            if notebook.tab(tab_id, "text") == "Cameras":
+                target_tab = notebook.nametowidget(tab_id)
+                notebook.select(tab_id)
+                break
+        if target_tab is not None and hasattr(target_tab, "show_specific_frame"):
+            target_tab.show_specific_frame(frame_number=frame_number, camera_name=camera_name)
+
+    def _worst_camera_for_frame(self, metric_kind: str, frame_number: int) -> str | None:
+        if self.pose_data is None:
+            return None
+        camera_names = list(self.pose_data.camera_names)
+        if frame_number not in set(int(frame) for frame in self.pose_data.frames):
+            return None
+        frame_idx = int(np.where(np.asarray(self.pose_data.frames, dtype=int) == int(frame_number))[0][0])
+        if metric_kind == "3D" and self.current_reconstruction_payload:
+            errors = np.asarray(self.current_reconstruction_payload.get("reprojection_error_per_view"), dtype=float)
+            if errors.ndim == 3 and frame_idx < errors.shape[0]:
+                per_camera = np.nanmean(errors[frame_idx], axis=0)
+                finite = np.isfinite(per_camera)
+                if np.any(finite):
+                    return camera_names[int(np.nanargmax(per_camera))]
+        per_camera_values = []
+        for cam_idx, camera_name in enumerate(camera_names):
+            values = frame_camera_epipolar_errors(
+                self.pose_data,
+                self.calibrations,
+                frame_idx=frame_idx,
+                camera_idx=cam_idx,
+            )
+            per_camera_values.append(np.nanmean(values))
+        per_camera_values = np.asarray(per_camera_values, dtype=float)
+        finite = np.isfinite(per_camera_values)
+        if not np.any(finite):
+            return camera_names[0] if camera_names else None
+        return camera_names[int(np.nanargmax(per_camera_values))]
+
+    def render_summary(self) -> None:
+        self.summary.delete("1.0", tk.END)
+        if self.qc is None or self.pose_data is None:
+            self.summary.insert(tk.END, "No calibration analysis available.\n")
+            return
+        two_d = self.qc.two_d
+        lines = [
+            "2D calibration quality",
+            f"- Trimmed worst 2D fraction: {int(round(two_d.trim_fraction * 100.0))}%",
+            (
+                "- Trim threshold: "
+                + ("none" if two_d.trim_threshold_px is None else f"{two_d.trim_threshold_px:.2f} px")
+            ),
+            f"- Kept pairwise 2D samples: {two_d.kept_ratio * 100.0:.1f}%",
+        ]
+        worst_pairs = self._worst_camera_pairs(two_d.pairwise_median_px)
+        if worst_pairs:
+            lines.append("- Worst camera pairs (median epipolar px):")
+            lines.extend(f"  - {cam_a} / {cam_b}: {value:.2f} px" for cam_a, cam_b, value in worst_pairs[:3])
+        worst_frames_2d = self._worst_frames(two_d.per_frame_mean_px, count=5)
+        if worst_frames_2d:
+            lines.append("- Worst 2D frames (mean epipolar px):")
+            lines.extend(f"  - frame {frame}: {value:.2f} px" for frame, value in worst_frames_2d)
+
+        if self.qc.three_d is not None:
+            three_d = self.qc.three_d
+            reproj_mean = three_d.reprojection_summary.get("mean_px")
+            reproj_std = three_d.reprojection_summary.get("std_px")
+            lines.extend(
+                [
+                    "",
+                    "3D calibration quality",
+                    "- Reprojection mean/std: "
+                    + (
+                        "none"
+                        if reproj_mean is None or reproj_std is None
+                        else f"{float(reproj_mean):.2f} +/- {float(reproj_std):.2f} px"
+                    ),
+                    "- Spatial non-uniformity (CV / range): "
+                    + (
+                        "none"
+                        if three_d.spatial_uniformity_cv is None or three_d.spatial_uniformity_range_px is None
+                        else f"{three_d.spatial_uniformity_cv:.3f} / {three_d.spatial_uniformity_range_px:.2f} px"
+                    ),
+                ]
+            )
+            worst_frames_3d = self._worst_frames(three_d.per_frame_mean_px, count=5)
+            if worst_frames_3d:
+                lines.append("- Worst 3D frames (mean reprojection px):")
+                lines.extend(f"  - frame {frame}: {value:.2f} px" for frame, value in worst_frames_3d)
+
+        self.summary.insert(tk.END, "\n".join(lines) + "\n")
+
+    def refresh_plot(self) -> None:
+        self.figure.clear()
+        axes = self.figure.subplots(2, 2)
+        if self.qc is None or self.pose_data is None:
+            for ax in axes.flat:
+                ax.axis("off")
+            self.canvas.draw_idle()
+            return
+        two_d = self.qc.two_d
+        camera_names = list(self.pose_data.camera_names)
+
+        ax = axes[0, 0]
+        matrix = np.asarray(two_d.pairwise_median_px, dtype=float)
+        if np.isfinite(matrix).any():
+            image = ax.imshow(matrix, cmap="magma")
+            ax.set_xticks(range(len(camera_names)), camera_names, rotation=45, ha="right")
+            ax.set_yticks(range(len(camera_names)), camera_names)
+            ax.set_title("Pairwise epipolar median (px)")
+            self.figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+        else:
+            ax.axis("off")
+            ax.text(0.5, 0.5, "No finite pairwise epipolar data", ha="center", va="center", transform=ax.transAxes)
+
+        ax = axes[0, 1]
+        x = np.arange(len(camera_names))
+        width = 0.38
+        ax.bar(x - width / 2, np.nan_to_num(two_d.per_camera_median_px, nan=0.0), width=width, label="2D epi median")
+        if self.qc.three_d is not None:
+            per_camera = self.qc.three_d.reprojection_summary.get("per_camera", {})
+            reproj_values = np.array(
+                [float(per_camera.get(name, {}).get("mean_px") or 0.0) for name in camera_names],
+                dtype=float,
+            )
+            ax.bar(x + width / 2, reproj_values, width=width, label="3D reproj mean")
+        ax.set_xticks(x, camera_names, rotation=45, ha="right")
+        ax.set_ylabel("px")
+        ax.set_title("Per-camera quality")
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(alpha=0.25, axis="y")
+
+        ax = axes[1, 0]
+        frames = np.asarray(self.pose_data.frames, dtype=int)
+        ax.plot(frames, two_d.per_frame_mean_px, label="2D epipolar mean", linewidth=1.2)
+        if self.qc.three_d is not None:
+            ax.plot(frames, self.qc.three_d.per_frame_mean_px, label="3D reproj mean", linewidth=1.2)
+        ax.set_title("Worst frames over time")
+        ax.set_xlabel("Frame")
+        ax.set_ylabel("px")
+        ax.grid(alpha=0.25)
+        ax.legend(loc="best", fontsize=8)
+
+        ax = axes[1, 1]
+        if self.qc.three_d is None or self.qc.three_d.point_positions.size == 0:
+            ax.axis("off")
+            ax.text(
+                0.5,
+                0.5,
+                "Select a reconstruction with 3D points to inspect spatial calibration quality.",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        else:
+            cv_text = (
+                "n/a"
+                if self.qc.three_d.spatial_uniformity_cv is None
+                else f"{self.qc.three_d.spatial_uniformity_cv:.3f}"
+            )
+            scatter = ax.scatter(
+                self.qc.three_d.point_positions[:, 0],
+                self.qc.three_d.point_positions[:, 2],
+                c=self.qc.three_d.point_errors_px,
+                cmap="turbo",
+                s=10,
+                alpha=0.65,
+            )
+            ax.set_title("Spatial reprojection quality (X/Z)\n" f"CV={cv_text}")
+            ax.set_xlabel("X (m)")
+            ax.set_ylabel("Z (m)")
+            ax.grid(alpha=0.2)
+            self.figure.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="px")
+
+        self.figure.tight_layout()
+        self.canvas.draw_idle()
+
+    def _worst_camera_pairs(self, matrix: np.ndarray) -> list[tuple[str, str, float]]:
+        if self.pose_data is None:
+            return []
+        pairs = []
+        camera_names = list(self.pose_data.camera_names)
+        for i in range(len(camera_names)):
+            for j in range(i + 1, len(camera_names)):
+                value = float(matrix[i, j])
+                if np.isfinite(value):
+                    pairs.append((camera_names[i], camera_names[j], value))
+        pairs.sort(key=lambda item: item[2], reverse=True)
+        return pairs
+
+    def _worst_frames(self, values: np.ndarray, *, count: int) -> list[tuple[int, float]]:
+        if self.pose_data is None:
+            return []
+        array = np.asarray(values, dtype=float)
+        finite_idx = np.flatnonzero(np.isfinite(array))
+        if finite_idx.size == 0:
+            return []
+        order = finite_idx[np.argsort(array[finite_idx])[::-1]]
+        return [(int(self.pose_data.frames[idx]), float(array[idx])) for idx in order[:count]]
+
+
 class CameraToolsTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
@@ -12123,6 +12559,17 @@ class CameraToolsTab(ttk.Frame):
         ).pack(side=tk.LEFT, padx=(0, 8))
         self.images_root_entry = LabeledEntry(image_controls, "Images root", "", browse=True, directory=True)
         self.images_root_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        overlay_label = ttk.Label(image_controls, text="QA overlay", width=10)
+        overlay_label.pack(side=tk.LEFT, padx=(8, 0))
+        self.qa_overlay_var = tk.StringVar(value="none")
+        self.qa_overlay_box = ttk.Combobox(
+            image_controls,
+            textvariable=self.qa_overlay_var,
+            values=["none", "2D epipolar", "3D reproj", "3D excluded"],
+            width=14,
+            state="readonly",
+        )
+        self.qa_overlay_box.pack(side=tk.LEFT, padx=(0, 8))
 
         inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
         inspector_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
@@ -12165,6 +12612,10 @@ class CameraToolsTab(ttk.Frame):
             self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F."
         )
         attach_tooltip(self.images_root_entry, "Dossier d'images utilisé comme fond du preview caméra, si disponible.")
+        attach_tooltip(
+            self.qa_overlay_box,
+            "Overlay calibration QA on the 2D image: local 2D epipolar error, selected 3D reprojection error, or 3D excluded keypoints.",
+        )
         attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
         attach_tooltip(
             self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée."
@@ -12172,6 +12623,7 @@ class CameraToolsTab(ttk.Frame):
 
         self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.flip_camera_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
+        self.qa_overlay_var.trace_add("write", lambda *_args: self.render_flip_preview())
         self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
         for widget in (self.flip_frame_list, self.flip_canvas_widget, self.flip_method_box, self.flip_camera_box):
             widget.bind("<KeyPress-f>", self.toggle_flip_current_frame)
@@ -12458,6 +12910,54 @@ class CameraToolsTab(ttk.Frame):
                 return self.flip_frame_local_indices[idx]
         return self.flip_frame_local_indices[0] if self.flip_frame_local_indices else None
 
+    def show_specific_frame(self, *, frame_number: int, camera_name: str | None = None) -> None:
+        if self.base_pose_data is None:
+            return
+        frames = np.asarray(self.base_pose_data.frames, dtype=int)
+        matches = np.flatnonzero(frames == int(frame_number))
+        if matches.size == 0:
+            return
+        if camera_name and camera_name in self.base_pose_data.camera_names:
+            self.flip_camera_var.set(camera_name)
+        local_idx = int(matches[0])
+        self.flip_frame_local_indices = [local_idx]
+        self.flip_frame_list.delete(0, tk.END)
+        selected_camera = self.flip_camera_var.get() or (
+            self.base_pose_data.camera_names[0] if self.base_pose_data.camera_names else ""
+        )
+        self.flip_frame_list.insert(tk.END, f"manual | frame {int(frame_number)} | {selected_camera}")
+        self.flip_frame_list.selection_set(0)
+        self.render_flip_preview()
+
+    def _qa_overlay_data(
+        self, camera_name: str, frame_local_idx: int
+    ) -> tuple[str, np.ndarray | None, np.ndarray | None, str | None]:
+        mode = self.qa_overlay_var.get().strip().lower()
+        if mode == "2d epipolar":
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            values = frame_camera_epipolar_errors(
+                self.pose_data, self.calibrations, frame_idx=frame_local_idx, camera_idx=cam_idx
+            )
+            return "2D epipolar", values, None, "turbo"
+        payload = self._reference_payload()
+        if mode == "3d reproj":
+            errors = payload.get("reprojection_error_per_view")
+            if errors is None:
+                return "3D reproj", None, None, None
+            errors = np.asarray(errors, dtype=float)
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            if errors.ndim == 3 and frame_local_idx < errors.shape[0] and cam_idx < errors.shape[2]:
+                return "3D reproj", np.asarray(errors[frame_local_idx, :, cam_idx], dtype=float), None, "turbo"
+        if mode == "3d excluded":
+            excluded = payload.get("excluded_views")
+            if excluded is None:
+                return "3D excluded", None, None, None
+            excluded = np.asarray(excluded, dtype=bool)
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            if excluded.ndim == 3 and frame_local_idx < excluded.shape[0] and cam_idx < excluded.shape[2]:
+                return "3D excluded", None, np.asarray(excluded[frame_local_idx, :, cam_idx], dtype=bool), None
+        return "none", None, None, None
+
     def _reference_projection(self, camera_name: str, frame_local_idx: int) -> tuple[np.ndarray | None, str, str]:
         reference_name = (self._selected_reconstruction() or "").strip()
         if not reference_name:
@@ -12568,6 +13068,37 @@ class CameraToolsTab(ttk.Frame):
             xlabel="x (px)",
             ylabel="y (px)",
         )
+        overlay_label, overlay_values, overlay_mask, overlay_cmap = self._qa_overlay_data(camera_name, frame_local_idx)
+        finite_points_mask = np.all(np.isfinite(display_raw_points), axis=1)
+        if overlay_values is not None:
+            finite_overlay = finite_points_mask & np.isfinite(overlay_values)
+            if np.any(finite_overlay):
+                scatter = ax.scatter(
+                    display_raw_points[finite_overlay, 0],
+                    display_raw_points[finite_overlay, 1],
+                    c=np.asarray(overlay_values[finite_overlay], dtype=float),
+                    cmap=overlay_cmap or "turbo",
+                    s=18.0,
+                    linewidths=0.8,
+                    edgecolors="white",
+                    alpha=0.95,
+                    zorder=6,
+                )
+                self.flip_figure.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=overlay_label)
+        if overlay_mask is not None:
+            marked = finite_points_mask & np.asarray(overlay_mask, dtype=bool)
+            if np.any(marked):
+                ax.scatter(
+                    display_raw_points[marked, 0],
+                    display_raw_points[marked, 1],
+                    marker="x",
+                    s=34.0,
+                    linewidths=1.6,
+                    c="#111111",
+                    alpha=0.95,
+                    zorder=7,
+                    label="Excluded in 3D",
+                )
         side_handles = [
             plt.Line2D(
                 [],
@@ -12612,6 +13143,7 @@ class CameraToolsTab(ttk.Frame):
                     f"method={method}",
                     f"raw_swapped={'yes' if self.flip_applied_var.get() else 'no'}",
                     f"reference={projected_label if projected_points is not None else 'none'}",
+                    f"qa_overlay={overlay_label}",
                     f"suspect={'yes' if suspect else 'no'}",
                     f"candidate={'yes' if self._flip_flag(detail_arrays, 'candidate_mask', cam_idx, frame_local_idx) else 'no'}",
                     f"temporal_support={'yes' if self._flip_flag(detail_arrays, 'temporal_support_mask', cam_idx, frame_local_idx) else 'no'}",
@@ -13644,6 +14176,7 @@ class LauncherApp(tk.Tk):
         tab_specs = [
             ("2D analysis", DataExplorer2DTab),
             ("Cameras", CameraToolsTab),
+            ("Calibration", CalibrationTab),
             ("Annotation", AnnotationTab),
             ("Models", ModelTab),
             ("Profiles", ProfilesTab),

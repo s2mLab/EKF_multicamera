@@ -195,6 +195,160 @@ def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_sta
     assert loaded_preview_state is preview_state
 
 
+def test_calibration_tab_refresh_analysis_uses_selected_reconstruction_payload(monkeypatch):
+    tab = pipeline_gui.CalibrationTab.__new__(pipeline_gui.CalibrationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([0], dtype=int))
+    tab.calibrations = {"cam0": object()}
+    tab.state = SimpleNamespace(
+        shared_reconstruction_selection=("triangulation_exhaustive",),
+        output_root_var=SimpleNamespace(get=lambda: "output"),
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/demo_keypoints.json"),
+    )
+    tab.trim_fraction_var = SimpleNamespace(get=lambda: "15")
+    tab.pose_data_mode = SimpleNamespace(get=lambda: "cleaned")
+    tab.status_var = SimpleNamespace(set=lambda value: setattr(tab, "_status_text", value))
+    tab.worst_frame_list = _FakeListbox()
+    tab.render_summary = lambda: setattr(tab, "_summary_rendered", True)
+    tab.refresh_plot = lambda: setattr(tab, "_plot_rendered", True)
+
+    captured = {}
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/demo"))
+    monkeypatch.setattr(
+        pipeline_gui,
+        "reconstruction_dir_by_name",
+        lambda _dataset_dir, _name: Path("output/demo/reconstructions/triangulation_exhaustive"),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "load_bundle_payload",
+        lambda _path: {"points_3d": np.zeros((1, 17, 3)), "reprojection_error_per_view": np.zeros((1, 17, 1))},
+    )
+
+    def _fake_qc(pose_data, calibrations, *, reconstruction_payload, trim_fraction, spatial_bins):
+        captured["pose_data"] = pose_data
+        captured["calibrations"] = calibrations
+        captured["payload"] = reconstruction_payload
+        captured["trim_fraction"] = trim_fraction
+        captured["spatial_bins"] = spatial_bins
+        return SimpleNamespace(
+            two_d=SimpleNamespace(trim_fraction=trim_fraction, per_frame_mean_px=np.array([1.0], dtype=float)),
+            three_d=None,
+        )
+
+    monkeypatch.setattr(pipeline_gui, "compute_calibration_qc", _fake_qc)
+
+    pipeline_gui.CalibrationTab.refresh_analysis(tab)
+
+    assert captured["pose_data"] is tab.pose_data
+    assert captured["calibrations"] is tab.calibrations
+    assert "points_3d" in captured["payload"]
+    assert captured["trim_fraction"] == 0.15
+    assert captured["spatial_bins"] == 3
+    assert tab._summary_rendered is True
+    assert tab._plot_rendered is True
+
+
+def test_calibration_tab_refresh_pose_mode_choices_falls_back_when_annotated_missing(monkeypatch, tmp_path):
+    root = tmp_path
+
+    class _Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    tab = pipeline_gui.CalibrationTab.__new__(pipeline_gui.CalibrationTab)
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        annotation_path_var=SimpleNamespace(get=lambda: "inputs/annotations/trial_annotations.json"),
+    )
+    tab.pose_mode_box = _FakeCombobox()
+    tab.pose_data_mode = _Var("annotated")
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", root)
+
+    pipeline_gui.CalibrationTab.refresh_pose_mode_choices(tab)
+
+    assert tab.pose_mode_box.values == ["raw", "cleaned"]
+    assert tab.pose_data_mode.get() == "cleaned"
+
+
+def test_calibration_tab_load_resources_uses_local_pose_mode(monkeypatch):
+    tab = pipeline_gui.CalibrationTab.__new__(pipeline_gui.CalibrationTab)
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        calib_var=SimpleNamespace(get=lambda: "inputs/calibration/Calib.toml"),
+        pose_filter_window_var=SimpleNamespace(get=lambda: "9"),
+        pose_outlier_ratio_var=SimpleNamespace(get=lambda: "0.1"),
+        pose_p_low_var=SimpleNamespace(get=lambda: "5"),
+        pose_p_high_var=SimpleNamespace(get=lambda: "95"),
+        pose_data_mode_var=SimpleNamespace(get=lambda: "cleaned"),
+        annotation_path_var=SimpleNamespace(get=lambda: "inputs/annotations/trial_annotations.json"),
+    )
+    tab.pose_mode_box = _FakeCombobox()
+    tab.pose_data_mode = SimpleNamespace(get=lambda: "raw", set=lambda _value: None)
+    tab.refresh_analysis = lambda: setattr(tab, "_analysis_refreshed", True)
+    tab.refresh_pose_mode_choices = lambda: None
+
+    captured = {}
+
+    def _fake_get_cached_pose_data(_state, **kwargs):
+        captured.update(kwargs)
+        return {"cam0": object()}, object()
+
+    monkeypatch.setattr(pipeline_gui, "get_cached_pose_data", _fake_get_cached_pose_data)
+
+    pipeline_gui.CalibrationTab.load_resources(tab)
+
+    assert captured["data_mode"] == "raw"
+    assert tab._analysis_refreshed is True
+
+
+def test_calibration_tab_refresh_worst_frame_list_populates_both_2d_and_3d():
+    tab = pipeline_gui.CalibrationTab.__new__(pipeline_gui.CalibrationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13], dtype=int))
+    tab.qc = SimpleNamespace(
+        two_d=SimpleNamespace(per_frame_mean_px=np.array([1.0, 4.0, np.nan, 3.0], dtype=float)),
+        three_d=SimpleNamespace(per_frame_mean_px=np.array([2.0, np.nan, 7.0, 5.0], dtype=float)),
+    )
+    tab.worst_frame_list = _FakeListbox()
+
+    pipeline_gui.CalibrationTab.refresh_worst_frame_list(tab)
+
+    assert tab.worst_frame_list.items[0].startswith("2D | frame 11")
+    assert any(item.startswith("3D | frame 12") for item in tab.worst_frame_list.items)
+
+
+def test_camera_tools_tab_qa_overlay_data_reads_reprojection_and_excluded_payload(monkeypatch):
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.pose_data = SimpleNamespace(camera_names=["cam0", "cam1"])
+    tab.calibrations = {"cam0": object(), "cam1": object()}
+    tab.qa_overlay_var = SimpleNamespace(get=lambda: "3D reproj")
+    tab._reference_payload = lambda: {
+        "reprojection_error_per_view": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=float),
+        "excluded_views": np.array([[[False, True], [True, False]]], dtype=bool),
+    }
+
+    label, values, mask, cmap = pipeline_gui.CameraToolsTab._qa_overlay_data(tab, "cam1", 0)
+
+    assert label == "3D reproj"
+    np.testing.assert_array_equal(values, np.array([2.0, 4.0]))
+    assert mask is None
+    assert cmap == "turbo"
+
+    tab.qa_overlay_var = SimpleNamespace(get=lambda: "3D excluded")
+    label, values, mask, cmap = pipeline_gui.CameraToolsTab._qa_overlay_data(tab, "cam0", 0)
+    assert label == "3D excluded"
+    assert values is None
+    np.testing.assert_array_equal(mask, np.array([False, True]))
+    assert cmap is None
+
+
 def test_get_cached_calibrations_reports_startup_status(monkeypatch, tmp_path):
     messages = []
     state = SimpleNamespace(calibration_cache={}, startup_status_callback=messages.append)
