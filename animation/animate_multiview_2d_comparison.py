@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
-import math
 import os
 import sys
 import tempfile
@@ -51,6 +50,13 @@ from animation.animate_dual_stick_comparison import (
 )
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations, subset_pose_data
 from judging.execution import infer_execution_images_root, resolve_execution_image_path
+from preview.two_d_view import (
+    apply_2d_axis_limits,
+    camera_layout,
+    compute_pose_crop_limits_2d,
+    draw_2d_background_image,
+    hide_2d_axes,
+)
 from reconstruction.reconstruction_dataset import (
     dataset_source_paths,
     reconstruction_color,
@@ -209,58 +215,6 @@ def subsample_layer_dict(
     return {key: value for key, value in zip(keys, subsampled)}
 
 
-def camera_layout(n_cameras: int) -> tuple[int, int]:
-    ncols = math.ceil(math.sqrt(n_cameras))
-    nrows = math.ceil(n_cameras / ncols)
-    return nrows, ncols
-
-
-def square_crop_bounds(
-    xmin: float,
-    xmax: float,
-    ymin: float,
-    ymax: float,
-    width: float,
-    height: float,
-    margin: float,
-) -> np.ndarray:
-    """Return a square crop preserving equal x/y scale around visible points."""
-
-    span_x = max(10.0, float(xmax - xmin))
-    span_y = max(10.0, float(ymax - ymin))
-    half_size = 0.5 * max(span_x, span_y) * (1.0 + float(margin))
-    half_size = max(12.0, half_size)
-    center_x = 0.5 * (float(xmin) + float(xmax))
-    center_y = 0.5 * (float(ymin) + float(ymax))
-    x0 = center_x - half_size
-    x1 = center_x + half_size
-    y0 = center_y - half_size
-    y1 = center_y + half_size
-    if x0 < 0.0:
-        x1 = min(float(width), x1 - x0)
-        x0 = 0.0
-    if x1 > float(width):
-        x0 = max(0.0, x0 - (x1 - float(width)))
-        x1 = float(width)
-    if y0 < 0.0:
-        y1 = min(float(height), y1 - y0)
-        y0 = 0.0
-    if y1 > float(height):
-        y0 = max(0.0, y0 - (y1 - float(height)))
-        y1 = float(height)
-    final_size = min(float(x1 - x0), float(y1 - y0))
-    if final_size <= 0.0:
-        return np.array([0.0, float(width), float(height), 0.0], dtype=float)
-    center_x = 0.5 * (x0 + x1)
-    center_y = 0.5 * (y0 + y1)
-    half_final = 0.5 * final_size
-    x0 = max(0.0, center_x - half_final)
-    x1 = min(float(width), center_x + half_final)
-    y0 = max(0.0, center_y - half_final)
-    y1 = min(float(height), center_y + half_final)
-    return np.array([x0, x1, y1, y0], dtype=float)
-
-
 def layer_style(name: str, marker_size: float) -> dict[str, object]:
     if name == "raw":
         return {
@@ -313,49 +267,6 @@ def scatter_markers(name: str) -> dict[str, str]:
     return {"center": center, "left": "^", "right": "s"}
 
 
-def compute_pose_crop_limits(
-    raw_2d: np.ndarray, calibrations: dict, camera_names: list[str], margin: float
-) -> dict[str, np.ndarray]:
-    """Calcule des bornes de crop par frame et par camera a partir des keypoints 2D."""
-    limits: dict[str, np.ndarray] = {}
-    for cam_idx, cam_name in enumerate(camera_names):
-        width, height = calibrations[cam_name].image_size
-        n_frames = raw_2d.shape[1]
-        camera_limits = np.full((n_frames, 4), np.nan, dtype=float)
-        for frame_idx in range(n_frames):
-            points = raw_2d[cam_idx, frame_idx]
-            valid = np.all(np.isfinite(points), axis=1)
-            if not np.any(valid):
-                continue
-            xy = points[valid]
-            xmin, ymin = np.min(xy, axis=0)
-            xmax, ymax = np.max(xy, axis=0)
-            camera_limits[frame_idx] = square_crop_bounds(
-                xmin=xmin,
-                xmax=xmax,
-                ymin=ymin,
-                ymax=ymax,
-                width=width,
-                height=height,
-                margin=margin,
-            )
-        valid_frames = np.flatnonzero(np.all(np.isfinite(camera_limits), axis=1))
-        if valid_frames.size == 0:
-            camera_limits[:] = np.array([0.0, float(width), float(height), 0.0], dtype=float)
-        else:
-            first_valid = int(valid_frames[0])
-            last_valid = int(valid_frames[-1])
-            for frame_idx in range(0, first_valid):
-                camera_limits[frame_idx] = camera_limits[first_valid]
-            for frame_idx in range(first_valid + 1, n_frames):
-                if not np.all(np.isfinite(camera_limits[frame_idx])):
-                    camera_limits[frame_idx] = camera_limits[frame_idx - 1]
-            for frame_idx in range(last_valid + 1, n_frames):
-                camera_limits[frame_idx] = camera_limits[last_valid]
-        limits[cam_name] = camera_limits
-    return limits
-
-
 def compose_crop_reference_points(
     base_points_2d: np.ndarray,
     layer_2d: dict[str, np.ndarray],
@@ -374,50 +285,6 @@ def compose_crop_reference_points(
     if len(stacked) == 1:
         return stacked[0]
     return np.concatenate(stacked, axis=2)
-
-
-def apply_2d_axis_limits(
-    ax,
-    *,
-    crop_mode: str,
-    crop_limits: dict[str, np.ndarray],
-    cam_name: str,
-    frame_idx: int,
-    width: float,
-    height: float,
-) -> None:
-    """Applique un cadrage 2D fixe et empeche l'autoscale de l'annuler."""
-    if crop_mode == "pose":
-        x0, x1, y1, y0 = crop_limits[cam_name][frame_idx]
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(y1, y0)
-    else:
-        ax.set_xlim(0, width)
-        ax.set_ylim(height, 0)
-    ax.set_autoscale_on(False)
-
-
-def draw_2d_background_image(ax, image: np.ndarray, width: float, height: float) -> None:
-    """Display a 2D image in the same pixel coordinates as the plotted keypoints."""
-
-    ax.imshow(
-        image,
-        extent=(0.0, float(width), float(height), 0.0),
-        origin="upper",
-        interpolation="none",
-        zorder=0,
-    )
-
-
-def hide_2d_axes(ax) -> None:
-    """Hide pixel axes while keeping titles and plotted data visible."""
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    for spine in ax.spines.values():
-        spine.set_visible(False)
 
 
 def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
@@ -547,7 +414,7 @@ def create_animation(
     line_artists: dict[str, list[list]] = {key: [] for key in display_names}
     title = fig.suptitle("", fontsize=14)
     crop_limits = (
-        compute_pose_crop_limits(crop_reference_points, calibrations, camera_names, crop_margin)
+        compute_pose_crop_limits_2d(crop_reference_points, calibrations, camera_names, crop_margin)
         if crop_mode == "pose"
         else {}
     )
@@ -764,7 +631,7 @@ def render_frame(
     fig, axes = plt.subplots(nrows, ncols, figsize=(5.9 * ncols, 4.8 * nrows))
     axes = np.atleast_1d(axes).ravel()
     crop_limits = (
-        compute_pose_crop_limits(
+        compute_pose_crop_limits_2d(
             compose_crop_reference_points(raw_2d, layer_2d, show), calibrations, camera_names, crop_margin
         )
         if crop_mode == "pose"

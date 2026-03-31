@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 import pipeline_gui
+from annotation import frame_navigation
 from preview.dataset_preview_state import DatasetPreviewState
 from preview.shared_reconstruction_panel import SharedReconstructionPanel
 from vitpose_ekf_pipeline import CameraCalibration
@@ -909,7 +910,7 @@ def test_annotation_navigable_frames_use_indexed_image_availability(monkeypatch,
 
     calls = []
     monkeypatch.setattr(
-        pipeline_gui,
+        frame_navigation,
         "available_execution_image_frames",
         lambda root, camera_names: calls.append((root, tuple(camera_names))) or {"cam0": {11}, "cam1": {13}},
     )
