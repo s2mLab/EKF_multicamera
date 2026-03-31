@@ -161,6 +161,7 @@ from kinematics.root_series import (
 from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.dataset_preview_loader import load_dataset_preview_resources
 from preview.dataset_preview_state import DatasetPreviewState, build_dataset_preview_state
+from preview.frame_2d_render import SkeletonLayer2D, render_camera_frame_2d
 from preview.preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -1629,6 +1630,7 @@ def compose_multiview_crop_points(
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
 ANNOTATION_DELETE_RADIUS_PX = 18.0
 ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
+ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER = 3
 ANNOTATION_KINEMATIC_CLICK_PASSES = 3
 ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES = 1
 ANNOTATION_FRAME_FILTER_OPTIONS = {
@@ -1653,6 +1655,15 @@ def annotation_marker_shape(keypoint_name: str) -> str:
     if str(keypoint_name) in RIGHT_KEYPOINTS:
         return "x"
     return "+"
+
+
+def annotation_keypoint_names_for_biomod(biomod_path: str | Path | None) -> tuple[str, ...]:
+    """Return the annotation keypoint order, adding segmented-back markers when available."""
+
+    names = list(ANNOTATION_KEYPOINT_ORDER)
+    if biomod_supports_upper_back_options(biomod_path) and "mid_back" not in names:
+        names.insert(12, "mid_back")
+    return tuple(names)
 
 
 def annotation_motion_prior_center(
@@ -4688,36 +4699,25 @@ class MultiViewTab(CommandTab):
                 continue
             cam_name = camera_names[ax_idx]
             width, height = self.calibrations[cam_name].image_size
-            has_image_background = False
-            if self.show_images_var.get():
-                background_image = load_camera_background_image(
+            background_image = (
+                load_camera_background_image(
                     images_root,
                     cam_name,
                     frame_number,
                     image_reader=plt.imread,
                 )
-                if background_image is not None:
-                    draw_2d_background_image(ax, background_image, width, height)
-                    has_image_background = True
-            apply_2d_axis_limits(
-                ax,
-                crop_mode=crop_mode,
-                crop_limits=crop_limits,
-                cam_name=cam_name,
-                frame_idx=frame_idx,
-                width=width,
-                height=height,
+                if self.show_images_var.get()
+                else None
             )
-            ax.set_aspect("equal", adjustable="box")
-            ax.set_title(cam_name.replace("Camera", ""))
-            hide_2d_axes(ax)
+            layers: list[SkeletonLayer2D] = []
             if "raw" in selected:
-                draw_skeleton_2d(
-                    ax,
-                    raw_points[ax_idx, frame_idx],
-                    ("white" if has_image_background else "#444444"),
-                    "Raw",
-                    marker_size=float(self.marker_size.get()),
+                layers.append(
+                    SkeletonLayer2D(
+                        points=raw_points[ax_idx, frame_idx],
+                        color=("white" if background_image is not None else "#444444"),
+                        label="Raw",
+                        marker_size=float(self.marker_size.get()),
+                    )
                 )
             for raw_name in selected:
                 mapped = "ekf_2d_acc" if raw_name == "ekf_2d" else raw_name
@@ -4727,13 +4727,39 @@ class MultiViewTab(CommandTab):
                 if mapped == "raw" or mapped not in projected_layers:
                     continue
                 points_2d = projected_layers[mapped][ax_idx, frame_idx]
-                draw_skeleton_2d(
-                    ax,
-                    points_2d,
-                    reconstruction_display_color(self.state, mapped),
-                    reconstruction_legend_label(self.state, mapped),
-                    marker_size=float(self.marker_size.get()),
+                layers.append(
+                    SkeletonLayer2D(
+                        points=points_2d,
+                        color=reconstruction_display_color(self.state, mapped),
+                        label=reconstruction_legend_label(self.state, mapped),
+                        marker_size=float(self.marker_size.get()),
+                    )
                 )
+            render_camera_frame_2d(
+                ax,
+                width=width,
+                height=height,
+                title=cam_name.replace("Camera", ""),
+                layers=layers,
+                draw_skeleton_fn=draw_skeleton_2d,
+                background_image=background_image,
+                draw_background_fn=draw_2d_background_image,
+                crop_mode=crop_mode,
+                crop_limits=crop_limits,
+                cam_name=cam_name,
+                frame_idx=frame_idx,
+                apply_axis_limits_fn=apply_2d_axis_limits,
+                hide_axes=True,
+                hide_axes_fn=hide_2d_axes,
+            )
+            for raw_name in selected:
+                mapped = "ekf_2d_acc" if raw_name == "ekf_2d" else raw_name
+                mapped = "triangulation_adaptive" if raw_name == "triangulation" else mapped
+                if mapped == "biorbd_kalman":
+                    mapped = "ekf_3d"
+                if mapped == "raw" or mapped not in projected_layers:
+                    continue
+                points_2d = projected_layers[mapped][ax_idx, frame_idx]
                 segmented_back_layers = self.segmented_back_projected_layers.get(mapped, {})
                 draw_upper_back_overlay_2d(
                     ax,
@@ -5001,7 +5027,12 @@ class AnnotationTab(ttk.Frame):
         )
         self.kinematic_model_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.kinematic_model_var.trace_add(
-            "write", lambda *_args: (self._clear_kinematic_assist_preview(), self.refresh_preview())
+            "write",
+            lambda *_args: (
+                self.refresh_annotation_keypoint_choices(),
+                self._clear_kinematic_assist_preview(),
+                self.refresh_preview(),
+            ),
         )
         ttk.Button(kinematic_row, text="Estimate q", command=self.estimate_kinematic_assist_state).pack(side=tk.LEFT)
         self.kinematic_status_var = tk.StringVar(value="")
@@ -5040,9 +5071,7 @@ class AnnotationTab(ttk.Frame):
         self.annotation_keypoints_list.bind("<<ListboxSelect>>", lambda _event: self.on_keypoint_selection_changed())
         self.annotation_keypoints_list.bind("<Up>", lambda event: self._step_annotation_keypoint(-1, event))
         self.annotation_keypoints_list.bind("<Down>", lambda event: self._step_annotation_keypoint(1, event))
-        for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
-            self.annotation_keypoints_list.insert(tk.END, keypoint_name)
-        self.annotation_keypoints_list.selection_set(0)
+        self.refresh_annotation_keypoint_choices()
 
         preview_box = ttk.LabelFrame(right, text="Annotation preview")
         preview_box.pack(fill=tk.BOTH, expand=True)
@@ -5174,11 +5203,50 @@ class AnnotationTab(ttk.Frame):
         current = str(self.kinematic_model_var.get()).strip()
         if current not in choices:
             self.kinematic_model_var.set(labels[0] if labels else "")
+        self.refresh_annotation_keypoint_choices()
         self.kinematic_status_var.set("" if labels else "No existing bioMod available for kinematic assist.")
 
     def _selected_kinematic_biomod_path(self) -> Path | None:
+        if not hasattr(self, "kinematic_model_var"):
+            return None
         label = str(self.kinematic_model_var.get()).strip()
         return self.kinematic_model_choices.get(label)
+
+    def annotation_keypoint_names(self) -> tuple[str, ...]:
+        biomod_path = self._selected_kinematic_biomod_path()
+        return annotation_keypoint_names_for_biomod(biomod_path)
+
+    def refresh_annotation_keypoint_choices(self) -> None:
+        if not hasattr(self, "annotation_keypoints_list"):
+            return
+        previous_name = None
+        selection = self.annotation_keypoints_list.curselection()
+        if selection:
+            previous_name = str(self.annotation_keypoints_list.get(selection[0]))
+        names = list(self.annotation_keypoint_names())
+        self.annotation_keypoints_list.delete(0, tk.END)
+        for keypoint_name in names:
+            self.annotation_keypoints_list.insert(tk.END, keypoint_name)
+        if not names:
+            self.current_marker_var.set("Current marker:")
+            return
+        target_name = previous_name if previous_name in names else names[0]
+        target_index = names.index(target_name)
+        self.annotation_keypoints_list.selection_set(target_index)
+        self.annotation_keypoints_list.activate(target_index)
+        self.annotation_keypoints_list.see(target_index)
+        self.current_marker_var.set(f"Current marker: {target_name}")
+
+    def _frame_annotation_measurement_count(self, frame_number: int, camera_names: list[str]) -> int:
+        if self.pose_data is None:
+            return 0
+        annotation_pose_data = annotation_pose_data_for_frame(
+            self.pose_data,
+            camera_names=camera_names,
+            frame_number=int(frame_number),
+            annotation_payload=self.annotation_payload,
+        )
+        return int(np.sum(np.asarray(annotation_pose_data.scores, dtype=float) > 0.0))
 
     def selected_annotation_camera_names(self) -> list[str]:
         if self.pose_data is None:
@@ -5325,7 +5393,7 @@ class AnnotationTab(ttk.Frame):
         camera_names = self.selected_annotation_camera_names()
         pending: dict[tuple[str, int, str], np.ndarray] = {}
         for target_camera_name in camera_names:
-            for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
+            for keypoint_name in self.annotation_keypoint_names():
                 existing_xy = self._annotation_xy(target_camera_name, frame_number, keypoint_name)
                 if existing_xy is None:
                     continue
@@ -5378,6 +5446,10 @@ class AnnotationTab(ttk.Frame):
             return
         current_index = int(round(self.frame_var.get()))
         current_frame_number = int(self.pose_data.frames[current_index])
+        try:
+            selected_camera_names = self.selected_annotation_camera_names()
+        except Exception:
+            selected_camera_names = []
         candidates = self._navigable_annotation_frame_local_indices()
         if candidates:
             next_frame = step_frame_index_within_subset(current_index, int(delta), candidates)
@@ -5386,7 +5458,7 @@ class AnnotationTab(ttk.Frame):
                 frames=self.pose_data.frames,
                 current_index=current_index,
                 direction=int(delta),
-                camera_names=self.selected_annotation_camera_names(),
+                camera_names=selected_camera_names,
                 images_root=self._current_images_root(),
             )
         if next_frame is None:
@@ -5418,6 +5490,13 @@ class AnnotationTab(ttk.Frame):
                 except Exception:
                     pass
         self._set_frame_index(next_frame)
+        if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
+            try:
+                next_frame_number = int(self.pose_data.frames[int(next_frame)])
+                if self._frame_annotation_measurement_count(next_frame_number, selected_camera_names) > 0:
+                    self._estimate_kinematic_q()
+            except Exception:
+                pass
         self.refresh_preview()
 
     def load_resources(self) -> None:
@@ -5575,6 +5654,7 @@ class AnnotationTab(ttk.Frame):
                     ANNOTATION_KINEMATIC_CLICK_PASSES
                     if keypoint_name is not None
                     else ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES
+                    * (ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER if previous_state is None else 1)
                 )
                 refined_state, bootstrap_diagnostics = refine_annotation_q_with_local_ekf(
                     model=model,
@@ -5969,7 +6049,7 @@ class AnnotationTab(ttk.Frame):
         nearest_name = None
         nearest_distance = None
         point = np.asarray(xy, dtype=float).reshape(2)
-        for keypoint_name in ANNOTATION_KEYPOINT_ORDER:
+        for keypoint_name in self.annotation_keypoint_names():
             annotated_xy = self._annotation_xy(camera_name, frame_number, keypoint_name)
             if annotated_xy is None:
                 continue
@@ -12436,41 +12516,58 @@ class CameraToolsTab(ttk.Frame):
         x_limits, y_limits = crop_limits_from_points(finite, width=float(width), height=float(height), margin=0.2)
 
         ax = self.flip_figure.subplots(1, 1)
-        has_image_background = False
         images_root = (
             Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
         )
-        if self.show_images_var.get():
-            background_image = load_camera_background_image(
+        background_image = (
+            load_camera_background_image(
                 images_root,
                 camera_name,
                 frame_number,
                 image_reader=plt.imread,
             )
-            if background_image is not None:
-                ax.imshow(background_image)
-                has_image_background = True
-        draw_skeleton_2d(
-            ax,
-            display_raw_points,
-            ("white" if has_image_background else "#000000"),
-            "Raw 2D",
-            marker_size=28.0,
-            marker_fill=False,
-            marker_edge_width=1.9,
-            line_alpha=0.55,
-            line_style=(0, (2.0, 2.2)),
-            line_width_scale=0.6,
+            if self.show_images_var.get()
+            else None
         )
+        layers = [
+            SkeletonLayer2D(
+                points=display_raw_points,
+                color=("white" if background_image is not None else "#000000"),
+                label="Raw 2D",
+                marker_size=28.0,
+                marker_fill=False,
+                marker_edge_width=1.9,
+                line_alpha=0.55,
+                line_style=(0, (2.0, 2.2)),
+                line_width_scale=0.6,
+            )
+        ]
         if projected_points is not None:
-            draw_skeleton_2d(ax, projected_points, projected_color, projected_label, marker_size=20.0)
-        ax.set_xlim(*x_limits)
-        ax.set_ylim(*y_limits)
-        ax.set_aspect("equal", adjustable="box")
-        ax.set_title(f"Raw {'(swapped)' if self.flip_applied_var.get() else ''} + reprojection")
-        ax.grid(alpha=0.18)
-        ax.set_xlabel("x (px)")
-        ax.set_ylabel("y (px)")
+            layers.append(
+                SkeletonLayer2D(
+                    points=projected_points,
+                    color=projected_color,
+                    label=projected_label,
+                    marker_size=20.0,
+                )
+            )
+        render_camera_frame_2d(
+            ax,
+            width=width,
+            height=height,
+            title=f"Raw {'(swapped)' if self.flip_applied_var.get() else ''} + reprojection",
+            layers=layers,
+            draw_skeleton_fn=draw_skeleton_2d,
+            background_image=background_image,
+            draw_background_fn=draw_2d_background_image,
+            x_limits=x_limits,
+            y_limits=y_limits,
+            hide_axes=False,
+            show_grid=True,
+            grid_alpha=0.18,
+            xlabel="x (px)",
+            ylabel="y (px)",
+        )
         side_handles = [
             plt.Line2D(
                 [],

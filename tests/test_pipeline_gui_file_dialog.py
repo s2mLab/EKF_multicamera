@@ -135,6 +135,40 @@ def test_annotation_keypoint_order_groups_left_then_right_then_head():
     ]
 
 
+def test_annotation_keypoint_names_for_biomod_adds_mid_back_only_for_segmented_back(monkeypatch):
+    monkeypatch.setattr(pipeline_gui, "biomod_supports_upper_back_options", lambda path: bool(path))
+
+    with_mid_back = pipeline_gui.annotation_keypoint_names_for_biomod("demo.bioMod")
+    without_mid_back = pipeline_gui.annotation_keypoint_names_for_biomod(None)
+
+    assert "mid_back" in with_mid_back
+    assert with_mid_back.index("mid_back") == 12
+    assert "mid_back" not in without_mid_back
+
+
+def test_refresh_annotation_keypoint_choices_preserves_selection_when_possible(monkeypatch):
+    monkeypatch.setattr(
+        pipeline_gui,
+        "annotation_keypoint_names_for_biomod",
+        lambda _path: ("left_shoulder", "mid_back", "nose"),
+    )
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_keypoints_list = _FakeListbox()
+    tab.current_marker_var = SimpleNamespace(set=lambda value: setattr(tab, "_marker_text", value))
+    tab.kinematic_model_choices = {"demo": Path("demo.bioMod")}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    for keypoint_name in ("left_shoulder", "nose"):
+        tab.annotation_keypoints_list.insert("end", keypoint_name)
+    tab.annotation_keypoints_list.selection_set(1)
+
+    pipeline_gui.AnnotationTab.refresh_annotation_keypoint_choices(tab)
+
+    assert tab.annotation_keypoints_list.items == ["left_shoulder", "mid_back", "nose"]
+    assert tab.annotation_keypoints_list.curselection() == (2,)
+    assert tab._marker_text == "Current marker: nose"
+
+
 def test_load_shared_reconstruction_preview_state_returns_bundle_and_preview_state(monkeypatch):
     state = SimpleNamespace()
     bundle = {"recon_q": {"demo": object()}}
@@ -1353,7 +1387,10 @@ def test_annotation_estimate_kinematic_q_runs_bootstrap_when_measurements_are_av
     estimated_q = pipeline_gui.AnnotationTab._estimate_kinematic_q(tab)
 
     np.testing.assert_allclose(estimated_q, np.array([0.4, -0.5], dtype=float))
-    assert ekf_calls["passes"] == pipeline_gui.ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES
+    assert ekf_calls["passes"] == (
+        pipeline_gui.ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES
+        * pipeline_gui.ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER
+    )
     assert ekf_calls["pose_data"].frames.tolist() == [10]
     assert "local ekf 3/" in tab._kin_status
 
@@ -1604,6 +1641,49 @@ def test_annotation_step_frame_propagates_state_with_frame_delta(monkeypatch, tm
 
     assert tab._frame_index == 2
     np.testing.assert_allclose(tab.kinematic_frame_states[("demo", 15)], np.array([2.375, 3.5, 3.0]))
+    assert tab._refreshed is True
+
+
+def test_annotation_step_frame_runs_local_estimate_when_target_frame_has_annotations(monkeypatch, tmp_path):
+    biomod_path = tmp_path / "demo.bioMod"
+    biomod_path.write_text("demo", encoding="utf-8")
+
+    class _FakeBiorbdModel:
+        def __init__(self, _path):
+            pass
+
+        def nbQ(self):
+            return 1
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "biorbd", SimpleNamespace(Model=_FakeBiorbdModel))
+    monkeypatch.setattr(pipeline_gui, "canonicalize_model_q_rotation_branches", lambda _model, q: np.asarray(q))
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 12, 15], dtype=int))
+    tab.frame_var = SimpleNamespace(get=lambda: 0, set=lambda value: setattr(tab, "_frame_index", value))
+    tab._current_frame_idx = 0
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: True)
+    tab.kinematic_model_choices = {"demo": biomod_path}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {("demo", 10): np.array([1.0, 2.0, 3.0], dtype=float)}
+    tab.state = SimpleNamespace(fps_var=SimpleNamespace(get=lambda: "10"))
+    tab._selected_kinematic_biomod_path = lambda: biomod_path
+    tab._navigable_annotation_frame_local_indices = lambda: [2]
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab._current_images_root = lambda: None
+    tab._frame_annotation_measurement_count = lambda frame_number, camera_names: 4 if int(frame_number) == 15 else 0
+    tab._estimate_kinematic_q = lambda: setattr(tab, "_estimate_called", True) or np.array([0.5], dtype=float)
+    tab.save_annotations = lambda: None
+    tab._clear_pending_reprojection = lambda: None
+    tab._clear_kinematic_assist_preview = lambda: None
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+
+    pipeline_gui.AnnotationTab.step_frame(tab, 1)
+
+    assert tab._frame_index == 2
+    assert tab._estimate_called is True
     assert tab._refreshed is True
 
 
