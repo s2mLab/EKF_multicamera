@@ -174,9 +174,10 @@ from preview.two_d_view import (
     apply_2d_axis_limits,
     camera_layout,
     compute_pose_crop_limits_2d,
+    crop_limits_from_points,
     draw_2d_background_image,
     hide_2d_axes,
-    square_crop_bounds,
+    load_camera_background_image,
 )
 from reconstruction.reconstruction_bundle import (
     extract_root_from_points,
@@ -4689,9 +4690,14 @@ class MultiViewTab(CommandTab):
             width, height = self.calibrations[cam_name].image_size
             has_image_background = False
             if self.show_images_var.get():
-                image_path = resolve_execution_image_path(images_root, cam_name, frame_number)
-                if image_path is not None and image_path.exists():
-                    draw_2d_background_image(ax, plt.imread(str(image_path)), width, height)
+                background_image = load_camera_background_image(
+                    images_root,
+                    cam_name,
+                    frame_number,
+                    image_reader=plt.imread,
+                )
+                if background_image is not None:
+                    draw_2d_background_image(ax, background_image, width, height)
                     has_image_background = True
             apply_2d_axis_limits(
                 ax,
@@ -6128,15 +6134,18 @@ class AnnotationTab(ttk.Frame):
             camera_name = camera_names[ax_idx]
             self._axis_to_camera[ax] = camera_name
             width, height = self.calibrations[camera_name].image_size
-            background_image = None
-            if self.show_images_var.get():
-                image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
-                if image_path is not None and image_path.exists():
-                    background_image = adjust_image_levels(
-                        plt.imread(str(image_path)),
-                        brightness=float(self.image_brightness_var.get()),
-                        contrast=float(self.image_contrast_var.get()),
-                    )
+            background_image = (
+                load_camera_background_image(
+                    images_root,
+                    camera_name,
+                    frame_number,
+                    image_reader=plt.imread,
+                    brightness=float(self.image_brightness_var.get()),
+                    contrast=float(self.image_contrast_var.get()),
+                )
+                if self.show_images_var.get()
+                else None
+            )
             self._annotation_hover_entries[ax] = render_annotation_camera_view(
                 ax,
                 ax_idx=ax_idx,
@@ -12424,23 +12433,7 @@ class CameraToolsTab(ttk.Frame):
             if (finite_raw.size or finite_projected.size)
             else np.empty((0, 2))
         )
-        if finite.size:
-            xmin, ymin = np.min(finite, axis=0)
-            xmax, ymax = np.max(finite, axis=0)
-            x0, x1, y1, y0 = square_crop_bounds(
-                xmin=float(xmin),
-                xmax=float(xmax),
-                ymin=float(ymin),
-                ymax=float(ymax),
-                width=float(width),
-                height=float(height),
-                margin=0.2,
-            )
-            x_limits = (x0, x1)
-            y_limits = (y1, y0)
-        else:
-            x_limits = (0.0, float(width))
-            y_limits = (float(height), 0.0)
+        x_limits, y_limits = crop_limits_from_points(finite, width=float(width), height=float(height), margin=0.2)
 
         ax = self.flip_figure.subplots(1, 1)
         has_image_background = False
@@ -12448,9 +12441,14 @@ class CameraToolsTab(ttk.Frame):
             Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
         )
         if self.show_images_var.get():
-            image_path = resolve_execution_image_path(images_root, camera_name, frame_number)
-            if image_path is not None and image_path.exists():
-                ax.imshow(plt.imread(str(image_path)))
+            background_image = load_camera_background_image(
+                images_root,
+                camera_name,
+                frame_number,
+                image_reader=plt.imread,
+            )
+            if background_image is not None:
+                ax.imshow(background_image)
                 has_image_background = True
         draw_skeleton_2d(
             ax,

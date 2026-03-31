@@ -49,13 +49,14 @@ from animation.animate_dual_stick_comparison import (
     resample_points,
 )
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations, subset_pose_data
-from judging.execution import infer_execution_images_root, resolve_execution_image_path
+from judging.execution import infer_execution_images_root
 from preview.two_d_view import (
     apply_2d_axis_limits,
     camera_layout,
     compute_pose_crop_limits_2d,
     draw_2d_background_image,
     hide_2d_axes,
+    load_camera_background_image,
 )
 from reconstruction.reconstruction_dataset import (
     dataset_source_paths,
@@ -505,9 +506,14 @@ def create_animation(
             label = camera_names[cam_idx]
             has_image_background = False
             if show_images:
-                image_path = resolve_execution_image_path(images_root, label, int(frame_numbers[frame_idx]))
-                if image_path is not None and image_path.exists():
-                    image_artists[cam_idx].set_data(plt.imread(str(image_path)))
+                background_image = load_camera_background_image(
+                    images_root,
+                    label,
+                    int(frame_numbers[frame_idx]),
+                    image_reader=plt.imread,
+                )
+                if background_image is not None:
+                    image_artists[cam_idx].set_data(background_image)
                     image_artists[cam_idx].set_visible(True)
                     has_image_background = True
                 else:
@@ -648,9 +654,14 @@ def render_frame(
         width, height = calibrations[cam_name].image_size
         has_image_background = False
         if show_images:
-            image_path = resolve_execution_image_path(images_root, cam_name, int(frame_numbers[frame_idx]))
-            if image_path is not None and image_path.exists():
-                draw_2d_background_image(ax, plt.imread(str(image_path)), width, height)
+            background_image = load_camera_background_image(
+                images_root,
+                cam_name,
+                int(frame_numbers[frame_idx]),
+                image_reader=plt.imread,
+            )
+            if background_image is not None:
+                draw_2d_background_image(ax, background_image, width, height)
                 has_image_background = True
         apply_2d_axis_limits(
             ax,

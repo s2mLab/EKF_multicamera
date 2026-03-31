@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
+
+from judging.execution import resolve_execution_image_path
 
 
 def camera_layout(n_cameras: int) -> tuple[int, int]:
@@ -150,6 +153,34 @@ def hide_2d_axes(ax) -> None:
         spine.set_visible(False)
 
 
+def crop_limits_from_points(
+    points_2d: np.ndarray,
+    *,
+    width: float,
+    height: float,
+    margin: float,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Return x/y limits from the finite 2D points, or full-image limits."""
+
+    points_2d = np.asarray(points_2d, dtype=float)
+    valid = np.all(np.isfinite(points_2d), axis=1)
+    if not np.any(valid):
+        return (0.0, float(width)), (float(height), 0.0)
+    finite = points_2d[valid]
+    xmin, ymin = np.min(finite, axis=0)
+    xmax, ymax = np.max(finite, axis=0)
+    x0, x1, y1, y0 = square_crop_bounds(
+        xmin=float(xmin),
+        xmax=float(xmax),
+        ymin=float(ymin),
+        ymax=float(ymax),
+        width=float(width),
+        height=float(height),
+        margin=float(margin),
+    )
+    return (x0, x1), (y1, y0)
+
+
 def adjust_image_levels(
     image: np.ndarray,
     *,
@@ -170,3 +201,21 @@ def adjust_image_levels(
     if scale > 1.5:
         adjusted = np.round(adjusted * scale).astype(image.dtype, copy=False)
     return adjusted
+
+
+def load_camera_background_image(
+    images_root: Path | None,
+    camera_name: str,
+    frame_number: int,
+    *,
+    image_reader,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+) -> np.ndarray | None:
+    """Resolve and optionally adjust one camera background image."""
+
+    image_path = resolve_execution_image_path(images_root, camera_name, int(frame_number))
+    if image_path is None or not image_path.exists():
+        return None
+    image = image_reader(str(image_path))
+    return adjust_image_levels(image, brightness=brightness, contrast=contrast)

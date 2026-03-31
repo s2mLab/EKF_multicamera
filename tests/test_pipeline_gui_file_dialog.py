@@ -6,6 +6,7 @@ import pytest
 
 import pipeline_gui
 from annotation import frame_navigation
+from preview import two_d_view
 from preview.dataset_preview_state import DatasetPreviewState
 from preview.shared_reconstruction_panel import SharedReconstructionPanel
 from vitpose_ekf_pipeline import CameraCalibration
@@ -3403,7 +3404,7 @@ def test_camera_tools_render_flip_preview_uses_image_frame_number_before_overlay
 
     requested = []
     monkeypatch.setattr(
-        pipeline_gui,
+        two_d_view,
         "resolve_execution_image_path",
         lambda root, camera_name, frame_number: requested.append((root, camera_name, frame_number)) or None,
     )
