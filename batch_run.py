@@ -12,9 +12,11 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
 
-from openpyxl import Workbook
+if TYPE_CHECKING:
+    from openpyxl import Workbook
 
 from annotation.annotation_store import default_annotation_path
 from reconstruction.reconstruction_profiles import ReconstructionProfile, build_pipeline_command, validate_profile
@@ -30,6 +32,16 @@ DEFAULT_OUTPUT_ROOT = Path("output")
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_KEYPOINTS_GLOB = "inputs/keypoints/*.json"
 DEFAULT_EXCEL_OUTPUT = Path("output/batch_summary.xlsx")
+
+
+def _require_openpyxl():
+    try:
+        from openpyxl import Workbook
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Excel export requires `openpyxl`. Install it in the environment or skip the batch workbook export."
+        ) from exc
+    return Workbook
 
 
 def parse_args() -> argparse.Namespace:
@@ -336,7 +348,7 @@ def collect_manifest_rows(
     return run_rows, stage_rows, camera_rows, keypoint_rows, failures + recognition_rows
 
 
-def write_rows_sheet(workbook: Workbook, title: str, rows: list[dict[str, Any]]) -> None:
+def write_rows_sheet(workbook: Any, title: str, rows: list[dict[str, Any]]) -> None:
     worksheet = workbook.create_sheet(title=title)
     if not rows:
         worksheet.append(["empty"])
@@ -356,6 +368,7 @@ def write_rows_sheet(workbook: Workbook, title: str, rows: list[dict[str, Any]])
 
 
 def write_batch_workbook(batch_manifest: dict[str, Any], workbook_path: Path) -> Path:
+    Workbook = _require_openpyxl()
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)

@@ -59,16 +59,21 @@ def test_render_annotation_camera_view_collects_hover_entries_and_draws_overlays
             "shoulder_triangle": np.zeros((1, 1, 4, 2), dtype=float),
             "mid_back": np.zeros((1, 1, 1, 2), dtype=float),
         },
+        reference_projected_points=np.zeros((2, 2), dtype=float),
+        reference_projected_label="Recon",
+        reference_projected_color="#8844ff",
         motion_prior_enabled=True,
         motion_prior_diameter=15.0,
         motion_prior_center_fn=lambda pt1, pt2: np.array([12.0, 22.0], dtype=float),
     )
 
-    assert calls == {"background": 1, "limits": 1, "hide": 1, "skeleton": 1, "upper_back": 1}
+    assert calls == {"background": 1, "limits": 1, "hide": 1, "skeleton": 2, "upper_back": 1}
     assert [entry["source"] for entry in hover_entries] == [
         "annotated",
         "annotated",
         "model reproj",
         "model reproj",
+        "reconstruction reproj",
+        "reconstruction reproj",
         "pending reproj",
     ]

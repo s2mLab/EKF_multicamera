@@ -34,6 +34,8 @@ class Calibration3DQC:
     per_frame_mean_px: np.ndarray
     spatial_bin_mean_px: np.ndarray
     spatial_bin_count: np.ndarray
+    spatial_xz_mean_px: np.ndarray
+    spatial_xz_count: np.ndarray
     spatial_uniformity_cv: float | None
     spatial_uniformity_range_px: float | None
     spatial_axis_means_px: dict[str, np.ndarray]
@@ -263,6 +265,8 @@ def compute_3d_calibration_qc(
             per_frame_mean_px=np.full(points_3d.shape[0], np.nan, dtype=float),
             spatial_bin_mean_px=empty_bins,
             spatial_bin_count=np.zeros((1, 1, 1), dtype=int),
+            spatial_xz_mean_px=np.full((1, 1), np.nan, dtype=float),
+            spatial_xz_count=np.zeros((1, 1), dtype=int),
             spatial_uniformity_cv=None,
             spatial_uniformity_range_px=None,
             spatial_axis_means_px={"x": np.full(1, np.nan), "y": np.full(1, np.nan), "z": np.full(1, np.nan)},
@@ -281,6 +285,11 @@ def compute_3d_calibration_qc(
     bin_mean = np.full_like(bin_sum, np.nan, dtype=float)
     occupied = bin_count > 0
     bin_mean[occupied] = bin_sum[occupied] / bin_count[occupied]
+    xz_sum = np.sum(bin_sum, axis=1)
+    xz_count = np.sum(bin_count, axis=1)
+    xz_mean = np.full_like(xz_sum, np.nan, dtype=float)
+    xz_occupied = xz_count > 0
+    xz_mean[xz_occupied] = xz_sum[xz_occupied] / xz_count[xz_occupied]
     occupied_means = bin_mean[occupied]
     if occupied_means.size >= 2:
         overall_mean = float(np.mean(occupied_means))
@@ -306,6 +315,8 @@ def compute_3d_calibration_qc(
         per_frame_mean_px=per_frame_mean,
         spatial_bin_mean_px=bin_mean,
         spatial_bin_count=bin_count,
+        spatial_xz_mean_px=xz_mean,
+        spatial_xz_count=xz_count,
         spatial_uniformity_cv=uniformity_cv,
         spatial_uniformity_range_px=uniformity_range,
         spatial_axis_means_px=spatial_axis_means,

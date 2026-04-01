@@ -52,6 +52,9 @@ def render_annotation_camera_view(
     draw_upper_back_fn: Callable[..., None],
     kinematic_projected_points: np.ndarray | None,
     kinematic_segmented_back_projected: dict[str, np.ndarray] | None,
+    reference_projected_points: np.ndarray | None,
+    reference_projected_label: str | None,
+    reference_projected_color,
     motion_prior_enabled: bool,
     motion_prior_diameter: float,
     motion_prior_center_fn: Callable[[np.ndarray | None, np.ndarray | None], np.ndarray | None],
@@ -145,6 +148,31 @@ def render_annotation_camera_view(
             marker_line_width=0.9,
             marker_alpha=0.38,
         )
+
+    if reference_projected_points is not None:
+        draw_skeleton_fn(
+            ax,
+            np.asarray(reference_projected_points, dtype=float),
+            reference_projected_color,
+            reference_projected_label,
+            marker_size=2.8,
+            marker_fill=False,
+            marker_edge_width=0.7,
+            line_alpha=0.26,
+            line_style="--",
+            line_width_scale=0.5,
+        )
+        for keypoint_name in keypoint_names:
+            projected_xy = np.asarray(reference_projected_points[kp_index[keypoint_name]], dtype=float)
+            if not np.all(np.isfinite(projected_xy)):
+                continue
+            hover_entries.append(
+                {
+                    "xy": projected_xy,
+                    "keypoint_name": str(keypoint_name),
+                    "source": "reconstruction reproj",
+                }
+            )
 
     for (pending_camera, pending_frame, keypoint_name), pending_xy in pending_reprojection_points.items():
         if pending_camera != str(camera_name) or int(pending_frame) != int(frame_number):

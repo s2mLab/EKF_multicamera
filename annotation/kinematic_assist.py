@@ -118,6 +118,44 @@ def annotation_relevant_q_prefixes(keypoint_name: str) -> tuple[str, ...]:
     return tuple(prefixes)
 
 
+def annotation_relevant_q_mask(
+    q_names: list[str] | np.ndarray,
+    keypoint_name: str,
+) -> np.ndarray:
+    """Return a boolean mask selecting the DoFs relevant to one annotated keypoint."""
+
+    prefixes = annotation_relevant_q_prefixes(keypoint_name)
+    return np.asarray(
+        [any(str(q_name).startswith(f"{prefix}:") for prefix in prefixes) for q_name in q_names],
+        dtype=bool,
+    )
+
+
+def constrain_annotation_state_to_mask(
+    state: np.ndarray,
+    reference_state: np.ndarray,
+    active_q_mask: np.ndarray | None,
+) -> np.ndarray:
+    """Freeze inactive generalized coordinates and their derivatives to the reference state."""
+
+    state = np.asarray(state, dtype=float).reshape(-1)
+    reference_state = np.asarray(reference_state, dtype=float).reshape(-1)
+    if active_q_mask is None:
+        return np.array(state, copy=True)
+    active_q_mask = np.asarray(active_q_mask, dtype=bool).reshape(-1)
+    if active_q_mask.size == 0:
+        return np.array(reference_state, copy=True)
+    nq = active_q_mask.size
+    constrained = np.array(state, copy=True)
+    inactive = ~active_q_mask
+    constrained[:nq][inactive] = reference_state[:nq][inactive]
+    if constrained.size >= 2 * nq:
+        constrained[nq : 2 * nq][inactive] = reference_state[nq : 2 * nq][inactive]
+    if constrained.size >= 3 * nq:
+        constrained[2 * nq : 3 * nq][inactive] = reference_state[2 * nq : 3 * nq][inactive]
+    return constrained
+
+
 def annotation_blend_q_by_relevance(
     q_names: list[str] | np.ndarray,
     previous_q: np.ndarray | None,
@@ -218,6 +256,8 @@ def refine_annotation_q_with_local_ekf(
     measurement_noise_scale: float = 1.0,
     process_noise_scale: float = 1.0,
     epipolar_threshold_px: float,
+    q_names: list[str] | np.ndarray | None = None,
+    keypoint_name: str | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Refine one frame from sparse 2D annotations using local EKF2D corrections."""
 
@@ -229,6 +269,11 @@ def refine_annotation_q_with_local_ekf(
         raise ValueError("seed_state must contain either q or [q, qdot, qddot].")
     seed_state = np.array(seed_state, copy=True)
     seed_state[:nq] = _canonicalize_annotation_q(model, seed_state[:nq])
+    active_q_mask = (
+        annotation_relevant_q_mask(q_names or [], keypoint_name)
+        if keypoint_name is not None and q_names is not None
+        else None
+    )
     reconstruction = annotation_reconstruction_from_points(
         np.full((len(COCO17), 3), np.nan, dtype=float),
         frame_number=frame_number,
@@ -271,6 +316,7 @@ def refine_annotation_q_with_local_ekf(
             diagnostics["reason"] = f"local_{update_status}"
             return np.array(seed_state, copy=True), diagnostics
         corrected_state = np.asarray(corrected_state, dtype=float).reshape(3 * nq)
+        corrected_state = constrain_annotation_state_to_mask(corrected_state, seed_state, active_q_mask)
         corrected_state[:nq] = _canonicalize_annotation_q(model, corrected_state[:nq])
         q_delta_norm = float(np.linalg.norm(corrected_state[:nq] - state_iter[:nq]))
         diagnostics.setdefault("q_delta_norms", []).append(q_delta_norm)
@@ -290,6 +336,8 @@ def refine_annotation_q_with_direct_measurements(
     seed_state: np.ndarray,
     passes: int,
     measurement_std_px: float = 2.0,
+    q_names: list[str] | np.ndarray | None = None,
+    keypoint_name: str | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Apply a direct image-space correction from sparse annotated 2D points.
 
@@ -321,6 +369,11 @@ def refine_annotation_q_with_direct_measurements(
 
     state = np.array(seed_state, copy=True)
     state[:nq] = _canonicalize_annotation_q(model, state[:nq])
+    active_q_mask = (
+        annotation_relevant_q_mask(q_names or [], keypoint_name)
+        if keypoint_name is not None and q_names is not None
+        else None
+    )
     covariance = np.eye(nx) * 1e-2
     identity_x = np.eye(nx)
     diagnostics: dict[str, object] = {
@@ -376,12 +429,15 @@ def refine_annotation_q_with_direct_measurements(
             if not np.any(selected_mask):
                 continue
             selected_scores = np.maximum(measured_scores[selected_mask], 1e-3)
+            H_q_selected = np.asarray(H_q_blocks[selected_mask], dtype=float)
+            if active_q_mask is not None:
+                H_q_selected[..., ~active_q_mask] = 0.0
             variances = np.repeat((float(measurement_std_px) / selected_scores) ** 2, 2).astype(float, copy=False)
             measurement_blocks.append(
                 (
                     measured_points[selected_mask].reshape(-1),
                     projected_uv[selected_mask].reshape(-1),
-                    H_q_blocks[selected_mask].reshape(-1, nq),
+                    H_q_selected.reshape(-1, nq),
                     variances,
                 )
             )
@@ -407,6 +463,7 @@ def refine_annotation_q_with_direct_measurements(
             return np.array(seed_state, copy=True), diagnostics
         updated_state, covariance = update_result
         updated_state = np.asarray(updated_state, dtype=float).reshape(nx)
+        updated_state = constrain_annotation_state_to_mask(updated_state, seed_state, active_q_mask)
         updated_state[:nq] = _canonicalize_annotation_q(model, updated_state[:nq])
         q_delta_norm = float(np.linalg.norm(updated_state[:nq] - state[:nq]))
         diagnostics.setdefault("q_delta_norms", []).append(q_delta_norm)

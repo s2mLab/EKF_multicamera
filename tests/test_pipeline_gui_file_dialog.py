@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from matplotlib.figure import Figure
 
 import pipeline_gui
 from annotation import frame_navigation
@@ -424,6 +425,34 @@ def test_camera_tools_tab_qa_overlay_data_reads_reprojection_and_excluded_payloa
 
     tab.qa_overlay_var = SimpleNamespace(get=lambda: "3D excluded")
     label, values, mask, cmap = pipeline_gui.CameraToolsTab._qa_overlay_data(tab, "cam0", 0)
+    assert label == "3D excluded"
+    assert values is None
+    np.testing.assert_array_equal(mask, np.array([False, True]))
+    assert cmap is None
+
+
+def test_multiview_tab_qa_overlay_data_reads_reprojection_and_excluded_payload(monkeypatch):
+    tab = pipeline_gui.MultiViewTab.__new__(pipeline_gui.MultiViewTab)
+    tab.pose_data = SimpleNamespace(camera_names=["cam0", "cam1"])
+    tab.calibrations = {"cam0": object(), "cam1": object()}
+    tab.qa_overlay_var = SimpleNamespace(get=lambda: "3D reproj")
+    tab._selected_reconstruction = lambda: "demo"
+    tab.reconstruction_payloads = {
+        "demo": {
+            "reprojection_error_per_view": np.array([[[1.0, 2.0], [3.0, 4.0]]], dtype=float),
+            "excluded_views": np.array([[[False, True], [True, False]]], dtype=bool),
+        }
+    }
+
+    label, values, mask, cmap = pipeline_gui.MultiViewTab._qa_overlay_data(tab, "cam1", 0)
+
+    assert label == "3D reproj"
+    np.testing.assert_array_equal(values, np.array([2.0, 4.0]))
+    assert mask is None
+    assert cmap == "turbo"
+
+    tab.qa_overlay_var = SimpleNamespace(get=lambda: "3D excluded")
+    label, values, mask, cmap = pipeline_gui.MultiViewTab._qa_overlay_data(tab, "cam0", 0)
     assert label == "3D excluded"
     assert values is None
     np.testing.assert_array_equal(mask, np.array([False, True]))
@@ -860,6 +889,57 @@ def test_annotation_click_advances_marker_without_monoview():
     assert getattr(tab, "_advanced", False) is True
     assert saved == ["saved"]
     assert refreshed == ["refreshed"]
+
+
+def test_annotation_refresh_preview_preserves_saved_view_limits(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(
+        camera_names=["cam0"],
+        frames=np.array([10], dtype=int),
+    )
+    tab.calibrations = {"cam0": SimpleNamespace(image_size=(640, 480))}
+    tab.annotation_payload = {}
+    tab.preview_figure = Figure(figsize=(4, 4))
+    tab.preview_canvas = SimpleNamespace(draw_idle=lambda: None)
+    tab.frame_var = SimpleNamespace(get=lambda: 0, set=lambda _value: None)
+    tab.frame_label = SimpleNamespace(configure=lambda **_kwargs: None)
+    tab.crop_var = SimpleNamespace(get=lambda: False)
+    tab.show_images_var = SimpleNamespace(get=lambda: False)
+    tab.image_brightness_var = SimpleNamespace(get=lambda: 1.0)
+    tab.image_contrast_var = SimpleNamespace(get=lambda: 1.0)
+    tab.show_reference_reprojection_var = SimpleNamespace(get=lambda: False)
+    tab.show_motion_prior_var = SimpleNamespace(get=lambda: False)
+    tab.show_triangulated_hint_var = SimpleNamespace(get=lambda: False)
+    tab.motion_prior_diameter = SimpleNamespace(get=lambda: "15")
+    tab.show_epipolar_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_projected_points = None
+    tab.kinematic_segmented_back_projected = {}
+    tab._annotation_hover_entries = {}
+    tab._cursor_artists = {}
+    tab._axis_to_camera = {}
+    tab._annotation_view_limits = {"cam0": ((10.0, 20.0), (40.0, 30.0))}
+    tab._pending_reprojection_points = {}
+    tab.current_frame_number = lambda: 10
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab._current_images_root = lambda: None
+    tab._frame_filter_mode = lambda: "all"
+    tab._filtered_annotation_frame_local_indices = lambda: [0]
+    tab.selected_keypoint_name = lambda: "nose"
+    tab._reference_projected_points = lambda *_args, **_kwargs: (None, None, "#6c5ce7")
+    tab._annotation_xy = lambda *_args, **_kwargs: None
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "render_annotation_camera_view",
+        lambda ax, **_kwargs: (ax.scatter([], []), [])[1],
+    )
+
+    pipeline_gui.AnnotationTab.refresh_preview(tab)
+
+    ax = tab.preview_figure.axes[0]
+    np.testing.assert_allclose(ax.get_xlim(), np.array([10.0, 20.0]))
+    np.testing.assert_allclose(ax.get_ylim(), np.array([40.0, 30.0]))
 
 
 def test_annotation_delete_nearest_annotation_removes_closest_marker():

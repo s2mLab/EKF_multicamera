@@ -1,9 +1,12 @@
 import json
 from pathlib import Path
 
-from openpyxl import load_workbook
+import pytest
 
 import batch_run
+
+openpyxl = pytest.importorskip("openpyxl")
+load_workbook = openpyxl.load_workbook
 
 
 def test_discover_keypoints_files_resolves_patterns_and_deduplicates(tmp_path):

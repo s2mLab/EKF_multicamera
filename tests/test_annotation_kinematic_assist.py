@@ -1,6 +1,8 @@
 import numpy as np
 
 from annotation.kinematic_assist import (
+    annotation_relevant_q_mask,
+    constrain_annotation_state_to_mask,
     resolve_annotation_kinematic_state_info,
     store_annotation_kinematic_state,
 )
@@ -68,3 +70,26 @@ def test_store_annotation_kinematic_state_normalizes_before_storing():
 
     np.testing.assert_allclose(stored, np.array([1.0, 2.0, 0.0, 0.0, 0.0, 0.0]))
     np.testing.assert_allclose(frame_states[("demo", 8)], stored)
+
+
+def test_annotation_relevant_q_mask_targets_left_arm_and_trunk():
+    mask = annotation_relevant_q_mask(
+        [
+            "TRUNK:RotX",
+            "LEFT_UPPER_ARM:RotY",
+            "LEFT_LOWER_ARM:RotZ",
+            "RIGHT_THIGH:RotX",
+        ],
+        "left_wrist",
+    )
+
+    np.testing.assert_array_equal(mask, np.array([True, True, True, False]))
+
+
+def test_constrain_annotation_state_to_mask_freezes_inactive_dofs():
+    state = np.array([10.0, 20.0, 1.0, 2.0, 3.0, 4.0], dtype=float)
+    reference = np.array([5.0, 6.0, 0.1, 0.2, 0.3, 0.4], dtype=float)
+
+    constrained = constrain_annotation_state_to_mask(state, reference, np.array([True, False]))
+
+    np.testing.assert_allclose(constrained, np.array([10.0, 6.0, 1.0, 0.2, 3.0, 0.4]))

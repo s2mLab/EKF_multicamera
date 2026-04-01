@@ -19,6 +19,61 @@ class SkeletonLayer2D:
     line_width_scale: float = 1.0
 
 
+@dataclass(frozen=True)
+class PointValueOverlay2D:
+    label: str
+    points: np.ndarray
+    values: np.ndarray | None = None
+    mask: np.ndarray | None = None
+    cmap: str | None = "turbo"
+    size: float = 18.0
+    edgecolors: str = "white"
+    linewidths: float = 0.8
+    alpha: float = 0.95
+    excluded_color: str = "#111111"
+    excluded_marker: str = "x"
+    excluded_size: float = 34.0
+    excluded_linewidths: float = 1.6
+
+
+def draw_point_value_overlay(ax, overlay: PointValueOverlay2D):
+    """Draw an optional per-point overlay and return the color-mapped scatter when present."""
+
+    points = np.asarray(overlay.points, dtype=float)
+    finite_points_mask = np.all(np.isfinite(points), axis=1)
+    scatter = None
+    if overlay.values is not None:
+        values = np.asarray(overlay.values, dtype=float).reshape(-1)
+        finite_overlay = finite_points_mask & np.isfinite(values)
+        if np.any(finite_overlay):
+            scatter = ax.scatter(
+                points[finite_overlay, 0],
+                points[finite_overlay, 1],
+                c=np.asarray(values[finite_overlay], dtype=float),
+                cmap=overlay.cmap or "turbo",
+                s=float(overlay.size),
+                linewidths=float(overlay.linewidths),
+                edgecolors=overlay.edgecolors,
+                alpha=float(overlay.alpha),
+                zorder=6,
+            )
+    if overlay.mask is not None:
+        mask = finite_points_mask & np.asarray(overlay.mask, dtype=bool).reshape(-1)
+        if np.any(mask):
+            ax.scatter(
+                points[mask, 0],
+                points[mask, 1],
+                marker=overlay.excluded_marker,
+                s=float(overlay.excluded_size),
+                linewidths=float(overlay.excluded_linewidths),
+                c=overlay.excluded_color,
+                alpha=float(overlay.alpha),
+                zorder=7,
+                label=overlay.label if overlay.values is None else None,
+            )
+    return scatter
+
+
 def render_camera_frame_2d(
     ax,
     *,

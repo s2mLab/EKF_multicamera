@@ -72,6 +72,9 @@ def test_compute_3d_calibration_qc_reports_spatial_non_uniformity():
     assert qc.spatial_uniformity_cv > 0.0
     assert qc.spatial_uniformity_range_px == 9.0
     np.testing.assert_allclose(qc.spatial_axis_means_px["x"], np.array([1.0, 10.0]))
+    finite_spatial = np.sort(qc.spatial_xz_mean_px[np.isfinite(qc.spatial_xz_mean_px)])
+    np.testing.assert_allclose(finite_spatial, np.array([1.0, 10.0]))
+    np.testing.assert_array_equal(np.sort(qc.spatial_xz_count[qc.spatial_xz_count > 0]), np.array([51, 51]))
     assert qc.view_usage_summary["per_camera"]["cam0"]["excluded_ratio"] == 0.0
 
 

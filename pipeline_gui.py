@@ -162,7 +162,12 @@ from kinematics.root_series import (
 from observability.observability_analysis import compute_observability_rank_series, summarize_rank_series
 from preview.dataset_preview_loader import load_dataset_preview_resources
 from preview.dataset_preview_state import DatasetPreviewState, build_dataset_preview_state
-from preview.frame_2d_render import SkeletonLayer2D, render_camera_frame_2d
+from preview.frame_2d_render import (
+    PointValueOverlay2D,
+    SkeletonLayer2D,
+    draw_point_value_overlay,
+    render_camera_frame_2d,
+)
 from preview.preview_bundle import (
     align_to_reference,
     load_dataset_preview_bundle,
@@ -180,6 +185,7 @@ from preview.two_d_view import (
     draw_2d_background_image,
     hide_2d_axes,
     load_camera_background_image,
+    square_crop_bounds,
 )
 from reconstruction.reconstruction_bundle import (
     extract_root_from_points,
@@ -4316,6 +4322,16 @@ class MultiViewTab(CommandTab):
         ttk.Checkbutton(
             row_images_1, text="Show images", variable=self.show_images_var, command=self.refresh_preview
         ).pack(side=tk.LEFT)
+        ttk.Label(row_images_1, text="QA").pack(side=tk.LEFT, padx=(12, 4))
+        self.qa_overlay_var = tk.StringVar(value="none")
+        self.qa_overlay_box = ttk.Combobox(
+            row_images_1,
+            textvariable=self.qa_overlay_var,
+            values=["none", "2D epipolar", "3D reproj", "3D excluded"],
+            width=14,
+            state="readonly",
+        )
+        self.qa_overlay_box.pack(side=tk.LEFT)
         self.images_root_entry = LabeledEntry(images_box, "Images root", "", browse=True, directory=True)
         self.images_root_entry.pack(fill=tk.X, padx=8, pady=(0, 6))
 
@@ -4359,12 +4375,17 @@ class MultiViewTab(CommandTab):
         )
         attach_tooltip(self.multiview_cameras_list, "Choisissez les caméras visibles dans le preview et le GIF.")
         self.images_root_entry.set_tooltip("Dossier d'images utilisé comme fond des vues 2D, par caméra si disponible.")
+        attach_tooltip(
+            self.qa_overlay_box,
+            "Overlay QA rapide dans le preview 2D: erreur épipolaire 2D ou diagnostics 3D de la reconstruction sélectionnée.",
+        )
         attach_tooltip(self.frame_scale, "Slider de navigation temporelle du preview 2D.")
         attach_tooltip(self.frame_label, "Index de frame actuellement affiche dans le preview 2D.")
         self.extra.set_tooltip("Options CLI supplémentaires pour animation/animate_multiview_2d_comparison.py.")
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
+        self.qa_overlay_var.trace_add("write", lambda *_args: self.refresh_preview())
         self.refresh_available_reconstructions()
 
     def default_gif_name(self) -> str:
@@ -4773,6 +4794,21 @@ class MultiViewTab(CommandTab):
                 hide_axes=True,
                 hide_axes_fn=hide_2d_axes,
             )
+            overlay_label, overlay_values, overlay_mask, overlay_cmap = self._qa_overlay_data(cam_name, frame_idx)
+            overlay_scatter = draw_point_value_overlay(
+                ax,
+                PointValueOverlay2D(
+                    label=overlay_label,
+                    points=raw_points[ax_idx, frame_idx],
+                    values=overlay_values,
+                    mask=overlay_mask,
+                    cmap=overlay_cmap,
+                    size=16.0,
+                    excluded_size=max(18.0, float(self.marker_size.get()) * 0.75),
+                ),
+            )
+            if overlay_scatter is not None:
+                self.preview_figure.colorbar(overlay_scatter, ax=ax, fraction=0.042, pad=0.02, label=overlay_label)
             for raw_name in selected:
                 mapped = "ekf_2d_acc" if raw_name == "ekf_2d" else raw_name
                 mapped = "triangulation_adaptive" if raw_name == "triangulation" else mapped
@@ -4850,6 +4886,40 @@ class MultiViewTab(CommandTab):
             self.crop_limits_key = cache_key
         return self.crop_limits_cache
 
+    def _qa_overlay_data(
+        self, camera_name: str, frame_local_idx: int
+    ) -> tuple[str, np.ndarray | None, np.ndarray | None, str | None]:
+        if self.pose_data is None or self.calibrations is None:
+            return "none", None, None, None
+        mode = str(self.qa_overlay_var.get()).strip().lower()
+        if mode == "2d epipolar":
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            values = frame_camera_epipolar_errors(
+                self.pose_data, self.calibrations, frame_idx=frame_local_idx, camera_idx=cam_idx
+            )
+            return "2D epipolar", values, None, "turbo"
+        reference_name = (self._selected_reconstruction() or "").strip()
+        if not reference_name:
+            return "none", None, None, None
+        payload = self.reconstruction_payloads.get(reference_name, {})
+        if mode == "3d reproj":
+            errors = payload.get("reprojection_error_per_view")
+            if errors is None:
+                return "3D reproj", None, None, None
+            errors = np.asarray(errors, dtype=float)
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            if errors.ndim == 3 and frame_local_idx < errors.shape[0] and cam_idx < errors.shape[2]:
+                return "3D reproj", np.asarray(errors[frame_local_idx, :, cam_idx], dtype=float), None, "turbo"
+        if mode == "3d excluded":
+            excluded = payload.get("excluded_views")
+            if excluded is None:
+                return "3D excluded", None, None, None
+            excluded = np.asarray(excluded, dtype=bool)
+            cam_idx = list(self.pose_data.camera_names).index(camera_name)
+            if excluded.ndim == 3 and frame_local_idx < excluded.shape[0] and cam_idx < excluded.shape[2]:
+                return "3D excluded", None, np.asarray(excluded[frame_local_idx, :, cam_idx], dtype=bool), None
+        return "none", None, None, None
+
     def _draw_excluded_reprojection_points(
         self,
         *,
@@ -4913,9 +4983,11 @@ class AnnotationTab(ttk.Frame):
         self._axis_to_camera: dict[object, str] = {}
         self._current_frame_idx = 0
         self._pan_state: dict[str, object] | None = None
+        self._drag_annotation_state: dict[str, object] | None = None
         self._dragging_frame_scale = False
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
         self._annotation_hover_entries: dict[object, list[dict[str, object]]] = {}
+        self._annotation_view_limits: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
         self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
         self.kinematic_model_choices: dict[str, Path] = {}
         self.kinematic_frame_states: dict[tuple[str, int], np.ndarray] = {}
@@ -4976,6 +5048,13 @@ class AnnotationTab(ttk.Frame):
             variable=self.show_triangulated_hint_var,
             command=self.refresh_preview,
         ).pack(side=tk.LEFT)
+        self.show_reference_reprojection_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row2,
+            text="Selected recon reproj",
+            variable=self.show_reference_reprojection_var,
+            command=self.refresh_preview,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         row3 = ttk.Frame(controls)
         row3.pack(fill=tk.X, padx=8, pady=4)
@@ -5302,6 +5381,26 @@ class AnnotationTab(ttk.Frame):
         self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
         self.refresh_preview()
 
+    def _store_current_annotation_view_limits(self) -> None:
+        if not hasattr(self, "preview_figure") or self.preview_figure is None:
+            return
+        for ax in list(getattr(self.preview_figure, "axes", [])):
+            camera_name = self._axis_to_camera.get(ax)
+            if camera_name is None:
+                continue
+            self._annotation_view_limits[str(camera_name)] = (
+                tuple(float(value) for value in ax.get_xlim()),
+                tuple(float(value) for value in ax.get_ylim()),
+            )
+
+    def _annotation_view_limits_for_camera(
+        self, camera_name: str
+    ) -> tuple[tuple[float, float], tuple[float, float]] | tuple[None, None]:
+        limits = getattr(self, "_annotation_view_limits", {}).get(str(camera_name))
+        if limits is None:
+            return None, None
+        return limits
+
     def _step_annotation_keypoint(self, delta: int, event=None) -> str:
         if not hasattr(self, "annotation_keypoints_list"):
             return "break"
@@ -5413,6 +5512,49 @@ class AnnotationTab(ttk.Frame):
         self._pending_reprojection_points = {}
         if hasattr(self, "reproject_button_var"):
             self.reproject_button_var.set("Reproject")
+
+    def _reference_projected_points(self, camera_name: str, frame_number: int) -> tuple[np.ndarray | None, str | None, str]:
+        selected = self.selected_reconstruction_names()
+        if not selected:
+            return None, None, "#6c5ce7"
+        reference_name = str(selected[-1]).strip()
+        if not reference_name or reference_name == "raw":
+            return None, None, "#6c5ce7"
+        recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), reference_name)
+        if recon_dir is None:
+            return None, None, reconstruction_display_color(self.state, reference_name)
+        payload = load_bundle_payload(recon_dir)
+        points_3d = np.asarray(payload.get("points_3d"), dtype=float) if "points_3d" in payload else None
+        bundle_frames = np.asarray(payload.get("frames"), dtype=int) if "frames" in payload else None
+        bundle_camera_names = (
+            [str(name) for name in np.asarray(payload.get("camera_names"), dtype=object).tolist()]
+            if "camera_names" in payload
+            else list(self.pose_data.camera_names if self.pose_data is not None else [])
+        )
+        if points_3d is None or points_3d.ndim != 3 or bundle_frames is None:
+            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
+                self.state, reference_name
+            )
+        matches = np.flatnonzero(bundle_frames == int(frame_number))
+        if matches.size == 0 or camera_name not in bundle_camera_names:
+            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
+                self.state, reference_name
+            )
+        frame_idx = int(matches[0])
+        calibration = self.calibrations.get(str(camera_name)) if self.calibrations is not None else None
+        if calibration is None:
+            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
+                self.state, reference_name
+            )
+        projected = np.full((points_3d.shape[1], 2), np.nan, dtype=float)
+        for kp_idx, point_3d in enumerate(np.asarray(points_3d[frame_idx], dtype=float)):
+            if np.all(np.isfinite(point_3d)):
+                projected[kp_idx] = calibration.project_point(point_3d)
+        return (
+            projected,
+            reconstruction_legend_label(self.state, reference_name),
+            reconstruction_display_color(self.state, reference_name),
+        )
 
     def _compute_pending_reprojection_points(self) -> dict[tuple[str, int, str], np.ndarray]:
         if self.pose_data is None or self.calibrations is None:
@@ -5695,17 +5837,10 @@ class AnnotationTab(ttk.Frame):
                     measurement_noise_scale=1.0,
                     process_noise_scale=1.0,
                     epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
+                    q_names=self.kinematic_q_names,
+                    keypoint_name=keypoint_name,
                 )
                 estimated_state = np.asarray(refined_state, dtype=float)
-                if keypoint_name is not None:
-                    blended_q = annotation_blend_q_by_relevance(
-                        self.kinematic_q_names,
-                        previous_q,
-                        estimated_state[: model.nbQ()],
-                        keypoint_name,
-                    )
-                    estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
-                    estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
                 bootstrap_summary = f" | local ekf {int(bootstrap_diagnostics.get('completed_passes', 0))}/" f"{passes}"
                 if bool(bootstrap_diagnostics.get("used_fallback")):
                     bootstrap_summary += " fallback"
@@ -5722,17 +5857,11 @@ class AnnotationTab(ttk.Frame):
                     seed_state=estimated_state,
                     passes=ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES,
                     measurement_std_px=2.0,
+                    q_names=self.kinematic_q_names,
+                    keypoint_name=keypoint_name,
                 )
                 if not bool(direct_diagnostics.get("used_fallback")):
                     estimated_state = np.asarray(direct_state, dtype=float)
-                    blended_q = annotation_blend_q_by_relevance(
-                        self.kinematic_q_names,
-                        previous_q,
-                        estimated_state[: model.nbQ()],
-                        keypoint_name,
-                    )
-                    estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
-                    estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
                     direct_summary = (
                         f" | direct fit {int(direct_diagnostics.get('completed_passes', 0))}/"
                         f"{ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES}"
@@ -6010,7 +6139,7 @@ class AnnotationTab(ttk.Frame):
         return self._cursor_artists[ax]
 
     def _nearest_annotation_hover_entry(self, ax, x: float, y: float) -> dict[str, object] | None:
-        entries = self._annotation_hover_entries.get(ax, [])
+        entries = getattr(self, "_annotation_hover_entries", {}).get(ax, [])
         best_entry = None
         best_distance = None
         for entry in entries:
@@ -6122,19 +6251,34 @@ class AnnotationTab(ttk.Frame):
         frame_number = self.current_frame_number()
         event_key = str(getattr(event, "key", "") or "").lower()
         delete_request = int(getattr(event, "button", 1)) == 3 or ("control" in event_key or "ctrl" in event_key)
+        pointer_xy = np.array([float(event.xdata), float(event.ydata)], dtype=float)
         if delete_request:
-            self._delete_nearest_annotation(
-                camera_name,
-                frame_number,
-                np.array([float(event.xdata), float(event.ydata)], dtype=float),
-            )
+            self._delete_nearest_annotation(camera_name, frame_number, pointer_xy)
         else:
+            hover_entry = self._nearest_annotation_hover_entry(event.inaxes, float(event.xdata), float(event.ydata))
+            if hover_entry is not None and str(hover_entry.get("source")) == "annotated":
+                if not hasattr(self, "_drag_annotation_state"):
+                    self._drag_annotation_state = None
+                self._drag_annotation_state = {
+                    "camera_name": str(camera_name),
+                    "frame_number": int(frame_number),
+                    "keypoint_name": str(hover_entry.get("keypoint_name", keypoint_name)),
+                }
+                set_annotation_point(
+                    self.annotation_payload,
+                    camera_name=camera_name,
+                    frame_number=frame_number,
+                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
+                    xy=pointer_xy,
+                )
+                self.refresh_preview()
+                return
             set_annotation_point(
                 self.annotation_payload,
                 camera_name=camera_name,
                 frame_number=frame_number,
                 keypoint_name=keypoint_name,
-                xy=[float(event.xdata), float(event.ydata)],
+                xy=pointer_xy,
             )
             if self.advance_marker_var.get():
                 self._advance_to_next_keypoint()
@@ -6158,9 +6302,30 @@ class AnnotationTab(ttk.Frame):
         cy = float(event.ydata)
         event.inaxes.set_xlim(cx + (x0 - cx) * scale, cx + (x1 - cx) * scale)
         event.inaxes.set_ylim(cy + (y0 - cy) * scale, cy + (y1 - cy) * scale)
+        camera_name = self._axis_to_camera.get(event.inaxes)
+        if camera_name is not None:
+            self._annotation_view_limits[str(camera_name)] = (
+                tuple(float(value) for value in event.inaxes.get_xlim()),
+                tuple(float(value) for value in event.inaxes.get_ylim()),
+            )
         self.preview_canvas.draw_idle()
 
     def on_preview_motion(self, event) -> None:
+        if self._drag_annotation_state is not None:
+            if event.inaxes is None or event.xdata is None or event.ydata is None:
+                self._update_preview_cursor(event)
+                return
+            camera_name = self._axis_to_camera.get(event.inaxes)
+            if camera_name == self._drag_annotation_state.get("camera_name"):
+                set_annotation_point(
+                    self.annotation_payload,
+                    camera_name=str(self._drag_annotation_state["camera_name"]),
+                    frame_number=int(self._drag_annotation_state["frame_number"]),
+                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
+                    xy=[float(event.xdata), float(event.ydata)],
+                )
+                self.refresh_preview()
+                return
         if self._pan_state is None or event.inaxes is None or event.xdata is None or event.ydata is None:
             self._update_preview_cursor(event)
             return
@@ -6175,15 +6340,35 @@ class AnnotationTab(ttk.Frame):
         dy = float(event.ydata) - y_press
         event.inaxes.set_xlim(xlim0[0] - dx, xlim0[1] - dx)
         event.inaxes.set_ylim(ylim0[0] - dy, ylim0[1] - dy)
+        camera_name = self._axis_to_camera.get(event.inaxes)
+        if camera_name is not None:
+            self._annotation_view_limits[str(camera_name)] = (
+                tuple(float(value) for value in event.inaxes.get_xlim()),
+                tuple(float(value) for value in event.inaxes.get_ylim()),
+            )
         self.preview_canvas.draw_idle()
         self._update_preview_cursor(None)
 
     def on_preview_release(self, _event) -> None:
+        if self._drag_annotation_state is not None:
+            dragged_keypoint = str(self._drag_annotation_state.get("keypoint_name", ""))
+            self._drag_annotation_state = None
+            if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
+                try:
+                    self._estimate_kinematic_q(keypoint_name=dragged_keypoint)
+                except Exception as exc:
+                    self._clear_kinematic_assist_preview()
+                    self.kinematic_status_var.set(f"Kinematic assist update skipped: {exc}")
+            self.save_annotations()
+            self.refresh_preview()
         self._pan_state = None
 
     def refresh_preview(self) -> None:
         if self.pose_data is None or self.calibrations is None or len(self.pose_data.frames) == 0:
             return
+        if not hasattr(self, "_annotation_view_limits"):
+            self._annotation_view_limits = {}
+        self._store_current_annotation_view_limits()
         all_camera_names = [str(name) for name in self.pose_data.camera_names]
         camera_names = self.selected_annotation_camera_names()
         if not camera_names:
@@ -6259,6 +6444,16 @@ class AnnotationTab(ttk.Frame):
                 if self.show_images_var.get()
                 else None
             )
+            x_limits, y_limits = self._annotation_view_limits_for_camera(camera_name)
+            reference_projected_points = None
+            reference_projected_label = None
+            reference_projected_color = "#6c5ce7"
+            if bool(getattr(self, "show_reference_reprojection_var", None) and self.show_reference_reprojection_var.get()):
+                (
+                    reference_projected_points,
+                    reference_projected_label,
+                    reference_projected_color,
+                ) = self._reference_projected_points(camera_name, frame_number)
             self._annotation_hover_entries[ax] = render_annotation_camera_view(
                 ax,
                 ax_idx=ax_idx,
@@ -6289,10 +6484,16 @@ class AnnotationTab(ttk.Frame):
                     else None
                 ),
                 kinematic_segmented_back_projected=self.kinematic_segmented_back_projected,
+                reference_projected_points=reference_projected_points,
+                reference_projected_label=reference_projected_label,
+                reference_projected_color=reference_projected_color,
                 motion_prior_enabled=bool(self.show_motion_prior_var.get()),
                 motion_prior_diameter=float(self.motion_prior_diameter.get()),
                 motion_prior_center_fn=annotation_motion_prior_center,
             )
+            if x_limits is not None and y_limits is not None:
+                ax.set_xlim(*x_limits)
+                ax.set_ylim(*y_limits)
 
             other_camera_names: list[str] = []
             other_points: list[np.ndarray] = []
@@ -12426,19 +12627,33 @@ class CalibrationTab(ttk.Frame):
                 if self.qc.three_d.spatial_uniformity_cv is None
                 else f"{self.qc.three_d.spatial_uniformity_cv:.3f}"
             )
-            scatter = ax.scatter(
-                self.qc.three_d.point_positions[:, 0],
-                self.qc.three_d.point_positions[:, 2],
-                c=self.qc.three_d.point_errors_px,
-                cmap="turbo",
-                s=10,
-                alpha=0.65,
-            )
-            ax.set_title("Spatial reprojection quality (X/Z)\n" f"CV={cv_text}")
-            ax.set_xlabel("X (m)")
-            ax.set_ylabel("Z (m)")
-            ax.grid(alpha=0.2)
-            self.figure.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="px")
+            spatial_map = np.asarray(self.qc.three_d.spatial_xz_mean_px, dtype=float)
+            if np.isfinite(spatial_map).any():
+                image = ax.imshow(spatial_map.T, origin="lower", cmap="turbo", aspect="auto")
+                ax.set_title("Spatial reprojection map (X/Z bins)\n" f"CV={cv_text}")
+                ax.set_xlabel("X bins")
+                ax.set_ylabel("Z bins")
+                ax.set_xticks(range(spatial_map.shape[0]))
+                ax.set_yticks(range(spatial_map.shape[1]))
+                mean_value = float(np.nanmean(spatial_map)) if np.isfinite(spatial_map).any() else np.nan
+                for x_idx in range(spatial_map.shape[0]):
+                    for z_idx in range(spatial_map.shape[1]):
+                        value = float(spatial_map[x_idx, z_idx])
+                        count = int(self.qc.three_d.spatial_xz_count[x_idx, z_idx])
+                        if np.isfinite(value) and count > 0:
+                            ax.text(
+                                x_idx,
+                                z_idx,
+                                f"{value:.1f}\n(n={count})",
+                                ha="center",
+                                va="center",
+                                fontsize=7,
+                                color=("white" if np.isfinite(mean_value) and value > mean_value else "black"),
+                            )
+                self.figure.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="px")
+            else:
+                ax.axis("off")
+                ax.text(0.5, 0.5, "No occupied spatial bins", ha="center", va="center", transform=ax.transAxes)
 
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -13013,13 +13228,15 @@ class CameraToolsTab(ttk.Frame):
     def _qa_overlay_data(
         self, camera_name: str, frame_local_idx: int
     ) -> tuple[str, np.ndarray | None, np.ndarray | None, str | None]:
-        mode = self.qa_overlay_var.get().strip().lower()
+        mode = str(getattr(getattr(self, "qa_overlay_var", None), "get", lambda: "none")()).strip().lower()
         if mode == "2d epipolar":
             cam_idx = list(self.pose_data.camera_names).index(camera_name)
             values = frame_camera_epipolar_errors(
                 self.pose_data, self.calibrations, frame_idx=frame_local_idx, camera_idx=cam_idx
             )
             return "2D epipolar", values, None, "turbo"
+        if mode not in {"3d reproj", "3d excluded"}:
+            return "none", None, None, None
         payload = self._reference_payload()
         if mode == "3d reproj":
             errors = payload.get("reprojection_error_per_view")
@@ -13150,36 +13367,18 @@ class CameraToolsTab(ttk.Frame):
             ylabel="y (px)",
         )
         overlay_label, overlay_values, overlay_mask, overlay_cmap = self._qa_overlay_data(camera_name, frame_local_idx)
-        finite_points_mask = np.all(np.isfinite(display_raw_points), axis=1)
-        if overlay_values is not None:
-            finite_overlay = finite_points_mask & np.isfinite(overlay_values)
-            if np.any(finite_overlay):
-                scatter = ax.scatter(
-                    display_raw_points[finite_overlay, 0],
-                    display_raw_points[finite_overlay, 1],
-                    c=np.asarray(overlay_values[finite_overlay], dtype=float),
-                    cmap=overlay_cmap or "turbo",
-                    s=18.0,
-                    linewidths=0.8,
-                    edgecolors="white",
-                    alpha=0.95,
-                    zorder=6,
-                )
-                self.flip_figure.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=overlay_label)
-        if overlay_mask is not None:
-            marked = finite_points_mask & np.asarray(overlay_mask, dtype=bool)
-            if np.any(marked):
-                ax.scatter(
-                    display_raw_points[marked, 0],
-                    display_raw_points[marked, 1],
-                    marker="x",
-                    s=34.0,
-                    linewidths=1.6,
-                    c="#111111",
-                    alpha=0.95,
-                    zorder=7,
-                    label="Excluded in 3D",
-                )
+        overlay_scatter = draw_point_value_overlay(
+            ax,
+            PointValueOverlay2D(
+                label=overlay_label,
+                points=display_raw_points,
+                values=overlay_values,
+                mask=overlay_mask,
+                cmap=overlay_cmap,
+            ),
+        )
+        if overlay_scatter is not None:
+            self.flip_figure.colorbar(overlay_scatter, ax=ax, fraction=0.046, pad=0.04, label=overlay_label)
         side_handles = [
             plt.Line2D(
                 [],
