@@ -1728,6 +1728,9 @@ def compose_multiview_crop_points(
 
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
 ANNOTATION_DELETE_RADIUS_PX = 18.0
+ANNOTATION_HOVER_RADIUS_PX = 10.0
+ANNOTATION_DRAG_START_RADIUS_PX = 10.0
+ANNOTATION_DRAG_ACTIVATION_PX = 3.0
 ANNOTATION_SNAP_RADIUS_PX = 24.0
 ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
 ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER = 3
@@ -6112,13 +6115,6 @@ class AnnotationTab(ttk.Frame):
             )
             seed_source = f"triangulation ({n_triangulated} markers)"
         if keypoint_name is not None:
-            blended_q = annotation_blend_q_by_relevance(
-                self.kinematic_q_names,
-                previous_q,
-                estimated_state[: model.nbQ()],
-                keypoint_name,
-            )
-            estimated_state[: model.nbQ()] = np.asarray(blended_q, dtype=float)
             estimated_state[model.nbQ() : 3 * model.nbQ()] = 0.0
         bootstrap_summary = " | local ekf skipped"
         direct_summary = ""
@@ -6151,7 +6147,7 @@ class AnnotationTab(ttk.Frame):
                     process_noise_scale=1.0,
                     epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
                     q_names=self.kinematic_q_names,
-                    keypoint_name=keypoint_name,
+                    keypoint_name=None,
                 )
                 estimated_state = np.asarray(refined_state, dtype=float)
                 bootstrap_summary = f" | local ekf {int(bootstrap_diagnostics.get('completed_passes', 0))}/" f"{passes}"
@@ -6171,7 +6167,7 @@ class AnnotationTab(ttk.Frame):
                     passes=ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES,
                     measurement_std_px=2.0,
                     q_names=self.kinematic_q_names,
-                    keypoint_name=keypoint_name,
+                    keypoint_name=None,
                 )
                 if not bool(direct_diagnostics.get("used_fallback")):
                     estimated_state = np.asarray(direct_state, dtype=float)
@@ -6614,9 +6610,19 @@ class AnnotationTab(ttk.Frame):
             if best_distance is None or distance < best_distance:
                 best_distance = distance
                 best_entry = entry
-        if best_entry is None or best_distance is None or best_distance > ANNOTATION_DELETE_RADIUS_PX:
+        if best_entry is None or best_distance is None or best_distance > ANNOTATION_HOVER_RADIUS_PX:
             return None
         return best_entry
+
+    def _nearest_annotated_drag_entry(self, ax, x: float, y: float) -> dict[str, object] | None:
+        hover_entry = self._nearest_annotation_hover_entry(ax, x, y)
+        if hover_entry is None or str(hover_entry.get("source")) != "annotated":
+            return None
+        point = np.asarray(hover_entry.get("xy"), dtype=float).reshape(2)
+        distance = float(np.linalg.norm(point - np.array([x, y], dtype=float)))
+        if not np.isfinite(distance) or distance > ANNOTATION_DRAG_START_RADIUS_PX:
+            return None
+        return hover_entry
 
     def _annotation_hover_label(self, entry: dict[str, object]) -> str:
         keypoint_name = str(entry.get("keypoint_name", ""))
@@ -6719,45 +6725,18 @@ class AnnotationTab(ttk.Frame):
         if delete_request:
             self._delete_nearest_annotation(camera_name, frame_number, pointer_xy)
         else:
-            hover_entry = self._nearest_annotation_hover_entry(event.inaxes, float(event.xdata), float(event.ydata))
-            if hover_entry is not None and str(hover_entry.get("source")) == "annotated":
-                if not hasattr(self, "_drag_annotation_state"):
-                    self._drag_annotation_state = None
-                self._drag_annotation_state = {
-                    "camera_name": str(camera_name),
-                    "frame_number": int(frame_number),
-                    "keypoint_name": str(hover_entry.get("keypoint_name", keypoint_name)),
-                }
-                snapped_xy = self._snap_annotation_xy(
-                    camera_name=str(camera_name),
-                    frame_number=int(frame_number),
-                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
-                    pointer_xy=pointer_xy,
-                )
-                set_annotation_point(
-                    self.annotation_payload,
-                    camera_name=camera_name,
-                    frame_number=frame_number,
-                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
-                    xy=snapped_xy,
-                )
-                self.refresh_preview()
-                return
-            snapped_xy = self._snap_annotation_xy(
-                camera_name=str(camera_name),
-                frame_number=int(frame_number),
-                keypoint_name=keypoint_name,
-                pointer_xy=pointer_xy,
-            )
-            set_annotation_point(
-                self.annotation_payload,
-                camera_name=camera_name,
-                frame_number=frame_number,
-                keypoint_name=keypoint_name,
-                xy=snapped_xy,
-            )
-            if self.advance_marker_var.get():
-                self._advance_to_next_keypoint()
+            hover_entry = self._nearest_annotated_drag_entry(event.inaxes, float(event.xdata), float(event.ydata))
+            self._drag_annotation_state = {
+                "camera_name": str(camera_name),
+                "frame_number": int(frame_number),
+                "selected_keypoint_name": str(keypoint_name),
+                "pressed_xy": np.array(pointer_xy, copy=True),
+                "did_drag": False,
+                "existing_keypoint_name": (
+                    str(hover_entry.get("keypoint_name", "")) if hover_entry is not None else None
+                ),
+            }
+            return
         self._clear_kinematic_assist_preview()
         if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
             try:
@@ -6793,17 +6772,30 @@ class AnnotationTab(ttk.Frame):
                 return
             camera_name = self._axis_to_camera.get(event.inaxes)
             if camera_name == self._drag_annotation_state.get("camera_name"):
+                pointer_xy = np.array([float(event.xdata), float(event.ydata)], dtype=float)
+                pressed_xy = np.asarray(self._drag_annotation_state.get("pressed_xy"), dtype=float).reshape(2)
+                if not bool(self._drag_annotation_state.get("did_drag")):
+                    drag_distance = float(np.linalg.norm(pointer_xy - pressed_xy))
+                    if drag_distance < ANNOTATION_DRAG_ACTIVATION_PX:
+                        self._update_preview_cursor(event)
+                        return
+                    self._drag_annotation_state["did_drag"] = True
+                dragged_keypoint_name = str(
+                    self._drag_annotation_state.get("existing_keypoint_name")
+                    or self._drag_annotation_state.get("selected_keypoint_name")
+                    or ""
+                )
                 snapped_xy = self._snap_annotation_xy(
                     camera_name=str(self._drag_annotation_state["camera_name"]),
                     frame_number=int(self._drag_annotation_state["frame_number"]),
-                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
-                    pointer_xy=np.array([float(event.xdata), float(event.ydata)], dtype=float),
+                    keypoint_name=dragged_keypoint_name,
+                    pointer_xy=pointer_xy,
                 )
                 set_annotation_point(
                     self.annotation_payload,
                     camera_name=str(self._drag_annotation_state["camera_name"]),
                     frame_number=int(self._drag_annotation_state["frame_number"]),
-                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
+                    keypoint_name=dragged_keypoint_name,
                     xy=snapped_xy,
                 )
                 self.refresh_preview()
@@ -6831,13 +6823,43 @@ class AnnotationTab(ttk.Frame):
         self.preview_canvas.draw_idle()
         self._update_preview_cursor(None)
 
-    def on_preview_release(self, _event) -> None:
+    def on_preview_release(self, event) -> None:
         if self._drag_annotation_state is not None:
-            dragged_keypoint = str(self._drag_annotation_state.get("keypoint_name", ""))
+            state = dict(self._drag_annotation_state)
             self._drag_annotation_state = None
+            camera_name = str(state.get("camera_name", ""))
+            frame_number = int(state.get("frame_number", self.current_frame_number()))
+            selected_keypoint_name = str(state.get("selected_keypoint_name", self.selected_keypoint_name()))
+            did_drag = bool(state.get("did_drag"))
+            if (
+                not did_drag
+                and event is not None
+                and event.inaxes is not None
+                and event.xdata is not None
+                and event.ydata is not None
+            ):
+                release_camera_name = self._axis_to_camera.get(event.inaxes)
+                if release_camera_name == camera_name:
+                    snapped_xy = self._snap_annotation_xy(
+                        camera_name=camera_name,
+                        frame_number=frame_number,
+                        keypoint_name=selected_keypoint_name,
+                        pointer_xy=np.array([float(event.xdata), float(event.ydata)], dtype=float),
+                    )
+                    set_annotation_point(
+                        self.annotation_payload,
+                        camera_name=camera_name,
+                        frame_number=frame_number,
+                        keypoint_name=selected_keypoint_name,
+                        xy=snapped_xy,
+                    )
+                    if self.advance_marker_var.get():
+                        self._advance_to_next_keypoint()
+            updated_keypoint = str(state.get("existing_keypoint_name")) if did_drag else selected_keypoint_name
+            self._clear_kinematic_assist_preview()
             if bool(getattr(self, "kinematic_assist_var", None) and self.kinematic_assist_var.get()):
                 try:
-                    self._estimate_kinematic_q(keypoint_name=dragged_keypoint)
+                    self._estimate_kinematic_q(keypoint_name=updated_keypoint)
                 except Exception as exc:
                     self._clear_kinematic_assist_preview()
                     self.kinematic_status_var.set(f"Kinematic assist update skipped: {exc}")

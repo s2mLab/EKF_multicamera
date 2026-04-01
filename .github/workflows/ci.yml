@@ -25,13 +25,32 @@ jobs:
           pip install -e .[test]
 
       - name: Run isort --check-only
+        id: isort
+        continue-on-error: true
         run: isort . --check-only --profile black
 
       - name: Run black --check
+        id: black
+        continue-on-error: true
         run: black . --check --verbose
 
       - name: Run flake8
+        id: flake8
+        continue-on-error: true
         run: flake8 .
 
       - name: Run test suite
+        id: pytest
+        continue-on-error: true
         run: pytest -q
+
+      - name: Fail if any check failed
+        if: always()
+        run: |
+          if [ "${{ steps.isort.outcome }}" != "success" ] || \
+             [ "${{ steps.black.outcome }}" != "success" ] || \
+             [ "${{ steps.flake8.outcome }}" != "success" ] || \
+             [ "${{ steps.pytest.outcome }}" != "success" ]; then
+            echo "One or more checks failed."
+            exit 1
+          fi

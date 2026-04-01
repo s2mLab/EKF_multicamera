@@ -961,8 +961,14 @@ def test_annotation_click_advances_marker_without_monoview():
     tab._advance_to_next_keypoint = lambda: setattr(tab, "_advanced", True)
     tab.selected_keypoint_name = lambda: "left_shoulder"
     tab.current_frame_number = lambda: 10
+    tab._clear_kinematic_assist_preview = lambda: None
+    tab._snap_annotation_xy = lambda **kwargs: np.array([kwargs["pointer_xy"][0], kwargs["pointer_xy"][1]], dtype=float)
 
     pipeline_gui.AnnotationTab.on_preview_click(
+        tab,
+        SimpleNamespace(inaxes="axis0", xdata=120.0, ydata=240.0, button=1),
+    )
+    pipeline_gui.AnnotationTab.on_preview_release(
         tab,
         SimpleNamespace(inaxes="axis0", xdata=120.0, ydata=240.0, button=1),
     )
@@ -1703,6 +1709,20 @@ def test_annotation_nearest_hover_entry_returns_closest_point():
     assert nearest["keypoint_name"] == "left_wrist"
 
 
+def test_annotation_nearest_hover_entry_uses_small_hover_radius():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    ax = object()
+    tab._annotation_hover_entries = {
+        ax: [
+            {"xy": np.array([10.0, 20.0]), "keypoint_name": "nose", "source": "annotated"},
+        ]
+    }
+
+    nearest = pipeline_gui.AnnotationTab._nearest_annotation_hover_entry(tab, ax, 25.0, 20.0)
+
+    assert nearest is None
+
+
 def test_annotation_estimate_kinematic_q_with_keypoint_reports_local_update(monkeypatch, tmp_path):
     biomod_path = tmp_path / "demo.bioMod"
     biomod_path.write_text("demo", encoding="utf-8")
@@ -1912,6 +1932,103 @@ def test_annotation_estimate_kinematic_q_click_zeroes_derivatives_and_uses_short
 
     np.testing.assert_allclose(ekf_calls["seed_state"][2:], np.zeros(4, dtype=float))
     assert ekf_calls["passes"] == pipeline_gui.ANNOTATION_KINEMATIC_CLICK_PASSES
+    assert ekf_calls["keypoint_name"] is None
+
+
+def test_annotation_click_release_places_selected_marker_without_drag(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int))
+    tab.annotation_payload = pipeline_gui.empty_annotation_payload()
+    tab._pending_reprojection_points = {}
+    tab._axis_to_camera = {}
+    tab._drag_annotation_state = None
+    tab._clear_kinematic_assist_preview = lambda: None
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab.save_annotations = lambda: setattr(tab, "_saved", True)
+    tab.current_frame_number = lambda: 10
+    tab.selected_keypoint_name = lambda: "nose"
+    tab.advance_marker_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
+    tab._snap_annotation_xy = lambda **kwargs: np.array([kwargs["pointer_xy"][0], kwargs["pointer_xy"][1]], dtype=float)
+    ax = object()
+    tab._axis_to_camera[ax] = "cam0"
+    tab._nearest_annotated_drag_entry = lambda *_args, **_kwargs: {
+        "xy": np.array([100.0, 100.0]),
+        "keypoint_name": "left_eye",
+        "source": "annotated",
+    }
+
+    press_event = SimpleNamespace(inaxes=ax, xdata=120.0, ydata=80.0, button=1, key="")
+    release_event = SimpleNamespace(inaxes=ax, xdata=120.0, ydata=80.0, button=1, key="")
+
+    pipeline_gui.AnnotationTab.on_preview_click(tab, press_event)
+    pipeline_gui.AnnotationTab.on_preview_release(tab, release_event)
+
+    point_xy, _score = pipeline_gui.get_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="nose",
+    )
+    np.testing.assert_allclose(point_xy, np.array([120.0, 80.0], dtype=float))
+    left_eye_xy, _score = pipeline_gui.get_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="left_eye",
+    )
+    assert left_eye_xy is None
+
+
+def test_annotation_drag_moves_existing_marker_only_after_motion(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int))
+    tab.annotation_payload = pipeline_gui.empty_annotation_payload()
+    pipeline_gui.set_annotation_point(
+        tab.annotation_payload, camera_name="cam0", frame_number=10, keypoint_name="left_eye", xy=[100.0, 100.0]
+    )
+    tab._pending_reprojection_points = {}
+    tab._axis_to_camera = {}
+    tab._drag_annotation_state = None
+    tab._clear_kinematic_assist_preview = lambda: None
+    tab.refresh_preview = lambda: None
+    tab.save_annotations = lambda: None
+    tab.current_frame_number = lambda: 10
+    tab.selected_keypoint_name = lambda: "nose"
+    tab.advance_marker_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
+    tab._snap_annotation_xy = lambda **kwargs: np.array([kwargs["pointer_xy"][0], kwargs["pointer_xy"][1]], dtype=float)
+    tab._update_preview_cursor = lambda _event: None
+    ax = object()
+    tab._axis_to_camera[ax] = "cam0"
+    tab._nearest_annotated_drag_entry = lambda *_args, **_kwargs: {
+        "xy": np.array([100.0, 100.0]),
+        "keypoint_name": "left_eye",
+        "source": "annotated",
+    }
+
+    press_event = SimpleNamespace(inaxes=ax, xdata=100.0, ydata=100.0, button=1, key="")
+    move_event = SimpleNamespace(inaxes=ax, xdata=108.0, ydata=103.0, button=1, key="")
+    release_event = SimpleNamespace(inaxes=ax, xdata=108.0, ydata=103.0, button=1, key="")
+
+    pipeline_gui.AnnotationTab.on_preview_click(tab, press_event)
+    pipeline_gui.AnnotationTab.on_preview_motion(tab, move_event)
+    pipeline_gui.AnnotationTab.on_preview_release(tab, release_event)
+
+    left_eye_xy, _score = pipeline_gui.get_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="left_eye",
+    )
+    np.testing.assert_allclose(left_eye_xy, np.array([108.0, 103.0], dtype=float))
+    nose_xy, _score = pipeline_gui.get_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="nose",
+    )
+    assert nose_xy is None
 
 
 def test_annotation_estimate_kinematic_q_click_uses_single_measurement_when_state_exists(monkeypatch, tmp_path):
