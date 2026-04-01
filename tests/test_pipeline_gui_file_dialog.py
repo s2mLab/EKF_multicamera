@@ -2003,6 +2003,70 @@ def test_annotation_refresh_preview_draws_model_overlay_with_light_style(monkeyp
     assert captured["back"]["marker_alpha"] == pytest.approx(0.38)
 
 
+def test_annotation_refresh_preview_keeps_epipolar_guides_from_all_cameras_when_single_view_selected(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(
+        frames=np.array([10], dtype=int),
+        camera_names=["cam0", "cam1", "cam2"],
+        raw_keypoints=np.zeros((3, 1, len(pipeline_gui.COCO17), 2), dtype=float),
+    )
+    tab.calibrations = {
+        "cam0": SimpleNamespace(image_size=(640, 480)),
+        "cam1": SimpleNamespace(image_size=(640, 480)),
+        "cam2": SimpleNamespace(image_size=(640, 480)),
+    }
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_projected_points = None
+    tab.kinematic_segmented_back_projected = {}
+    tab.frame_var = SimpleNamespace(get=lambda: 0, set=lambda value: setattr(tab, "_frame_index", value))
+    tab._current_frame_idx = 0
+    tab.frame_label = SimpleNamespace(configure=lambda **kwargs: setattr(tab, "_frame_label_text", kwargs["text"]))
+    tab.frame_filter_var = SimpleNamespace(get=lambda: pipeline_gui.ANNOTATION_FRAME_FILTER_OPTIONS["all"])
+    tab.crop_var = SimpleNamespace(get=lambda: False)
+    tab.selected_keypoint_name = lambda: "nose"
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab.show_images_var = SimpleNamespace(get=lambda: False)
+    tab._current_images_root = lambda: None
+    tab.preview_figure = pipeline_gui.Figure(figsize=(4, 4))
+    tab.preview_canvas = SimpleNamespace(draw_idle=lambda: None)
+    tab.motion_prior_diameter = SimpleNamespace(get=lambda: "15")
+    tab.show_motion_prior_var = SimpleNamespace(get=lambda: False)
+    tab.show_epipolar_var = SimpleNamespace(get=lambda: True)
+    tab.show_triangulated_hint_var = SimpleNamespace(get=lambda: False)
+    tab._pending_reprojection_points = {}
+    tab.annotation_payload = {}
+    tab._axis_to_camera = {}
+    tab._cursor_artists = {}
+    tab.image_brightness_var = SimpleNamespace(get=lambda: 1.0)
+    tab.image_contrast_var = SimpleNamespace(get=lambda: 1.0)
+    tab.preview_canvas_widget = SimpleNamespace()
+    tab._ensure_crop_limits = lambda _camera_names: {}
+    tab._annotation_xy = lambda camera_name, _frame_number, _keypoint_name: (
+        np.array([100.0, 200.0], dtype=float) if camera_name in {"cam1", "cam2"} else None
+    )
+
+    seen_sources = []
+
+    monkeypatch.setattr(pipeline_gui, "camera_layout", lambda _n: (1, 1))
+    monkeypatch.setattr(pipeline_gui, "apply_2d_axis_limits", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "hide_2d_axes", lambda ax: None)
+    monkeypatch.setattr(pipeline_gui, "draw_skeleton_2d", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "draw_upper_back_overlay_2d", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_gui, "render_annotation_camera_view", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        pipeline_gui,
+        "annotation_epipolar_guides",
+        lambda _calibs, source_camera_name, target_camera_name, _xy: (
+            seen_sources.append((source_camera_name, target_camera_name)) or None
+        ),
+    )
+
+    pipeline_gui.AnnotationTab.refresh_preview(tab)
+
+    assert ("cam1", "cam0") in seen_sources
+    assert ("cam2", "cam0") in seen_sources
+
+
 def test_annotation_compute_pending_reprojection_points_updates_only_existing_annotations(monkeypatch):
     tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
     tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int), camera_names=["cam0", "cam1", "cam2"])

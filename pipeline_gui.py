@@ -6168,6 +6168,7 @@ class AnnotationTab(ttk.Frame):
         camera_names = self.selected_annotation_camera_names()
         if not camera_names:
             camera_names = list(all_camera_names)
+        support_camera_names = list(all_camera_names)
         frame_idx = max(0, min(len(self.pose_data.frames) - 1, int(round(self.frame_var.get()))))
         self._current_frame_idx = frame_idx
         self.frame_var.set(frame_idx)
@@ -6275,7 +6276,7 @@ class AnnotationTab(ttk.Frame):
 
             other_camera_names: list[str] = []
             other_points: list[np.ndarray] = []
-            for other_camera_name in camera_names:
+            for other_camera_name in support_camera_names:
                 if other_camera_name == camera_name:
                     continue
                 other_xy = self._annotation_xy(other_camera_name, frame_number, current_marker)
@@ -12330,9 +12331,21 @@ class CalibrationTab(ttk.Frame):
 
         ax = axes[1, 0]
         frames = np.asarray(self.pose_data.frames, dtype=int)
-        ax.plot(frames, two_d.per_frame_mean_px, label="2D epipolar mean", linewidth=1.2)
+        plot_start_idx = min(5, len(frames))
+        plot_frames = frames[plot_start_idx:]
+        ax.plot(
+            plot_frames,
+            np.asarray(two_d.per_frame_mean_px, dtype=float)[plot_start_idx:],
+            label="2D epipolar mean",
+            linewidth=1.2,
+        )
         if self.qc.three_d is not None:
-            ax.plot(frames, self.qc.three_d.per_frame_mean_px, label="3D reproj mean", linewidth=1.2)
+            ax.plot(
+                plot_frames,
+                np.asarray(self.qc.three_d.per_frame_mean_px, dtype=float)[plot_start_idx:],
+                label="3D reproj mean",
+                linewidth=1.2,
+            )
         ax.set_title("Worst frames over time")
         ax.set_xlabel("Frame")
         ax.set_ylabel("px")
