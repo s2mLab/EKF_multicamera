@@ -82,6 +82,72 @@ def test_normalize_pose_correction_mode_falls_back_to_none():
     assert pipeline_gui.normalize_pose_correction_mode("unexpected_mode") == "none"
 
 
+def test_schedule_after_idle_once_coalesces_multiple_requests():
+    calls = []
+
+    class _FakeWidget:
+        def __init__(self):
+            self._queued = []
+            self._token = 0
+
+        def after_idle(self, callback):
+            self._token += 1
+            self._queued.append((self._token, callback))
+            return self._token
+
+        def after_cancel(self, _token):
+            return
+
+    widget = _FakeWidget()
+
+    pipeline_gui.schedule_after_idle_once(widget, "_scheduled_demo", lambda: calls.append("run"))
+    pipeline_gui.schedule_after_idle_once(widget, "_scheduled_demo", lambda: calls.append("run"))
+
+    assert len(widget._queued) == 1
+    _token, callback = widget._queued.pop()
+    callback()
+    assert calls == ["run"]
+
+
+def test_annotation_path_change_is_ignored_while_syncing_defaults():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab._syncing_annotation_defaults = True
+    tab.request_load_resources = lambda: (_ for _ in ()).throw(
+        AssertionError("request_load_resources should not be called")
+    )
+
+    pipeline_gui.AnnotationTab._on_annotation_path_changed(tab)
+
+
+def test_annotation_sync_dataset_defaults_requests_one_load(monkeypatch, tmp_path):
+    keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
+    keypoints_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(pipeline_gui, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline_gui, "default_annotation_path", lambda _path: tmp_path / "inputs" / "annotations.json")
+    monkeypatch.setattr(pipeline_gui, "infer_execution_images_root", lambda _path: tmp_path / "inputs" / "images")
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        annotation_path_var=SimpleNamespace(
+            get=lambda: "", set=lambda value: setattr(tab, "_annotation_path_set", value)
+        ),
+    )
+    tab.images_root_entry = SimpleNamespace(
+        var=SimpleNamespace(get=lambda: "", set=lambda value: setattr(tab, "_images_root_set", value))
+    )
+    tab.refresh_kinematic_model_choices = lambda: setattr(tab, "_models_refreshed", True)
+    calls = []
+    tab.request_load_resources = lambda: calls.append("load")
+
+    pipeline_gui.AnnotationTab.sync_dataset_defaults(tab)
+
+    assert calls == ["load"]
+    assert tab._annotation_path_set.endswith("inputs/annotations.json")
+    assert tab._images_root_set.endswith("inputs/images")
+
+
 def test_append_default_pose2sim_profile_adds_pose2sim_when_trc_exists():
     triangulation = pipeline_gui.ReconstructionProfile(name="tri", family="triangulation")
     pose2sim = pipeline_gui.ReconstructionProfile(name="p2s", family="pose2sim")
@@ -1027,6 +1093,106 @@ def test_annotation_refresh_preview_preserves_saved_view_limits(monkeypatch):
     ax = tab.preview_figure.axes[0]
     np.testing.assert_allclose(ax.get_xlim(), np.array([10.0, 20.0]))
     np.testing.assert_allclose(ax.get_ylim(), np.array([40.0, 30.0]))
+
+
+def test_annotation_set_frame_index_resets_user_view_limits_on_frame_change():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11], dtype=int))
+    tab._current_frame_idx = 0
+    tab._annotation_view_limits = {"cam0": ((10.0, 20.0), (40.0, 30.0))}
+    tab._reset_annotation_view_limits_on_next_refresh = False
+    tab.save_annotations = lambda: setattr(tab, "_saved", True)
+    tab._clear_pending_reprojection = lambda: setattr(tab, "_cleared_pending", True)
+    tab._clear_kinematic_assist_preview = lambda: setattr(tab, "_cleared_kinematic", True)
+    tab.frame_var = SimpleNamespace(set=lambda value: setattr(tab, "_frame_var_value", value))
+
+    pipeline_gui.AnnotationTab._set_frame_index(tab, 1)
+
+    assert tab._annotation_view_limits == {}
+    assert tab._reset_annotation_view_limits_on_next_refresh is True
+    assert tab._frame_var_value == 1
+    assert tab._saved is True
+    assert tab._cleared_pending is True
+    assert tab._cleared_kinematic is True
+
+
+def test_annotation_set_frame_index_keeps_user_view_limits_when_frame_unchanged():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10, 11], dtype=int))
+    tab._current_frame_idx = 1
+    original_limits = {"cam0": ((10.0, 20.0), (40.0, 30.0))}
+    tab._annotation_view_limits = dict(original_limits)
+    tab._reset_annotation_view_limits_on_next_refresh = False
+    tab.save_annotations = lambda: (_ for _ in ()).throw(AssertionError("save_annotations should not be called"))
+    tab._clear_pending_reprojection = lambda: (_ for _ in ()).throw(
+        AssertionError("_clear_pending_reprojection should not be called")
+    )
+    tab._clear_kinematic_assist_preview = lambda: (_ for _ in ()).throw(
+        AssertionError("_clear_kinematic_assist_preview should not be called")
+    )
+    tab.frame_var = SimpleNamespace(set=lambda value: setattr(tab, "_frame_var_value", value))
+
+    pipeline_gui.AnnotationTab._set_frame_index(tab, 1)
+
+    assert tab._annotation_view_limits == original_limits
+    assert tab._reset_annotation_view_limits_on_next_refresh is False
+    assert tab._frame_var_value == 1
+
+
+def test_annotation_refresh_preview_skips_storing_old_view_limits_after_frame_change(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(
+        camera_names=["cam0"],
+        frames=np.array([10, 11], dtype=int),
+    )
+    tab.calibrations = {"cam0": SimpleNamespace(image_size=(640, 480))}
+    tab.annotation_payload = {}
+    tab.preview_figure = Figure(figsize=(4, 4))
+    tab.preview_canvas = SimpleNamespace(draw_idle=lambda: None)
+    tab.frame_var = SimpleNamespace(get=lambda: 1, set=lambda _value: None)
+    tab.frame_label = SimpleNamespace(configure=lambda **_kwargs: None)
+    tab.crop_var = SimpleNamespace(get=lambda: False)
+    tab.show_images_var = SimpleNamespace(get=lambda: False)
+    tab.image_brightness_var = SimpleNamespace(get=lambda: 1.0)
+    tab.image_contrast_var = SimpleNamespace(get=lambda: 1.0)
+    tab.show_reference_reprojection_var = SimpleNamespace(get=lambda: False)
+    tab.show_motion_prior_var = SimpleNamespace(get=lambda: False)
+    tab.show_triangulated_hint_var = SimpleNamespace(get=lambda: False)
+    tab.motion_prior_diameter = SimpleNamespace(get=lambda: "15")
+    tab.show_epipolar_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_assist_var = SimpleNamespace(get=lambda: False)
+    tab.kinematic_projected_points = None
+    tab.kinematic_segmented_back_projected = {}
+    tab._annotation_hover_entries = {}
+    tab._cursor_artists = {}
+    tab._axis_to_camera = {}
+    tab._annotation_view_limits = {"cam0": ((10.0, 20.0), (40.0, 30.0))}
+    tab._reset_annotation_view_limits_on_next_refresh = True
+    tab._pending_reprojection_points = {}
+    tab.current_frame_number = lambda: 11
+    tab.selected_annotation_camera_names = lambda: ["cam0"]
+    tab._current_images_root = lambda: None
+    tab._frame_filter_mode = lambda: "all"
+    tab._filtered_annotation_frame_local_indices = lambda: [0, 1]
+    tab.selected_keypoint_name = lambda: "nose"
+    tab._reference_projected_points = lambda *_args, **_kwargs: (None, None, "#6c5ce7")
+    tab._annotation_xy = lambda *_args, **_kwargs: None
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "render_annotation_camera_view",
+        lambda ax, **_kwargs: (ax.scatter([], []), [])[1],
+    )
+    monkeypatch.setattr(
+        pipeline_gui.AnnotationTab,
+        "_store_current_annotation_view_limits",
+        lambda _self: (_ for _ in ()).throw(AssertionError("old view limits should not be stored")),
+    )
+
+    pipeline_gui.AnnotationTab.refresh_preview(tab)
+
+    assert tab._annotation_view_limits == {}
+    assert tab._reset_annotation_view_limits_on_next_refresh is False
 
 
 def test_annotation_delete_nearest_annotation_removes_closest_marker():

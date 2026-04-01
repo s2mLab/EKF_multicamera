@@ -2714,6 +2714,42 @@ def current_calibration_correction_mode(state: SharedAppState) -> str:
     )
 
 
+def schedule_after_idle_once(widget, attr_name: str, callback) -> None:
+    """Coalesce repeated refresh requests into one idle callback."""
+
+    scheduled_id = getattr(widget, attr_name, None)
+    if scheduled_id is not None:
+        return
+    if not hasattr(widget, "after_idle"):
+        callback()
+        return
+
+    def _runner():
+        setattr(widget, attr_name, None)
+        callback()
+
+    try:
+        scheduled_id = widget.after_idle(_runner)
+    except Exception:
+        callback()
+        return
+    setattr(widget, attr_name, scheduled_id)
+
+
+def cancel_scheduled_after_idle(widget, attr_name: str) -> None:
+    """Cancel one scheduled idle callback when the widget supports it."""
+
+    scheduled_id = getattr(widget, attr_name, None)
+    if scheduled_id is None:
+        return
+    setattr(widget, attr_name, None)
+    if hasattr(widget, "after_cancel"):
+        try:
+            widget.after_cancel(scheduled_id)
+        except Exception:
+            pass
+
+
 def normalize_pose_correction_mode(raw: str) -> str:
     value = str(raw).strip()
     return (
@@ -4204,6 +4240,10 @@ class DualAnimationTab(CommandTab):
     def selected_reconstruction_names(self) -> list[str]:
         return list(self.state.shared_reconstruction_selection)
 
+    def _selected_reconstruction(self) -> str | None:
+        selected = self.selected_reconstruction_names()
+        return str(selected[-1]) if selected else None
+
     def _publish_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
         panel = self.state.shared_reconstruction_panel
         if panel is not None and self.state.active_reconstruction_consumer is self:
@@ -5234,7 +5274,12 @@ class AnnotationTab(ttk.Frame):
         self._cursor_artists: dict[object, tuple[object, ...]] = {}
         self._annotation_hover_entries: dict[object, list[dict[str, object]]] = {}
         self._annotation_view_limits: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {}
+        self._reset_annotation_view_limits_on_next_refresh = False
         self._pending_reprojection_points: dict[tuple[str, int, str], np.ndarray] = {}
+        self._syncing_annotation_defaults = False
+        self._scheduled_annotation_refresh_id = None
+        self._scheduled_annotation_load_id = None
+        self._scheduled_annotation_recon_id = None
         self.kinematic_model_choices: dict[str, Path] = {}
         self.kinematic_frame_states: dict[tuple[str, int], np.ndarray] = {}
         self.kinematic_q_current: np.ndarray | None = None
@@ -5369,13 +5414,13 @@ class AnnotationTab(ttk.Frame):
 
         self.images_root_entry = LabeledEntry(controls, "Images root", "", browse=True, directory=True)
         self.images_root_entry.pack(fill=tk.X, padx=8, pady=4)
-        self.images_root_entry.var.trace_add("write", lambda *_args: self.refresh_preview())
+        self.images_root_entry.var.trace_add("write", lambda *_args: self.request_refresh_preview())
         self.annotations_path_entry = LabeledEntry(controls, "Annotations", "", browse=True, directory=False)
         self.annotations_path_entry.pack(fill=tk.X, padx=8, pady=4)
         self.annotations_path_entry.var = self.state.annotation_path_var
         self.annotations_path_entry.entry_widget.configure(textvariable=self.state.annotation_path_var)
-        self.annotations_path_entry.on_browse_selected = lambda _value: self.load_resources()
-        self.state.annotation_path_var.trace_add("write", lambda *_args: self.load_resources())
+        self.annotations_path_entry.on_browse_selected = lambda _value: self.request_load_resources()
+        self.state.annotation_path_var.trace_add("write", lambda *_args: self._on_annotation_path_changed())
 
         kinematic_row = ttk.Frame(controls)
         kinematic_row.pack(fill=tk.X, padx=8, pady=4)
@@ -5394,7 +5439,7 @@ class AnnotationTab(ttk.Frame):
             lambda *_args: (
                 self.refresh_annotation_keypoint_choices(),
                 self._clear_kinematic_assist_preview(),
-                self.refresh_preview(),
+                self.request_refresh_preview(),
             ),
         )
         ttk.Button(kinematic_row, text="Estimate q", command=self.estimate_kinematic_assist_state).pack(side=tk.LEFT)
@@ -5508,9 +5553,9 @@ class AnnotationTab(ttk.Frame):
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.frame_filter_var.trace_add("write", lambda *_args: self.on_frame_filter_changed())
-        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.state.register_reconstruction_listener(self.request_refresh_available_reconstructions)
         self.sync_dataset_defaults()
-        self.after_idle(self.refresh_available_reconstructions)
+        self.request_refresh_available_reconstructions()
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
         panel.configure_for_consumer(
@@ -5532,7 +5577,22 @@ class AnnotationTab(ttk.Frame):
     def _on_reconstruction_selection_changed(self) -> None:
         self.on_frame_filter_changed()
 
+    def request_refresh_preview(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_annotation_refresh_id", self.refresh_preview)
+
+    def request_load_resources(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_annotation_load_id", self.load_resources)
+
+    def request_refresh_available_reconstructions(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_annotation_recon_id", self.refresh_available_reconstructions)
+
+    def _on_annotation_path_changed(self) -> None:
+        if bool(getattr(self, "_syncing_annotation_defaults", False)):
+            return
+        self.request_load_resources()
+
     def refresh_available_reconstructions(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_annotation_recon_id")
         try:
             _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
                 self.state,
@@ -5549,13 +5609,21 @@ class AnnotationTab(ttk.Frame):
 
     def sync_dataset_defaults(self) -> None:
         keypoints_path = ROOT / self.state.keypoints_var.get()
-        self.annotation_path = default_annotation_path(keypoints_path)
-        self.state.annotation_path_var.set(display_path(self.annotation_path))
-        inferred_images_root = infer_execution_images_root(keypoints_path)
-        self.images_root = inferred_images_root
-        self.images_root_entry.var.set("" if inferred_images_root is None else display_path(inferred_images_root))
-        self.refresh_kinematic_model_choices()
-        self.load_resources()
+        self._syncing_annotation_defaults = True
+        try:
+            self.annotation_path = default_annotation_path(keypoints_path)
+            annotation_display = display_path(self.annotation_path)
+            if str(self.state.annotation_path_var.get()) != annotation_display:
+                self.state.annotation_path_var.set(annotation_display)
+            inferred_images_root = infer_execution_images_root(keypoints_path)
+            self.images_root = inferred_images_root
+            images_display = "" if inferred_images_root is None else display_path(inferred_images_root)
+            if str(self.images_root_entry.var.get()) != images_display:
+                self.images_root_entry.var.set(images_display)
+            self.refresh_kinematic_model_choices()
+        finally:
+            self._syncing_annotation_defaults = False
+        self.request_load_resources()
 
     def refresh_kinematic_model_choices(self) -> None:
         dataset_dir = current_dataset_dir(self.state)
@@ -5640,7 +5708,7 @@ class AnnotationTab(ttk.Frame):
         self._clear_pending_reprojection()
         self._clear_kinematic_assist_preview()
         self.update_camera_summary()
-        self.refresh_preview()
+        self.request_refresh_preview()
 
     def selected_keypoint_name(self) -> str:
         selection = self.annotation_keypoints_list.curselection()
@@ -5650,7 +5718,7 @@ class AnnotationTab(ttk.Frame):
     def on_keypoint_selection_changed(self) -> None:
         self._clear_pending_reprojection()
         self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
-        self.refresh_preview()
+        self.request_refresh_preview()
 
     def _store_current_annotation_view_limits(self) -> None:
         if not hasattr(self, "preview_figure") or self.preview_figure is None:
@@ -5731,6 +5799,8 @@ class AnnotationTab(ttk.Frame):
             self.save_annotations()
             self._clear_pending_reprojection()
             self._clear_kinematic_assist_preview()
+            self._annotation_view_limits = {}
+            self._reset_annotation_view_limits_on_next_refresh = True
         self._current_frame_idx = clamped
         self.frame_var.set(clamped)
 
@@ -5949,6 +6019,7 @@ class AnnotationTab(ttk.Frame):
         self.refresh_preview()
 
     def load_resources(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_annotation_load_id")
         try:
             with gui_busy_popup(self, title="Annotation", message="Chargement des données d'annotation...") as popup:
                 keypoints_path = ROOT / self.state.keypoints_var.get()
@@ -6569,7 +6640,7 @@ class AnnotationTab(ttk.Frame):
         clamped_index = clamp_index_to_subset(int(round(self.frame_var.get())), candidates)
         if clamped_index is not None and clamped_index != int(round(self.frame_var.get())):
             self._set_frame_index(clamped_index)
-        self.refresh_preview()
+        self.request_refresh_preview()
 
     def _ensure_cursor_artists(self, ax) -> tuple[object, ...]:
         artists = self._cursor_artists.get(ax)
@@ -6868,11 +6939,16 @@ class AnnotationTab(ttk.Frame):
         self._pan_state = None
 
     def refresh_preview(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_annotation_refresh_id")
         if self.pose_data is None or self.calibrations is None or len(self.pose_data.frames) == 0:
             return
         if not hasattr(self, "_annotation_view_limits"):
             self._annotation_view_limits = {}
-        self._store_current_annotation_view_limits()
+        if bool(getattr(self, "_reset_annotation_view_limits_on_next_refresh", False)):
+            self._annotation_view_limits = {}
+            self._reset_annotation_view_limits_on_next_refresh = False
+        else:
+            self._store_current_annotation_view_limits()
         all_camera_names = [str(name) for name in self.pose_data.camera_names]
         camera_names = self.selected_annotation_camera_names()
         if not camera_names:
@@ -12720,6 +12796,9 @@ class CalibrationTab(ttk.Frame):
         self.current_reconstruction_payload: dict[str, np.ndarray] = {}
         self.current_reconstruction_summary: dict[str, object] = {}
         self.jump_analysis: DDSessionAnalysis | None = None
+        self._scheduled_calibration_load_id = None
+        self._scheduled_calibration_refresh_id = None
+        self._scheduled_calibration_recon_id = None
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
@@ -12816,10 +12895,10 @@ class CalibrationTab(ttk.Frame):
 
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
-        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.load_resources())
-        self.pose_data_mode.trace_add("write", lambda *_args: self.load_resources())
-        self.trim_fraction_var.trace_add("write", lambda *_args: self.refresh_analysis())
-        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.request_load_resources())
+        self.pose_data_mode.trace_add("write", lambda *_args: self.request_load_resources())
+        self.trim_fraction_var.trace_add("write", lambda *_args: self.request_refresh_analysis())
+        self.state.register_reconstruction_listener(self.request_refresh_available_reconstructions)
         self.state.register_shared_reconstruction_selection_listener(self._on_reconstruction_selection_changed)
         self.worst_frame_list.bind("<Double-Button-1>", lambda _event: self.open_selected_frame_in_cameras())
         self.sync_dataset_dir()
@@ -12839,7 +12918,16 @@ class CalibrationTab(ttk.Frame):
             panel.set_rows(rows, defaults)
 
     def _on_reconstruction_selection_changed(self) -> None:
-        self.refresh_analysis()
+        self.request_refresh_analysis()
+
+    def request_load_resources(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_calibration_load_id", self.load_resources)
+
+    def request_refresh_analysis(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_calibration_refresh_id", self.refresh_analysis)
+
+    def request_refresh_available_reconstructions(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_calibration_recon_id", self.refresh_available_reconstructions)
 
     def _selected_reconstruction(self) -> str | None:
         selected = list(self.state.shared_reconstruction_selection)
@@ -12847,8 +12935,8 @@ class CalibrationTab(ttk.Frame):
 
     def sync_dataset_dir(self) -> None:
         self.refresh_pose_mode_choices()
-        self.refresh_available_reconstructions()
-        self.load_resources()
+        self.request_refresh_available_reconstructions()
+        self.request_load_resources()
 
     def _available_pose_modes(self) -> list[str]:
         keypoints_value = self.state.keypoints_var.get().strip()
@@ -12865,6 +12953,7 @@ class CalibrationTab(ttk.Frame):
             self.pose_data_mode.set(fallback)
 
     def refresh_available_reconstructions(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_calibration_recon_id")
         try:
             _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
                 self.state,
@@ -12879,6 +12968,7 @@ class CalibrationTab(ttk.Frame):
             pass
 
     def load_resources(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_calibration_load_id")
         try:
             self.refresh_pose_mode_choices()
             keypoints_path = ROOT / self.state.keypoints_var.get()
@@ -12895,11 +12985,12 @@ class CalibrationTab(ttk.Frame):
                     annotations_path=existing_annotation_path_for_keypoints(self.state, keypoints_path),
                 )
             self.pose_data = pose_data
-            self.refresh_analysis()
+            self.request_refresh_analysis()
         except Exception as exc:
             messagebox.showerror("Calibration", str(exc))
 
     def refresh_analysis(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_calibration_refresh_id")
         if self.pose_data is None or self.calibrations is None:
             return
         with gui_busy_popup(self, title="Calibration", message="Analyse de la qualité de calibration...") as popup:
@@ -13237,6 +13328,8 @@ class CameraToolsTab(ttk.Frame):
         self.flip_detail_arrays: dict[str, dict[str, np.ndarray]] = {}
         self.flip_frame_local_indices: list[int] = []
         self.images_root: Path | None = None
+        self._scheduled_camera_load_id = None
+        self._scheduled_camera_recon_id = None
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
@@ -13468,12 +13561,18 @@ class CameraToolsTab(ttk.Frame):
             widget.bind("<Enter>", lambda _event, w=widget: w.focus_set())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
-        self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.load_resources())
-        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.load_resources())
-        self.state.register_reconstruction_listener(lambda: self.after_idle(self.refresh_available_reconstructions))
+        self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.request_load_resources())
+        self.state.calibration_correction_var.trace_add("write", lambda *_args: self.request_load_resources())
+        self.state.register_reconstruction_listener(self.request_refresh_available_reconstructions)
         self.state.register_shared_reconstruction_selection_listener(self._on_reconstruction_selection_changed)
         self.state.selected_camera_names_var.trace_add("write", lambda *_args: self.update_camera_filter_status())
         self.sync_dataset_dir()
+
+    def request_load_resources(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_camera_load_id", self.load_resources)
+
+    def request_refresh_available_reconstructions(self) -> None:
+        schedule_after_idle_once(self, "_scheduled_camera_recon_id", self.refresh_available_reconstructions)
 
     def toggle_flip_current_frame(self, _event=None) -> str:
         self.flip_applied_var.set(not self.flip_applied_var.get())
@@ -13483,9 +13582,9 @@ class CameraToolsTab(ttk.Frame):
     def sync_dataset_dir(self) -> None:
         self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
         self.images_root_entry.var.set("" if self.images_root is None else display_path(self.images_root))
-        self.refresh_available_reconstructions()
+        self.request_refresh_available_reconstructions()
         self.update_camera_filter_status()
-        self.load_resources()
+        self.request_load_resources()
 
     def update_camera_filter_status(self) -> None:
         selected = current_selected_camera_names(self.state)
@@ -13517,6 +13616,7 @@ class CameraToolsTab(ttk.Frame):
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_camera_recon_id")
         try:
             _output_dir, _bundle, preview_state = load_shared_reconstruction_preview_state(
                 self.state,
@@ -13537,6 +13637,7 @@ class CameraToolsTab(ttk.Frame):
         return selected[-1] if selected else None
 
     def load_resources(self) -> None:
+        cancel_scheduled_after_idle(self, "_scheduled_camera_load_id")
         try:
             self.calibrations, self.base_pose_data = get_cached_pose_data(
                 self.state,
