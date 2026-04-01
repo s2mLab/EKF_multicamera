@@ -73,6 +73,7 @@ from annotation.kinematic_assist import (
     propagate_annotation_kinematic_state,
     refine_annotation_q_with_direct_measurements,
     refine_annotation_q_with_local_ekf,
+    refine_annotation_window_states,
     resolve_annotation_kinematic_state_info,
     store_annotation_kinematic_state,
 )
@@ -1636,6 +1637,59 @@ def shared_jump_analysis(
     )
 
 
+def shared_jump_analysis_for_reconstruction(
+    state: "SharedAppState",
+    reconstruction_name: str | None,
+    *,
+    analysis_start_frame: int = ANALYSIS_START_FRAME,
+    require_complete_jumps: bool = True,
+) -> DDSessionAnalysis | None:
+    """Resolve one reconstruction through the shared preview cache and reuse jump analysis."""
+
+    name = str(reconstruction_name or "").strip()
+    if not name:
+        return None
+    try:
+        _output_dir, bundle, _preview_state = load_shared_reconstruction_preview_state(
+            state,
+            preferred_names=[name],
+            fallback_count=1,
+            include_3d=True,
+            include_q=True,
+            include_q_root=True,
+        )
+        root_q, full_q, q_names = preview_root_series_for_reconstruction(
+            bundle=bundle,
+            name=name,
+            initial_rotation_correction=bool(state.initial_rotation_correction_var.get()),
+        )
+        if root_q is None:
+            return None
+        recon_3d = bundle.get("recon_3d", {}) if isinstance(bundle, dict) else {}
+        points_3d = np.asarray(recon_3d[name], dtype=float) if name in recon_3d else None
+        return shared_jump_analysis(
+            state,
+            reconstruction_name=name,
+            root_q=np.asarray(root_q, dtype=float),
+            points_3d=points_3d,
+            fps=float(state.fps_var.get()),
+            height_threshold=TRAMPOLINE_BED_HEIGHT_M,
+            height_threshold_range_ratio=0.20,
+            smoothing_window_s=0.15,
+            min_airtime_s=0.25,
+            min_gap_s=0.08,
+            min_peak_prominence_m=0.35,
+            contact_window_s=0.35,
+            full_q=None if full_q is None else np.asarray(full_q, dtype=float),
+            q_names=q_names,
+            angle_mode="euler",
+            analysis_start_frame=analysis_start_frame,
+            require_complete_jumps=require_complete_jumps,
+        )
+    except Exception:
+        return None
+
+
 def preview_pose_frame_indices(pose_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
     """Map preview frame ids back to pose-data indices."""
 
@@ -1678,6 +1732,8 @@ ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
 ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER = 3
 ANNOTATION_KINEMATIC_CLICK_PASSES = 3
 ANNOTATION_KINEMATIC_CLICK_DIRECT_PASSES = 1
+ANNOTATION_KINEMATIC_WINDOW_RADIUS = 1
+ANNOTATION_KINEMATIC_WINDOW_PASSES = 2
 ANNOTATION_FRAME_FILTER_OPTIONS = {
     "all": "All frames",
     "flipped": "Flipped L/R",
@@ -5150,6 +5206,7 @@ class AnnotationTab(ttk.Frame):
         self.kinematic_q_names: list[str] = []
         self.kinematic_projected_points: np.ndarray | None = None
         self.kinematic_segmented_back_projected: dict[str, np.ndarray] = {}
+        self.annotation_jump_analysis: DDSessionAnalysis | None = None
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -5307,6 +5364,10 @@ class AnnotationTab(ttk.Frame):
         ttk.Button(kinematic_row, text="Estimate q", command=self.estimate_kinematic_assist_state).pack(side=tk.LEFT)
         self.kinematic_status_var = tk.StringVar(value="")
         ttk.Label(controls, textvariable=self.kinematic_status_var, anchor="w", foreground="#4f5b66").pack(
+            fill=tk.X, padx=8, pady=(0, 4)
+        )
+        self.jump_context_var = tk.StringVar(value="")
+        ttk.Label(controls, textvariable=self.jump_context_var, anchor="w", foreground="#4f5b66").pack(
             fill=tk.X, padx=8, pady=(0, 4)
         )
 
@@ -5923,6 +5984,40 @@ class AnnotationTab(ttk.Frame):
         state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number, model)
         return state
 
+    def _annotation_window_frame_numbers(self, frame_number: int) -> list[int]:
+        if self.pose_data is None or len(self.pose_data.frames) == 0:
+            return [int(frame_number)]
+        frame_values = np.asarray(self.pose_data.frames, dtype=int)
+        if frame_values.size == 0:
+            return [int(frame_number)]
+        current_matches = np.flatnonzero(frame_values == int(frame_number))
+        if current_matches.size > 0:
+            current_index = int(current_matches[0])
+        else:
+            current_index = int(np.argmin(np.abs(frame_values - int(frame_number))))
+        start = max(0, current_index - ANNOTATION_KINEMATIC_WINDOW_RADIUS)
+        end = min(frame_values.size, current_index + ANNOTATION_KINEMATIC_WINDOW_RADIUS + 1)
+        return [int(value) for value in frame_values[start:end]]
+
+    def _annotation_pose_data_by_frame(
+        self,
+        frame_numbers: list[int],
+        camera_names: list[str],
+    ) -> dict[int, PoseData]:
+        if self.pose_data is None:
+            return {}
+        pose_data_by_frame: dict[int, PoseData] = {}
+        for frame_number in frame_numbers:
+            if self._frame_annotation_measurement_count(int(frame_number), camera_names) <= 0:
+                continue
+            pose_data_by_frame[int(frame_number)] = annotation_pose_data_for_frame(
+                self.pose_data,
+                camera_names=camera_names,
+                frame_number=int(frame_number),
+                annotation_payload=self.annotation_payload,
+            )
+        return pose_data_by_frame
+
     def _set_kinematic_preview_from_q(self, biomod_path: Path, camera_names: list[str], q_values: np.ndarray) -> None:
         q_values = np.asarray(q_values, dtype=float).reshape(-1)
         q_series = q_values.reshape(1, -1)
@@ -6057,6 +6152,41 @@ class AnnotationTab(ttk.Frame):
                 direct_summary = " | direct fit fallback"
         if not hasattr(self, "kinematic_frame_states") or self.kinematic_frame_states is None:
             self.kinematic_frame_states = {}
+        temporal_summary = ""
+        if keypoint_name is None:
+            try:
+                pose_data_by_frame = self._annotation_pose_data_by_frame(
+                    self._annotation_window_frame_numbers(frame_number),
+                    camera_names,
+                )
+                if len(pose_data_by_frame) > 1:
+                    refined_window_states, window_diagnostics = refine_annotation_window_states(
+                        model=model,
+                        calibrations=self.calibrations,
+                        pose_data_by_frame=pose_data_by_frame,
+                        center_frame_number=frame_number,
+                        seed_state=estimated_state,
+                        fps=float(self.state.fps_var.get()),
+                        passes=ANNOTATION_KINEMATIC_WINDOW_PASSES,
+                        epipolar_threshold_px=DEFAULT_EPIPOLAR_THRESHOLD_PX,
+                        q_names=self.kinematic_q_names,
+                    )
+                    for saved_frame_number, saved_state in refined_window_states.items():
+                        store_annotation_kinematic_state(
+                            self.kinematic_frame_states,
+                            model_label=str(self.kinematic_model_var.get()).strip(),
+                            frame_number=int(saved_frame_number),
+                            model=model,
+                            state=np.asarray(saved_state, dtype=float),
+                        )
+                    if frame_number in refined_window_states:
+                        estimated_state = np.asarray(refined_window_states[frame_number], dtype=float)
+                    temporal_summary = (
+                        f" | local window {int(window_diagnostics.get('completed_frames', 0))}/"
+                        f"{len(pose_data_by_frame)}"
+                    )
+            except Exception:
+                temporal_summary = ""
         estimated_state = store_annotation_kinematic_state(
             self.kinematic_frame_states,
             model_label=str(self.kinematic_model_var.get()).strip(),
@@ -6068,7 +6198,7 @@ class AnnotationTab(ttk.Frame):
         self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_state[: model.nbQ()])
         self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
         if keypoint_name is None:
-            self.kinematic_status_var.set(f"Estimated q from {seed_source}{bootstrap_summary}.")
+            self.kinematic_status_var.set(f"Estimated q from {seed_source}{bootstrap_summary}{temporal_summary}.")
         else:
             warm_start_text = ""
             if previous_state is not None and source_frame is not None:
@@ -6242,6 +6372,21 @@ class AnnotationTab(ttk.Frame):
     def _selected_reconstruction(self) -> str | None:
         selected = list(getattr(self.state, "shared_reconstruction_selection", []))
         return str(selected[-1]) if selected else None
+
+    def _annotation_jump_context(self) -> str:
+        selected_name = self._selected_reconstruction()
+        if not selected_name or self.pose_data is None:
+            self.annotation_jump_analysis = None
+            return ""
+        analysis = shared_jump_analysis_for_reconstruction(self.state, selected_name)
+        self.annotation_jump_analysis = analysis
+        if analysis is None:
+            return ""
+        frame_number = self.current_frame_number()
+        for jump_index, jump in enumerate(analysis.jumps, start=1):
+            if int(jump.segment.start) <= int(frame_number) <= int(jump.segment.end):
+                return f"Jump context: S{jump_index} | {jump.classification} | frames {jump.segment.start}-{jump.segment.end}"
+        return "Jump context: between jumps"
 
     def _frame_filter_mode(self) -> str:
         return resolve_annotation_frame_filter_mode(self.frame_filter_var.get(), ANNOTATION_FRAME_FILTER_OPTIONS)
@@ -6693,6 +6838,9 @@ class AnnotationTab(ttk.Frame):
                 mode_labels=ANNOTATION_FRAME_FILTER_OPTIONS,
             )
         )
+        jump_context_var = getattr(self, "jump_context_var", None)
+        if jump_context_var is not None:
+            jump_context_var.set(self._annotation_jump_context())
         crop_limits = self._ensure_crop_limits(camera_names) if self.crop_var.get() else {}
         current_marker = self.selected_keypoint_name()
         current_color = annotation_marker_color(current_marker)
@@ -12516,6 +12664,7 @@ class CalibrationTab(ttk.Frame):
         self.current_reconstruction_name = None
         self.current_reconstruction_payload: dict[str, np.ndarray] = {}
         self.current_reconstruction_summary: dict[str, object] = {}
+        self.jump_analysis: DDSessionAnalysis | None = None
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
@@ -12715,6 +12864,7 @@ class CalibrationTab(ttk.Frame):
                 payload = {}
             self.current_reconstruction_payload = payload
             self.current_reconstruction_summary = summary
+            self.jump_analysis = shared_jump_analysis_for_reconstruction(self.state, self.current_reconstruction_name)
             trim_fraction = max(0.0, float(self.trim_fraction_var.get() or "0")) / 100.0
             popup.set_status("Agrégation 2D/3D des métriques de calibration...")
             self.qc = compute_calibration_qc(
@@ -12930,6 +13080,17 @@ class CalibrationTab(ttk.Frame):
                 label="3D reproj mean",
                 linewidth=1.2,
             )
+        if self.jump_analysis is not None:
+            for idx, segment in enumerate(self.jump_analysis.jump_segments):
+                if int(segment.end) < int(plot_frames[0]) or int(segment.start) > int(plot_frames[-1]):
+                    continue
+                ax.axvspan(
+                    max(int(segment.start), int(plot_frames[0])),
+                    min(int(segment.end), int(plot_frames[-1])),
+                    color="#4c72b0",
+                    alpha=0.06,
+                    label="Detected jumps" if idx == 0 else None,
+                )
         ax.set_title("Worst frames over time")
         ax.set_xlabel("Frame")
         ax.set_ylabel("px")

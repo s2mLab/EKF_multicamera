@@ -474,3 +474,105 @@ def refine_annotation_q_with_direct_measurements(
             break
 
     return np.array(state, copy=True), diagnostics
+
+
+def refine_annotation_window_states(
+    *,
+    model,
+    calibrations: dict[str, object],
+    pose_data_by_frame: dict[int, PoseData],
+    center_frame_number: int,
+    seed_state: np.ndarray,
+    fps: float,
+    passes: int,
+    epipolar_threshold_px: float,
+    q_names: list[str] | np.ndarray | None = None,
+) -> tuple[dict[int, np.ndarray], dict[str, object]]:
+    """Refine a short temporal window of sparse annotation states around one frame.
+
+    The window is initialized from the center state, propagated to neighboring
+    frames with the constant-acceleration model, then corrected frame-by-frame
+    where annotated 2D measurements exist.
+    """
+
+    frame_numbers = sorted(int(frame_number) for frame_number in pose_data_by_frame)
+    if not frame_numbers:
+        return {}, {
+            "method": "annotation_window_local_ekf",
+            "requested_passes": int(max(1, passes)),
+            "completed_frames": 0,
+            "used_fallback": True,
+            "reason": "no_frames",
+        }
+
+    center_frame_number = int(center_frame_number)
+    if center_frame_number not in frame_numbers:
+        raise ValueError("center_frame_number must be present in pose_data_by_frame.")
+
+    center_state = normalize_annotation_kinematic_state(model, seed_state)
+    if center_state is None:
+        raise ValueError("Invalid seed_state for local annotation window.")
+
+    refined_states: dict[int, np.ndarray] = {center_frame_number: np.asarray(center_state, dtype=float)}
+    diagnostics: dict[str, object] = {
+        "method": "annotation_window_local_ekf",
+        "requested_passes": int(max(1, passes)),
+        "completed_frames": 0,
+        "used_fallback": False,
+        "frame_statuses": {},
+    }
+    center_idx = frame_numbers.index(center_frame_number)
+
+    def _refine_one_frame(frame_number: int, seed: np.ndarray) -> np.ndarray:
+        pose_data = pose_data_by_frame.get(int(frame_number))
+        if pose_data is None or float(np.sum(np.asarray(pose_data.scores) > 0.0)) <= 0.0:
+            diagnostics["frame_statuses"][int(frame_number)] = "propagated"
+            return np.asarray(seed, dtype=float)
+        refined_state, frame_diag = refine_annotation_q_with_local_ekf(
+            model=model,
+            calibrations=calibrations,
+            pose_data=pose_data,
+            frame_number=int(frame_number),
+            seed_state=np.asarray(seed, dtype=float),
+            fps=float(fps),
+            passes=max(1, int(passes)),
+            measurement_noise_scale=1.0,
+            process_noise_scale=1.0,
+            epipolar_threshold_px=float(epipolar_threshold_px),
+            q_names=q_names,
+            keypoint_name=None,
+        )
+        diagnostics["completed_frames"] = int(diagnostics["completed_frames"]) + 1
+        diagnostics["frame_statuses"][int(frame_number)] = str(
+            "fallback" if frame_diag.get("used_fallback") else "corrected"
+        )
+        if bool(frame_diag.get("used_fallback")):
+            return np.asarray(seed, dtype=float)
+        return np.asarray(refined_state, dtype=float)
+
+    state = refined_states[center_frame_number]
+    for frame_number in frame_numbers[center_idx + 1 :]:
+        previous_frame = frame_numbers[frame_numbers.index(frame_number) - 1]
+        state = propagate_annotation_kinematic_state(
+            model,
+            state,
+            dt=1.0 / float(fps),
+            frame_delta=int(frame_number) - int(previous_frame),
+        )
+        state = _refine_one_frame(frame_number, state)
+        refined_states[int(frame_number)] = np.asarray(state, dtype=float)
+
+    state = refined_states[center_frame_number]
+    for reverse_idx in range(center_idx - 1, -1, -1):
+        frame_number = frame_numbers[reverse_idx]
+        next_frame = frame_numbers[reverse_idx + 1]
+        state = propagate_annotation_kinematic_state(
+            model,
+            state,
+            dt=1.0 / float(fps),
+            frame_delta=int(frame_number) - int(next_frame),
+        )
+        state = _refine_one_frame(frame_number, state)
+        refined_states[int(frame_number)] = np.asarray(state, dtype=float)
+
+    return refined_states, diagnostics

@@ -252,6 +252,29 @@ def test_calibration_tab_refresh_analysis_uses_selected_reconstruction_payload(m
     assert tab._plot_rendered is True
 
 
+def test_annotation_jump_context_uses_shared_jump_analysis(monkeypatch):
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([100], dtype=int))
+    tab.state = SimpleNamespace(shared_reconstruction_selection=("demo_recon",))
+    tab.annotation_jump_analysis = None
+    tab.current_frame_number = lambda: 120
+
+    analysis = SimpleNamespace(
+        jumps=[
+            SimpleNamespace(
+                classification="straight",
+                segment=SimpleNamespace(start=110, end=130),
+            )
+        ]
+    )
+    monkeypatch.setattr(pipeline_gui, "shared_jump_analysis_for_reconstruction", lambda _state, _name: analysis)
+
+    text = pipeline_gui.AnnotationTab._annotation_jump_context(tab)
+
+    assert text == "Jump context: S1 | straight | frames 110-130"
+    assert tab.annotation_jump_analysis is analysis
+
+
 def test_annotation_only_pose_data_keeps_only_manual_annotations(tmp_path):
     keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
     annotations_path = tmp_path / "inputs" / "annotations" / "trial_annotations.json"
