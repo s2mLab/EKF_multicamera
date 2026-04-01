@@ -1355,6 +1355,44 @@ def test_annotation_triangulated_reprojection_projects_hint_into_target_view():
     np.testing.assert_allclose(hint, calibrations["cam2"].project_point(point_3d), atol=1e-8)
 
 
+def test_annotation_snap_annotation_xy_prefers_nearest_reprojection_candidate():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.snap_reprojection_var = SimpleNamespace(get=lambda: True)
+    tab.snap_epipolar_var = SimpleNamespace(get=lambda: False)
+    tab._triangulated_hint_for_keypoint = lambda *_args, **_kwargs: np.array([10.0, 10.0], dtype=float)
+    tab._reference_projected_keypoint = lambda *_args, **_kwargs: np.array([30.0, 30.0], dtype=float)
+    tab._epipolar_lines_for_keypoint = lambda *_args, **_kwargs: []
+
+    snapped = pipeline_gui.AnnotationTab._snap_annotation_xy(
+        tab,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="left_wrist",
+        pointer_xy=np.array([12.0, 11.0], dtype=float),
+    )
+
+    np.testing.assert_allclose(snapped, np.array([10.0, 10.0], dtype=float))
+
+
+def test_annotation_snap_annotation_xy_projects_to_epipolar_line():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.snap_reprojection_var = SimpleNamespace(get=lambda: False)
+    tab.snap_epipolar_var = SimpleNamespace(get=lambda: True)
+    tab._triangulated_hint_for_keypoint = lambda *_args, **_kwargs: None
+    tab._reference_projected_keypoint = lambda *_args, **_kwargs: None
+    tab._epipolar_lines_for_keypoint = lambda *_args, **_kwargs: [np.array([1.0, 0.0, -20.0], dtype=float)]
+
+    snapped = pipeline_gui.AnnotationTab._snap_annotation_xy(
+        tab,
+        camera_name="cam0",
+        frame_number=10,
+        keypoint_name="left_wrist",
+        pointer_xy=np.array([12.0, 15.0], dtype=float),
+    )
+
+    np.testing.assert_allclose(snapped, np.array([20.0, 15.0], dtype=float))
+
+
 def test_triangulate_annotation_frame_points_uses_existing_annotations_only():
     calibrations = {
         "cam0": CameraCalibration(

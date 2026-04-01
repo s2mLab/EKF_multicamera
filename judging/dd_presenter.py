@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis
+from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis, body_shape_display_label
 
 
 @dataclass
@@ -238,7 +238,7 @@ def format_dd_summary(
             f"{jump.classification}"
         )
         code_text = jump.code if jump.code is not None else "-"
-        body_shape = jump.body_shape if jump.body_shape is not None else "-"
+        body_shape = body_shape_display_label(jump.body_shape) if jump.body_shape is not None else "-"
         lines.append(f"  body shape={body_shape} | code={code_text}")
         expected_code = (expected_codes_by_jump or {}).get(idx)
         if expected_code:

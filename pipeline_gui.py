@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -89,7 +90,7 @@ from batch_run import infer_pose2sim_trc_for_keypoints as batch_infer_pose2sim_t
 from calibration_qc import compute_calibration_qc, frame_camera_epipolar_errors
 from camera_tools.camera_metrics import compute_camera_metric_rows, suggest_best_camera_names
 from camera_tools.camera_selection import format_camera_names, parse_camera_names
-from judging.dd_analysis import DDSessionAnalysis, analyze_dd_session, contiguous_true_regions
+from judging.dd_analysis import DDSessionAnalysis, contiguous_true_regions
 from judging.dd_presenter import (
     build_jump_plot_data,
     compare_dd_code_characters,
@@ -113,6 +114,8 @@ from judging.execution import (
     infer_execution_images_root,
     resolve_execution_image_path,
 )
+from judging.jump_cache import get_cached_jump_analysis
+from judging.jump_cache import jump_segmentation_height_series as shared_jump_segmentation_height_series
 from judging.trampoline_displacement import (
     BED_X_MAX,
     BED_Y_MAX,
@@ -1581,22 +1584,56 @@ def compute_airborne_mask_from_points(
 
 
 def jump_segmentation_height_series(points_3d: np.ndarray | None, root_q: np.ndarray) -> np.ndarray:
-    """Return the vertical series used to segment jumps.
+    """Backward-compatible wrapper around the shared jump-segmentation helper."""
 
-    Prefer foot-to-bed clearance when 3D markers are available. Fall back to the
-    lowest visible marker, then to the root vertical translation.
-    """
+    return shared_jump_segmentation_height_series(points_3d, root_q)
 
-    if points_3d is not None:
-        points_3d = np.asarray(points_3d, dtype=float)
-        if points_3d.ndim == 3 and points_3d.shape[2] >= 3:
-            ankles = np.asarray(points_3d[:, [KP_INDEX["left_ankle"], KP_INDEX["right_ankle"]], 2], dtype=float)
-            if np.any(np.isfinite(ankles)):
-                return np.nanmin(ankles, axis=1)
-            all_markers_z = np.asarray(points_3d[:, :, 2], dtype=float)
-            if np.any(np.isfinite(all_markers_z)):
-                return np.nanmin(all_markers_z, axis=1)
-    return np.asarray(root_q[:, 2], dtype=float)
+
+def shared_jump_analysis(
+    state: "SharedAppState",
+    *,
+    reconstruction_name: str,
+    root_q: np.ndarray,
+    points_3d: np.ndarray | None,
+    fps: float,
+    height_threshold: float | None,
+    height_threshold_range_ratio: float,
+    smoothing_window_s: float,
+    min_airtime_s: float,
+    min_gap_s: float,
+    min_peak_prominence_m: float,
+    contact_window_s: float,
+    full_q: np.ndarray | None = None,
+    q_names: list[str] | None = None,
+    angle_mode: str = "euler",
+    analysis_start_frame: int = 0,
+    require_complete_jumps: bool = True,
+) -> DDSessionAnalysis:
+    """Reuse one DD jump analysis through the shared GUI state cache."""
+
+    cache = getattr(state, "jump_analysis_cache", None)
+    if cache is None:
+        cache = {}
+        state.jump_analysis_cache = cache
+    return get_cached_jump_analysis(
+        cache,
+        reconstruction_name=reconstruction_name,
+        root_q=np.asarray(root_q, dtype=float),
+        points_3d=None if points_3d is None else np.asarray(points_3d, dtype=float),
+        fps=float(fps),
+        height_threshold=height_threshold,
+        height_threshold_range_ratio=height_threshold_range_ratio,
+        smoothing_window_s=smoothing_window_s,
+        min_airtime_s=min_airtime_s,
+        min_gap_s=min_gap_s,
+        min_peak_prominence_m=min_peak_prominence_m,
+        contact_window_s=contact_window_s,
+        full_q=None if full_q is None else np.asarray(full_q, dtype=float),
+        q_names=list(q_names) if q_names is not None else None,
+        angle_mode=angle_mode,
+        analysis_start_frame=analysis_start_frame,
+        require_complete_jumps=require_complete_jumps,
+    )
 
 
 def preview_pose_frame_indices(pose_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
@@ -1636,6 +1673,7 @@ def compose_multiview_crop_points(
 
 ANNOTATION_MARKER_COLORS = plt.colormaps["tab20"].resampled(len(COCO17))
 ANNOTATION_DELETE_RADIUS_PX = 18.0
+ANNOTATION_SNAP_RADIUS_PX = 24.0
 ANNOTATION_KINEMATIC_BOOTSTRAP_PASSES = 10
 ANNOTATION_KINEMATIC_INITIAL_BOOTSTRAP_MULTIPLIER = 3
 ANNOTATION_KINEMATIC_CLICK_PASSES = 3
@@ -1711,6 +1749,50 @@ def annotation_epipolar_guides(
     if not np.all(np.isfinite(line)) or np.linalg.norm(line[:2]) < 1e-12:
         return None
     return line
+
+
+def annotation_project_point_to_line(line: np.ndarray, point_xy: np.ndarray) -> np.ndarray | None:
+    """Project one 2D point orthogonally onto an epipolar line."""
+
+    line = np.asarray(line, dtype=float).reshape(3)
+    point_xy = np.asarray(point_xy, dtype=float).reshape(2)
+    if not (np.all(np.isfinite(line)) and np.all(np.isfinite(point_xy))):
+        return None
+    a, b, c = [float(value) for value in line]
+    denom = a * a + b * b
+    if denom <= 1e-12:
+        return None
+    distance = (a * point_xy[0] + b * point_xy[1] + c) / denom
+    return np.array([point_xy[0] - a * distance, point_xy[1] - b * distance], dtype=float)
+
+
+def annotation_intersect_epipolar_lines(lines: list[np.ndarray]) -> np.ndarray | None:
+    """Return the least-squares intersection of multiple epipolar lines."""
+
+    if len(lines) < 2:
+        return None
+    rows = []
+    offsets = []
+    for line in lines:
+        array = np.asarray(line, dtype=float).reshape(3)
+        if not np.all(np.isfinite(array)):
+            continue
+        normal = array[:2]
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-12:
+            continue
+        rows.append(normal / norm)
+        offsets.append(-array[2] / norm)
+    if len(rows) < 2:
+        return None
+    matrix = np.asarray(rows, dtype=float)
+    rhs = np.asarray(offsets, dtype=float)
+    try:
+        solution, *_rest = np.linalg.lstsq(matrix, rhs, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    solution = np.asarray(solution, dtype=float).reshape(2)
+    return solution if np.all(np.isfinite(solution)) else None
 
 
 def annotation_triangulated_reprojection(
@@ -2378,6 +2460,7 @@ class SharedAppState:
     calibration_cache: dict[str, dict[str, object]] = field(default_factory=dict)
     pose_data_cache: dict[tuple[object, ...], object] = field(default_factory=dict)
     preview_bundle_cache: dict[tuple[object, ...], dict[str, object]] = field(default_factory=dict)
+    jump_analysis_cache: dict[tuple[object, ...], DDSessionAnalysis] = field(default_factory=dict)
     shared_reconstruction_selection: list[str] = field(default_factory=list)
     shared_reconstruction_selection_listeners: list[callable] = field(default_factory=list)
     shared_reconstruction_panel: object | None = None
@@ -2400,6 +2483,7 @@ class SharedAppState:
 
     def notify_reconstructions_updated(self) -> None:
         self.preview_bundle_cache.clear()
+        self.jump_analysis_cache.clear()
         for callback in list(self.reconstruction_listeners):
             try:
                 callback()
@@ -2435,6 +2519,76 @@ def report_startup_status(state: SharedAppState | None, message: str) -> None:
         callback(str(message))
     except Exception:
         pass
+
+
+class BusyStatusWindow(tk.Toplevel):
+    """Small transient popup shown during long synchronous computations."""
+
+    def __init__(self, parent, title: str, message: str):
+        super().__init__(parent)
+        self.title(str(title))
+        self.resizable(False, False)
+        self.transient(parent)
+        self.attributes("-topmost", True)
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill=tk.BOTH, expand=True)
+        self.message_var = tk.StringVar(value=str(message))
+        ttk.Label(body, textvariable=self.message_var, justify=tk.LEFT, wraplength=320).pack(fill=tk.X)
+        self.progress = ttk.Progressbar(body, mode="indeterminate", length=320)
+        self.progress.pack(fill=tk.X, pady=(10, 0))
+        self.progress.start(12)
+        self.update_idletasks()
+        try:
+            parent_root_x = int(parent.winfo_rootx())
+            parent_root_y = int(parent.winfo_rooty())
+            parent_width = int(parent.winfo_width())
+            parent_height = int(parent.winfo_height())
+            width = int(self.winfo_reqwidth())
+            height = int(self.winfo_reqheight())
+            x_pos = parent_root_x + max((parent_width - width) // 2, 0)
+            y_pos = parent_root_y + max((parent_height - height) // 2, 0)
+            self.geometry(f"+{x_pos}+{y_pos}")
+        except Exception:
+            pass
+
+    def set_status(self, message: str) -> None:
+        self.message_var.set(str(message))
+        self.update_idletasks()
+
+    def close(self) -> None:
+        try:
+            self.progress.stop()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+@contextmanager
+def gui_busy_popup(parent, *, title: str, message: str):
+    """Show one small popup while a long synchronous task is running."""
+
+    class _NullBusyPopup:
+        def set_status(self, _message: str) -> None:
+            return
+
+    try:
+        popup = BusyStatusWindow(parent, title=title, message=message)
+    except Exception:
+        popup = _NullBusyPopup()
+    try:
+        if hasattr(popup, "update"):
+            popup.update()
+        yield popup
+    finally:
+        if hasattr(popup, "close"):
+            popup.close()
+        try:
+            parent.update_idletasks()
+        except Exception:
+            pass
 
 
 def current_dataset_name(state: SharedAppState) -> str:
@@ -5058,10 +5212,26 @@ class AnnotationTab(ttk.Frame):
 
         row3 = ttk.Frame(controls)
         row3.pack(fill=tk.X, padx=8, pady=4)
-        ttk.Label(row3, text="Frame set", width=10).pack(side=tk.LEFT, padx=(0, 6))
+        self.snap_reprojection_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row3,
+            text="Snap reproj",
+            variable=self.snap_reprojection_var,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        self.snap_epipolar_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row3,
+            text="Snap epipolar",
+            variable=self.snap_epipolar_var,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(row3, text=f"radius {int(ANNOTATION_SNAP_RADIUS_PX)} px", foreground="#4f5b66").pack(side=tk.LEFT)
+
+        row4 = ttk.Frame(controls)
+        row4.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(row4, text="Frame set", width=10).pack(side=tk.LEFT, padx=(0, 6))
         self.frame_filter_var = tk.StringVar(value=ANNOTATION_FRAME_FILTER_OPTIONS["all"])
         self.frame_filter_box = ttk.Combobox(
-            row3,
+            row4,
             textvariable=self.frame_filter_var,
             values=list(ANNOTATION_FRAME_FILTER_OPTIONS.values()),
             width=18,
@@ -5069,24 +5239,24 @@ class AnnotationTab(ttk.Frame):
         )
         self.frame_filter_box.pack(side=tk.LEFT, padx=(0, 10))
 
-        row4 = ttk.Frame(controls)
-        row4.pack(fill=tk.X, padx=8, pady=4)
+        row5 = ttk.Frame(controls)
+        row5.pack(fill=tk.X, padx=8, pady=4)
         self.show_motion_prior_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            row4,
+            row5,
             text="Velocity prior zone",
             variable=self.show_motion_prior_var,
             command=self.refresh_preview,
         ).pack(side=tk.LEFT, padx=(0, 8))
-        self.motion_prior_diameter = LabeledEntry(row4, "Diameter", "15", label_width=7, entry_width=4)
+        self.motion_prior_diameter = LabeledEntry(row5, "Diameter", "15", label_width=7, entry_width=4)
         self.motion_prior_diameter.pack(side=tk.LEFT)
 
-        row5 = ttk.Frame(controls)
-        row5.pack(fill=tk.X, padx=8, pady=4)
+        row6 = ttk.Frame(controls)
+        row6.pack(fill=tk.X, padx=8, pady=4)
         self.image_brightness_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row5, text="Brightness", width=10).pack(side=tk.LEFT)
+        ttk.Label(row6, text="Brightness", width=10).pack(side=tk.LEFT)
         ttk.Scale(
-            row5,
+            row6,
             from_=0.2,
             to=2.0,
             orient=tk.HORIZONTAL,
@@ -5094,9 +5264,9 @@ class AnnotationTab(ttk.Frame):
             command=lambda _value: self.refresh_preview(),
         ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.image_contrast_var = tk.DoubleVar(value=1.0)
-        ttk.Label(row5, text="Contrast", width=8).pack(side=tk.LEFT)
+        ttk.Label(row6, text="Contrast", width=8).pack(side=tk.LEFT)
         ttk.Scale(
-            row5,
+            row6,
             from_=0.2,
             to=2.0,
             orient=tk.HORIZONTAL,
@@ -5228,6 +5398,10 @@ class AnnotationTab(ttk.Frame):
         attach_tooltip(
             self.frame_filter_box,
             "Choisit un sous-ensemble de frames: toutes, celles marquées comme flip L/R, ou les 5% pires erreurs de reprojection pour la reconstruction sélectionnée.",
+        )
+        attach_tooltip(
+            row3,
+            "Snaps the placed point to the nearest reprojection or epipolar guide when the corresponding option is enabled.",
         )
         attach_tooltip(
             self.preview_canvas.get_tk_widget(),
@@ -5513,7 +5687,9 @@ class AnnotationTab(ttk.Frame):
         if hasattr(self, "reproject_button_var"):
             self.reproject_button_var.set("Reproject")
 
-    def _reference_projected_points(self, camera_name: str, frame_number: int) -> tuple[np.ndarray | None, str | None, str]:
+    def _reference_projected_points(
+        self, camera_name: str, frame_number: int
+    ) -> tuple[np.ndarray | None, str | None, str]:
         selected = self.selected_reconstruction_names()
         if not selected:
             return None, None, "#6c5ce7"
@@ -5532,19 +5708,25 @@ class AnnotationTab(ttk.Frame):
             else list(self.pose_data.camera_names if self.pose_data is not None else [])
         )
         if points_3d is None or points_3d.ndim != 3 or bundle_frames is None:
-            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
-                self.state, reference_name
+            return (
+                None,
+                reconstruction_legend_label(self.state, reference_name),
+                reconstruction_display_color(self.state, reference_name),
             )
         matches = np.flatnonzero(bundle_frames == int(frame_number))
         if matches.size == 0 or camera_name not in bundle_camera_names:
-            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
-                self.state, reference_name
+            return (
+                None,
+                reconstruction_legend_label(self.state, reference_name),
+                reconstruction_display_color(self.state, reference_name),
             )
         frame_idx = int(matches[0])
         calibration = self.calibrations.get(str(camera_name)) if self.calibrations is not None else None
         if calibration is None:
-            return None, reconstruction_legend_label(self.state, reference_name), reconstruction_display_color(
-                self.state, reference_name
+            return (
+                None,
+                reconstruction_legend_label(self.state, reference_name),
+                reconstruction_display_color(self.state, reference_name),
             )
         projected = np.full((points_3d.shape[1], 2), np.nan, dtype=float)
         for kp_idx, point_3d in enumerate(np.asarray(points_3d[frame_idx], dtype=float)):
@@ -5671,39 +5853,42 @@ class AnnotationTab(ttk.Frame):
 
     def load_resources(self) -> None:
         try:
-            keypoints_path = ROOT / self.state.keypoints_var.get()
-            calib_path = ROOT / self.state.calib_var.get()
-            self.calibrations, self.pose_data = get_cached_pose_data(
-                self.state,
-                keypoints_path=keypoints_path,
-                calib_path=calib_path,
-                data_mode="raw",
-                smoothing_window=int(self.state.pose_filter_window_var.get()),
-                outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
-                lower_percentile=float(self.state.pose_p_low_var.get()),
-                upper_percentile=float(self.state.pose_p_high_var.get()),
-            )
-            annotation_path_value = self.annotations_path_entry.get().strip()
-            self.annotation_path = (
-                (ROOT / annotation_path_value) if annotation_path_value else default_annotation_path(keypoints_path)
-            )
-            self.annotation_payload = load_annotation_payload(self.annotation_path, keypoints_path=keypoints_path)
-            self.refresh_kinematic_model_choices()
-            self.annotation_cameras_list.delete(0, tk.END)
-            for camera_name in self.pose_data.camera_names:
-                self.annotation_cameras_list.insert(tk.END, str(camera_name))
-                self.annotation_cameras_list.selection_set(tk.END)
-            self.update_camera_summary()
-            self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
-            self.frame_scale.configure(to=max(len(self.pose_data.frames) - 1, 0))
-            self._set_frame_index(min(int(self.frame_var.get()), max(len(self.pose_data.frames) - 1, 0)))
-            self.crop_limits_cache = {}
-            self.crop_limits_key = None
-            self._navigable_frame_cache = {}
-            self._clear_kinematic_assist_preview()
-            self._clear_pending_reprojection()
-            self.on_frame_filter_changed()
-            self.refresh_preview()
+            with gui_busy_popup(self, title="Annotation", message="Chargement des données d'annotation...") as popup:
+                keypoints_path = ROOT / self.state.keypoints_var.get()
+                calib_path = ROOT / self.state.calib_var.get()
+                popup.set_status("Chargement des calibrations et des 2D bruts...")
+                self.calibrations, self.pose_data = get_cached_pose_data(
+                    self.state,
+                    keypoints_path=keypoints_path,
+                    calib_path=calib_path,
+                    data_mode="raw",
+                    smoothing_window=int(self.state.pose_filter_window_var.get()),
+                    outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
+                    lower_percentile=float(self.state.pose_p_low_var.get()),
+                    upper_percentile=float(self.state.pose_p_high_var.get()),
+                )
+                annotation_path_value = self.annotations_path_entry.get().strip()
+                self.annotation_path = (
+                    (ROOT / annotation_path_value) if annotation_path_value else default_annotation_path(keypoints_path)
+                )
+                popup.set_status("Chargement des annotations et des modèles existants...")
+                self.annotation_payload = load_annotation_payload(self.annotation_path, keypoints_path=keypoints_path)
+                self.refresh_kinematic_model_choices()
+                self.annotation_cameras_list.delete(0, tk.END)
+                for camera_name in self.pose_data.camera_names:
+                    self.annotation_cameras_list.insert(tk.END, str(camera_name))
+                    self.annotation_cameras_list.selection_set(tk.END)
+                self.update_camera_summary()
+                self.current_marker_var.set(f"Current marker: {self.selected_keypoint_name()}")
+                self.frame_scale.configure(to=max(len(self.pose_data.frames) - 1, 0))
+                self._set_frame_index(min(int(self.frame_var.get()), max(len(self.pose_data.frames) - 1, 0)))
+                self.crop_limits_cache = {}
+                self.crop_limits_key = None
+                self._navigable_frame_cache = {}
+                self._clear_kinematic_assist_preview()
+                self._clear_pending_reprojection()
+                self.on_frame_filter_changed()
+                self.refresh_preview()
         except Exception as exc:
             messagebox.showerror("Annotation", str(exc))
 
@@ -5937,6 +6122,107 @@ class AnnotationTab(ttk.Frame):
             keypoint_name=keypoint_name,
         )
         return None if xy is None else np.asarray(xy, dtype=float)
+
+    def _annotation_support_camera_names(self) -> list[str]:
+        if self.pose_data is None:
+            return []
+        return [str(name) for name in self.pose_data.camera_names]
+
+    def _reference_projected_keypoint(
+        self,
+        camera_name: str,
+        frame_number: int,
+        keypoint_name: str,
+    ) -> np.ndarray | None:
+        if keypoint_name not in KP_INDEX:
+            return None
+        projected_points, _label, _color = self._reference_projected_points(camera_name, frame_number)
+        if projected_points is None:
+            return None
+        xy = np.asarray(projected_points[KP_INDEX[keypoint_name]], dtype=float)
+        return xy if np.all(np.isfinite(xy)) else None
+
+    def _triangulated_hint_for_keypoint(
+        self,
+        camera_name: str,
+        frame_number: int,
+        keypoint_name: str,
+    ) -> np.ndarray | None:
+        support_camera_names = []
+        support_points = []
+        for other_camera_name in self._annotation_support_camera_names():
+            if other_camera_name == str(camera_name):
+                continue
+            other_xy = self._annotation_xy(other_camera_name, frame_number, keypoint_name)
+            if other_xy is None:
+                continue
+            support_camera_names.append(str(other_camera_name))
+            support_points.append(np.asarray(other_xy, dtype=float))
+        return annotation_triangulated_reprojection(
+            self.calibrations,
+            target_camera_name=str(camera_name),
+            source_camera_names=support_camera_names,
+            source_points_2d=support_points,
+        )
+
+    def _epipolar_lines_for_keypoint(
+        self,
+        target_camera_name: str,
+        frame_number: int,
+        keypoint_name: str,
+    ) -> list[np.ndarray]:
+        lines: list[np.ndarray] = []
+        for other_camera_name in self._annotation_support_camera_names():
+            if str(other_camera_name) == str(target_camera_name):
+                continue
+            other_xy = self._annotation_xy(other_camera_name, frame_number, keypoint_name)
+            if other_xy is None:
+                continue
+            line = annotation_epipolar_guides(
+                self.calibrations,
+                str(other_camera_name),
+                str(target_camera_name),
+                other_xy,
+            )
+            if line is not None:
+                lines.append(np.asarray(line, dtype=float))
+        return lines
+
+    def _snap_annotation_xy(
+        self,
+        *,
+        camera_name: str,
+        frame_number: int,
+        keypoint_name: str,
+        pointer_xy: np.ndarray,
+    ) -> np.ndarray:
+        pointer_xy = np.asarray(pointer_xy, dtype=float).reshape(2)
+        candidates: list[np.ndarray] = []
+        if bool(getattr(self, "snap_reprojection_var", None) and self.snap_reprojection_var.get()):
+            triangulated = self._triangulated_hint_for_keypoint(camera_name, frame_number, keypoint_name)
+            if triangulated is not None and np.all(np.isfinite(triangulated)):
+                candidates.append(np.asarray(triangulated, dtype=float))
+            reference_xy = self._reference_projected_keypoint(camera_name, frame_number, keypoint_name)
+            if reference_xy is not None:
+                candidates.append(np.asarray(reference_xy, dtype=float))
+        if bool(getattr(self, "snap_epipolar_var", None) and self.snap_epipolar_var.get()):
+            lines = self._epipolar_lines_for_keypoint(camera_name, frame_number, keypoint_name)
+            intersection = annotation_intersect_epipolar_lines(lines)
+            if intersection is not None:
+                candidates.append(np.asarray(intersection, dtype=float))
+            for line in lines:
+                projected = annotation_project_point_to_line(line, pointer_xy)
+                if projected is not None:
+                    candidates.append(np.asarray(projected, dtype=float))
+        if not candidates:
+            return np.array(pointer_xy, copy=True)
+        distances = np.array([np.linalg.norm(candidate - pointer_xy) for candidate in candidates], dtype=float)
+        if not np.any(np.isfinite(distances)):
+            return np.array(pointer_xy, copy=True)
+        best_index = int(np.nanargmin(distances))
+        if float(distances[best_index]) > ANNOTATION_SNAP_RADIUS_PX:
+            return np.array(pointer_xy, copy=True)
+        return np.asarray(candidates[best_index], dtype=float)
 
     def _advance_to_next_keypoint(self) -> None:
         if not self.advance_marker_var.get():
@@ -6264,21 +6550,33 @@ class AnnotationTab(ttk.Frame):
                     "frame_number": int(frame_number),
                     "keypoint_name": str(hover_entry.get("keypoint_name", keypoint_name)),
                 }
+                snapped_xy = self._snap_annotation_xy(
+                    camera_name=str(camera_name),
+                    frame_number=int(frame_number),
+                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
+                    pointer_xy=pointer_xy,
+                )
                 set_annotation_point(
                     self.annotation_payload,
                     camera_name=camera_name,
                     frame_number=frame_number,
                     keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
-                    xy=pointer_xy,
+                    xy=snapped_xy,
                 )
                 self.refresh_preview()
                 return
+            snapped_xy = self._snap_annotation_xy(
+                camera_name=str(camera_name),
+                frame_number=int(frame_number),
+                keypoint_name=keypoint_name,
+                pointer_xy=pointer_xy,
+            )
             set_annotation_point(
                 self.annotation_payload,
                 camera_name=camera_name,
                 frame_number=frame_number,
                 keypoint_name=keypoint_name,
-                xy=pointer_xy,
+                xy=snapped_xy,
             )
             if self.advance_marker_var.get():
                 self._advance_to_next_keypoint()
@@ -6317,12 +6615,18 @@ class AnnotationTab(ttk.Frame):
                 return
             camera_name = self._axis_to_camera.get(event.inaxes)
             if camera_name == self._drag_annotation_state.get("camera_name"):
+                snapped_xy = self._snap_annotation_xy(
+                    camera_name=str(self._drag_annotation_state["camera_name"]),
+                    frame_number=int(self._drag_annotation_state["frame_number"]),
+                    keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
+                    pointer_xy=np.array([float(event.xdata), float(event.ydata)], dtype=float),
+                )
                 set_annotation_point(
                     self.annotation_payload,
                     camera_name=str(self._drag_annotation_state["camera_name"]),
                     frame_number=int(self._drag_annotation_state["frame_number"]),
                     keypoint_name=str(self._drag_annotation_state["keypoint_name"]),
-                    xy=[float(event.xdata), float(event.ydata)],
+                    xy=snapped_xy,
                 )
                 self.refresh_preview()
                 return
@@ -6448,7 +6752,9 @@ class AnnotationTab(ttk.Frame):
             reference_projected_points = None
             reference_projected_label = None
             reference_projected_color = "#6c5ce7"
-            if bool(getattr(self, "show_reference_reprojection_var", None) and self.show_reference_reprojection_var.get()):
+            if bool(
+                getattr(self, "show_reference_reprojection_var", None) and self.show_reference_reprojection_var.get()
+            ):
                 (
                     reference_projected_points,
                     reference_projected_label,
@@ -11798,81 +12104,97 @@ class ExecutionTab(ttk.Frame):
 
     def refresh_analysis(self) -> None:
         try:
-            dataset_dir = current_dataset_dir(self.state)
-            biomod_path = resolve_preview_biomod(dataset_dir)
-            pose2sim_trc = (
-                ROOT / self.state.pose2sim_trc_var.get() if self.state.pose2sim_trc_var.get().strip() else None
-            )
-            self.bundle = get_cached_preview_bundle(
-                self.state, dataset_dir, biomod_path, pose2sim_trc, align_root=False
-            )
-            selected_name = self._selected_reconstruction()
-            self.current_reconstruction_name = selected_name
-            if selected_name is None:
-                self.execution_analysis = None
-                self._populate_jump_list()
-                self._populate_deduction_tree()
-                self._show_empty_plot("Select one reconstruction to inspect execution deductions.")
-                return
-            recon_q = self.bundle.get("recon_q", {})
-            recon_points = self.bundle.get("recon_3d", {})
-            q = recon_q.get(selected_name)
-            points_3d = recon_points.get(selected_name)
-            if q is None or points_3d is None:
-                self.execution_analysis = None
-                self._populate_jump_list()
-                self._populate_deduction_tree()
-                self._show_empty_plot("Execution analysis requires q and 3D markers for the selected reconstruction.")
-                return
-            q = np.asarray(q, dtype=float)
-            points_3d = np.asarray(points_3d, dtype=float)
-            qdot = self.bundle.get("recon_qdot", {}).get(selected_name)
-            if qdot is not None:
-                qdot = np.asarray(qdot, dtype=float)
-            root_q, _full_q, q_name_list = preview_root_series_for_reconstruction(
-                bundle=self.bundle,
-                name=selected_name,
-                initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
-            )
-            if root_q is None or q_name_list is None:
-                self.execution_analysis = None
-                self._populate_jump_list()
-                self._populate_deduction_tree()
-                self._show_empty_plot("Unable to derive root kinematics for execution analysis.")
-                return
-            fps = float(self.state.fps_var.get())
-            self.dd_analysis = analyze_dd_session(
-                np.asarray(root_q, dtype=float),
-                fps,
-                height_values=jump_segmentation_height_series(points_3d, np.asarray(root_q, dtype=float)),
-                height_threshold=TRAMPOLINE_BED_HEIGHT_M,
-                angle_mode="euler",
-                analysis_start_frame=ANALYSIS_START_FRAME,
-                require_complete_jumps=True,
-            )
-            self.execution_analysis = analyze_execution_session(
-                self.dd_analysis,
-                q,
-                qdot,
-                q_name_list,
-                points_3d,
-                fps,
-            )
-            try:
-                self.calibrations, self.pose_data, _diagnostics = get_calibration_pose_data(
-                    self.state,
-                    keypoints_path=ROOT / self.state.keypoints_var.get(),
-                    calib_path=ROOT / self.state.calib_var.get(),
-                    **shared_pose_data_kwargs(self.state),
+            with gui_busy_popup(self, title="Execution", message="Calcul des déductions d'exécution...") as popup:
+                dataset_dir = current_dataset_dir(self.state)
+                biomod_path = resolve_preview_biomod(dataset_dir)
+                pose2sim_trc = (
+                    ROOT / self.state.pose2sim_trc_var.get() if self.state.pose2sim_trc_var.get().strip() else None
                 )
-            except Exception:
-                self.calibrations, self.pose_data = None, None
-            self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
-            self._update_camera_choices()
-            self._populate_jump_list()
-            self._populate_deduction_tree()
-            self.render_summary()
-            self.refresh_plot()
+                popup.set_status("Chargement du bundle partagé...")
+                self.bundle = get_cached_preview_bundle(
+                    self.state, dataset_dir, biomod_path, pose2sim_trc, align_root=False
+                )
+                selected_name = self._selected_reconstruction()
+                self.current_reconstruction_name = selected_name
+                if selected_name is None:
+                    self.execution_analysis = None
+                    self._populate_jump_list()
+                    self._populate_deduction_tree()
+                    self._show_empty_plot("Select one reconstruction to inspect execution deductions.")
+                    return
+                recon_q = self.bundle.get("recon_q", {})
+                recon_points = self.bundle.get("recon_3d", {})
+                q = recon_q.get(selected_name)
+                points_3d = recon_points.get(selected_name)
+                if q is None or points_3d is None:
+                    self.execution_analysis = None
+                    self._populate_jump_list()
+                    self._populate_deduction_tree()
+                    self._show_empty_plot(
+                        "Execution analysis requires q and 3D markers for the selected reconstruction."
+                    )
+                    return
+                q = np.asarray(q, dtype=float)
+                points_3d = np.asarray(points_3d, dtype=float)
+                qdot = self.bundle.get("recon_qdot", {}).get(selected_name)
+                if qdot is not None:
+                    qdot = np.asarray(qdot, dtype=float)
+                root_q, _full_q, q_name_list = preview_root_series_for_reconstruction(
+                    bundle=self.bundle,
+                    name=selected_name,
+                    initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+                )
+                if root_q is None or q_name_list is None:
+                    self.execution_analysis = None
+                    self._populate_jump_list()
+                    self._populate_deduction_tree()
+                    self._show_empty_plot("Unable to derive root kinematics for execution analysis.")
+                    return
+                fps = float(self.state.fps_var.get())
+                popup.set_status("Segmentation partagée des sauts...")
+                self.dd_analysis = shared_jump_analysis(
+                    self.state,
+                    reconstruction_name=selected_name,
+                    root_q=np.asarray(root_q, dtype=float),
+                    points_3d=points_3d,
+                    fps=fps,
+                    height_threshold=TRAMPOLINE_BED_HEIGHT_M,
+                    height_threshold_range_ratio=0.20,
+                    smoothing_window_s=0.15,
+                    min_airtime_s=0.25,
+                    min_gap_s=0.08,
+                    min_peak_prominence_m=0.35,
+                    contact_window_s=0.35,
+                    full_q=None,
+                    q_names=q_name_list,
+                    angle_mode="euler",
+                    analysis_start_frame=ANALYSIS_START_FRAME,
+                    require_complete_jumps=True,
+                )
+                popup.set_status("Calcul des déductions localisées...")
+                self.execution_analysis = analyze_execution_session(
+                    self.dd_analysis,
+                    q,
+                    qdot,
+                    q_name_list,
+                    points_3d,
+                    fps,
+                )
+                try:
+                    self.calibrations, self.pose_data, _diagnostics = get_calibration_pose_data(
+                        self.state,
+                        keypoints_path=ROOT / self.state.keypoints_var.get(),
+                        calib_path=ROOT / self.state.calib_var.get(),
+                        **shared_pose_data_kwargs(self.state),
+                    )
+                except Exception:
+                    self.calibrations, self.pose_data = None, None
+                self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+                self._update_camera_choices()
+                self._populate_jump_list()
+                self._populate_deduction_tree()
+                self.render_summary()
+                self.refresh_plot()
         except Exception as exc:
             messagebox.showerror("Execution", str(exc))
 
@@ -12376,43 +12698,47 @@ class CalibrationTab(ttk.Frame):
     def refresh_analysis(self) -> None:
         if self.pose_data is None or self.calibrations is None:
             return
-        self.current_reconstruction_name = self._selected_reconstruction()
-        payload = {}
-        summary = {}
-        if self.current_reconstruction_name:
-            recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), self.current_reconstruction_name)
-            if recon_dir is not None:
-                payload = load_bundle_payload(recon_dir)
-                summary = load_bundle_summary(recon_dir)
-        selected_pose_mode = str(self.pose_data_mode.get()).strip()
-        reconstruction_pose_mode = str(summary.get("pose_data_mode") or "").strip()
-        if payload and reconstruction_pose_mode and reconstruction_pose_mode != selected_pose_mode:
+        with gui_busy_popup(self, title="Calibration", message="Analyse de la qualité de calibration...") as popup:
+            self.current_reconstruction_name = self._selected_reconstruction()
             payload = {}
-        self.current_reconstruction_payload = payload
-        self.current_reconstruction_summary = summary
-        trim_fraction = max(0.0, float(self.trim_fraction_var.get() or "0")) / 100.0
-        self.qc = compute_calibration_qc(
-            self.pose_data,
-            self.calibrations,
-            reconstruction_payload=payload or None,
-            trim_fraction=trim_fraction,
-            spatial_bins=3,
-        )
-        self.status_var.set(
-            f"Source: {self.pose_data_mode.get()} | 2D trim: "
-            f"{int(round(self.qc.two_d.trim_fraction * 100.0))}% | Reconstruction: "
-            f"{self.current_reconstruction_name or 'none selected'}"
-            + (
-                ""
-                if not self.current_reconstruction_name
-                or not reconstruction_pose_mode
-                or reconstruction_pose_mode == selected_pose_mode
-                else f" | 3D hidden: reconstruction uses {reconstruction_pose_mode}"
+            summary = {}
+            if self.current_reconstruction_name:
+                recon_dir = reconstruction_dir_by_name(
+                    current_dataset_dir(self.state), self.current_reconstruction_name
+                )
+                if recon_dir is not None:
+                    payload = load_bundle_payload(recon_dir)
+                    summary = load_bundle_summary(recon_dir)
+            selected_pose_mode = str(self.pose_data_mode.get()).strip()
+            reconstruction_pose_mode = str(summary.get("pose_data_mode") or "").strip()
+            if payload and reconstruction_pose_mode and reconstruction_pose_mode != selected_pose_mode:
+                payload = {}
+            self.current_reconstruction_payload = payload
+            self.current_reconstruction_summary = summary
+            trim_fraction = max(0.0, float(self.trim_fraction_var.get() or "0")) / 100.0
+            popup.set_status("Agrégation 2D/3D des métriques de calibration...")
+            self.qc = compute_calibration_qc(
+                self.pose_data,
+                self.calibrations,
+                reconstruction_payload=payload or None,
+                trim_fraction=trim_fraction,
+                spatial_bins=3,
             )
-        )
-        self.render_summary()
-        self.refresh_worst_frame_list()
-        self.refresh_plot()
+            self.status_var.set(
+                f"Source: {self.pose_data_mode.get()} | 2D trim: "
+                f"{int(round(self.qc.two_d.trim_fraction * 100.0))}% | Reconstruction: "
+                f"{self.current_reconstruction_name or 'none selected'}"
+                + (
+                    ""
+                    if not self.current_reconstruction_name
+                    or not reconstruction_pose_mode
+                    or reconstruction_pose_mode == selected_pose_mode
+                    else f" | 3D hidden: reconstruction uses {reconstruction_pose_mode}"
+                )
+            )
+            self.render_summary()
+            self.refresh_worst_frame_list()
+            self.refresh_plot()
 
     def refresh_worst_frame_list(self) -> None:
         self.worst_frame_list.delete(0, tk.END)
@@ -13565,49 +13891,55 @@ class TrampolineTab(ttk.Frame):
 
     def refresh_analysis(self) -> None:
         try:
-            self.bundle = get_cached_preview_bundle(
-                self.state, current_dataset_dir(self.state), None, None, align_root=False
-            )
-            self.current_reconstruction_name = self._selected_reconstruction()
-            if self.current_reconstruction_name is None:
-                self.analysis = None
-                self.contacts = []
+            with gui_busy_popup(self, title="Toile", message="Analyse du déplacement sur la toile...") as popup:
+                self.bundle = get_cached_preview_bundle(
+                    self.state, current_dataset_dir(self.state), None, None, align_root=False
+                )
+                self.current_reconstruction_name = self._selected_reconstruction()
+                if self.current_reconstruction_name is None:
+                    self.analysis = None
+                    self.contacts = []
+                    self.render_summary()
+                    self.refresh_plot()
+                    return
+                root_q, full_q, q_names = preview_root_series_for_reconstruction(
+                    bundle=self.bundle,
+                    name=self.current_reconstruction_name,
+                    initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
+                )
+                if root_q is None:
+                    raise ValueError(f"Aucune cinématique racine disponible pour {self.current_reconstruction_name}.")
+                fps = float(self.state.fps_var.get())
+                recon_3d = self.bundle.get("recon_3d", {}) if isinstance(self.bundle, dict) else {}
+                points_3d = (
+                    np.asarray(recon_3d[self.current_reconstruction_name], dtype=float)
+                    if self.current_reconstruction_name in recon_3d
+                    else None
+                )
+                popup.set_status("Segmentation partagée des sauts...")
+                self.analysis = shared_jump_analysis(
+                    self.state,
+                    reconstruction_name=self.current_reconstruction_name,
+                    root_q=np.asarray(root_q, dtype=float),
+                    points_3d=points_3d,
+                    fps=fps,
+                    height_threshold=TRAMPOLINE_BED_HEIGHT_M,
+                    height_threshold_range_ratio=0.20,
+                    smoothing_window_s=0.15,
+                    min_airtime_s=0.25,
+                    min_gap_s=0.08,
+                    min_peak_prominence_m=0.35,
+                    contact_window_s=0.35,
+                    full_q=None if full_q is None else np.asarray(full_q, dtype=float),
+                    q_names=q_names,
+                    angle_mode="euler",
+                    analysis_start_frame=ANALYSIS_START_FRAME,
+                    require_complete_jumps=True,
+                )
+                contact_series = points_3d if points_3d is not None else np.asarray(root_q[:, :2], dtype=float)
+                self.contacts = analyze_trampoline_contacts(self.analysis, contact_series)
                 self.render_summary()
                 self.refresh_plot()
-                return
-            root_q, _full_q, _q_names = preview_root_series_for_reconstruction(
-                bundle=self.bundle,
-                name=self.current_reconstruction_name,
-                initial_rotation_correction=bool(self.state.initial_rotation_correction_var.get()),
-            )
-            if root_q is None:
-                raise ValueError(f"Aucune cinématique racine disponible pour {self.current_reconstruction_name}.")
-            fps = float(self.state.fps_var.get())
-            recon_3d = self.bundle.get("recon_3d", {}) if isinstance(self.bundle, dict) else {}
-            self.analysis = analyze_dd_session(
-                np.asarray(root_q, dtype=float),
-                fps,
-                height_values=jump_segmentation_height_series(
-                    (
-                        np.asarray(recon_3d[self.current_reconstruction_name], dtype=float)
-                        if self.current_reconstruction_name in recon_3d
-                        else None
-                    ),
-                    np.asarray(root_q, dtype=float),
-                ),
-                height_threshold=TRAMPOLINE_BED_HEIGHT_M,
-                angle_mode="euler",
-                analysis_start_frame=ANALYSIS_START_FRAME,
-                require_complete_jumps=True,
-            )
-            recon_3d = self.bundle.get("recon_3d", {}) if isinstance(self.bundle, dict) else {}
-            if self.current_reconstruction_name in recon_3d:
-                contact_series = np.asarray(recon_3d[self.current_reconstruction_name], dtype=float)
-            else:
-                contact_series = np.asarray(root_q[:, :2], dtype=float)
-            self.contacts = analyze_trampoline_contacts(self.analysis, contact_series)
-            self.render_summary()
-            self.refresh_plot()
         except Exception as exc:
             messagebox.showerror("Déplacement toile", str(exc))
 
@@ -14036,92 +14368,94 @@ class DDTab(ttk.Frame):
 
     def refresh_analysis(self) -> None:
         try:
-            gui_debug(f"DD refresh_analysis start dataset={current_dataset_dir(self.state)}")
-            self.bundle = get_cached_preview_bundle(
-                self.state, current_dataset_dir(self.state), None, None, align_root=False
-            )
-            available_names = bundle_available_reconstruction_names(
-                self.bundle, include_3d=True, include_q=True, include_q_root=True
-            )
-            selected_name = self._selected_reconstruction()
-            self.current_reconstruction_name = selected_name
-            gui_debug(f"DD selected reconstruction={selected_name}")
-            self.expected_dd_codes = self._load_expected_dd_codes()
-            if selected_name is None:
-                self.analysis = None
+            with gui_busy_popup(self, title="DD", message="Analyse des sauts et des codes DD...") as popup:
+                gui_debug(f"DD refresh_analysis start dataset={current_dataset_dir(self.state)}")
+                self.bundle = get_cached_preview_bundle(
+                    self.state, current_dataset_dir(self.state), None, None, align_root=False
+                )
+                available_names = bundle_available_reconstruction_names(
+                    self.bundle, include_3d=True, include_q=True, include_q_root=True
+                )
+                selected_name = self._selected_reconstruction()
+                self.current_reconstruction_name = selected_name
+                gui_debug(f"DD selected reconstruction={selected_name}")
+                self.expected_dd_codes = self._load_expected_dd_codes()
+                if selected_name is None:
+                    self.analysis = None
+                    self.analysis_by_name = {}
+                    self.render_comparison_table(available_names)
+                    self.render_summary()
+                    self.refresh_plot()
+                    return
+
+                recon_q = self.bundle.get("recon_q", {})
+                recon_q_root = self.bundle.get("recon_q_root", {})
+                recon_3d = self.bundle.get("recon_3d", {})
+                q_names = np.asarray(self.bundle.get("q_names", np.array([], dtype=object)), dtype=object)
+                root_q, full_q, q_name_list = self._root_series_for_reconstruction(
+                    selected_name, recon_q, recon_q_root, recon_3d, q_names
+                )
+                if root_q is None:
+                    raise ValueError(f"Aucune cinématique racine disponible pour {selected_name}.")
+                gui_debug(
+                    "DD root series ready "
+                    f"name={selected_name} root_shape={root_q.shape} "
+                    f"full_q={'yes' if full_q is not None else 'no'}"
+                )
+                self._update_height_dof_choices(q_name_list)
+                fps = float(self.state.fps_var.get())
+                height_threshold_abs = self.height_threshold_abs.get().strip()
+                popup.set_status("Segmentation partagée et classification DD...")
+                gui_debug(
+                    "DD analyze_dd_session "
+                    f"fps={fps} height_dof={self.height_dof.get()} "
+                    f"smooth={self.smoothing_window_s.get()} thr_ratio={self.height_threshold_ratio.get()} "
+                    f"thr_abs={height_threshold_abs or '-'}"
+                )
                 self.analysis_by_name = {}
+                for name in available_names:
+                    name_root_q, name_full_q, name_q_name_list = self._root_series_for_reconstruction(
+                        name, recon_q, recon_q_root, recon_3d, q_names
+                    )
+                    if name_root_q is None:
+                        continue
+                    try:
+                        points_3d = np.asarray(recon_3d[name], dtype=float) if name in recon_3d else None
+                        self.analysis_by_name[name] = shared_jump_analysis(
+                            self.state,
+                            reconstruction_name=name,
+                            root_q=np.asarray(name_root_q, dtype=float),
+                            points_3d=points_3d,
+                            fps=fps,
+                            height_threshold=(
+                                float(height_threshold_abs) if height_threshold_abs else TRAMPOLINE_BED_HEIGHT_M
+                            ),
+                            height_threshold_range_ratio=float(self.height_threshold_ratio.get()),
+                            smoothing_window_s=float(self.smoothing_window_s.get()),
+                            min_airtime_s=float(self.min_airtime_s.get()),
+                            min_gap_s=float(self.min_gap_s.get()),
+                            min_peak_prominence_m=float(self.min_peak_prominence_m.get()),
+                            contact_window_s=float(self.contact_window_s.get()),
+                            full_q=name_full_q,
+                            q_names=name_q_name_list,
+                            angle_mode=self.angle_mode.get(),
+                            analysis_start_frame=ANALYSIS_START_FRAME,
+                            require_complete_jumps=True,
+                        )
+                    except Exception:
+                        continue
+                self.analysis = self.analysis_by_name.get(selected_name)
                 self.render_comparison_table(available_names)
+                if self.analysis is None:
+                    raise ValueError(f"Aucune analyse DD disponible pour {selected_name}.")
+                gui_debug(
+                    "DD analyze_dd_session done "
+                    f"jumps={len(self.analysis.jumps)} threshold={self.analysis.height_threshold:.4f}"
+                )
+                self.render_jump_list()
                 self.render_summary()
                 self.refresh_plot()
-                return
-
-            recon_q = self.bundle.get("recon_q", {})
-            recon_q_root = self.bundle.get("recon_q_root", {})
-            recon_3d = self.bundle.get("recon_3d", {})
-            q_names = np.asarray(self.bundle.get("q_names", np.array([], dtype=object)), dtype=object)
-            root_q, full_q, q_name_list = self._root_series_for_reconstruction(
-                selected_name, recon_q, recon_q_root, recon_3d, q_names
-            )
-            if root_q is None:
-                raise ValueError(f"Aucune cinématique racine disponible pour {selected_name}.")
-            gui_debug(
-                "DD root series ready "
-                f"name={selected_name} root_shape={root_q.shape} "
-                f"full_q={'yes' if full_q is not None else 'no'}"
-            )
-            self._update_height_dof_choices(q_name_list)
-            fps = float(self.state.fps_var.get())
-            height_threshold_abs = self.height_threshold_abs.get().strip()
-            gui_debug(
-                "DD analyze_dd_session "
-                f"fps={fps} height_dof={self.height_dof.get()} "
-                f"smooth={self.smoothing_window_s.get()} thr_ratio={self.height_threshold_ratio.get()} "
-                f"thr_abs={height_threshold_abs or '-'}"
-            )
-            self.analysis_by_name = {}
-            for name in available_names:
-                name_root_q, name_full_q, name_q_name_list = self._root_series_for_reconstruction(
-                    name, recon_q, recon_q_root, recon_3d, q_names
-                )
-                if name_root_q is None:
-                    continue
-                try:
-                    self.analysis_by_name[name] = analyze_dd_session(
-                        np.asarray(name_root_q, dtype=float),
-                        fps,
-                        height_values=jump_segmentation_height_series(
-                            np.asarray(recon_3d[name], dtype=float) if name in recon_3d else None,
-                            np.asarray(name_root_q, dtype=float),
-                        ),
-                        height_threshold=(
-                            float(height_threshold_abs) if height_threshold_abs else TRAMPOLINE_BED_HEIGHT_M
-                        ),
-                        height_threshold_range_ratio=float(self.height_threshold_ratio.get()),
-                        smoothing_window_s=float(self.smoothing_window_s.get()),
-                        min_airtime_s=float(self.min_airtime_s.get()),
-                        min_gap_s=float(self.min_gap_s.get()),
-                        min_peak_prominence_m=float(self.min_peak_prominence_m.get()),
-                        contact_window_s=float(self.contact_window_s.get()),
-                        full_q=name_full_q,
-                        q_names=name_q_name_list,
-                        angle_mode=self.angle_mode.get(),
-                        analysis_start_frame=ANALYSIS_START_FRAME,
-                        require_complete_jumps=True,
-                    )
-                except Exception:
-                    continue
-            self.analysis = self.analysis_by_name.get(selected_name)
-            self.render_comparison_table(available_names)
-            if self.analysis is None:
-                raise ValueError(f"Aucune analyse DD disponible pour {selected_name}.")
-            gui_debug(
-                "DD analyze_dd_session done "
-                f"jumps={len(self.analysis.jumps)} threshold={self.analysis.height_threshold:.4f}"
-            )
-            self.render_jump_list()
-            self.render_summary()
-            self.refresh_plot()
-            gui_debug("DD refresh_analysis done")
+                gui_debug("DD refresh_analysis done")
         except Exception as exc:
             gui_debug(f"DD refresh_analysis error: {exc}")
             messagebox.showerror("Analyse DD", str(exc))
@@ -14390,8 +14724,8 @@ class DDTab(ttk.Frame):
                 label="knee flex",
             )
             for phase_name, mask, color_fill in (
-                ("grouped", selected_jump.grouped_mask, "#dd8452"),
-                ("piked", selected_jump.piked_mask, "#4c72b0"),
+                ("groupé", selected_jump.grouped_mask, "#dd8452"),
+                ("carpé", selected_jump.piked_mask, "#4c72b0"),
             ):
                 phase_regions = contiguous_true_regions(mask)
                 for region_idx, (start_idx, end_idx) in enumerate(phase_regions):
