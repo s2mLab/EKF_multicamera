@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -224,6 +225,7 @@ def test_calibration_tab_refresh_analysis_uses_selected_reconstruction_payload(m
         "load_bundle_payload",
         lambda _path: {"points_3d": np.zeros((1, 17, 3)), "reprojection_error_per_view": np.zeros((1, 17, 1))},
     )
+    monkeypatch.setattr(pipeline_gui, "load_bundle_summary", lambda _path: {"pose_data_mode": "cleaned"})
 
     def _fake_qc(pose_data, calibrations, *, reconstruction_payload, trim_fraction, spatial_bins):
         captured["pose_data"] = pose_data
@@ -245,6 +247,85 @@ def test_calibration_tab_refresh_analysis_uses_selected_reconstruction_payload(m
     assert "points_3d" in captured["payload"]
     assert captured["trim_fraction"] == 0.15
     assert captured["spatial_bins"] == 3
+    assert tab._summary_rendered is True
+    assert tab._plot_rendered is True
+
+
+def test_annotation_only_pose_data_keeps_only_manual_annotations(tmp_path):
+    keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
+    annotations_path = tmp_path / "inputs" / "annotations" / "trial_annotations.json"
+    keypoints_path.parent.mkdir(parents=True)
+    annotations_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}", encoding="utf-8")
+    annotations_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "annotations": {"cam0": {"0": {"nose": {"xy": [11.0, 22.0], "score": 1.0}}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    pose_data = pipeline_gui.PoseData(
+        camera_names=["cam0", "cam1"],
+        frames=np.array([0], dtype=int),
+        keypoints=np.full((2, 1, len(pipeline_gui.COCO17), 2), 99.0, dtype=float),
+        scores=np.ones((2, 1, len(pipeline_gui.COCO17)), dtype=float),
+    )
+
+    sparse_pose = pipeline_gui.annotation_only_pose_data(
+        pose_data,
+        keypoints_path=keypoints_path,
+        annotations_path=annotations_path,
+    )
+
+    np.testing.assert_allclose(sparse_pose.keypoints[0, 0, 0], np.array([11.0, 22.0]))
+    assert sparse_pose.scores[0, 0, 0] == 1.0
+    assert np.isnan(sparse_pose.keypoints[1]).all()
+    assert np.all(sparse_pose.scores[1] == 0.0)
+
+
+def test_calibration_tab_refresh_analysis_hides_3d_when_reconstruction_pose_mode_mismatches(monkeypatch):
+    tab = pipeline_gui.CalibrationTab.__new__(pipeline_gui.CalibrationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([0], dtype=int))
+    tab.calibrations = {"cam0": object()}
+    tab.state = SimpleNamespace(shared_reconstruction_selection=("demo",))
+    tab.trim_fraction_var = SimpleNamespace(get=lambda: "15")
+    tab.pose_data_mode = SimpleNamespace(get=lambda: "annotated")
+    tab.status_var = SimpleNamespace(set=lambda value: setattr(tab, "_status_text", value))
+    tab.worst_frame_list = _FakeListbox()
+    tab.render_summary = lambda: setattr(tab, "_summary_rendered", True)
+    tab.refresh_plot = lambda: setattr(tab, "_plot_rendered", True)
+    tab.refresh_worst_frame_list = lambda: setattr(tab, "_worst_rendered", True)
+
+    captured = {}
+
+    monkeypatch.setattr(pipeline_gui, "current_dataset_dir", lambda _state: Path("output/demo"))
+    monkeypatch.setattr(
+        pipeline_gui,
+        "reconstruction_dir_by_name",
+        lambda _dataset_dir, _name: Path("output/demo/reconstructions/demo"),
+    )
+    monkeypatch.setattr(
+        pipeline_gui,
+        "load_bundle_payload",
+        lambda _path: {"points_3d": np.zeros((1, 17, 3)), "reprojection_error_per_view": np.zeros((1, 17, 1))},
+    )
+    monkeypatch.setattr(pipeline_gui, "load_bundle_summary", lambda _path: {"pose_data_mode": "cleaned"})
+
+    def _fake_qc(pose_data, calibrations, *, reconstruction_payload, trim_fraction, spatial_bins):
+        captured["reconstruction_payload"] = reconstruction_payload
+        return SimpleNamespace(
+            two_d=SimpleNamespace(trim_fraction=trim_fraction, per_frame_mean_px=np.array([1.0], dtype=float)),
+            three_d=None,
+        )
+
+    monkeypatch.setattr(pipeline_gui, "compute_calibration_qc", _fake_qc)
+
+    pipeline_gui.CalibrationTab.refresh_analysis(tab)
+
+    assert captured["reconstruction_payload"] is None
+    assert "3D hidden" in tab._status_text
     assert tab._summary_rendered is True
     assert tab._plot_rendered is True
 

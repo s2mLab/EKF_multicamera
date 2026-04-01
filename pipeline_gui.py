@@ -22,7 +22,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -2898,6 +2898,26 @@ def existing_annotation_path_for_keypoints(state: SharedAppState, keypoints_path
         except Exception:
             continue
     return None
+
+
+def annotation_only_pose_data(
+    pose_data: PoseData,
+    *,
+    keypoints_path: Path,
+    annotations_path: Path | None,
+) -> PoseData:
+    """Return one sparse pose-data view containing only manual annotations."""
+
+    payload = load_annotation_payload(annotations_path, keypoints_path=keypoints_path)
+    sparse_keypoints, sparse_scores = apply_annotations_to_pose_arrays(
+        keypoints=np.full_like(np.asarray(pose_data.keypoints, dtype=float), np.nan),
+        scores=np.zeros_like(np.asarray(pose_data.scores, dtype=float)),
+        camera_names=list(pose_data.camera_names),
+        frames=np.asarray(pose_data.frames, dtype=int),
+        keypoint_names=COCO17,
+        payload=payload,
+    )
+    return replace(pose_data, keypoints=sparse_keypoints, scores=sparse_scores)
 
 
 def available_model_pose_modes(state: SharedAppState, keypoints_path: Path) -> list[str]:
@@ -11972,6 +11992,7 @@ class CalibrationTab(ttk.Frame):
         self.qc = None
         self.current_reconstruction_name = None
         self.current_reconstruction_payload: dict[str, np.ndarray] = {}
+        self.current_reconstruction_summary: dict[str, object] = {}
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
 
@@ -12133,12 +12154,20 @@ class CalibrationTab(ttk.Frame):
     def load_resources(self) -> None:
         try:
             self.refresh_pose_mode_choices()
-            self.calibrations, self.pose_data = get_cached_pose_data(
+            keypoints_path = ROOT / self.state.keypoints_var.get()
+            self.calibrations, pose_data = get_cached_pose_data(
                 self.state,
-                keypoints_path=ROOT / self.state.keypoints_var.get(),
+                keypoints_path=keypoints_path,
                 calib_path=ROOT / self.state.calib_var.get(),
                 **shared_pose_data_kwargs(self.state, data_mode=self.pose_data_mode.get()),
             )
+            if str(self.pose_data_mode.get()).strip() == "annotated":
+                pose_data = annotation_only_pose_data(
+                    pose_data,
+                    keypoints_path=keypoints_path,
+                    annotations_path=existing_annotation_path_for_keypoints(self.state, keypoints_path),
+                )
+            self.pose_data = pose_data
             self.refresh_analysis()
         except Exception as exc:
             messagebox.showerror("Calibration", str(exc))
@@ -12148,10 +12177,18 @@ class CalibrationTab(ttk.Frame):
             return
         self.current_reconstruction_name = self._selected_reconstruction()
         payload = {}
+        summary = {}
         if self.current_reconstruction_name:
             recon_dir = reconstruction_dir_by_name(current_dataset_dir(self.state), self.current_reconstruction_name)
-            payload = {} if recon_dir is None else load_bundle_payload(recon_dir)
+            if recon_dir is not None:
+                payload = load_bundle_payload(recon_dir)
+                summary = load_bundle_summary(recon_dir)
+        selected_pose_mode = str(self.pose_data_mode.get()).strip()
+        reconstruction_pose_mode = str(summary.get("pose_data_mode") or "").strip()
+        if payload and reconstruction_pose_mode and reconstruction_pose_mode != selected_pose_mode:
+            payload = {}
         self.current_reconstruction_payload = payload
+        self.current_reconstruction_summary = summary
         trim_fraction = max(0.0, float(self.trim_fraction_var.get() or "0")) / 100.0
         self.qc = compute_calibration_qc(
             self.pose_data,
@@ -12164,6 +12201,13 @@ class CalibrationTab(ttk.Frame):
             f"Source: {self.pose_data_mode.get()} | 2D trim: "
             f"{int(round(self.qc.two_d.trim_fraction * 100.0))}% | Reconstruction: "
             f"{self.current_reconstruction_name or 'none selected'}"
+            + (
+                ""
+                if not self.current_reconstruction_name
+                or not reconstruction_pose_mode
+                or reconstruction_pose_mode == selected_pose_mode
+                else f" | 3D hidden: reconstruction uses {reconstruction_pose_mode}"
+            )
         )
         self.render_summary()
         self.refresh_worst_frame_list()
@@ -12286,6 +12330,19 @@ class CalibrationTab(ttk.Frame):
             if worst_frames_3d:
                 lines.append("- Worst 3D frames (mean reprojection px):")
                 lines.extend(f"  - frame {frame}: {value:.2f} px" for frame, value in worst_frames_3d)
+        elif self.current_reconstruction_name and self.current_reconstruction_summary:
+            reconstruction_pose_mode = str(self.current_reconstruction_summary.get("pose_data_mode") or "").strip()
+            if reconstruction_pose_mode and reconstruction_pose_mode != str(self.pose_data_mode.get()).strip():
+                lines.extend(
+                    [
+                        "",
+                        "3D calibration quality",
+                        (
+                            "- Hidden because the selected reconstruction uses "
+                            f"`{reconstruction_pose_mode}` while the tab uses `{self.pose_data_mode.get()}`."
+                        ),
+                    ]
+                )
 
         self.summary.insert(tk.END, "\n".join(lines) + "\n")
 
