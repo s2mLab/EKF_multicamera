@@ -275,6 +275,64 @@ def test_annotation_jump_context_uses_shared_jump_analysis(monkeypatch):
     assert tab.annotation_jump_analysis is analysis
 
 
+def test_gui_busy_popup_does_not_show_before_delay(monkeypatch):
+    created = []
+
+    class _FakeBusyWindow:
+        def __init__(self, _parent, title, message):
+            created.append((title, message))
+
+        def set_status(self, _message):
+            return
+
+        def close(self):
+            return
+
+        def update(self):
+            return
+
+    times = iter([0.0, 0.2])
+    monkeypatch.setattr(pipeline_gui, "BusyStatusWindow", _FakeBusyWindow)
+    monkeypatch.setattr(pipeline_gui.time, "monotonic", lambda: next(times))
+
+    with pipeline_gui.gui_busy_popup(
+        SimpleNamespace(update_idletasks=lambda: None), title="Test", message="Short"
+    ) as popup:
+        popup.set_status("Still short")
+
+    assert created == []
+
+
+def test_gui_busy_popup_shows_after_delay(monkeypatch):
+    created = []
+
+    class _FakeBusyWindow:
+        def __init__(self, _parent, title, message):
+            self.title = title
+            self.message = message
+            created.append((title, message))
+
+        def set_status(self, message):
+            self.message = message
+
+        def close(self):
+            return
+
+        def update(self):
+            return
+
+    times = iter([0.0, 0.8])
+    monkeypatch.setattr(pipeline_gui, "BusyStatusWindow", _FakeBusyWindow)
+    monkeypatch.setattr(pipeline_gui.time, "monotonic", lambda: next(times))
+
+    with pipeline_gui.gui_busy_popup(
+        SimpleNamespace(update_idletasks=lambda: None), title="DD", message="Analyse..."
+    ) as popup:
+        popup.set_status("Long")
+
+    assert created == [("DD", "Long")]
+
+
 def test_annotation_only_pose_data_keeps_only_manual_annotations(tmp_path):
     keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
     annotations_path = tmp_path / "inputs" / "annotations" / "trial_annotations.json"

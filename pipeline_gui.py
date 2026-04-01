@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -2626,21 +2627,53 @@ class BusyStatusWindow(tk.Toplevel):
 def gui_busy_popup(parent, *, title: str, message: str):
     """Show one small popup while a long synchronous task is running."""
 
+    delay_s = 0.5
+
     class _NullBusyPopup:
         def set_status(self, _message: str) -> None:
             return
 
+        def close(self) -> None:
+            return
+
+        def update(self) -> None:
+            return
+
+    class _DelayedBusyPopup:
+        def __init__(self) -> None:
+            self._started_at = time.monotonic()
+            self._last_message = str(message)
+            self._popup = None
+
+        def _ensure_popup(self) -> None:
+            if self._popup is not None:
+                return
+            if (time.monotonic() - self._started_at) < delay_s:
+                return
+            try:
+                self._popup = BusyStatusWindow(parent, title=title, message=self._last_message)
+            except Exception:
+                self._popup = _NullBusyPopup()
+
+        def set_status(self, current_message: str) -> None:
+            self._last_message = str(current_message)
+            self._ensure_popup()
+            self._popup.set_status(self._last_message) if self._popup is not None else None
+
+        def close(self) -> None:
+            if self._popup is not None:
+                self._popup.close()
+
+        def update(self) -> None:
+            self._ensure_popup()
+            if self._popup is not None:
+                self._popup.update()
+
+    popup = _DelayedBusyPopup()
     try:
-        popup = BusyStatusWindow(parent, title=title, message=message)
-    except Exception:
-        popup = _NullBusyPopup()
-    try:
-        if hasattr(popup, "update"):
-            popup.update()
         yield popup
     finally:
-        if hasattr(popup, "close"):
-            popup.close()
+        popup.close()
         try:
             parent.update_idletasks()
         except Exception:
