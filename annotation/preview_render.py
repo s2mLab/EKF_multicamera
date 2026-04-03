@@ -1,3 +1,5 @@
+"""Rendering helpers for the Matplotlib-based Annotation preview."""
+
 from __future__ import annotations
 
 from collections.abc import Callable

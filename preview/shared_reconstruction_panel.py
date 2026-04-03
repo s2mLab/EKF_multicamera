@@ -64,6 +64,8 @@ def _select_all_treeview(tree: ttk.Treeview) -> str:
 
 
 def bind_extended_treeview_shortcuts(tree: ttk.Treeview) -> None:
+    """Bind multi-selection keyboard shortcuts to one reconstruction treeview."""
+
     tree.bind("<Shift-Up>", lambda _event: _extend_treeview_selection(tree, -1), add="+")
     tree.bind("<Shift-Down>", lambda _event: _extend_treeview_selection(tree, 1), add="+")
     for sequence in ("<Control-a>", "<Control-A>", "<Command-a>", "<Command-A>"):

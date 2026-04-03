@@ -1,3 +1,5 @@
+"""Shared 2D camera-frame rendering primitives for previews and exports."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,6 +10,8 @@ import numpy as np
 
 @dataclass(frozen=True)
 class SkeletonLayer2D:
+    """One styled 2D skeleton layer rendered on top of a camera frame."""
+
     points: np.ndarray
     color: str
     label: str | None = None
@@ -21,6 +25,8 @@ class SkeletonLayer2D:
 
 @dataclass(frozen=True)
 class PointValueOverlay2D:
+    """Per-point scalar overlay with optional excluded-point markers."""
+
     label: str
     points: np.ndarray
     values: np.ndarray | None = None

@@ -72,6 +72,8 @@ DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX = 15.0
 
 @dataclass
 class ReconstructionProfile:
+    """Serializable description of one reproducible reconstruction configuration."""
+
     name: str
     family: str
     camera_names: list[str] | None = None
@@ -124,6 +126,8 @@ class ReconstructionProfile:
 
 
 def canonical_profile_name(profile: ReconstructionProfile) -> str:
+    """Build the canonical slug used to name outputs for one profile."""
+
     parts = [profile.family]
     if profile.model_variant != "single_trunk":
         parts.append(profile.model_variant)
@@ -220,6 +224,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
 
 
 def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
+    """Normalize and validate one reconstruction profile in place."""
+
     if profile.family not in SUPPORTED_FAMILIES:
         raise ValueError(f"Unsupported family: {profile.family}")
     if profile.pose_data_mode not in SUPPORTED_POSE_DATA_MODES:
@@ -346,6 +352,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
 
 
 def profile_from_dict(data: dict[str, object]) -> ReconstructionProfile:
+    """Deserialize one JSON mapping into a validated reconstruction profile."""
+
     payload = dict(data)
     if "root_unwrap_mode" not in payload and "no_root_unwrap" in payload:
         payload["root_unwrap_mode"] = "off" if bool(payload.get("no_root_unwrap")) else "single"
@@ -354,10 +362,14 @@ def profile_from_dict(data: dict[str, object]) -> ReconstructionProfile:
 
 
 def profile_to_dict(profile: ReconstructionProfile) -> dict[str, object]:
+    """Serialize one reconstruction profile into JSON-compatible values."""
+
     return asdict(validate_profile(profile))
 
 
 def load_profiles_json(path: Path) -> list[ReconstructionProfile]:
+    """Load and validate all reconstruction profiles from one JSON file."""
+
     payload = json.loads(path.read_text())
     if isinstance(payload, dict):
         entries = payload.get("profiles", [])
@@ -367,12 +379,16 @@ def load_profiles_json(path: Path) -> list[ReconstructionProfile]:
 
 
 def save_profiles_json(path: Path, profiles: list[ReconstructionProfile]) -> None:
+    """Write one list of reconstruction profiles to disk as JSON."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"profiles": [profile_to_dict(profile) for profile in profiles]}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def example_profiles() -> list[ReconstructionProfile]:
+    """Return a compact set of example profiles used by the GUI and tests."""
+
     examples = [
         ReconstructionProfile(name="pose2sim", family="pose2sim", initial_rotation_correction=False),
         ReconstructionProfile(name="pose2sim_rotfix", family="pose2sim", initial_rotation_correction=True),
@@ -424,6 +440,8 @@ def generate_supported_profiles(
     enable_dof_locking: bool = True,
     enable_initial_rotation_correction: bool = True,
 ) -> list[ReconstructionProfile]:
+    """Generate the supported family/predictor/profile combinations."""
+
     profiles: list[ReconstructionProfile] = []
     for family in families:
         if family == "pose2sim":
@@ -518,6 +536,8 @@ def variant_output_dir(
     keypoints_path: Path | None = None,
     pose2sim_trc: Path | None = None,
 ) -> Path:
+    """Return the output directory corresponding to one profile execution."""
+
     profile = validate_profile(profile)
     dataset_name = infer_dataset_name(
         keypoints_path=keypoints_path, pose2sim_trc=pose2sim_trc, dataset_name=dataset_name
@@ -535,6 +555,8 @@ def build_pipeline_command(
     python_executable: str | None = None,
     camera_names_override: list[str] | None = None,
 ) -> list[str]:
+    """Build the CLI command that executes one reconstruction profile."""
+
     profile = validate_profile(profile)
     python_executable = python_executable or sys.executable
     out_dir = variant_output_dir(
@@ -645,6 +667,8 @@ def build_pipeline_command(
 
 
 def scan_variant_output_dirs(output_root: Path) -> list[Path]:
+    """Scan all dataset directories for profile-generated reconstruction outputs."""
+
     candidates: list[Path] = []
     for dataset_dir in scan_dataset_dirs(output_root):
         candidates.extend(scan_reconstruction_dirs(dataset_dir))

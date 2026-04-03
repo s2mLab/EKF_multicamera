@@ -26,6 +26,8 @@ DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE = 95.0
 
 
 def normalize_output_root(output_root: Path | str) -> Path:
+    """Normalize legacy ``outputs/`` roots to the canonical ``output/`` path."""
+
     path = Path(output_root)
     parts = list(path.parts)
     if parts and parts[-1] == "outputs":
@@ -35,6 +37,8 @@ def normalize_output_root(output_root: Path | str) -> Path:
 
 
 def slugify(value: str) -> str:
+    """Convert arbitrary text into a filesystem-safe lowercase slug."""
+
     value = value.strip().lower()
     value = re.sub(r"[^a-z0-9]+", "_", value)
     value = re.sub(r"_+", "_", value).strip("_")
@@ -42,6 +46,8 @@ def slugify(value: str) -> str:
 
 
 def canonical_dataset_name(path_or_name: str | Path) -> str:
+    """Return the canonical dataset slug derived from a file path or name."""
+
     name = Path(path_or_name).stem if isinstance(path_or_name, Path) else str(path_or_name)
     for suffix in ("_keypoints", "_points", "_detections", "_2d"):
         if name.endswith(suffix):
@@ -53,6 +59,8 @@ def canonical_dataset_name(path_or_name: str | Path) -> str:
 def infer_dataset_name(
     keypoints_path: Path | None = None, pose2sim_trc: Path | None = None, dataset_name: str | None = None
 ) -> str:
+    """Infer the canonical dataset name from explicit or source-file inputs."""
+
     if dataset_name:
         return canonical_dataset_name(dataset_name)
     if keypoints_path is not None:
@@ -63,22 +71,32 @@ def infer_dataset_name(
 
 
 def dataset_output_dir(output_root: Path, dataset_name: str) -> Path:
+    """Return the root output directory for one dataset."""
+
     return normalize_output_root(output_root) / canonical_dataset_name(dataset_name)
 
 
 def dataset_models_dir(output_root: Path, dataset_name: str) -> Path:
+    """Return the model-output directory for one dataset."""
+
     return dataset_output_dir(output_root, dataset_name) / "models"
 
 
 def dataset_reconstructions_dir(output_root: Path, dataset_name: str) -> Path:
+    """Return the reconstruction-output directory for one dataset."""
+
     return dataset_output_dir(output_root, dataset_name) / "reconstructions"
 
 
 def dataset_figures_dir(output_root: Path, dataset_name: str) -> Path:
+    """Return the figures-output directory for one dataset."""
+
     return dataset_output_dir(output_root, dataset_name) / "figures"
 
 
 def reconstruction_output_dir(output_root: Path, dataset_name: str, reconstruction_name: str) -> Path:
+    """Return the bundle directory for one named reconstruction."""
+
     return dataset_reconstructions_dir(output_root, dataset_name) / slugify(reconstruction_name)
 
 
@@ -107,6 +125,8 @@ def default_model_stem(
     pose_amplitude_lower_percentile: float = DEFAULT_POSE_AMPLITUDE_LOWER_PERCENTILE,
     pose_amplitude_upper_percentile: float = DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE,
 ) -> str:
+    """Build the canonical directory stem for one generated biomechanical model."""
+
     tokens = ["model", "2d", slugify(pose_data_mode), slugify(triangulation_method)]
     if str(model_variant).strip() and str(model_variant).strip() != DEFAULT_MODEL_VARIANT:
         tokens.append(slugify(str(model_variant)))
@@ -159,6 +179,8 @@ def model_output_dir(
     pose_amplitude_lower_percentile: float = DEFAULT_POSE_AMPLITUDE_LOWER_PERCENTILE,
     pose_amplitude_upper_percentile: float = DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE,
 ) -> Path:
+    """Return the model directory corresponding to one model-generation setup."""
+
     stem = default_model_stem(
         pose_data_mode,
         triangulation_method,
@@ -197,6 +219,8 @@ def model_biomod_path(
     pose_amplitude_lower_percentile: float = DEFAULT_POSE_AMPLITUDE_LOWER_PERCENTILE,
     pose_amplitude_upper_percentile: float = DEFAULT_POSE_AMPLITUDE_UPPER_PERCENTILE,
 ) -> Path:
+    """Return the expected `.bioMod` path for one generated model directory."""
+
     model_dir = model_output_dir(
         output_root,
         dataset_name,
@@ -219,6 +243,8 @@ def model_biomod_path(
 
 
 def scan_dataset_dirs(output_root: Path) -> list[Path]:
+    """List dataset directories that contain manifests or bundle outputs."""
+
     if not output_root.exists():
         return []
     dataset_dirs = []
@@ -238,6 +264,8 @@ def scan_dataset_dirs(output_root: Path) -> list[Path]:
 
 
 def scan_reconstruction_dirs(dataset_dir: Path) -> list[Path]:
+    """List reconstruction bundle directories inside one dataset directory."""
+
     candidates: list[Path] = []
     if (dataset_dir / "bundle_summary.json").exists():
         candidates.append(dataset_dir)
@@ -256,6 +284,8 @@ def scan_reconstruction_dirs(dataset_dir: Path) -> list[Path]:
 
 
 def scan_model_dirs(dataset_dir: Path) -> list[Path]:
+    """List model directories that contain a generated `.bioMod` file."""
+
     candidates: list[Path] = []
     models_dir = dataset_dir / "models"
     if models_dir.exists():
@@ -272,4 +302,6 @@ def scan_model_dirs(dataset_dir: Path) -> list[Path]:
 
 
 def latest_version_for_family(family: str) -> int | None:
+    """Return the latest tracked algorithm version for one reconstruction family."""
+
     return ALGORITHM_VERSIONS.get(family)

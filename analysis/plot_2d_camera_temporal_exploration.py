@@ -35,6 +35,8 @@ DEFAULT_FPS = 120.0
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the temporal multi-camera 2D plotter."""
+
     parser = argparse.ArgumentParser(description="Figure temporelle d'exploration des donnees 2D par camera.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB, help="Calibration TOML.")
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS, help="JSON des detections 2D.")
@@ -52,6 +54,8 @@ def robust_center(points_2d: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray
 
 
 def save_figure(fig: plt.Figure, output: Path) -> None:
+    """Save one generated figure to the requested output path."""
+
     output.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output, dpi=220, bbox_inches="tight")
@@ -59,6 +63,8 @@ def save_figure(fig: plt.Figure, output: Path) -> None:
 
 
 def main() -> None:
+    """Generate the temporal 2D camera-exploration figure set."""
+
     args = parse_args()
     calibrations = load_calibrations(args.calib)
     pose_data = load_pose_data(args.keypoints, calibrations)

@@ -38,6 +38,8 @@ DEFAULT_FPS = 120.0
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the interactive 2D keypoint explorer."""
+
     parser = argparse.ArgumentParser(description="Exploration interactive des keypoints 2D sur les 8 cameras.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB, help="Calibration TOML.")
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS, help="JSON des detections 2D.")
@@ -58,6 +60,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def camera_layout(n_cameras: int) -> tuple[int, int]:
+    """Return the subplot grid used to display the requested cameras."""
+
     ncols = 4
     nrows = int(np.ceil(n_cameras / ncols))
     return nrows, ncols
@@ -76,6 +80,8 @@ def extract_component(points: np.ndarray, scores: np.ndarray, component: str) ->
 
 
 def configure_axis_limits(ax, component: str, image_size: tuple[int, int]) -> None:
+    """Configure one subplot axis according to the displayed data component."""
+
     width, height = image_size
     if component == "x":
         ax.set_ylim(0, width)
@@ -101,6 +107,8 @@ def compute_camera_counts(points: np.ndarray, scores: np.ndarray, visibility_thr
 
 
 def main() -> None:
+    """Launch the interactive temporal exploration of 2D keypoints."""
+
     args = parse_args()
     calibrations = load_calibrations(args.calib)
     pose_data = load_pose_data(args.keypoints, calibrations)

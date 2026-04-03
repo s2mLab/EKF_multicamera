@@ -1100,6 +1100,8 @@ def draw_upper_back_preview(
     ax,
     frame_points: np.ndarray,
     segment_frames: list[tuple[str, np.ndarray, np.ndarray]] | None = None,
+    *,
+    color: str = "#1d4e89",
 ) -> None:
     """Draw back triangles around the mid-back origin for models with a segmented trunk."""
 
@@ -1111,7 +1113,7 @@ def draw_upper_back_preview(
         hip_triangle[:, 0],
         hip_triangle[:, 1],
         hip_triangle[:, 2],
-        color="#1d4e89",
+        color=color,
         linewidth=2.4,
         alpha=0.9,
     )
@@ -1119,7 +1121,7 @@ def draw_upper_back_preview(
         shoulder_triangle[:, 0],
         shoulder_triangle[:, 1],
         shoulder_triangle[:, 2],
-        color="#1d4e89",
+        color=color,
         linewidth=2.4,
         alpha=0.9,
     )
@@ -1128,7 +1130,7 @@ def draw_upper_back_preview(
         [mid_back[1]],
         [mid_back[2]],
         s=44,
-        c="#1d4e89",
+        c=color,
         marker="D",
         depthshade=False,
     )
@@ -4535,17 +4537,18 @@ class DualAnimationTab(CommandTab):
                     )
         for name in show_names:
             frame_points = available[name][frame_idx]
+            recon_color = reconstruction_display_color(self.state, name)
             draw_skeleton_3d(
                 ax,
                 frame_points,
-                reconstruction_display_color(self.state, name),
+                recon_color,
                 reconstruction_legend_label(self.state, name),
                 marker_size=float(self.marker_size.get()),
             )
             summary = self.bundle.get("recon_summary", {}).get(name, {})
             q_names = self.bundle.get("q_names", [])
             if has_segmented_back_visualization(q_names=q_names, summary=summary):
-                draw_upper_back_preview(ax, frame_points)
+                draw_upper_back_preview(ax, frame_points, color=recon_color)
             if self.show_trunk_frames_var.get():
                 origin, rotation = compute_root_frame_from_points(frame_points)
                 if origin is not None and rotation is not None:

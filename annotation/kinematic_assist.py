@@ -1,3 +1,5 @@
+"""Kinematic-assist helpers shared by the Annotation tab."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +21,8 @@ from vitpose_ekf_pipeline import (
 
 @dataclass(frozen=True)
 class AnnotationKinematicStateInfo:
+    """Describe the exact or nearest saved kinematic state for one frame."""
+
     state: np.ndarray | None
     source_frame: int | None
     is_exact: bool
@@ -204,12 +208,16 @@ def annotation_state_from_q(
     model,
     q_values: np.ndarray,
 ) -> np.ndarray:
+    """Expand one ``q`` vector into the stacked ``[q, qdot, qddot]`` state."""
+
     nq = int(model.nbQ())
     q_values = _canonicalize_annotation_q(model, np.asarray(q_values, dtype=float).reshape(nq))
     return np.concatenate((q_values, np.zeros(nq, dtype=float), np.zeros(nq, dtype=float)))
 
 
 def normalize_annotation_kinematic_state(model, state: np.ndarray | None) -> np.ndarray | None:
+    """Normalize one saved annotation-assist state to the canonical EKF layout."""
+
     if state is None:
         return None
     nq = int(model.nbQ())
@@ -230,6 +238,8 @@ def propagate_annotation_kinematic_state(
     dt: float,
     frame_delta: int,
 ) -> np.ndarray:
+    """Propagate one annotation kinematic state with constant acceleration."""
+
     nq = int(model.nbQ())
     state = normalize_annotation_kinematic_state(model, state)
     if state is None:

@@ -48,6 +48,8 @@ DEFAULT_STATES = Path("output") / "vitpose_full" / "ekf_states.npz"
 
 @dataclass
 class JumpSegment:
+    """Continuous airborne segment delimited by contact minima and one peak."""
+
     start: int
     end: int
     peak_index: int
@@ -55,6 +57,8 @@ class JumpSegment:
 
 @dataclass
 class JumpAnalysis:
+    """Aggregated salto, twist, and body-shape analysis for one jump."""
+
     segment: JumpSegment
     total_saltos: float
     twists_per_salto: list[float]
@@ -63,6 +67,8 @@ class JumpAnalysis:
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the trampoline-jump analysis script."""
+
     parser = argparse.ArgumentParser(
         description="Analyse des sauts de trampoline a partir des coordonnees generalisees."
     )
@@ -146,6 +152,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_states(states_path: Path) -> tuple[np.ndarray, list[str]]:
+    """Load generalized coordinates and DoF names from one NPZ file."""
+
     data = np.load(states_path, allow_pickle=True)
     q = np.asarray(data["q"], dtype=float)
     q_names = [str(name) for name in data["q_names"]]
@@ -153,6 +161,8 @@ def load_states(states_path: Path) -> tuple[np.ndarray, list[str]]:
 
 
 def find_dof_indices(q_names: list[str], names: list[str]) -> list[int]:
+    """Resolve requested DoF names to their indices in the q-name list."""
+
     index_map = {name: idx for idx, name in enumerate(q_names)}
     missing = [name for name in names if name not in index_map]
     if missing:
@@ -161,6 +171,8 @@ def find_dof_indices(q_names: list[str], names: list[str]) -> list[int]:
 
 
 def contiguous_true_regions(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return inclusive index ranges for all contiguous ``True`` regions."""
+
     regions: list[tuple[int, int]] = []
     start = None
     for idx, value in enumerate(mask):
@@ -199,6 +211,8 @@ def local_minimum_index(height: np.ndarray, center: int, left_limit: int, right_
 def refine_jump_boundaries(
     height: np.ndarray, airborne_regions: list[tuple[int, int]], contact_window_frames: int
 ) -> list[JumpSegment]:
+    """Convert airborne ranges into jump segments snapped to nearby contacts."""
+
     segments: list[JumpSegment] = []
     if not airborne_regions:
         return segments
@@ -388,10 +402,14 @@ def plot_jump_rotations(
 
 
 def round_to_nearest(value: float, step: float) -> float:
+    """Round one value to the nearest multiple of ``step``."""
+
     return round(value / step) * step
 
 
 def crossing_index(cumulative_turns: np.ndarray, target: float) -> int | None:
+    """Return the first index where the cumulative turns reach ``target``."""
+
     hits = np.where(cumulative_turns >= target)[0]
     return int(hits[0]) if hits.size else None
 
@@ -404,6 +422,8 @@ def detect_body_shape(
     knee_tuck_threshold_deg: float,
     knee_pike_threshold_deg: float,
 ) -> str:
+    """Classify one jump as tucked, piked, or straight from flexion angles."""
+
     hip_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, hip_indices]), axis=0))
     knee_peak_deg = np.rad2deg(np.nanmax(np.abs(q_segment[:, knee_indices]), axis=0))
     hip_value = float(np.nanmax(hip_peak_deg))
@@ -417,10 +437,14 @@ def detect_body_shape(
 
 
 def body_shape_suffix(body_shape: str) -> str:
+    """Return the abbreviated judging suffix associated with one body shape."""
+
     return {"grouped": "o", "piked": "<", "straight": "/"}.get(body_shape, "?")
 
 
 def salto_count_token(total_saltos: float) -> str:
+    """Encode the salto count using the simplified DD token convention."""
+
     integer_part = int(total_saltos)
     quarter_map = {0.0: "", 0.25: ".", 0.5: "+", 0.75: "-"}
     fraction = round(total_saltos - integer_part, 2)
@@ -438,6 +462,8 @@ def analyze_jump(
     knee_tuck_threshold_deg: float,
     knee_pike_threshold_deg: float,
 ) -> JumpAnalysis:
+    """Analyze one jump segment and derive the simplified DD-style summary."""
+
     q_segment = q[segment.start : segment.end + 1]
     salto = np.unwrap(q_segment[:, salto_idx])
     twist = np.unwrap(q_segment[:, twist_idx])
@@ -482,6 +508,8 @@ def analyze_jump(
 
 
 def main() -> None:
+    """Run trampoline-jump analysis from the command line."""
+
     args = parse_args()
     q, q_names = load_states(args.states)
 

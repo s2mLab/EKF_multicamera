@@ -1,3 +1,5 @@
+"""Common 2D-view geometry, image, and crop helpers for previews."""
+
 from __future__ import annotations
 
 import math
@@ -9,6 +11,8 @@ from judging.execution import resolve_execution_image_path
 
 
 def camera_layout(n_cameras: int) -> tuple[int, int]:
+    """Return a compact ``(rows, cols)`` layout for the given camera count."""
+
     n_cameras = max(int(n_cameras), 1)
     ncols = min(4, max(1, int(math.ceil(math.sqrt(n_cameras)))))
     nrows = int(math.ceil(n_cameras / ncols))

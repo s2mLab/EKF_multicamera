@@ -1,3 +1,5 @@
+"""Helpers for filtered frame navigation inside the Annotation tab."""
+
 from __future__ import annotations
 
 from pathlib import Path

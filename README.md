@@ -317,6 +317,34 @@ Important improvements already integrated in the codebase:
 - lower confidence on views detected as left/right-flipped so they still help
   the filter without dominating it
 
+### 6.b Complexity overview
+
+The dominant asymptotic costs below use:
+
+- `F`: number of frames
+- `C`: number of cameras
+- `M`: number of observed model markers or keypoints per frame
+- `Q`: number of generalized coordinates / DoF
+- `L = 2 * C * M`: approximate 2D measurement dimension for one frame
+
+| Method | Main cost per frame | Full-sequence cost | Notes |
+| --- | --- | --- | --- |
+| Triangulation `once` | `O(M * C)` | `O(F * M * C)` | One weighted triangulation and one reprojection pass per marker. |
+| Triangulation `greedy` | `O(M * C^2)` | `O(F * M * C^2)` | Repeatedly removes the worst view, so the camera loop is effectively quadratic. |
+| Triangulation `exhaustive` | `O(M * 2^C)` worst case | `O(F * M * 2^C)` worst case | Tries many camera subsets; practical cost depends on the number of valid views. |
+| EKF2D `acc` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Prediction is dominated by covariance propagation; update is dominated by the Kalman solve on image measurements. |
+| EKF2D `dyn` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`, with a larger constant when root flight dynamics are active. |
+| EKF2D `history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`; the higher-order predictor adds only `O(Q)` state-history work. |
+| EKF2D `dyn_history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `dyn`; root uses `dyn`, joints use the smoothed history-based predictor. |
+
+In practice:
+
+- triangulation cost scales mostly with the number of cameras and valid keypoints
+- EKF2D cost scales most sharply with the measurement dimension `L`, so reducing
+  cameras or sparse observations can change runtime more than reducing `Q`
+- `history3` and `dyn_history3` are intended as better predictors, not faster
+  filters; their overhead is small compared with the Kalman update itself
+
 ### 7. Model building
 
 The `Models` tab and bundle generation code support:

@@ -82,6 +82,8 @@ LEFT_RIGHT_SWAP_PAIRS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the multi-view 2D comparison animation."""
+
     parser = argparse.ArgumentParser(description="Animation 2D multi-vues des donnees brutes et des reprojections 3D.")
     parser.add_argument(
         "--dataset-dir", type=Path, default=None, help="Dossier dataset contenant les bundles de reconstruction."
@@ -129,6 +131,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_triangulation(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load triangulated 3D points and their frame indices from one NPZ file."""
+
     data = np.load(npz_path, allow_pickle=True)
     points = np.asarray(data["points_3d"], dtype=float)
     frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(points.shape[0], dtype=int)
@@ -161,6 +165,8 @@ def compute_airborne_mask(points_3d: np.ndarray, threshold_m: float, min_consecu
 def load_q_reconstructions(
     ekf_states_path: Path, kalman_comparison_path: Path
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Load the q-trajectories used as animation layers in the 2D export."""
+
     ekf = np.load(ekf_states_path, allow_pickle=True)
     comparison = np.load(kalman_comparison_path, allow_pickle=True)
     q_ekf_3d = comparison["q_ekf_3d"] if "q_ekf_3d" in comparison else comparison["q_biorbd_kalman"]
@@ -190,6 +196,8 @@ def project_points(points_3d: np.ndarray, calibrations: dict, camera_names: list
 def subsample_all(
     arrays: list[np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
 ) -> list[np.ndarray]:
+    """Apply the same temporal subsampling to a list of frame-indexed arrays."""
+
     out = []
     for array in arrays:
         if array is None:
@@ -210,6 +218,8 @@ def subsample_all(
 def subsample_layer_dict(
     layers: dict[str, np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
 ) -> dict[str, np.ndarray]:
+    """Subsample one reconstruction-layer mapping along its frame axis."""
+
     keys = list(layers.keys())
     values = [layers[key] for key in keys]
     subsampled = subsample_all(values, stride=stride, max_frames=max_frames, frame_axis=frame_axis)
@@ -217,6 +227,8 @@ def subsample_layer_dict(
 
 
 def layer_style(name: str, marker_size: float) -> dict[str, object]:
+    """Return the display style associated with one animation layer."""
+
     if name == "raw":
         return {
             "color": "black",
@@ -246,6 +258,8 @@ def adapt_raw_style_for_background(style: dict[str, object], has_image_backgroun
 
 
 def grouped_points_2d(points: np.ndarray) -> dict[str, np.ndarray]:
+    """Split one COCO17 point cloud into left, right, and center subsets."""
+
     groups = {
         "left": [KP_INDEX[name] for name in COCO17 if name in LEFT_KEYPOINTS],
         "right": [KP_INDEX[name] for name in COCO17 if name in RIGHT_KEYPOINTS],
@@ -260,10 +274,14 @@ def grouped_points_2d(points: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def edge_linewidth(name_a: str, name_b: str, base: float) -> float:
+    """Return a thicker linewidth for lower-limb edges in 2D overlays."""
+
     return base * 3.0 if (name_a, name_b) in LOWER_LIMB_EDGES else base
 
 
 def scatter_markers(name: str) -> dict[str, str]:
+    """Return the marker shapes used for each body side for one layer."""
+
     center = "x" if name == "raw" else "o"
     return {"center": center, "left": "^", "right": "s"}
 
@@ -807,6 +825,8 @@ def create_animation_parallel(
 
 
 def main() -> None:
+    """Render and export the multi-view 2D comparison animation."""
+
     args = parse_args()
     if args.dataset_dir is not None:
         sources = dataset_source_paths(
