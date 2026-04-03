@@ -12,6 +12,7 @@ from vitpose_ekf_pipeline import (
     ReconstructionResult,
     apply_measurement_update_batch,
     canonicalize_model_q_rotation_branches,
+    compute_biorbd_kalman_initial_state,
     stack_measurement_blocks,
 )
 
@@ -473,6 +474,152 @@ def refine_annotation_q_with_direct_measurements(
             diagnostics["converged"] = True
             break
 
+    return np.array(state, copy=True), diagnostics
+
+
+def refine_annotation_q_with_marker_lm(
+    *,
+    model,
+    points_3d: np.ndarray,
+    frame_number: int,
+    n_cameras: int,
+    seed_state: np.ndarray | None = None,
+    passes: int = 30,
+    initial_damping: float = 1e-2,
+    damping_up: float = 10.0,
+    damping_down: float = 0.3,
+    tolerance: float = 1e-6,
+    q_names: list[str] | np.ndarray | None = None,
+    keypoint_name: str | None = None,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Refine q against triangulated 3D markers with a custom LM solver."""
+
+    nq = int(model.nbQ())
+    points_3d = np.asarray(points_3d, dtype=float).reshape(len(COCO17), 3)
+    reconstruction = annotation_reconstruction_from_points(points_3d, frame_number=frame_number, n_cameras=n_cameras)
+    if seed_state is None:
+        seed_state, _diagnostics = compute_biorbd_kalman_initial_state(
+            model, reconstruction, method="root_pose_zero_rest"
+        )
+    state = normalize_annotation_kinematic_state(model, seed_state)
+    if state is None:
+        raise ValueError("Invalid seed_state for marker LM.")
+
+    marker_pairs = [
+        (marker_idx, KP_INDEX[marker_name.to_string()])
+        for marker_idx, marker_name in enumerate(model.markerNames())
+        if marker_name.to_string() in KP_INDEX
+    ]
+    if not marker_pairs:
+        return np.array(state, copy=True), {
+            "method": "annotation_marker_lm",
+            "requested_passes": int(max(1, passes)),
+            "completed_passes": 0,
+            "used_fallback": True,
+            "reason": "no_marker_pairs",
+        }
+
+    active_q_mask = (
+        annotation_relevant_q_mask(q_names or [], keypoint_name)
+        if keypoint_name is not None and q_names is not None
+        else None
+    )
+    pair_indices = np.asarray([kp_idx for _, kp_idx in marker_pairs], dtype=int)
+    valid_pairs = np.all(np.isfinite(points_3d[pair_indices]), axis=1)
+    if not np.any(valid_pairs):
+        return np.array(state, copy=True), {
+            "method": "annotation_marker_lm",
+            "requested_passes": int(max(1, passes)),
+            "completed_passes": 0,
+            "used_fallback": True,
+            "reason": "no_valid_targets",
+        }
+    marker_pairs = [marker_pairs[idx] for idx in np.flatnonzero(valid_pairs)]
+    target_points = np.asarray([points_3d[kp_idx] for _, kp_idx in marker_pairs], dtype=float)
+
+    diagnostics: dict[str, object] = {
+        "method": "annotation_marker_lm",
+        "requested_passes": int(max(1, passes)),
+        "completed_passes": 0,
+        "used_fallback": False,
+        "converged": False,
+        "cost_history": [],
+        "accepted_steps": [],
+    }
+
+    damping = float(initial_damping)
+    state = np.array(state, copy=True)
+    q = np.asarray(state[:nq], dtype=float)
+
+    def _cost_and_system(q_values: np.ndarray):
+        q_values = _canonicalize_annotation_q(model, q_values)
+        marker_positions_all = model.markers(q_values)
+        marker_jacobians_all = model.markersJacobian(q_values)
+        predicted = np.asarray([marker_positions_all[idx].to_array() for idx, _ in marker_pairs], dtype=float)
+        jacobians = np.asarray([marker_jacobians_all[idx].to_array() for idx, _ in marker_pairs], dtype=float)
+        residual = (predicted - target_points).reshape(-1)
+        H = jacobians.reshape(-1, nq)
+        finite_rows = np.isfinite(residual) & np.all(np.isfinite(H), axis=1)
+        residual = residual[finite_rows]
+        H = H[finite_rows]
+        if active_q_mask is not None and H.size:
+            H[:, ~np.asarray(active_q_mask, dtype=bool)] = 0.0
+        cost = 0.5 * float(np.dot(residual, residual))
+        return cost, residual, H
+
+    cost, residual, H = _cost_and_system(q)
+    diagnostics["cost_history"].append(cost)
+    if not np.isfinite(cost):
+        diagnostics["used_fallback"] = True
+        diagnostics["reason"] = "non_finite_initial_cost"
+        return np.array(state, copy=True), diagnostics
+
+    for _ in range(max(1, int(passes))):
+        diagnostics["completed_passes"] = int(diagnostics["completed_passes"]) + 1
+        if H.size == 0:
+            diagnostics["used_fallback"] = True
+            diagnostics["reason"] = "empty_system"
+            return np.array(state, copy=True), diagnostics
+        jt_j = H.T @ H
+        gradient = H.T @ residual
+        diagonal = np.diag(jt_j).copy()
+        diagonal[~np.isfinite(diagonal) | (diagonal <= 1e-8)] = 1.0
+        accepted = False
+        for _trial in range(8):
+            normal_matrix = jt_j + damping * np.diag(diagonal)
+            try:
+                delta_q = -np.linalg.solve(normal_matrix, gradient)
+            except np.linalg.LinAlgError:
+                damping *= float(damping_up)
+                continue
+            if active_q_mask is not None:
+                delta_q = np.asarray(delta_q, dtype=float)
+                delta_q[~np.asarray(active_q_mask, dtype=bool)] = 0.0
+            trial_q = _canonicalize_annotation_q(model, q + delta_q)
+            trial_cost, trial_residual, trial_H = _cost_and_system(trial_q)
+            if np.isfinite(trial_cost) and trial_cost < cost:
+                q = trial_q
+                cost = float(trial_cost)
+                residual = np.asarray(trial_residual, dtype=float)
+                H = np.asarray(trial_H, dtype=float)
+                damping = max(1e-9, damping * float(damping_down))
+                diagnostics["accepted_steps"].append(True)
+                diagnostics["cost_history"].append(cost)
+                accepted = True
+                if float(np.linalg.norm(delta_q)) <= float(tolerance):
+                    diagnostics["converged"] = True
+                break
+            damping *= float(damping_up)
+        if not accepted:
+            diagnostics["accepted_steps"].append(False)
+            diagnostics["used_fallback"] = True
+            diagnostics["reason"] = "no_descent_step"
+            break
+        if diagnostics["converged"]:
+            break
+
+    state[:nq] = _canonicalize_annotation_q(model, q)
+    state[nq : 3 * nq] = 0.0
     return np.array(state, copy=True), diagnostics
 
 

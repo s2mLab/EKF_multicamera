@@ -1,6 +1,7 @@
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -1170,6 +1171,55 @@ def test_upper_back_zero_prior_blocks_pull_lateral_and_axial_dofs_to_zero():
     np.testing.assert_allclose(second_h, np.array([-0.15], dtype=float))
     np.testing.assert_allclose(second_h_q, np.array([[0.0, 0.0, 0.0, 0.0, 0.0, 1.0]], dtype=float))
     np.testing.assert_allclose(second_variance, np.array([np.deg2rad(8.0) ** 2], dtype=float))
+
+
+def test_ankle_bed_pseudo_measurement_blocks_keep_xz_targets_when_not_airborne():
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.ankle_bed_pseudo_obs = True
+    ekf.ankle_bed_pseudo_std_m = 0.02
+    ekf.ankle_bed_pair_indices = ((0, vitpose_ekf_pipeline.KP_INDEX["left_ankle"]),)
+    ekf.flight_height_threshold_m = 1.5
+    ekf.reconstruction = SimpleNamespace(points_3d=np.full((1, 17, 3), np.nan, dtype=float))
+    ekf.reconstruction.points_3d[0, vitpose_ekf_pipeline.KP_INDEX["left_ankle"]] = np.array([0.4, -0.1, 1.2])
+
+    marker_points_array = np.array([[0.3, 0.0, 1.25]], dtype=float)
+    marker_jacobians_array = np.array(
+        [
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        ],
+        dtype=float,
+    )
+
+    blocks = ekf._ankle_bed_pseudo_measurement_blocks(0, marker_points_array, marker_jacobians_array)
+
+    assert len(blocks) == 1
+    z, h, h_q, variance = blocks[0]
+    np.testing.assert_allclose(z, np.array([0.4, 1.2], dtype=float))
+    np.testing.assert_allclose(h, np.array([0.3, 1.25], dtype=float))
+    np.testing.assert_allclose(h_q, np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=float))
+    np.testing.assert_allclose(variance, np.array([0.0004, 0.0004], dtype=float))
+
+
+def test_ankle_bed_pseudo_measurement_blocks_are_disabled_in_airborne_frames():
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.ankle_bed_pseudo_obs = True
+    ekf.ankle_bed_pseudo_std_m = 0.02
+    ekf.ankle_bed_pair_indices = ((0, vitpose_ekf_pipeline.KP_INDEX["left_ankle"]),)
+    ekf.flight_height_threshold_m = 1.5
+    ekf.reconstruction = SimpleNamespace(points_3d=np.full((1, 17, 3), np.nan, dtype=float))
+    ekf.reconstruction.points_3d[0, :, 2] = 1.7
+
+    blocks = ekf._ankle_bed_pseudo_measurement_blocks(
+        0,
+        np.array([[0.3, 0.0, 1.25]], dtype=float),
+        np.array([np.eye(3, dtype=float)], dtype=float),
+    )
+
+    assert blocks == []
 
 
 def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():

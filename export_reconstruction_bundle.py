@@ -25,6 +25,7 @@ from reconstruction.reconstruction_bundle import (
     build_triangulation_bundle,
 )
 from vitpose_ekf_pipeline import (
+    DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
@@ -165,6 +166,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--upper-back-pseudo-std-deg", type=float, default=np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD)
     )
+    parser.add_argument("--ankle-bed-pseudo-obs", action="store_true")
+    parser.add_argument("--ankle-bed-pseudo-std-m", type=float, default=DEFAULT_ANKLE_BED_PSEUDO_STD_M)
     parser.add_argument("--min-frame-coherence-for-update", type=float, default=DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE)
     parser.add_argument("--skip-low-coherence-updates", action="store_true")
     parser.add_argument("--flight-height-threshold-m", type=float, default=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M)
@@ -341,6 +344,8 @@ def main() -> None:
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             upper_back_sagittal_gain=args.upper_back_sagittal_gain,
             upper_back_pseudo_std_deg=args.upper_back_pseudo_std_deg,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,

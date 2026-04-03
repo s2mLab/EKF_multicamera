@@ -114,6 +114,7 @@ DEFAULT_EKF2D_INITIAL_STATE_METHOD = "ekf_bootstrap"
 DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
+DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
 DEFAULT_FLIP_IMPROVEMENT_RATIO = 0.7
 DEFAULT_FLIP_MIN_GAIN_PX = 3.0
 DEFAULT_FLIP_MIN_OTHER_CAMERAS = 2
@@ -3550,6 +3551,8 @@ class MultiViewKinematicEKF:
         flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
         upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
         upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+        ankle_bed_pseudo_obs: bool = False,
+        ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     ):
         self.model = model
         self.calibrations = calibrations
@@ -3574,6 +3577,8 @@ class MultiViewKinematicEKF:
         self.flip_error_delta_threshold_px = float(flip_error_delta_threshold_px)
         self.upper_back_sagittal_gain = float(upper_back_sagittal_gain)
         self.upper_back_pseudo_std_rad = float(upper_back_pseudo_std_rad)
+        self.ankle_bed_pseudo_obs = bool(ankle_bed_pseudo_obs)
+        self.ankle_bed_pseudo_std_m = float(ankle_bed_pseudo_std_m)
         self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
         self.nq = model.nbQ()
         self.nx = 3 * self.nq
@@ -3588,6 +3593,9 @@ class MultiViewKinematicEKF:
             if marker_name in KP_INDEX
         ]
         self.marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in self.marker_pairs], dtype=int)
+        self.marker_pair_index_by_keypoint = {
+            kp_idx: pair_idx for pair_idx, (_marker_idx, kp_idx) in enumerate(self.marker_pairs)
+        }
         self.camera_order = pose_data.camera_names
         self.camera_calibrations = [self.calibrations[cam_name] for cam_name in self.camera_order]
         self.coherence_method = canonical_coherence_method(reconstruction.coherence_method)
@@ -3609,6 +3617,7 @@ class MultiViewKinematicEKF:
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
         self.upper_back_segment_name = back_pseudo_segment_name_for_q_names(self.q_names)
         self.upper_back_sagittal_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
+        self.ankle_bed_pair_indices = self._resolve_ankle_bed_pair_indices()
         self.upper_back_zero_prior_indices = tuple(
             idx
             for idx in (
@@ -3710,6 +3719,15 @@ class MultiViewKinematicEKF:
             return None, tuple()
         return int(upper_back_sagittal_idx), hip_indices
 
+    def _resolve_ankle_bed_pair_indices(self) -> tuple[tuple[int, int], ...]:
+        resolved: list[tuple[int, int]] = []
+        for keypoint_name in ("left_ankle", "right_ankle"):
+            keypoint_idx = KP_INDEX[keypoint_name]
+            pair_idx = self.marker_pair_index_by_keypoint.get(keypoint_idx)
+            if pair_idx is not None:
+                resolved.append((int(pair_idx), int(keypoint_idx)))
+        return tuple(resolved)
+
     def _upper_back_pseudo_measurement_block(
         self,
         reference_q: np.ndarray,
@@ -3746,6 +3764,43 @@ class MultiViewKinematicEKF:
                     np.array([current_value], dtype=float),
                     h_q,
                     np.array([self.upper_back_pseudo_std_rad**2], dtype=float),
+                )
+            )
+        return blocks
+
+    def _is_airborne_frame(self, frame_idx: int) -> bool:
+        if frame_idx < 0 or frame_idx >= self.reconstruction.points_3d.shape[0]:
+            return False
+        frame_points = np.asarray(self.reconstruction.points_3d[frame_idx], dtype=float)
+        frame_z = frame_points[:, 2]
+        valid = np.isfinite(frame_z)
+        if not np.any(valid):
+            return False
+        return bool(np.all(frame_z[valid] > self.flight_height_threshold_m))
+
+    def _ankle_bed_pseudo_measurement_blocks(
+        self,
+        frame_idx: int,
+        marker_points_array: np.ndarray,
+        marker_jacobians_array: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        if not self.ankle_bed_pseudo_obs or not self.ankle_bed_pair_indices or self._is_airborne_frame(frame_idx):
+            return []
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for pair_idx, keypoint_idx in self.ankle_bed_pair_indices:
+            target_point = np.asarray(self.reconstruction.points_3d[frame_idx, keypoint_idx], dtype=float)
+            current_point = np.asarray(marker_points_array[pair_idx], dtype=float)
+            current_jacobian = np.asarray(marker_jacobians_array[pair_idx], dtype=float)
+            if not (np.all(np.isfinite(target_point[[0, 2]])) and np.all(np.isfinite(current_point[[0, 2]]))):
+                continue
+            if not np.all(np.isfinite(current_jacobian[[0, 2], :])):
+                continue
+            blocks.append(
+                (
+                    target_point[[0, 2]].astype(float, copy=False),
+                    current_point[[0, 2]].astype(float, copy=False),
+                    current_jacobian[[0, 2], :].astype(float, copy=False),
+                    np.full(2, self.ankle_bed_pseudo_std_m**2, dtype=float),
                 )
             )
         return blocks
@@ -4036,20 +4091,26 @@ class MultiViewKinematicEKF:
             )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
+        pseudo_block = self._upper_back_pseudo_measurement_block(q)
+        zero_prior_blocks = self._upper_back_zero_prior_blocks(q)
+        ankle_bed_blocks = self._ankle_bed_pseudo_measurement_blocks(
+            frame_idx=frame_idx,
+            marker_points_array=marker_points_array,
+            marker_jacobians_array=marker_jacobians_array,
+        )
+        has_pseudo_priors = pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks)
+        if pseudo_block is not None:
+            measurement_blocks.append(pseudo_block)
+        measurement_blocks.extend(zero_prior_blocks)
+        measurement_blocks.extend(ankle_bed_blocks)
+
         if not measurement_blocks:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
-        pseudo_block = self._upper_back_pseudo_measurement_block(q)
-        zero_prior_blocks = self._upper_back_zero_prior_blocks(q)
-        has_upper_back_priors = pseudo_block is not None or bool(zero_prior_blocks)
-        if pseudo_block is not None:
-            measurement_blocks.append(pseudo_block)
-        measurement_blocks.extend(zero_prior_blocks)
-
         t_solve = time.perf_counter()
-        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_upper_back_priors else None
+        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_pseudo_priors else None
         update_result = None
         if stacked_measurements is not None:
             z_batch, h_batch, hq_batch, r_batch = stacked_measurements
@@ -4443,6 +4504,8 @@ def initial_state_from_ekf_bootstrap(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -4496,6 +4559,8 @@ def initial_state_from_ekf_bootstrap(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -4553,6 +4618,8 @@ def initial_state_from_root_pose_bootstrap(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -4590,6 +4657,8 @@ def initial_state_from_root_pose_bootstrap(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -4615,6 +4684,8 @@ def initial_state_from_root_pose_bootstrap(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -4646,6 +4717,8 @@ def compute_ekf2d_initial_state(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -4683,6 +4756,8 @@ def compute_ekf2d_initial_state(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -4706,6 +4781,8 @@ def compute_ekf2d_initial_state(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -4739,6 +4816,8 @@ def run_ekf(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -4776,6 +4855,8 @@ def run_ekf(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -4868,6 +4949,8 @@ def warmup_ekf_runtime(
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
     initial_state: np.ndarray,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> float:
     """Execute une frame jetable pour externaliser le warm-up du premier EKF.
 
@@ -4892,6 +4975,8 @@ def warmup_ekf_runtime(
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     covariance = np.eye(ekf.nx) * 1e-2
     state = np.array(initial_state, copy=True)
@@ -5814,6 +5899,17 @@ def parse_args() -> argparse.Namespace:
         help="Active le verrouillage automatique de certains DoF pres de singularites.",
     )
     parser.add_argument(
+        "--ankle-bed-pseudo-obs",
+        action="store_true",
+        help="En phase toile (hors aerien), ajoute une pseudo-observation 3D sur X/Z des chevilles pour aider l'EKF 2D.",
+    )
+    parser.add_argument(
+        "--ankle-bed-pseudo-std-m",
+        type=float,
+        default=DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+        help="Ecart-type (m) de la pseudo-observation 3D X/Z des chevilles sur la toile. Plus petit = contrainte plus forte.",
+    )
+    parser.add_argument(
         "--root-flight-dynamics",
         action="store_true",
         help="En phase aerienne, utilise une prediction dynamique de la racine basee sur la matrice de masse et les effets non lineaires.",
@@ -6225,6 +6321,8 @@ def main() -> None:
         enable_dof_locking=args.enable_dof_locking,
         method=args.ekf2d_initial_state_method,
         bootstrap_passes=args.ekf2d_bootstrap_passes,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
     stage_timings_s["ekf_initial_state_s"] = time.perf_counter() - t0
     shared_initial_state_flip_acc = shared_initial_state
@@ -6245,6 +6343,8 @@ def main() -> None:
             enable_dof_locking=args.enable_dof_locking,
             method=args.ekf2d_initial_state_method,
             bootstrap_passes=args.ekf2d_bootstrap_passes,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         stage_timings_s["ekf_initial_state_flip_acc_s"] = time.perf_counter() - t0
 
@@ -6264,6 +6364,8 @@ def main() -> None:
         flight_height_threshold_m=args.flight_height_threshold_m,
         flight_min_consecutive_frames=args.flight_min_consecutive_frames,
         initial_state=shared_initial_state,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
 
     ekf_result_acc, ekf_acc_timings = run_ekf(
@@ -6285,6 +6387,8 @@ def main() -> None:
         root_unwrap_mode=root_unwrap_mode,
         initial_state=shared_initial_state,
         model=shared_biorbd_model,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
     stage_timings_s["ekf_2d_acc_init_s"] = ekf_acc_timings["init_s"]
     stage_timings_s["ekf_2d_acc_loop_s"] = ekf_acc_timings["loop_s"]
@@ -6317,6 +6421,8 @@ def main() -> None:
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             initial_state=shared_initial_state_flip_acc,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         ekf_result_flip_acc, ekf_flip_acc_timings = run_ekf(
             biomod_path=None,
@@ -6337,6 +6443,8 @@ def main() -> None:
             root_unwrap_mode=root_unwrap_mode,
             initial_state=shared_initial_state_flip_acc,
             model=shared_biorbd_model,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         stage_timings_s["ekf_2d_flip_acc_init_s"] = ekf_flip_acc_timings["init_s"]
         stage_timings_s["ekf_2d_flip_acc_loop_s"] = ekf_flip_acc_timings["loop_s"]

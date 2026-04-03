@@ -113,6 +113,8 @@ class ReconstructionProfile:
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
+    ankle_bed_pseudo_obs: bool = False
+    ankle_bed_pseudo_std_m: float = 0.02
     pose_filter_window: int = 9
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
@@ -146,6 +148,13 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
             parts.append(f"ubg{slugify(f'{profile.upper_back_sagittal_gain:.2f}')}")
+        if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
+            parts.append("ankbed")
+            if not math.isclose(
+                float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)), 0.02, rel_tol=0.0, abs_tol=1e-9
+            ):
+                ankle_std_m = float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02))
+                parts.append(f"abm{slugify(f'{ankle_std_m:.3f}')}")
         if profile.flip:
             if profile.flip_method != "epipolar":
                 parts.append(f"flip_{profile.flip_method}")
@@ -238,6 +247,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError("upper_back_sagittal_gain must be >= 0.")
     if float(profile.upper_back_pseudo_std_deg) <= 0.0:
         raise ValueError("upper_back_pseudo_std_deg must be > 0.")
+    if float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)) <= 0.0:
+        raise ValueError("ankle_bed_pseudo_std_m must be > 0.")
     profile.frame_stride = int(profile.frame_stride)
     if profile.frame_stride not in SUPPORTED_FRAME_STRIDES:
         raise ValueError(f"Unsupported frame_stride: {profile.frame_stride}")
@@ -296,6 +307,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
         profile.dof_locking = False
+        profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
         profile.biorbd_kalman_init_method = "triangulation_ik_root_translation"
     if profile.family not in ("ekf_2d", "ekf_3d"):
@@ -304,6 +316,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.symmetrize_limbs = True
         profile.upper_back_sagittal_gain = 0.2
         profile.upper_back_pseudo_std_deg = 10.0
+        profile.ankle_bed_pseudo_obs = False
+        profile.ankle_bed_pseudo_std_m = 0.02
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -588,6 +602,9 @@ def build_pipeline_command(
             cmd.append("--no-symmetrize-limbs")
         cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
         cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
+        if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
+            cmd.append("--ankle-bed-pseudo-obs")
+        cmd.extend(["--ankle-bed-pseudo-std-m", str(float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)))])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])

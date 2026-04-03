@@ -74,6 +74,7 @@ from annotation.kinematic_assist import (
     propagate_annotation_kinematic_state,
     refine_annotation_q_with_direct_measurements,
     refine_annotation_q_with_local_ekf,
+    refine_annotation_q_with_marker_lm,
     refine_annotation_window_states,
     resolve_annotation_kinematic_state_info,
     store_annotation_kinematic_state,
@@ -5517,6 +5518,7 @@ class AnnotationTab(ttk.Frame):
         self.preview_canvas.mpl_connect("button_release_event", self.on_preview_release)
         self._bind_frame_navigation(self.preview_canvas_widget)
         self._bind_annotation_keypoint_navigation(self)
+        self._bind_annotation_camera_navigation(self)
         self._bind_cancel_pending_reprojection(controls)
         for clickable_parent in (self, body, left, right, preview_box, preview_controls):
             clickable_parent.bind("<Button-1>", self._cancel_pending_reprojection_from_tk_event, add="+")
@@ -5762,6 +5764,30 @@ class AnnotationTab(ttk.Frame):
         widget.bind("<Down>", lambda event: self._step_annotation_keypoint(1, event), add="+")
         for child in widget.winfo_children():
             self._bind_annotation_keypoint_navigation(child)
+
+    def _step_annotation_camera(self, delta: int, event=None) -> str:
+        if not hasattr(self, "annotation_cameras_list"):
+            return "break"
+        size = int(self.annotation_cameras_list.size())
+        if size <= 0:
+            return "break"
+        selection = self.annotation_cameras_list.curselection()
+        current_index = int(selection[-1]) if selection else 0
+        next_index = int((current_index + int(delta)) % size)
+        self.annotation_cameras_list.selection_clear(0, tk.END)
+        self.annotation_cameras_list.selection_set(next_index)
+        self.annotation_cameras_list.activate(next_index)
+        self.annotation_cameras_list.see(next_index)
+        self.on_camera_selection_changed()
+        return "break"
+
+    def _bind_annotation_camera_navigation(self, widget) -> None:
+        widget.bind("c", lambda event: self._step_annotation_camera(1, event), add="+")
+        widget.bind("C", lambda event: self._step_annotation_camera(1, event), add="+")
+        widget.bind("d", lambda event: self._step_annotation_camera(-1, event), add="+")
+        widget.bind("D", lambda event: self._step_annotation_camera(-1, event), add="+")
+        for child in widget.winfo_children():
+            self._bind_annotation_camera_navigation(child)
 
     def _cancel_pending_reprojection_from_tk_event(self, event) -> None:
         if not self._pending_reprojection_points:
@@ -6310,11 +6336,77 @@ class AnnotationTab(ttk.Frame):
             )
         return np.asarray(estimated_state[: model.nbQ()], dtype=float)
 
+    def _estimate_kinematic_q_via_triangulation_ik(self) -> np.ndarray:
+        biomod_path = self._selected_kinematic_biomod_path()
+        if biomod_path is None or not biomod_path.exists():
+            raise ValueError("Choose an existing bioMod first.")
+        camera_names = self.selected_annotation_camera_names()
+        if not camera_names:
+            raise ValueError("Select at least one camera.")
+        frame_number = self.current_frame_number()
+        import biorbd
+
+        model = biorbd.Model(str(biomod_path))
+        self.kinematic_q_names = biorbd_q_names(model)
+        annotation_pose_data = annotation_pose_data_for_frame(
+            self.pose_data,
+            camera_names=camera_names,
+            frame_number=frame_number,
+            annotation_payload=self.annotation_payload,
+        )
+        valid_measurements = int(np.sum(np.asarray(annotation_pose_data.scores) > 0.0))
+        if valid_measurements < 4:
+            raise ValueError(
+                "Not enough annotated 2D markers to estimate q. Add at least 4 annotated 2D points across views first."
+            )
+        triangulated_points = triangulate_annotation_frame_points(
+            self.calibrations,
+            camera_names=camera_names,
+            frame_number=frame_number,
+            annotation_payload=self.annotation_payload,
+        )
+        n_triangulated = int(np.sum(np.all(np.isfinite(triangulated_points), axis=1)))
+        if n_triangulated < 2:
+            raise ValueError(
+                "Not enough triangulated markers to estimate q. Add more annotated 2D points on multiple views first."
+            )
+        previous_state, _source_frame, _is_exact = self._selected_or_nearest_kinematic_state_info(frame_number, model)
+        triangulation_state, lm_diagnostics = refine_annotation_q_with_marker_lm(
+            model=model,
+            points_3d=triangulated_points,
+            frame_number=frame_number,
+            n_cameras=len(camera_names),
+            seed_state=previous_state,
+            passes=40,
+            initial_damping=1e-2,
+            damping_up=10.0,
+            damping_down=0.3,
+            tolerance=1e-6,
+            q_names=self.kinematic_q_names,
+            keypoint_name=None,
+        )
+        estimated_state = store_annotation_kinematic_state(
+            self.kinematic_frame_states,
+            model_label=str(self.kinematic_model_var.get()).strip(),
+            frame_number=frame_number,
+            model=model,
+            state=np.asarray(triangulation_state, dtype=float),
+        )
+        self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
+        self._set_kinematic_preview_from_q(biomod_path, camera_names, estimated_state[: model.nbQ()])
+        self.kinematic_state_current = np.asarray(estimated_state, dtype=float)
+        self.kinematic_status_var.set(
+            "Estimated q from triangulation LM "
+            f"({n_triangulated} markers, {valid_measurements} 2D points, "
+            f"{int(lm_diagnostics.get('completed_passes', 0))} iter)."
+        )
+        return np.asarray(estimated_state[: model.nbQ()], dtype=float)
+
     def estimate_kinematic_assist_state(self) -> None:
         if self.pose_data is None or self.calibrations is None:
             return
         try:
-            self._estimate_kinematic_q()
+            self._estimate_kinematic_q_via_triangulation_ik()
             self.refresh_preview()
         except Exception as exc:
             self._clear_kinematic_assist_preview()
@@ -9434,9 +9526,9 @@ class ProfilesTab(CommandTab):
         self.process_noise.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.upper_back_pseudo_std_deg = LabeledEntry(
             self.ekf2d_frame,
-            "3D pseudo-obs",
+            "3D pseudo-obs DOF",
             "10",
-            label_width=11,
+            label_width=15,
             entry_width=3,
         )
         self.upper_back_pseudo_std_deg.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -9505,6 +9597,21 @@ class ProfilesTab(CommandTab):
             entry_width=4,
         )
         self.upper_back_sagittal_gain.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self.ankle_bed_pseudo_obs_var = tk.BooleanVar(value=False)
+        self.ankle_bed_pseudo_obs_check = ttk.Checkbutton(
+            self.ekf2d_params_frame,
+            text="3D pseudo-obs (ankle-bed)",
+            variable=self.ankle_bed_pseudo_obs_var,
+        )
+        self.ankle_bed_pseudo_obs_check.pack(side=tk.LEFT, padx=(0, 6))
+        self.ankle_bed_pseudo_std_m = LabeledEntry(
+            self.ekf2d_params_frame,
+            "Std m",
+            "0.02",
+            label_width=6,
+            entry_width=5,
+        )
+        self.ankle_bed_pseudo_std_m.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         self.lock_var = tk.BooleanVar(value=False)
         self.ekf2d_lock_check = ttk.Checkbutton(self.ekf2d_params_frame, text="dof_locking", variable=self.lock_var)
         self.ekf2d_lock_check.pack(side=tk.LEFT, padx=(0, 8))
@@ -9653,6 +9760,13 @@ class ProfilesTab(CommandTab):
         self.upper_back_pseudo_std_deg.set_tooltip(
             "Ecart-type angulaire (en degrés) de la pseudo-observation du dos. Plus petit = contrainte plus forte."
         )
+        attach_tooltip(
+            self.ankle_bed_pseudo_obs_check,
+            "Ajoute une pseudo-observation 3D sur X/Z des chevilles pendant les phases toile (hors phase aérienne) pour aider l'EKF 2D.",
+        )
+        self.ankle_bed_pseudo_std_m.set_tooltip(
+            "Ecart-type en mètres de la pseudo-observation ankle-bed. Plus petit = chevilles davantage maintenues sur la trajectoire 3D de support."
+        )
         self.measurement_noise.set_tooltip(
             "Bruit de mesure de l'EKF 2D. Plus grand = moins de confiance dans les keypoints 2D."
         )
@@ -9724,6 +9838,8 @@ class ProfilesTab(CommandTab):
         self.ekf2d_bootstrap_passes.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.upper_back_sagittal_gain.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.upper_back_pseudo_std_deg.var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ankle_bed_pseudo_obs_var.trace_add("write", lambda *_args: self.sync_profile_name())
+        self.ankle_bed_pseudo_std_m.var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.flip_method.trace_add("write", lambda *_args: self.sync_profile_name())
         self.lock_var.trace_add("write", lambda *_args: self.sync_profile_name())
         self.initial_rot_var.trace_add("write", lambda *_args: self.sync_profile_name())
@@ -10085,6 +10201,12 @@ class ProfilesTab(CommandTab):
             upper_back_pseudo_std_deg=(
                 float(self.upper_back_pseudo_std_deg.get()) if hasattr(self, "upper_back_pseudo_std_deg") else 10.0
             ),
+            ankle_bed_pseudo_obs=(
+                bool(self.ankle_bed_pseudo_obs_var.get()) if hasattr(self, "ankle_bed_pseudo_obs_var") else False
+            ),
+            ankle_bed_pseudo_std_m=(
+                float(self.ankle_bed_pseudo_std_m.get()) if hasattr(self, "ankle_bed_pseudo_std_m") else 0.02
+            ),
             pose_filter_window=int(self.state.pose_filter_window_var.get()),
             pose_outlier_threshold_ratio=float(self.state.pose_outlier_ratio_var.get()),
             pose_amplitude_lower_percentile=float(self.state.pose_p_low_var.get()),
@@ -10122,6 +10244,8 @@ class ProfilesTab(CommandTab):
                 flags.append(f"boot{int(getattr(profile, 'ekf2d_bootstrap_passes', 5))}")
             if abs(float(getattr(profile, "upper_back_sagittal_gain", 0.2)) - 0.2) > 1e-9:
                 flags.append(f"ubg:{float(getattr(profile, 'upper_back_sagittal_gain', 0.2)):.2f}")
+            if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
+                flags.append("ankbed")
             reprojection_threshold_px = getattr(profile, "reprojection_threshold_px", DEFAULT_REPROJECTION_THRESHOLD_PX)
             if reprojection_threshold_px is None:
                 flags.append("tau:none")
@@ -10223,6 +10347,8 @@ class ProfilesTab(CommandTab):
             self.ekf2d_bootstrap_passes.var.set(str(int(getattr(profile, "ekf2d_bootstrap_passes", 5))))
             self.upper_back_sagittal_gain.var.set(f"{float(getattr(profile, 'upper_back_sagittal_gain', 0.2)):g}")
             self.upper_back_pseudo_std_deg.var.set(f"{float(getattr(profile, 'upper_back_pseudo_std_deg', 10.0)):g}")
+            self.ankle_bed_pseudo_obs_var.set(bool(getattr(profile, "ankle_bed_pseudo_obs", False)))
+            self.ankle_bed_pseudo_std_m.var.set(f"{float(getattr(profile, 'ankle_bed_pseudo_std_m', 0.02)):g}")
             self.flip_method.set(getattr(profile, "flip_method", "epipolar") if profile.flip else "none")
             self.on_flip_method_changed()
             self.lock_var.set(bool(getattr(profile, "dof_locking", False)))

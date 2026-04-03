@@ -1723,6 +1723,38 @@ def test_annotation_step_keypoint_up_clamps_at_first_item():
     assert tab._selection_changed is True
 
 
+def test_annotation_step_camera_wraps_selection():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_cameras_list = _FakeListbox()
+    for camera_name in ["cam0", "cam1", "cam2"]:
+        tab.annotation_cameras_list.insert("end", camera_name)
+    tab.annotation_cameras_list.selection_set(2)
+    tab.on_camera_selection_changed = lambda: setattr(tab, "_camera_selection_changed", True)
+
+    result = pipeline_gui.AnnotationTab._step_annotation_camera(tab, 1)
+
+    assert result == "break"
+    assert tab.annotation_cameras_list.curselection() == (0,)
+    assert tab.annotation_cameras_list._active == 0
+    assert tab._camera_selection_changed is True
+
+
+def test_annotation_step_camera_backwards_wraps_selection():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_cameras_list = _FakeListbox()
+    for camera_name in ["cam0", "cam1", "cam2"]:
+        tab.annotation_cameras_list.insert("end", camera_name)
+    tab.annotation_cameras_list.selection_set(0)
+    tab.on_camera_selection_changed = lambda: setattr(tab, "_camera_selection_changed", True)
+
+    result = pipeline_gui.AnnotationTab._step_annotation_camera(tab, -1)
+
+    assert result == "break"
+    assert tab.annotation_cameras_list.curselection() == (2,)
+    assert tab.annotation_cameras_list._active == 2
+    assert tab._camera_selection_changed is True
+
+
 def test_annotation_advance_to_next_keypoint_wraps_to_start():
     tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
     tab.annotation_keypoints_list = _FakeListbox()
@@ -1773,11 +1805,28 @@ def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monke
     )
     monkeypatch.setattr(
         pipeline_gui,
-        "initial_state_from_triangulation",
-        lambda model, reconstruction: np.array([0.1, -0.2, 0.0, 0.0, 0.0, 0.0], dtype=float),
+        "annotation_pose_data_for_frame",
+        lambda *_args, **_kwargs: pipeline_gui.PoseData(
+            camera_names=["cam0", "cam1"],
+            frames=np.array([10], dtype=int),
+            keypoints=np.zeros((2, 1, len(pipeline_gui.COCO17), 2), dtype=float),
+            scores=np.pad(
+                np.ones((2, 1, 2), dtype=float),
+                ((0, 0), (0, 0), (0, len(pipeline_gui.COCO17) - 2)),
+                constant_values=0.0,
+            ),
+        ),
     )
     monkeypatch.setattr(pipeline_gui, "canonicalize_model_q_rotation_branches", lambda _model, q: np.asarray(q))
     monkeypatch.setattr(pipeline_gui, "biorbd_q_names", lambda _model: ["q0", "q1"])
+    monkeypatch.setattr(
+        pipeline_gui,
+        "refine_annotation_q_with_marker_lm",
+        lambda **_kwargs: (
+            np.array([0.1, -0.2, 0.0, 0.0, 0.0, 0.0], dtype=float),
+            {"completed_passes": 7},
+        ),
+    )
     monkeypatch.setattr(
         pipeline_gui,
         "biorbd_markers_from_q",
@@ -1801,8 +1850,66 @@ def test_annotation_estimate_kinematic_assist_state_sets_projected_overlay(monke
 
     np.testing.assert_allclose(tab.kinematic_q_current, np.array([0.1, -0.2], dtype=float))
     assert tab.kinematic_projected_points.shape == (2, 1, len(pipeline_gui.COCO17), 2)
-    assert tab._kin_status == "Estimated q from triangulation (2 markers) | local ekf fallback."
+    assert tab._kin_status == "Estimated q from triangulation LM (2 markers, 4 2D points, 7 iter)."
     assert tab._refreshed is True
+
+
+def test_annotation_estimate_kinematic_assist_state_reports_when_not_enough_2d_markers(monkeypatch, tmp_path):
+    biomod_path = tmp_path / "demo.bioMod"
+    biomod_path.write_text("demo", encoding="utf-8")
+
+    class _FakeBiorbdModel:
+        def __init__(self, _path):
+            pass
+
+        def nbQ(self):
+            return 2
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "biorbd", SimpleNamespace(Model=_FakeBiorbdModel))
+
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.pose_data = SimpleNamespace(frames=np.array([10], dtype=int))
+    tab.calibrations = {"cam0": object(), "cam1": object()}
+    tab.annotation_payload = {}
+    tab.kinematic_model_choices = {"demo": biomod_path}
+    tab.kinematic_model_var = SimpleNamespace(get=lambda: "demo")
+    tab.kinematic_frame_states = {}
+    tab.selected_annotation_camera_names = lambda: ["cam0", "cam1"]
+    tab.current_frame_number = lambda: 10
+    tab.kinematic_status_var = SimpleNamespace(set=lambda value: setattr(tab, "_kin_status", value))
+    tab.refresh_preview = lambda: setattr(tab, "_refreshed", True)
+    tab._clear_kinematic_assist_preview = lambda: setattr(tab, "_cleared_preview", True)
+
+    monkeypatch.setattr(
+        pipeline_gui,
+        "annotation_pose_data_for_frame",
+        lambda *_args, **_kwargs: pipeline_gui.PoseData(
+            camera_names=["cam0", "cam1"],
+            frames=np.array([10], dtype=int),
+            keypoints=np.zeros((2, 1, len(pipeline_gui.COCO17), 2), dtype=float),
+            scores=np.pad(
+                np.ones((2, 1, 1), dtype=float),
+                ((0, 0), (0, 0), (0, len(pipeline_gui.COCO17) - 1)),
+                constant_values=0.0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(pipeline_gui, "biorbd_q_names", lambda _model: ["q0", "q1"])
+    seen = {}
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "showerror",
+        lambda title, message: seen.update({"title": title, "message": message}),
+    )
+
+    pipeline_gui.AnnotationTab.estimate_kinematic_assist_state(tab)
+
+    assert tab._cleared_preview is True
+    assert tab._kin_status == ""
+    assert seen["title"] == "Annotation"
+    assert "Not enough annotated 2D markers to estimate q." in seen["message"]
 
 
 def test_annotation_pose_data_for_frame_uses_only_existing_annotations():
@@ -2922,6 +3029,12 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     tab.ekf2d_bootstrap_passes = _FakeEntryField("5")
     tab.upper_back_sagittal_gain = _FakeEntryField("0.2")
     tab.upper_back_pseudo_std_deg = _FakeEntryField("10")
+    tab.ankle_bed_pseudo_obs_var = SimpleNamespace(
+        get=lambda: tab._ankle_bed_enabled,
+        set=lambda value: setattr(tab, "_ankle_bed_enabled", bool(value)),
+    )
+    tab._ankle_bed_enabled = False
+    tab.ankle_bed_pseudo_std_m = _FakeEntryField("0.02")
     tab.flip_method = SimpleNamespace(
         get=lambda: tab._flip_method, set=lambda value: setattr(tab, "_flip_method", value)
     )
@@ -3000,6 +3113,8 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
         coherence_confidence_floor=0.4,
         upper_back_sagittal_gain=0.35,
         upper_back_pseudo_std_deg=6.0,
+        ankle_bed_pseudo_obs=True,
+        ankle_bed_pseudo_std_m=0.015,
         pose_filter_window=11,
         pose_outlier_threshold_ratio=0.25,
         pose_amplitude_lower_percentile=7.0,
@@ -3026,6 +3141,8 @@ def test_profiles_tab_load_profile_into_form_restores_profile_options():
     assert tab.ekf2d_bootstrap_passes.get() == "7"
     assert tab.upper_back_sagittal_gain.get() == "0.35"
     assert tab.upper_back_pseudo_std_deg.get() == "6"
+    assert tab._ankle_bed_enabled is True
+    assert tab.ankle_bed_pseudo_std_m.get() == "0.015"
     assert tab.profile_cameras_list.curselection() == (1, 2)
     assert tab.profile_models_list.curselection() == (1,)
     assert tab._pose_filter_window == "11"
@@ -3860,6 +3977,10 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     tab.predictor = SimpleNamespace(get=lambda: "acc")
     tab.ekf2d_initial_state_method = SimpleNamespace(get=lambda: "ekf_bootstrap")
     tab.ekf2d_bootstrap_passes = SimpleNamespace(get=lambda: "5")
+    tab.upper_back_sagittal_gain = SimpleNamespace(get=lambda: "0.2")
+    tab.upper_back_pseudo_std_deg = SimpleNamespace(get=lambda: "10")
+    tab.ankle_bed_pseudo_obs_var = SimpleNamespace(get=lambda: True)
+    tab.ankle_bed_pseudo_std_m = SimpleNamespace(get=lambda: "0.018")
     tab.selected_profile_flip_method = lambda: None
     tab.lock_var = SimpleNamespace(get=lambda: False)
     tab.initial_rot_var = SimpleNamespace(get=lambda: False)
@@ -3885,6 +4006,8 @@ def test_profiles_tab_current_profile_reuses_2d_explorer_clean_settings():
     assert profile.reprojection_threshold_px is None
     assert profile.root_unwrap_mode == "off"
     assert profile.no_root_unwrap is True
+    assert profile.ankle_bed_pseudo_obs is True
+    assert profile.ankle_bed_pseudo_std_m == 0.018
 
 
 def test_profiles_tab_update_profile_model_info_marks_existing_biomod_as_faster():

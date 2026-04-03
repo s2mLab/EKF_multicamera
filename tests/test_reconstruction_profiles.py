@@ -233,6 +233,8 @@ def test_build_pipeline_command_includes_upper_back_prior_parameters_for_ekf2d()
             ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
             upper_back_sagittal_gain=0.35,
             upper_back_pseudo_std_deg=8.0,
+            ankle_bed_pseudo_obs=True,
+            ankle_bed_pseudo_std_m=0.015,
         )
     )
 
@@ -247,6 +249,8 @@ def test_build_pipeline_command_includes_upper_back_prior_parameters_for_ekf2d()
 
     assert cmd[cmd.index("--upper-back-sagittal-gain") + 1] == "0.35"
     assert cmd[cmd.index("--upper-back-pseudo-std-deg") + 1] == "8.0"
+    assert "--ankle-bed-pseudo-obs" in cmd
+    assert cmd[cmd.index("--ankle-bed-pseudo-std-m") + 1] == "0.015"
 
 
 def test_canonical_profile_name_marks_asymmetric_auto_built_models():
