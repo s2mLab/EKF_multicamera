@@ -1251,19 +1251,20 @@ def test_history3_prediction_updates_joint_dofs_from_last_three_states():
     ekf.joint_indices = np.array([2, 3], dtype=int)
     ekf.n_root = 2
     ekf.predictor_mode = "dyn_history3"
-    ekf.corrected_q_history = [
-        np.array([0.0, 0.0, 1.0, 2.0], dtype=float),
-        np.array([0.0, 0.0, 2.0, 4.0], dtype=float),
-        np.array([0.0, 0.0, 4.0, 8.0], dtype=float),
+    ekf.corrected_state_history = [
+        np.array([0.0, 0.0, 1.0, 2.0, 10.0, 20.0, 12.0, 24.0, 0.0, 0.0, 10.0, 20.0], dtype=float),
+        np.array([0.0, 0.0, 2.0, 4.0, 15.0, 30.0, 16.0, 32.0, 0.0, 0.0, 30.0, 60.0], dtype=float),
+        np.array([0.0, 0.0, 4.0, 8.0, 20.0, 40.0, 20.0, 40.0, 0.0, 0.0, 50.0, 100.0], dtype=float),
     ]
+    ekf.corrected_q_history = [state[:4] for state in ekf.corrected_state_history]
     predicted_state = np.zeros(12, dtype=float)
     predicted_state[:4] = np.array([10.0, 20.0, -1.0, -1.0], dtype=float)
 
     updated = ekf._apply_history3_prediction(predicted_state)
 
-    np.testing.assert_allclose(updated[:4], np.array([10.0, 20.0, 7.0, 14.0], dtype=float))
-    np.testing.assert_allclose(updated[4:8], np.array([0.0, 0.0, 30.0, 60.0], dtype=float))
-    np.testing.assert_allclose(updated[8:12], np.array([0.0, 0.0, 100.0, 200.0], dtype=float))
+    np.testing.assert_allclose(updated[:4], np.array([10.0, 20.0, 6.225, 12.45], dtype=float))
+    np.testing.assert_allclose(updated[4:8], np.array([0.0, 0.0, 24.25, 48.5], dtype=float))
+    np.testing.assert_allclose(updated[8:12], np.array([0.0, 0.0, 35.0, 70.0], dtype=float))
 
 
 def test_history3_predicts_root_but_dyn_history3_keeps_root_from_base_predictor():
@@ -1278,11 +1279,12 @@ def test_history3_predicts_root_but_dyn_history3_keeps_root_from_base_predictor(
     history3_ekf.n_root = 2
     history3_ekf.joint_indices = np.array([2, 3], dtype=int)
     history3_ekf.predictor_mode = "history3"
-    history3_ekf.corrected_q_history = [
-        np.array([1.0, 10.0, 1.0, 2.0], dtype=float),
-        np.array([2.0, 20.0, 2.0, 4.0], dtype=float),
-        np.array([4.0, 40.0, 4.0, 8.0], dtype=float),
+    history3_ekf.corrected_state_history = [
+        np.array([1.0, 10.0, 1.0, 2.0, 3.0, 30.0, 10.0, 20.0, 5.0, 50.0, 10.0, 20.0], dtype=float),
+        np.array([2.0, 20.0, 2.0, 4.0, 4.0, 40.0, 15.0, 30.0, 8.0, 80.0, 30.0, 60.0], dtype=float),
+        np.array([4.0, 40.0, 4.0, 8.0, 5.0, 50.0, 20.0, 40.0, 11.0, 110.0, 50.0, 100.0], dtype=float),
     ]
+    history3_ekf.corrected_q_history = [state[:4] for state in history3_ekf.corrected_state_history]
     dyn_history3_ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
     dyn_history3_ekf.model = _Model()
     dyn_history3_ekf.nq = 4
@@ -1290,16 +1292,21 @@ def test_history3_predicts_root_but_dyn_history3_keeps_root_from_base_predictor(
     dyn_history3_ekf.n_root = 2
     dyn_history3_ekf.joint_indices = np.array([2, 3], dtype=int)
     dyn_history3_ekf.predictor_mode = "dyn_history3"
+    dyn_history3_ekf.corrected_state_history = history3_ekf.corrected_state_history
     dyn_history3_ekf.corrected_q_history = history3_ekf.corrected_q_history
 
     predicted_state = np.zeros(12, dtype=float)
     predicted_state[:4] = np.array([100.0, 200.0, -1.0, -1.0], dtype=float)
+    predicted_state[8:12] = np.array([7.0, 70.0, 0.0, 0.0], dtype=float)
 
     updated_history3 = history3_ekf._apply_history3_prediction(predicted_state)
     updated_dyn_history3 = dyn_history3_ekf._apply_history3_prediction(predicted_state)
 
-    np.testing.assert_allclose(updated_history3[:4], np.array([7.0, 70.0, 7.0, 14.0], dtype=float))
-    np.testing.assert_allclose(updated_dyn_history3[:4], np.array([100.0, 200.0, 7.0, 14.0], dtype=float))
+    np.testing.assert_allclose(
+        updated_history3[:4],
+        np.array([4.554166666666667, 45.541666666666664, 6.225, 12.45], dtype=float),
+    )
+    np.testing.assert_allclose(updated_dyn_history3[:4], np.array([100.0, 200.0, 6.225, 12.45], dtype=float))
 
 
 def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():

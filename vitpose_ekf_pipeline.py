@@ -3591,7 +3591,10 @@ class MultiViewKinematicEKF:
         self.n_root = int(model.nbRoot()) if hasattr(model, "nbRoot") else 0
         self.root_indices = np.arange(self.n_root, dtype=int)
         self.joint_indices = np.arange(self.n_root, self.nq, dtype=int)
+        self.q_eye = np.eye(self.nq)
+        self.q_zero = np.zeros((self.nq, self.nq))
         self.identity_x = np.eye(self.nx)
+        self._transition_matrix = self._build_transition_matrix()
         self.marker_names = marker_name_list(model)
         self.marker_pairs = [
             (marker_idx, KP_INDEX[marker_name])
@@ -3659,6 +3662,7 @@ class MultiViewKinematicEKF:
         }
         self.previous_prediction_gate_nominal_rms_px = np.full(len(self.camera_calibrations), np.nan, dtype=float)
         self.corrected_q_history: list[np.ndarray] = []
+        self.corrected_state_history: list[np.ndarray] = []
         self.effective_confidences, self.measurement_variances = self._precompute_measurement_variances()
 
     def _make_q_names(self) -> list[str]:
@@ -3842,17 +3846,22 @@ class MultiViewKinematicEKF:
             )
         return blocks
 
-    def transition_matrix(self) -> np.ndarray:
-        """Matrice d'etat du modele discret a acceleration constante."""
+    def _build_transition_matrix(self) -> np.ndarray:
+        """Build and cache the constant-acceleration state transition matrix."""
+
         dt = self.dt
-        eye = np.eye(self.nq)
         return np.block(
             [
-                [eye, dt * eye, 0.5 * dt * dt * eye],
-                [np.zeros_like(eye), eye, dt * eye],
-                [np.zeros_like(eye), np.zeros_like(eye), eye],
+                [self.q_eye, dt * self.q_eye, 0.5 * dt * dt * self.q_eye],
+                [self.q_zero, self.q_eye, dt * self.q_eye],
+                [self.q_zero, self.q_zero, self.q_eye],
             ]
         )
+
+    def transition_matrix(self) -> np.ndarray:
+        """Return the cached constant-acceleration state transition matrix."""
+
+        return self._transition_matrix
 
     def _use_history3_prediction(self) -> bool:
         return self.predictor_mode in {"history3", "dyn_history3"}
@@ -3866,33 +3875,96 @@ class MultiViewKinematicEKF:
             return np.asarray(self.joint_indices, dtype=int)
         return np.empty(0, dtype=int)
 
+    def _history3_state_components(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return the state components needed by the history-based predictor.
+
+        Returns:
+            ``(q_t, qdot_t, qddot_t, qddot_tm1, qddot_tm2)`` from the three
+            most recent corrected EKF states, or ``None`` when the history is
+            incomplete.
+        """
+
+        if len(self.corrected_state_history) < 3:
+            return None
+        state_tm2 = np.asarray(self.corrected_state_history[-3], dtype=float)
+        state_tm1 = np.asarray(self.corrected_state_history[-2], dtype=float)
+        state_t = np.asarray(self.corrected_state_history[-1], dtype=float)
+        return (
+            np.asarray(state_t[: self.nq], dtype=float),
+            np.asarray(state_t[self.nq : 2 * self.nq], dtype=float),
+            np.asarray(state_t[2 * self.nq : 3 * self.nq], dtype=float),
+            np.asarray(state_tm1[2 * self.nq : 3 * self.nq], dtype=float),
+            np.asarray(state_tm2[2 * self.nq : 3 * self.nq], dtype=float),
+        )
+
+    @staticmethod
+    def _limited_acceleration_extrapolation(
+        accel_t: np.ndarray,
+        accel_tm1: np.ndarray,
+        accel_tm2: np.ndarray,
+        dt: float,
+        *,
+        anchor_accel: np.ndarray,
+    ) -> np.ndarray:
+        """Predict the next acceleration with a damped jerk extrapolation.
+
+        The raw jerk estimate is computed from ``a(t)``, ``a(t-1)``, and
+        ``a(t-2)``. Its effect is then limited by the recent acceleration
+        increments and blended with the base predictor acceleration so the
+        result stays smooth and numerically stable.
+        """
+
+        jerk_t = (3.0 * accel_t - 4.0 * accel_tm1 + accel_tm2) / (2.0 * dt)
+        raw_next = accel_t + dt * jerk_t
+        delta_recent = accel_t - accel_tm1
+        delta_previous = accel_tm1 - accel_tm2
+        delta_limit = np.maximum(np.abs(delta_recent), np.abs(delta_previous))
+        delta_limit = np.maximum(delta_limit, 1e-9)
+        limited_delta = np.clip(raw_next - accel_t, -delta_limit, delta_limit)
+        history_next = accel_t + limited_delta
+        return 0.5 * np.asarray(anchor_accel, dtype=float) + 0.5 * history_next
+
     def _apply_history3_prediction(self, predicted_state: np.ndarray) -> np.ndarray:
-        """Apply quadratic extrapolation from ``t-2``, ``t-1``, and ``t``.
+        """Apply a smooth higher-order prediction from recent corrected states.
 
         Args:
             predicted_state: State already predicted by the base ACC/DYN model.
 
         Returns:
-            Updated state where the selected DoFs are replaced by a quadratic
-            extrapolation inferred from the three most recent corrected
-            generalized-coordinate vectors.
+            Updated state where the selected DoFs are re-predicted from the
+            latest corrected ``q(t)``, ``qdot(t)``, ``qddot(t)``,
+            ``qddot(t-1)``, and ``qddot(t-2)`` values.
         """
 
         q_indices = self._history3_q_indices()
-        if len(self.corrected_q_history) < 3 or q_indices.size == 0:
+        state_components = self._history3_state_components()
+        if state_components is None or q_indices.size == 0:
             return predicted_state
-        q_tm2 = np.asarray(self.corrected_q_history[-3], dtype=float)
-        q_tm1 = np.asarray(self.corrected_q_history[-2], dtype=float)
-        q_t = np.asarray(self.corrected_q_history[-1], dtype=float)
-        required = np.concatenate((q_tm2[q_indices], q_tm1[q_indices], q_t[q_indices]))
+        q_t, qdot_t, qddot_t, qddot_tm1, qddot_tm2 = state_components
+        required = np.concatenate(
+            (
+                q_t[q_indices],
+                qdot_t[q_indices],
+                qddot_t[q_indices],
+                qddot_tm1[q_indices],
+                qddot_tm2[q_indices],
+            )
+        )
         if not np.all(np.isfinite(required)):
             return predicted_state
         dt = float(self.dt)
-        second_diff = q_t[q_indices] - 2.0 * q_tm1[q_indices] + q_tm2[q_indices]
-        delta_next = q_t[q_indices] - q_tm1[q_indices] + second_diff
-        q_next = q_t[q_indices] + delta_next
-        qdot_next = delta_next / dt
-        qddot_next = second_diff / (dt * dt)
+        anchor_accel = np.asarray(predicted_state[2 * self.nq + q_indices], dtype=float)
+        qddot_next = self._limited_acceleration_extrapolation(
+            qddot_t[q_indices],
+            qddot_tm1[q_indices],
+            qddot_tm2[q_indices],
+            dt,
+            anchor_accel=anchor_accel,
+        )
+        qdot_next = qdot_t[q_indices] + 0.5 * dt * (qddot_t[q_indices] + qddot_next)
+        q_next = q_t[q_indices] + dt * qdot_t[q_indices] + (dt * dt / 6.0) * (2.0 * qddot_t[q_indices] + qddot_next)
         updated = np.array(predicted_state, copy=True)
         updated[q_indices] = q_next
         updated[self.nq + q_indices] = qdot_next
@@ -3909,9 +3981,15 @@ class MultiViewKinematicEKF:
         """
 
         q = np.asarray(state[: self.nq], dtype=float)
-        self.corrected_q_history.append(canonicalize_model_q_rotation_branches(self.model, q))
+        canonical_q = canonicalize_model_q_rotation_branches(self.model, q)
+        canonical_state = np.asarray(state, dtype=float).copy()
+        canonical_state[: self.nq] = canonical_q
+        self.corrected_q_history.append(canonical_q)
+        self.corrected_state_history.append(canonical_state)
         if len(self.corrected_q_history) > 3:
             self.corrected_q_history = self.corrected_q_history[-3:]
+        if len(self.corrected_state_history) > 3:
+            self.corrected_state_history = self.corrected_state_history[-3:]
 
     def _is_airborne_from_previous_frame(self, frame_idx: int) -> bool:
         """Retourne vrai si le critere de vol est satisfait sur assez de frames precedentes."""
