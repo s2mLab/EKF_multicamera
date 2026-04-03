@@ -40,6 +40,9 @@ class _FakeTree:
     def selection_set(self, selection):
         self._selection = tuple(selection)
 
+    def selection_clear(self):
+        self._selection = ()
+
     def selection_add(self, selection):
         if isinstance(selection, str):
             values = [selection]
@@ -339,6 +342,35 @@ def test_annotation_jump_context_uses_shared_jump_analysis(monkeypatch):
 
     assert text == "Jump context: S1 | straight | frames 110-130"
     assert tab.annotation_jump_analysis is analysis
+
+
+def test_contact_segments_from_airborne_regions_returns_complementary_intervals():
+    segments = pipeline_gui.contact_segments_from_airborne_regions(
+        [(3, 5), (8, 9)],
+        n_frames=12,
+        analysis_start_frame=2,
+    )
+
+    assert segments == [(2, 2), (6, 7), (10, 11)]
+
+
+def test_draw_jump_phase_spans_marks_contact_and_airborne():
+    spans = []
+
+    class _FakeAxis:
+        def axvspan(self, start, end, **kwargs):
+            spans.append((round(float(start), 3), round(float(end), 3), kwargs.get("label")))
+
+    time_s = np.arange(0, 6, dtype=float) * 0.1
+    analysis = SimpleNamespace(airborne_regions=[(1, 2), (4, 4)], analysis_start_frame=0)
+
+    pipeline_gui.draw_jump_phase_spans(_FakeAxis(), time_s=time_s, analysis=analysis)
+
+    assert (0.0, 0.0, "contact") in spans
+    assert (0.1, 0.2, "airborne") in spans
+    assert (0.3, 0.3, None) in spans
+    assert (0.4, 0.4, None) in spans
+    assert (0.5, 0.5, None) in spans
 
 
 def test_gui_busy_popup_does_not_show_before_delay(monkeypatch):
@@ -4507,3 +4539,80 @@ def test_camera_tools_render_flip_preview_uses_image_frame_number_before_overlay
 
     assert requested == [(tmp_path, "M11139", 24)]
     assert drawn_colors[0] == "#000000"
+
+
+def test_camera_tools_selected_flip_frame_local_idx_falls_back_to_slider():
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.flip_frame_list = _FakeListbox()
+    tab.flip_frame_local_indices = []
+    tab.base_pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13], dtype=int))
+    tab.flip_frame_var = SimpleNamespace(get=lambda: 2.4)
+
+    assert pipeline_gui.CameraToolsTab._selected_flip_frame_local_idx(tab) == 2
+
+
+def test_camera_tools_selected_inspector_camera_prefers_metrics_tree_focus():
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.base_pose_data = SimpleNamespace(camera_names=["cam0", "cam1", "cam2"])
+    tab.metrics_tree = _FakeTree()
+    tab.metrics_tree.selection_set(("cam0", "cam2"))
+    tab.metrics_tree.focus("cam2")
+    tab.flip_camera_var = SimpleNamespace(get=lambda: "")
+
+    assert pipeline_gui.CameraToolsTab._selected_inspector_camera_name(tab) == "cam2"
+
+
+def test_camera_tools_show_specific_frame_updates_slider_and_preview():
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.base_pose_data = SimpleNamespace(camera_names=["cam0"], frames=np.array([100, 120], dtype=int))
+    tab.metrics_tree = _FakeTree()
+    tab.metrics_tree.rows = {"cam0": ("cam0",)}
+    tab.flip_camera_var = SimpleNamespace(get=lambda: "cam0", set=lambda _value: None)
+    tab.flip_frame_local_indices = []
+    tab.flip_frame_list = _FakeListbox()
+    slider_value = {"value": None}
+    tab.flip_frame_var = SimpleNamespace(set=lambda value: slider_value.__setitem__("value", value))
+    tab._update_flip_frame_label = lambda: None
+    tab._render_flip_frame_markers = lambda: None
+    rendered = []
+    tab.render_flip_preview = lambda: rendered.append(True)
+
+    pipeline_gui.CameraToolsTab.show_specific_frame(tab, frame_number=120, camera_name="cam0")
+
+    assert slider_value["value"] == 1.0
+    assert tab.flip_frame_list.items == ["manual | frame 120 | cam0"]
+    assert rendered == [True]
+
+
+def test_camera_tools_render_flip_frame_markers_draws_suspects_and_candidates():
+    lines = []
+
+    class _FakeMarks:
+        def delete(self, _tag):
+            return None
+
+        def winfo_width(self):
+            return 101
+
+        def winfo_height(self):
+            return 10
+
+        def create_line(self, x0, y0, x1, y1, **kwargs):
+            lines.append((x0, y0, x1, y1, kwargs))
+
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.flip_frame_marks = _FakeMarks()
+    tab.base_pose_data = SimpleNamespace(camera_names=["cam0"], frames=np.arange(5, dtype=int))
+    tab.flip_camera_var = SimpleNamespace(get=lambda: "cam0")
+    tab.flip_method_var = SimpleNamespace(get=lambda: "epipolar")
+    tab.flip_masks = {"epipolar": np.array([[False, True, False, False, True]], dtype=bool)}
+    tab.flip_detail_arrays = {
+        "epipolar": {"candidate_mask": np.array([[True, False, False, True, False]], dtype=bool)}
+    }
+
+    pipeline_gui.CameraToolsTab._render_flip_frame_markers(tab)
+
+    candidate_lines = [entry for entry in lines if entry[4].get("fill") == "#9aa5b1"]
+    suspect_lines = [entry for entry in lines if entry[4].get("fill") == "#dd8452"]
+    assert len(candidate_lines) == 2
+    assert len(suspect_lines) == 2

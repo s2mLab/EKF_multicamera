@@ -1701,6 +1701,70 @@ def shared_jump_analysis_for_reconstruction(
         return None
 
 
+def contact_segments_from_airborne_regions(
+    airborne_regions: list[tuple[int, int]],
+    *,
+    n_frames: int,
+    analysis_start_frame: int = 0,
+) -> list[tuple[int, int]]:
+    """Return the contact intervals complementary to airborne regions."""
+
+    n_frames = max(0, int(n_frames))
+    if n_frames <= 0:
+        return []
+    start_frame = min(max(int(analysis_start_frame), 0), n_frames - 1)
+    contacts: list[tuple[int, int]] = []
+    cursor = start_frame
+    for start, end in airborne_regions:
+        region_start = min(max(int(start), start_frame), n_frames - 1)
+        region_end = min(max(int(end), start_frame), n_frames - 1)
+        if cursor < region_start:
+            contacts.append((cursor, region_start - 1))
+        cursor = max(cursor, region_end + 1)
+    if cursor < n_frames:
+        contacts.append((cursor, n_frames - 1))
+    return contacts
+
+
+def draw_jump_phase_spans(
+    ax,
+    *,
+    time_s: np.ndarray,
+    analysis: DDSessionAnalysis | None,
+    contact_color: str = "#4c72b0",
+    airborne_color: str = "#dd8452",
+) -> None:
+    """Overlay contact and airborne intervals on one time-series axis."""
+
+    if analysis is None:
+        return
+    time_s = np.asarray(time_s, dtype=float)
+    if time_s.ndim != 1 or time_s.size == 0:
+        return
+    contacts = contact_segments_from_airborne_regions(
+        analysis.airborne_regions,
+        n_frames=int(time_s.shape[0]),
+        analysis_start_frame=int(getattr(analysis, "analysis_start_frame", 0)),
+    )
+    for idx, (start, end) in enumerate(contacts):
+        ax.axvspan(
+            float(time_s[start]),
+            float(time_s[end]),
+            color=contact_color,
+            alpha=0.05,
+            label="contact" if idx == 0 else None,
+        )
+    for idx, (start, end) in enumerate(analysis.airborne_regions):
+        if 0 <= start < time_s.shape[0] and 0 <= end < time_s.shape[0]:
+            ax.axvspan(
+                float(time_s[start]),
+                float(time_s[end]),
+                color=airborne_color,
+                alpha=0.10,
+                label="airborne" if idx == 0 else None,
+            )
+
+
 def preview_pose_frame_indices(pose_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
     """Map preview frame ids back to pose-data indices."""
 
@@ -12347,6 +12411,13 @@ class Analysis3DTab(ttk.Frame):
 
             momentum_plotted = 0
             time_s_bundle = np.asarray(self.bundle.get("time_s", np.array([], dtype=float)), dtype=float)
+            momentum_jump_source: str | None = None
+            momentum_jump_analysis: DDSessionAnalysis | None = None
+            for candidate_name in reversed(selected_names):
+                momentum_jump_analysis = shared_jump_analysis_for_reconstruction(self.state, candidate_name)
+                if momentum_jump_analysis is not None:
+                    momentum_jump_source = candidate_name
+                    break
             for recon_name in selected_names:
                 q = self.bundle.get("recon_q", {}).get(recon_name)
                 if q is None:
@@ -12380,6 +12451,9 @@ class Analysis3DTab(ttk.Frame):
                 plot_data = angular_momentum_plot_data(model, q, qdot, time_s)
                 color = reconstruction_display_color(self.state, recon_name)
                 label = reconstruction_legend_label(self.state, recon_name)
+                if momentum_plotted == 0:
+                    draw_jump_phase_spans(comp_ax, time_s=plot_data.time_s, analysis=momentum_jump_analysis)
+                    draw_jump_phase_spans(norm_ax, time_s=plot_data.time_s, analysis=momentum_jump_analysis)
                 component_styles = [("-", "Hx"), ("--", "Hy"), (":", "Hz")]
                 for component_idx, (linestyle, axis_label) in enumerate(component_styles):
                     comp_ax.plot(
@@ -12399,16 +12473,25 @@ class Analysis3DTab(ttk.Frame):
                     )
 
             if momentum_plotted:
-                comp_ax.set_title("3D angular momentum components")
+                title_suffix = (
+                    f" | jump phases from {reconstruction_label(momentum_jump_source)}"
+                    if momentum_jump_source
+                    else ""
+                )
+                comp_ax.set_title(f"3D angular momentum components{title_suffix}")
                 comp_ax.set_ylabel("kg.m²/s")
                 comp_ax.grid(alpha=0.25)
                 comp_ax.legend(loc="upper right", fontsize=8, ncol=2)
-                norm_ax.set_title("3D angular momentum norm")
+                norm_ax.set_title(f"3D angular momentum norm{title_suffix}")
                 norm_ax.set_ylabel("kg.m²/s")
                 norm_ax.grid(alpha=0.25)
                 norm_ax.legend(loc="upper right", fontsize=8)
                 comp_ax.set_xlabel("Time (s)")
                 norm_ax.set_xlabel("Time (s)")
+                if momentum_jump_source is not None:
+                    summary_lines.append(
+                        f"Jump phases on angular momentum plots: {reconstruction_label(momentum_jump_source)}"
+                    )
             else:
                 comp_ax.axis("off")
                 comp_ax.text(
@@ -13571,18 +13654,6 @@ class CameraToolsTab(ttk.Frame):
         ttk.Label(controls, textvariable=self.calibration_pose_status_var, foreground="#4f5b66", justify=tk.LEFT).pack(
             fill=tk.X, padx=8, pady=(0, 2)
         )
-        ttk.Label(
-            controls,
-            text=(
-                "Scores shown: valid 2D coverage, detector confidence, epipolar coherence, confidence x coherence, "
-                "reprojection quality, triangulation usage, epipolar decision support, and flip rates.\n"
-                "Additional useful literature criteria: calibration uncertainty, baseline diversity, occlusion persistence, "
-                "view angle to the motion plane, and temporal stability of 2D tracks."
-            ),
-            foreground="#4f5b66",
-            justify=tk.LEFT,
-            wraplength=1200,
-        ).pack(fill=tk.X, padx=8, pady=(0, 4))
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -13675,10 +13746,7 @@ class CameraToolsTab(ttk.Frame):
         camera_label = ttk.Label(inspector_controls, text="Camera", width=8)
         camera_label.pack(side=tk.LEFT)
         self.flip_camera_var = tk.StringVar(value="")
-        self.flip_camera_box = ttk.Combobox(
-            inspector_controls, textvariable=self.flip_camera_var, width=18, state="readonly"
-        )
-        self.flip_camera_box.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(inspector_controls, textvariable=self.flip_camera_var, width=18).pack(side=tk.LEFT, padx=(0, 8))
         self.flip_applied_var = tk.BooleanVar(value=False)
         self.flip_check = ttk.Checkbutton(
             inspector_controls,
@@ -13722,6 +13790,24 @@ class CameraToolsTab(ttk.Frame):
         inspector_body.add(frame_panel, weight=1)
         inspector_body.add(preview_panel, weight=2)
 
+        frame_slider_row = ttk.Frame(frame_panel)
+        frame_slider_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(frame_slider_row, text="Frame", width=8).pack(side=tk.LEFT)
+        self.flip_frame_var = tk.DoubleVar(value=0.0)
+        self.flip_frame_scale = ttk.Scale(
+            frame_slider_row,
+            from_=0,
+            to=0,
+            variable=self.flip_frame_var,
+            orient=tk.HORIZONTAL,
+            command=self._on_flip_frame_scale_changed,
+        )
+        self.flip_frame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        self.flip_frame_label = ttk.Label(frame_slider_row, text="frame -", width=10)
+        self.flip_frame_label.pack(side=tk.LEFT)
+        self.flip_frame_marks = tk.Canvas(frame_panel, height=10, highlightthickness=0, bd=0)
+        self.flip_frame_marks.pack(fill=tk.X, pady=(0, 6))
+
         ttk.Label(frame_panel, text="Frames suspectes / candidates").pack(anchor="w", pady=(0, 4))
         self.flip_frame_list = tk.Listbox(frame_panel, exportselection=False, height=12)
         self.flip_frame_list.pack(fill=tk.BOTH, expand=True)
@@ -13750,8 +13836,7 @@ class CameraToolsTab(ttk.Frame):
             self.flip_method_box,
             "Méthode de diagnostic de flip L/R: cohérence épipolaire Sampson, cohérence épipolaire rapide par distance symétrique, ou triangulation/reprojection.",
         )
-        attach_tooltip(camera_label, "Caméra isolée à inspecter pour les frames suspectes.")
-        attach_tooltip(self.flip_camera_box, "Caméra isolée à inspecter pour les frames suspectes.")
+        attach_tooltip(camera_label, "Caméra inspectée, suivie automatiquement depuis le tableau de gauche.")
         attach_tooltip(
             self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F."
         )
@@ -13760,16 +13845,22 @@ class CameraToolsTab(ttk.Frame):
             self.qa_overlay_box,
             "Overlay calibration QA on the 2D image: local 2D epipolar error, selected 3D reprojection error, or 3D excluded keypoints.",
         )
+        attach_tooltip(self.flip_frame_scale, "Navigation continue entre les frames pour la caméra inspectée.")
+        attach_tooltip(
+            self.flip_frame_marks,
+            "Repères de frames suspectes de flip pour la caméra et la méthode courantes.",
+        )
         attach_tooltip(self.flip_frame_list, "Frames suspectes ou candidates pour la caméra et la méthode choisies.")
         attach_tooltip(
             self.flip_details, "Détails des coûts géométriques, temporels et combinés pour la frame sélectionnée."
         )
 
         self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
-        self.flip_camera_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.qa_overlay_var.trace_add("write", lambda *_args: self.render_flip_preview())
         self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
-        for widget in (self.flip_frame_list, self.flip_canvas_widget, self.flip_method_box, self.flip_camera_box):
+        self.flip_frame_marks.bind("<Configure>", lambda _event: self._render_flip_frame_markers())
+        self.metrics_tree.bind("<<TreeviewSelect>>", lambda _event: self._on_metrics_tree_selection_changed())
+        for widget in (self.flip_frame_list, self.flip_canvas_widget, self.flip_method_box, self.metrics_tree):
             widget.bind("<KeyPress-f>", self.toggle_flip_current_frame)
             widget.bind("<Enter>", lambda _event, w=widget: w.focus_set())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
@@ -13811,11 +13902,18 @@ class CameraToolsTab(ttk.Frame):
         for camera_name in selected:
             if self.metrics_tree.exists(camera_name):
                 self.metrics_tree.selection_add(camera_name)
+        self._sync_inspector_camera_name()
 
     def _on_reconstruction_selection_changed(self) -> None:
         if self.pose_data is None:
             return
         self.refresh_metrics()
+        self.refresh_flip_frame_list()
+
+    def _on_metrics_tree_selection_changed(self) -> None:
+        """Refresh the inspector when the camera table selection changes."""
+
+        self._sync_inspector_camera_name()
         self.refresh_flip_frame_list()
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
@@ -14007,22 +14105,51 @@ class CameraToolsTab(ttk.Frame):
     def refresh_flip_controls(self) -> None:
         if self.base_pose_data is None:
             return
-        camera_names = list(self.base_pose_data.camera_names)
-        self.flip_camera_box.configure(values=camera_names)
-        if self.flip_camera_var.get() not in camera_names:
-            self.flip_camera_var.set(camera_names[0] if camera_names else "")
+        self._sync_inspector_camera_name()
+        self._configure_flip_frame_slider()
         self.refresh_flip_frame_list()
 
+    def _selected_inspector_camera_name(self) -> str:
+        """Return the camera currently inspected in the right-hand preview."""
+
+        camera_names = list(getattr(getattr(self, "base_pose_data", None), "camera_names", []))
+        if not camera_names:
+            return ""
+        tree = getattr(self, "metrics_tree", None)
+        selection = list(getattr(tree, "selection", lambda: ())())
+        focus = str(getattr(tree, "focus", lambda: "")() or "")
+        if focus in selection and focus in camera_names:
+            return focus
+        for camera_name in selection:
+            if camera_name in camera_names:
+                return str(camera_name)
+        current = str(self.flip_camera_var.get()).strip()
+        if current in camera_names:
+            return current
+        return str(camera_names[0])
+
+    def _sync_inspector_camera_name(self) -> None:
+        """Mirror the selected table camera into the inspector header."""
+
+        if not hasattr(self, "flip_camera_var"):
+            return
+        self.flip_camera_var.set(self._selected_inspector_camera_name())
+
     def refresh_flip_frame_list(self) -> None:
+        current_local_idx = self._selected_flip_frame_local_idx()
         self.flip_frame_local_indices = []
         self.flip_frame_list.delete(0, tk.END)
         self.flip_details.delete("1.0", tk.END)
         if self.base_pose_data is None:
+            self._configure_flip_frame_slider()
+            self._render_flip_frame_markers()
             self.render_flip_preview()
             return
         method = self.flip_method_var.get()
-        camera_name = self.flip_camera_var.get()
+        camera_name = self._selected_inspector_camera_name()
         if method not in self.flip_masks or camera_name not in self.base_pose_data.camera_names:
+            self._configure_flip_frame_slider()
+            self._render_flip_frame_markers()
             self.render_flip_preview()
             return
         cam_idx = list(self.base_pose_data.camera_names).index(camera_name)
@@ -14050,9 +14177,100 @@ class CameraToolsTab(ttk.Frame):
                 f"dec {self._fmt_float(decision_score)} / sm {self._fmt_float(smoothed_score)}"
             )
             self.flip_frame_list.insert(tk.END, label)
+        self._configure_flip_frame_slider()
         if local_indices:
-            self.flip_frame_list.selection_set(0)
+            preferred_local_idx = current_local_idx if current_local_idx in local_indices else local_indices[0]
+            list_idx = local_indices.index(preferred_local_idx)
+            self.flip_frame_list.selection_set(list_idx)
+            self.flip_frame_list.see(list_idx)
+            self.flip_frame_var.set(float(preferred_local_idx))
+        elif current_local_idx is not None:
+            self.flip_frame_var.set(float(current_local_idx))
+        self._update_flip_frame_label()
+        self._render_flip_frame_markers()
         self.render_flip_preview()
+
+    def _configure_flip_frame_slider(self) -> None:
+        """Configure the frame slider to cover the currently loaded trial."""
+
+        if not hasattr(self, "flip_frame_scale") or not hasattr(self, "flip_frame_var"):
+            return
+        n_frames = int(len(getattr(self.base_pose_data, "frames", [])))
+        max_frame = max(n_frames - 1, 0)
+        self.flip_frame_scale.configure(to=max_frame)
+        current = int(round(float(getattr(self.flip_frame_var, "get", lambda: 0.0)())))
+        self.flip_frame_var.set(float(clamp_frame_index(current, max_frame) if n_frames else 0))
+        self._update_flip_frame_label()
+
+    def _on_flip_frame_scale_changed(self, _value) -> None:
+        """Refresh the camera preview when the user scrubs the frame slider."""
+
+        if self.base_pose_data is None:
+            return
+        local_idx = self._selected_flip_frame_local_idx()
+        self._update_flip_frame_label()
+        if local_idx is None:
+            return
+        if local_idx in self.flip_frame_local_indices:
+            list_idx = self.flip_frame_local_indices.index(local_idx)
+            self.flip_frame_list.selection_clear(0, tk.END)
+            self.flip_frame_list.selection_set(list_idx)
+            self.flip_frame_list.see(list_idx)
+        else:
+            self.flip_frame_list.selection_clear(0, tk.END)
+        self.render_flip_preview()
+
+    def _update_flip_frame_label(self) -> None:
+        """Display the current frame number beside the slider."""
+
+        if not hasattr(self, "flip_frame_label"):
+            return
+        if self.base_pose_data is None or len(getattr(self.base_pose_data, "frames", [])) == 0:
+            self.flip_frame_label.configure(text="frame -")
+            return
+        local_idx = self._selected_flip_frame_local_idx()
+        if local_idx is None:
+            self.flip_frame_label.configure(text="frame -")
+            return
+        frame_number = int(np.asarray(self.base_pose_data.frames, dtype=int)[local_idx])
+        self.flip_frame_label.configure(text=f"frame {frame_number}")
+
+    def _render_flip_frame_markers(self) -> None:
+        """Draw small markers on the frame slider for suspect and candidate flips."""
+
+        canvas = getattr(self, "flip_frame_marks", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        camera_name = self._selected_inspector_camera_name()
+        if self.base_pose_data is None or camera_name not in getattr(self.base_pose_data, "camera_names", []):
+            return
+        width = max(int(canvas.winfo_width()), 1)
+        height = max(int(canvas.winfo_height()), 1)
+        n_frames = int(len(getattr(self.base_pose_data, "frames", [])))
+        if n_frames <= 1:
+            return
+        method = str(self.flip_method_var.get()).strip()
+        if method not in self.flip_masks:
+            return
+        cam_idx = list(self.base_pose_data.camera_names).index(camera_name)
+        suspect_mask = np.asarray(self.flip_masks.get(method), dtype=bool)
+        candidate_arrays = self.flip_detail_arrays.get(method, {})
+        candidate_mask = (
+            np.asarray(candidate_arrays.get("candidate_mask"), dtype=bool)
+            if "candidate_mask" in candidate_arrays
+            else None
+        )
+        if candidate_mask is not None and candidate_mask.ndim == 2 and cam_idx < candidate_mask.shape[0]:
+            candidate_idx = np.flatnonzero(candidate_mask[cam_idx])
+            for local_idx in candidate_idx:
+                x = round(local_idx * (width - 1) / max(n_frames - 1, 1))
+                canvas.create_line(x, 3, x, height - 1, fill="#9aa5b1")
+        if suspect_mask.ndim == 2 and cam_idx < suspect_mask.shape[0]:
+            suspect_idx = np.flatnonzero(suspect_mask[cam_idx])
+            for local_idx in suspect_idx:
+                x = round(local_idx * (width - 1) / max(n_frames - 1, 1))
+                canvas.create_line(x, 0, x, height - 1, fill="#dd8452", width=2)
 
     def _selected_flip_frame_local_idx(self) -> int | None:
         selection = self.flip_frame_list.curselection()
@@ -14060,7 +14278,12 @@ class CameraToolsTab(ttk.Frame):
             idx = int(selection[0])
             if idx < len(self.flip_frame_local_indices):
                 return self.flip_frame_local_indices[idx]
-        return self.flip_frame_local_indices[0] if self.flip_frame_local_indices else None
+        if self.base_pose_data is None or len(getattr(self.base_pose_data, "frames", [])) == 0:
+            return None
+        if not hasattr(self, "flip_frame_var"):
+            return None
+        max_frame = len(self.base_pose_data.frames) - 1
+        return clamp_frame_index(int(round(float(self.flip_frame_var.get()))), max_frame)
 
     def show_specific_frame(self, *, frame_number: int, camera_name: str | None = None) -> None:
         if self.base_pose_data is None:
@@ -14069,16 +14292,28 @@ class CameraToolsTab(ttk.Frame):
         matches = np.flatnonzero(frames == int(frame_number))
         if matches.size == 0:
             return
-        if camera_name and camera_name in self.base_pose_data.camera_names:
-            self.flip_camera_var.set(camera_name)
+        tree = getattr(self, "metrics_tree", None)
+        if (
+            camera_name
+            and camera_name in self.base_pose_data.camera_names
+            and tree is not None
+            and getattr(tree, "exists", lambda _name: False)(camera_name)
+        ):
+            clear = getattr(tree, "selection_clear", None)
+            if callable(clear):
+                clear()
+            tree.selection_set((camera_name,))
+            tree.focus(camera_name)
+        self._sync_inspector_camera_name()
         local_idx = int(matches[0])
         self.flip_frame_local_indices = [local_idx]
         self.flip_frame_list.delete(0, tk.END)
-        selected_camera = self.flip_camera_var.get() or (
-            self.base_pose_data.camera_names[0] if self.base_pose_data.camera_names else ""
-        )
+        selected_camera = self._selected_inspector_camera_name()
         self.flip_frame_list.insert(tk.END, f"manual | frame {int(frame_number)} | {selected_camera}")
         self.flip_frame_list.selection_set(0)
+        self.flip_frame_var.set(float(local_idx))
+        self._update_flip_frame_label()
+        self._render_flip_frame_markers()
         self.render_flip_preview()
 
     def _qa_overlay_data(
@@ -14140,7 +14375,7 @@ class CameraToolsTab(ttk.Frame):
             self.flip_canvas.draw_idle()
             return
         method = self.flip_method_var.get()
-        camera_name = self.flip_camera_var.get()
+        camera_name = self._selected_inspector_camera_name()
         frame_local_idx = self._selected_flip_frame_local_idx()
         if frame_local_idx is None or camera_name not in self.base_pose_data.camera_names:
             ax = self.flip_figure.subplots(1, 1)
