@@ -31,8 +31,21 @@ from typing import Iterable
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from annotation.annotation_store import (
+    apply_annotations_to_pose_arrays,
+    default_annotation_path,
+    load_annotation_payload,
+)
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations
-from kinematics.root_kinematics import compute_trunk_dofs_from_points, root_z_correction_angle_from_points
+from kinematics.root_kinematics import (
+    ROOT_ROTATION_SLICE,
+    SUPPORTED_ROOT_UNWRAP_MODES,
+    TRUNK_ROOT_ROTATION_SEQUENCE,
+    compute_trunk_dofs_from_points,
+    normalize_root_unwrap_mode,
+    root_z_correction_angle_from_points,
+    stabilize_root_rotations,
+)
 
 try:
     import tomllib
@@ -47,8 +60,9 @@ except ImportError:  # pragma: no cover - optional but useful for distortion-awa
 
 DEFAULT_CALIB = Path("inputs/calibration/Calib.toml")
 DEFAULT_KEYPOINTS = Path("inputs/keypoints/1_partie_0429_keypoints.json")
-LOCAL_BIOBUDDY = Path("/Users/mickaelbegon/Documents/GIT/biobuddy")
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+ROOT = Path(__file__).resolve().parent
+LOCAL_BIOBUDDY = Path(os.environ.get("BIOBUDDY_ROOT", ROOT.parent / "biobuddy"))
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 DEFAULT_CAMERA_FPS = 120.0
@@ -64,7 +78,13 @@ DEFAULT_MEASUREMENT_NOISE_SCALE = 1.5
 DEFAULT_TRIANGULATION_METHOD = "exhaustive"
 DEFAULT_TRIANGULATION_WORKERS = 6
 DEFAULT_MODEL_VARIANT = "single_trunk"
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
+SUPPORTED_MODEL_VARIANTS = (
+    "single_trunk",
+    "back_flexion_1d",
+    "back_3dof",
+    "upper_root_back_flexion_1d",
+    "upper_root_back_3dof",
+)
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -94,6 +114,7 @@ DEFAULT_EKF2D_INITIAL_STATE_METHOD = "ekf_bootstrap"
 DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
+DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
 DEFAULT_FLIP_IMPROVEMENT_RATIO = 0.7
 DEFAULT_FLIP_MIN_GAIN_PX = 3.0
 DEFAULT_FLIP_MIN_OTHER_CAMERAS = 2
@@ -159,6 +180,31 @@ FLIP_PROXIMAL_KEYPOINT_WEIGHTS = {
     "left_ear": 0.3,
     "right_ear": 0.3,
 }
+
+
+def model_variant_has_back_dofs(model_variant: str) -> bool:
+    return str(model_variant) in {
+        "back_flexion_1d",
+        "back_3dof",
+        "upper_root_back_flexion_1d",
+        "upper_root_back_3dof",
+    }
+
+
+def model_variant_uses_upper_trunk_root(model_variant: str) -> bool:
+    return str(model_variant) in {"upper_root_back_flexion_1d", "upper_root_back_3dof"}
+
+
+def back_dof_segment_name_for_variant(model_variant: str) -> str | None:
+    if str(model_variant) in {"back_flexion_1d", "back_3dof"}:
+        return "UPPER_BACK"
+    if str(model_variant) in {"upper_root_back_flexion_1d", "upper_root_back_3dof"}:
+        return "LOWER_TRUNK"
+    return None
+
+
+def root_translation_origin_for_model_variant(model_variant: str) -> str:
+    return "upper_trunk" if model_variant_uses_upper_trunk_root(model_variant) else "pelvis"
 
 
 @dataclass
@@ -248,6 +294,8 @@ class PoseData:
     frame_stride: int = 1
     raw_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
     filtered_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
+    annotated_keypoints: np.ndarray | None = None  # (n_cam, n_frames, 17, 2)
+    annotated_scores: np.ndarray | None = None  # (n_cam, n_frames, 17)
 
 
 @dataclass
@@ -265,6 +313,14 @@ class SegmentLengths:
     eye_offset_x: float
     eye_offset_y: float
     ear_offset_y: float
+    left_upper_arm_length: float | None = None
+    right_upper_arm_length: float | None = None
+    left_forearm_length: float | None = None
+    right_forearm_length: float | None = None
+    left_thigh_length: float | None = None
+    right_thigh_length: float | None = None
+    left_shank_length: float | None = None
+    right_shank_length: float | None = None
 
 
 @dataclass
@@ -587,6 +643,7 @@ def load_pose_data(
     outlier_threshold_ratio: float = 0.10,
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
+    annotations_path: Path | None = None,
 ) -> PoseData:
     """Charge les keypoints 2D et les aligne camera par camera.
 
@@ -664,6 +721,22 @@ def load_pose_data(
 
     raw_keypoints = np.array(keypoints, copy=True)
     raw_scores = np.array(scores, copy=True)
+    resolved_annotations_path = None if annotations_path is None else Path(annotations_path)
+    if data_mode == "annotated" and resolved_annotations_path is None:
+        resolved_annotations_path = default_annotation_path(keypoints_path)
+    annotation_payload = (
+        load_annotation_payload(resolved_annotations_path, keypoints_path=keypoints_path)
+        if resolved_annotations_path is not None and resolved_annotations_path.exists()
+        else None
+    )
+    annotated_keypoints, annotated_scores = apply_annotations_to_pose_arrays(
+        keypoints=raw_keypoints,
+        scores=raw_scores,
+        camera_names=[name for name, _ in ordered_items],
+        frames=frames,
+        keypoint_names=COCO17,
+        payload=annotation_payload,
+    )
     cleaned_keypoints, cleaned_scores, filtered_keypoints = filter_pose_keypoints(
         keypoints,
         scores,
@@ -685,6 +758,9 @@ def load_pose_data(
     elif data_mode == "cleaned":
         selected_keypoints = cleaned_keypoints
         selected_scores = cleaned_scores
+    elif data_mode == "annotated":
+        selected_keypoints = annotated_keypoints
+        selected_scores = annotated_scores
     else:
         raise ValueError(f"Unsupported pose data mode: {data_mode}")
 
@@ -696,6 +772,8 @@ def load_pose_data(
         frame_stride=frame_stride,
         raw_keypoints=raw_keypoints,
         filtered_keypoints=filtered_keypoints,
+        annotated_keypoints=annotated_keypoints,
+        annotated_scores=annotated_scores,
     )
 
 
@@ -900,6 +978,43 @@ def apply_measurement_update_batch(
         R_diag_array=R_diag_array,
         nq=nq,
         identity_x=identity_x,
+    )
+
+
+def stack_measurement_blocks(
+    measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+    nq: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Concatenate per-camera/pseudo-observation blocks into one batch update."""
+
+    z_blocks = []
+    h_blocks = []
+    hq_blocks = []
+    r_blocks = []
+    for z, h, H_q, R_diag_array in measurement_blocks:
+        if z.size == 0 or h.size == 0 or H_q.size == 0 or R_diag_array.size == 0:
+            continue
+        z_array = np.asarray(z, dtype=float).reshape(-1)
+        h_array = np.asarray(h, dtype=float).reshape(-1)
+        hq_array = np.asarray(H_q, dtype=float).reshape((-1, nq))
+        r_array = np.asarray(R_diag_array, dtype=float).reshape(-1)
+        if (
+            z_array.shape[0] != h_array.shape[0]
+            or z_array.shape[0] != hq_array.shape[0]
+            or z_array.shape[0] != r_array.shape[0]
+        ):
+            continue
+        z_blocks.append(z_array)
+        h_blocks.append(h_array)
+        hq_blocks.append(hq_array)
+        r_blocks.append(r_array)
+    if not z_blocks:
+        return None
+    return (
+        np.concatenate(z_blocks),
+        np.concatenate(h_blocks),
+        np.vstack(hq_blocks),
+        np.concatenate(r_blocks),
     )
 
 
@@ -2059,9 +2174,13 @@ def apply_left_right_flip_corrections(pose_data: PoseData, suspect_mask: np.ndar
 
     La correction s'applique camera par camera et frame par frame, uniquement
     quand le diagnostic epipolaire juge le swap gauche/droite plus coherent.
+    Les scores 2D de ces vues sont aussi divises par deux afin de reduire leur
+    poids dans les etapes suivantes du filtre.
     """
     corrected_keypoints = apply_left_right_flip_to_points(pose_data.keypoints, suspect_mask)
     corrected_scores = apply_left_right_flip_to_points(pose_data.scores[..., np.newaxis], suspect_mask)[..., 0]
+    corrected_scores = np.asarray(corrected_scores, dtype=float)
+    corrected_scores[suspect_mask] *= 0.5
     return PoseData(
         camera_names=list(pose_data.camera_names),
         frames=np.array(pose_data.frames, copy=True),
@@ -2262,7 +2381,7 @@ def once_triangulation_from_best_cameras(
     observations: np.ndarray,
     confidences: np.ndarray,
     calibrations: list[CameraCalibration],
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray, np.ndarray]:
     """Triangulate once from all valid cameras without view rejection."""
@@ -2292,9 +2411,14 @@ def once_triangulation_from_best_cameras(
     errors = np.linalg.norm(observations[included_indices] - projected, axis=1)
     mean_error = float(np.mean(errors)) if errors.size else np.nan
     reprojection_error_per_view[included_indices] = errors
+    coherence_threshold_px = (
+        float(DEFAULT_REPROJECTION_THRESHOLD_PX) if error_threshold_px is None else float(error_threshold_px)
+    )
     for i_cam in included_indices:
-        coherence_per_view[i_cam] = multiview_coherence_score(reprojection_error_per_view[i_cam], error_threshold_px)
-    if mean_error > error_threshold_px:
+        coherence_per_view[i_cam] = multiview_coherence_score(
+            reprojection_error_per_view[i_cam], coherence_threshold_px
+        )
+    if error_threshold_px is not None and mean_error > float(error_threshold_px):
         point = np.full(3, np.nan)
     return point, mean_error, reprojection_error_per_view, coherence_per_view, excluded_views
 
@@ -2464,7 +2588,7 @@ def compute_framewise_epipolar_measurement_weights(
 def triangulate_pose2sim_like(
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
-    error_threshold_px: float = DEFAULT_REPROJECTION_THRESHOLD_PX,
+    error_threshold_px: float | None = DEFAULT_REPROJECTION_THRESHOLD_PX,
     min_cameras_for_triangulation: int = DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     coherence_method: str = DEFAULT_COHERENCE_METHOD,
     epipolar_threshold_px: float = DEFAULT_EPIPOLAR_THRESHOLD_PX,
@@ -2625,30 +2749,18 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
     head_length = median_distance(pts[:, KP_INDEX["nose"], :], shoulder_center)
     shoulder_width = median_distance(l_shoulder, r_shoulder)
     hip_width = median_distance(l_hip, r_hip)
-    upper_arm_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_shoulder"], :], pts[:, KP_INDEX["left_elbow"], :]),
-            median_distance(pts[:, KP_INDEX["right_shoulder"], :], pts[:, KP_INDEX["right_elbow"], :]),
-        ]
-    )
-    forearm_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_elbow"], :], pts[:, KP_INDEX["left_wrist"], :]),
-            median_distance(pts[:, KP_INDEX["right_elbow"], :], pts[:, KP_INDEX["right_wrist"], :]),
-        ]
-    )
-    thigh_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_hip"], :], pts[:, KP_INDEX["left_knee"], :]),
-            median_distance(pts[:, KP_INDEX["right_hip"], :], pts[:, KP_INDEX["right_knee"], :]),
-        ]
-    )
-    shank_length = np.nanmedian(
-        [
-            median_distance(pts[:, KP_INDEX["left_knee"], :], pts[:, KP_INDEX["left_ankle"], :]),
-            median_distance(pts[:, KP_INDEX["right_knee"], :], pts[:, KP_INDEX["right_ankle"], :]),
-        ]
-    )
+    left_upper_arm_length = median_distance(pts[:, KP_INDEX["left_shoulder"], :], pts[:, KP_INDEX["left_elbow"], :])
+    right_upper_arm_length = median_distance(pts[:, KP_INDEX["right_shoulder"], :], pts[:, KP_INDEX["right_elbow"], :])
+    upper_arm_length = np.nanmedian([left_upper_arm_length, right_upper_arm_length])
+    left_forearm_length = median_distance(pts[:, KP_INDEX["left_elbow"], :], pts[:, KP_INDEX["left_wrist"], :])
+    right_forearm_length = median_distance(pts[:, KP_INDEX["right_elbow"], :], pts[:, KP_INDEX["right_wrist"], :])
+    forearm_length = np.nanmedian([left_forearm_length, right_forearm_length])
+    left_thigh_length = median_distance(pts[:, KP_INDEX["left_hip"], :], pts[:, KP_INDEX["left_knee"], :])
+    right_thigh_length = median_distance(pts[:, KP_INDEX["right_hip"], :], pts[:, KP_INDEX["right_knee"], :])
+    thigh_length = np.nanmedian([left_thigh_length, right_thigh_length])
+    left_shank_length = median_distance(pts[:, KP_INDEX["left_knee"], :], pts[:, KP_INDEX["left_ankle"], :])
+    right_shank_length = median_distance(pts[:, KP_INDEX["right_knee"], :], pts[:, KP_INDEX["right_ankle"], :])
+    shank_length = np.nanmedian([left_shank_length, right_shank_length])
 
     left_eye = pts[:, KP_INDEX["left_eye"], :]
     right_eye = pts[:, KP_INDEX["right_eye"], :]
@@ -2671,6 +2783,14 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
         "eye_offset_x": 0.05,
         "eye_offset_y": 0.03,
         "ear_offset_y": 0.07,
+        "left_upper_arm_length": 0.29,
+        "right_upper_arm_length": 0.29,
+        "left_forearm_length": 0.27,
+        "right_forearm_length": 0.27,
+        "left_thigh_length": 0.42,
+        "right_thigh_length": 0.42,
+        "left_shank_length": 0.43,
+        "right_shank_length": 0.43,
     }
     values = {
         "trunk_height": trunk_height,
@@ -2684,6 +2804,14 @@ def estimate_segment_lengths(reconstruction: ReconstructionResult, fps: float, w
         "eye_offset_x": eye_offset_x,
         "eye_offset_y": eye_offset_y,
         "ear_offset_y": ear_offset_y,
+        "left_upper_arm_length": left_upper_arm_length,
+        "right_upper_arm_length": right_upper_arm_length,
+        "left_forearm_length": left_forearm_length,
+        "right_forearm_length": right_forearm_length,
+        "left_thigh_length": left_thigh_length,
+        "right_thigh_length": right_thigh_length,
+        "left_shank_length": left_shank_length,
+        "right_shank_length": right_shank_length,
     }
 
     for key, default_value in fallback.items():
@@ -2788,6 +2916,24 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
     }
 
 
+def segment_length_for_side(
+    lengths: SegmentLengths,
+    *,
+    side: str,
+    base_name: str,
+    symmetrize_limbs: bool = True,
+) -> float:
+    """Return one limb length for the requested side."""
+
+    shared_value = float(getattr(lengths, base_name))
+    if symmetrize_limbs:
+        return shared_value
+    side_value = getattr(lengths, f"{side}_{base_name}", None)
+    if side_value is None or not np.isfinite(side_value) or float(side_value) <= 0.0:
+        return shared_value
+    return float(side_value)
+
+
 def build_biomod(
     lengths: SegmentLengths,
     output_path: Path,
@@ -2795,6 +2941,7 @@ def build_biomod(
     reconstruction: ReconstructionResult | None = None,
     apply_initial_root_rotation_correction: bool = True,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = True,
 ) -> Path:
     """Construit un modele `.bioMod` minimal compatible avec les keypoints COCO17.
 
@@ -2858,19 +3005,58 @@ def build_biomod(
     upper_back_height = 0.0
     trunk_inertia = inertia["TRUNK"]
     upper_back_inertia = None
-    if model_variant in {"back_flexion_1d", "back_3dof"}:
+    lower_back_inertia = None
+    uses_back_dofs = model_variant_has_back_dofs(model_variant)
+    uses_upper_root = model_variant_uses_upper_trunk_root(model_variant)
+    if uses_back_dofs:
         lower_back_height = 0.5 * lengths.trunk_height
         upper_back_height = lengths.trunk_height - lower_back_height
-        trunk_inertia = scaled_inertia(
-            inertia["TRUNK"],
-            mass_scale=0.55,
-            local_com=(0.0, 0.0, 0.5 * lower_back_height),
-        )
-        upper_back_inertia = scaled_inertia(
-            inertia["TRUNK"],
-            mass_scale=0.45,
-            local_com=(0.0, 0.0, 0.5 * upper_back_height),
-        )
+        if uses_upper_root:
+            trunk_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.45,
+                local_com=(0.0, 0.0, -0.5 * upper_back_height),
+            )
+            lower_back_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.55,
+                local_com=(0.0, 0.0, -0.5 * lower_back_height),
+            )
+        else:
+            trunk_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.55,
+                local_com=(0.0, 0.0, 0.5 * lower_back_height),
+            )
+            upper_back_inertia = scaled_inertia(
+                inertia["TRUNK"],
+                mass_scale=0.45,
+                local_com=(0.0, 0.0, 0.5 * upper_back_height),
+            )
+
+    if uses_upper_root:
+        trunk_mesh_points = [
+            (0.0, -lengths.shoulder_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, lengths.shoulder_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, -upper_back_height),
+        ]
+    else:
+        trunk_mesh_points = [
+            (0.0, -lengths.hip_half_width, 0.0),
+            (0.0, lengths.hip_half_width, 0.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, lower_back_height),
+        ]
+        if uses_back_dofs:
+            trunk_mesh_points = [
+                (0.0, -lengths.hip_half_width, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, lengths.hip_half_width, 0.0),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, lower_back_height),
+            ]
 
     model.add_segment(
         SegmentReal(
@@ -2879,56 +3065,110 @@ def build_biomod(
             rotations=Rotations.YXZ,
             inertia_parameters=trunk_inertia,
             mesh=mesh_with_axes(
-                [
-                    (0.0, -lengths.hip_half_width, 0.0),
-                    (0.0, lengths.hip_half_width, 0.0),
-                    (0.0, 0.0, 0.0),
-                    (0.0, 0.0, lower_back_height),
-                ],
-                axis_scale=0.25 * max(lower_back_height, 1e-3),
+                trunk_mesh_points,
+                axis_scale=0.25 * max(lengths.trunk_height, 1e-3),
             ),
         )
     )
     trunk = model.segments["TRUNK"]
-    trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
-    trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
 
     shoulder_parent_name = "TRUNK"
-    shoulder_parent_local_z = lower_back_height
-    if model_variant in {"back_flexion_1d", "back_3dof"}:
+    shoulder_parent_local_z = 0.0 if uses_upper_root else lower_back_height
+    leg_parent_name = "TRUNK"
+    leg_parent_local_z = 0.0
+
+    if uses_upper_root:
+        trunk.add_marker(
+            MarkerReal(name="left_shoulder", parent_name="TRUNK", position=[0, lengths.shoulder_half_width, 0])
+        )
+        trunk.add_marker(
+            MarkerReal(name="right_shoulder", parent_name="TRUNK", position=[0, -lengths.shoulder_half_width, 0])
+        )
+        lower_trunk_mesh_points = [
+            (0.0, 0.0, 0.0),
+            (0.0, -lengths.hip_half_width, -lower_back_height),
+            (0.0, 0.0, -lower_back_height),
+            (0.0, lengths.hip_half_width, -lower_back_height),
+        ]
         model.add_segment(
             SegmentReal(
-                name="UPPER_BACK",
+                name="LOWER_TRUNK",
                 parent_name="TRUNK",
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0.0, 0.0, -upper_back_height]), is_scs_local=True
                 ),
-                rotations=(Rotations.X if model_variant == "back_flexion_1d" else Rotations.YXZ),
-                inertia_parameters=upper_back_inertia,
+                rotations=(Rotations.Y if model_variant == "upper_root_back_flexion_1d" else Rotations.YXZ),
+                inertia_parameters=lower_back_inertia,
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, upper_back_height)],
-                    axis_scale=0.2 * max(upper_back_height, 1e-3),
+                    lower_trunk_mesh_points,
+                    axis_scale=0.2 * max(lower_back_height, 1e-3),
                 ),
             )
         )
-        shoulder_parent_name = "UPPER_BACK"
-        shoulder_parent_local_z = upper_back_height
+        lower_trunk = model.segments["LOWER_TRUNK"]
+        lower_trunk.add_marker(MarkerReal(name="mid_back", parent_name="LOWER_TRUNK", position=[0, 0, 0]))
+        lower_trunk.add_marker(
+            MarkerReal(
+                name="left_hip", parent_name="LOWER_TRUNK", position=[0, lengths.hip_half_width, -lower_back_height]
+            )
+        )
+        lower_trunk.add_marker(
+            MarkerReal(
+                name="right_hip",
+                parent_name="LOWER_TRUNK",
+                position=[0, -lengths.hip_half_width, -lower_back_height],
+            )
+        )
+        leg_parent_name = "LOWER_TRUNK"
+        leg_parent_local_z = -lower_back_height
+    else:
+        trunk.add_marker(MarkerReal(name="left_hip", parent_name="TRUNK", position=[0, lengths.hip_half_width, 0]))
+        trunk.add_marker(MarkerReal(name="right_hip", parent_name="TRUNK", position=[0, -lengths.hip_half_width, 0]))
+        if uses_back_dofs:
+            upper_back_mesh_points = [
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, upper_back_height),
+                (0.0, lengths.shoulder_half_width, upper_back_height),
+                (0.0, 0.0, upper_back_height),
+                (0.0, -lengths.shoulder_half_width, upper_back_height),
+            ]
+            model.add_segment(
+                SegmentReal(
+                    name="UPPER_BACK",
+                    parent_name="TRUNK",
+                    segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
+                        np.zeros(3), "xyz", np.array([0.0, 0.0, lower_back_height]), is_scs_local=True
+                    ),
+                    rotations=(Rotations.Y if model_variant == "back_flexion_1d" else Rotations.YXZ),
+                    inertia_parameters=upper_back_inertia,
+                    mesh=mesh_with_axes(
+                        upper_back_mesh_points,
+                        axis_scale=0.2 * max(upper_back_height, 1e-3),
+                    ),
+                )
+            )
+            shoulder_parent_name = "UPPER_BACK"
+            shoulder_parent_local_z = upper_back_height
+            model.segments["UPPER_BACK"].add_marker(
+                MarkerReal(name="mid_back", parent_name="UPPER_BACK", position=[0, 0, 0])
+            )
 
     shoulder_parent = model.segments[shoulder_parent_name]
-    shoulder_parent.add_marker(
-        MarkerReal(
-            name="left_shoulder",
-            parent_name=shoulder_parent_name,
-            position=[0, lengths.shoulder_half_width, shoulder_parent_local_z],
+    if not uses_upper_root:
+        shoulder_parent.add_marker(
+            MarkerReal(
+                name="left_shoulder",
+                parent_name=shoulder_parent_name,
+                position=[0, lengths.shoulder_half_width, shoulder_parent_local_z],
+            )
         )
-    )
-    shoulder_parent.add_marker(
-        MarkerReal(
-            name="right_shoulder",
-            parent_name=shoulder_parent_name,
-            position=[0, -lengths.shoulder_half_width, shoulder_parent_local_z],
+        shoulder_parent.add_marker(
+            MarkerReal(
+                name="right_shoulder",
+                parent_name=shoulder_parent_name,
+                position=[0, -lengths.shoulder_half_width, shoulder_parent_local_z],
+            )
         )
-    )
 
     model.add_segment(
         SegmentReal(
@@ -2969,8 +3209,20 @@ def build_biomod(
     )
 
     for side, sign in (("left", 1.0), ("right", -1.0)):
+        upper_arm_length = segment_length_for_side(
+            lengths, side=side, base_name="upper_arm_length", symmetrize_limbs=symmetrize_limbs
+        )
+        forearm_length = segment_length_for_side(
+            lengths, side=side, base_name="forearm_length", symmetrize_limbs=symmetrize_limbs
+        )
+        thigh_length = segment_length_for_side(
+            lengths, side=side, base_name="thigh_length", symmetrize_limbs=symmetrize_limbs
+        )
+        shank_length = segment_length_for_side(
+            lengths, side=side, base_name="shank_length", symmetrize_limbs=symmetrize_limbs
+        )
         shoulder_offset = (0, sign * lengths.shoulder_half_width, shoulder_parent_local_z)
-        hip_offset = (0, sign * lengths.hip_half_width, 0)
+        hip_offset = (0, sign * lengths.hip_half_width, leg_parent_local_z)
 
         upper_name = f"{side.upper()}_UPPER_ARM"
         forearm_name = f"{side.upper()}_FOREARM"
@@ -2987,14 +3239,14 @@ def build_biomod(
                 rotations=Rotations.YX,
                 inertia_parameters=inertia["UPPER_ARM"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.upper_arm_length)],
-                    axis_scale=0.3 * lengths.upper_arm_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -upper_arm_length)],
+                    axis_scale=0.3 * upper_arm_length,
                 ),
             )
         )
         upper_arm = model.segments[upper_name]
         upper_arm.add_marker(
-            MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -lengths.upper_arm_length])
+            MarkerReal(name=f"{side}_elbow", parent_name=upper_name, position=[0, 0, -upper_arm_length])
         )
 
         model.add_segment(
@@ -3002,60 +3254,54 @@ def build_biomod(
                 name=forearm_name,
                 parent_name=upper_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0, 0, -lengths.upper_arm_length]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0, 0, -upper_arm_length]), is_scs_local=True
                 ),
                 rotations=Rotations.ZY,
                 inertia_parameters=inertia["FOREARM"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.forearm_length)],
-                    axis_scale=0.3 * lengths.forearm_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -forearm_length)],
+                    axis_scale=0.3 * forearm_length,
                 ),
             )
         )
         forearm = model.segments[forearm_name]
-        forearm.add_marker(
-            MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -lengths.forearm_length])
-        )
+        forearm.add_marker(MarkerReal(name=f"{side}_wrist", parent_name=forearm_name, position=[0, 0, -forearm_length]))
 
         model.add_segment(
             SegmentReal(
                 name=thigh_name,
-                parent_name="TRUNK",
+                parent_name=leg_parent_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
                     np.zeros(3), "xyz", np.asarray(hip_offset, dtype=float), is_scs_local=True
                 ),
                 rotations=Rotations.YXZ,
                 inertia_parameters=inertia["THIGH"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.thigh_length)],
-                    axis_scale=0.25 * lengths.thigh_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -thigh_length)],
+                    axis_scale=0.25 * thigh_length,
                 ),
             )
         )
         thigh = model.segments[thigh_name]
-        thigh.add_marker(
-            MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -lengths.thigh_length])
-        )
+        thigh.add_marker(MarkerReal(name=f"{side}_knee", parent_name=thigh_name, position=[0, 0, -thigh_length]))
 
         model.add_segment(
             SegmentReal(
                 name=shank_name,
                 parent_name=thigh_name,
                 segment_coordinate_system=SegmentCoordinateSystemReal.from_euler_and_translation(
-                    np.zeros(3), "xyz", np.array([0, 0, -lengths.thigh_length]), is_scs_local=True
+                    np.zeros(3), "xyz", np.array([0, 0, -thigh_length]), is_scs_local=True
                 ),
                 rotations=Rotations.Y,
                 inertia_parameters=inertia["SHANK"],
                 mesh=mesh_with_axes(
-                    [(0.0, 0.0, 0.0), (0.0, 0.0, -lengths.shank_length)],
-                    axis_scale=0.25 * lengths.shank_length,
+                    [(0.0, 0.0, 0.0), (0.0, 0.0, -shank_length)],
+                    axis_scale=0.25 * shank_length,
                 ),
             )
         )
         shank = model.segments[shank_name]
-        shank.add_marker(
-            MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -lengths.shank_length])
-        )
+        shank.add_marker(MarkerReal(name=f"{side}_ankle", parent_name=shank_name, position=[0, 0, -shank_length]))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.to_biomod(str(output_path), with_mesh=True)
@@ -3169,7 +3415,11 @@ def unwrap_with_gaps(values: np.ndarray) -> np.ndarray:
     return unwrapped[:, 0] if squeeze else unwrapped
 
 
-def unwrap_root_rotations(q: np.ndarray, q_names: np.ndarray | list[str]) -> np.ndarray:
+def unwrap_root_rotations(
+    q: np.ndarray,
+    q_names: np.ndarray | list[str],
+    mode: str | None = "single",
+) -> np.ndarray:
     """Applique un unwrap temporel aux trois rotations de la racine.
 
     Le but est d'eviter des sauts artificiels de type `+-2pi` sur les trois
@@ -3178,10 +3428,22 @@ def unwrap_root_rotations(q: np.ndarray, q_names: np.ndarray | list[str]) -> np.
     q_unwrapped = np.array(q, copy=True)
     name_to_index = {str(name): i for i, name in enumerate(q_names)}
     root_rotation_names = ["TRUNK:RotX", "TRUNK:RotY", "TRUNK:RotZ"]
-    for dof_name in root_rotation_names:
-        if dof_name in name_to_index:
-            q_unwrapped[:, name_to_index[dof_name]] = unwrap_with_gaps(q_unwrapped[:, name_to_index[dof_name]])
+    root_rotation_indices = [name_to_index[dof_name] for dof_name in root_rotation_names if dof_name in name_to_index]
+    if root_rotation_indices:
+        q_unwrapped[:, root_rotation_indices] = stabilize_root_rotations(
+            q_unwrapped[:, root_rotation_indices],
+            mode,
+        )
     return q_unwrapped
+
+
+def canonicalize_state_q_rotation_branches(model, state: np.ndarray) -> np.ndarray:
+    """Canonicalize only the generalized coordinates portion of one EKF state."""
+
+    state_array = np.asarray(state, dtype=float).reshape(-1)
+    canonical_state = np.array(state_array, copy=True)
+    canonical_state[: model.nbQ()] = canonicalize_model_q_rotation_branches(model, canonical_state[: model.nbQ()])
+    return canonical_state
 
 
 def debug_state_summary(state: np.ndarray, q_names: np.ndarray | list[str], nq: int, prefix: str) -> str:
@@ -3285,6 +3547,7 @@ class MultiViewKinematicEKF:
         root_flight_dynamics: bool = False,
         flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
         flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
+        predictor_mode: str = "acc",
         flip_method: str | None = None,
         flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
         flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
@@ -3293,6 +3556,8 @@ class MultiViewKinematicEKF:
         flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
         upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
         upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+        ankle_bed_pseudo_obs: bool = False,
+        ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     ):
         self.model = model
         self.calibrations = calibrations
@@ -3307,6 +3572,7 @@ class MultiViewKinematicEKF:
         self.epipolar_threshold_px = float(epipolar_threshold_px)
         self.enable_dof_locking = enable_dof_locking
         self.root_flight_dynamics = root_flight_dynamics
+        self.predictor_mode = str(predictor_mode or "acc")
         self.flight_height_threshold_m = flight_height_threshold_m
         self.flight_min_consecutive_frames = max(1, int(flight_min_consecutive_frames))
         self.flip_method = None if flip_method is None else str(flip_method)
@@ -3317,13 +3583,18 @@ class MultiViewKinematicEKF:
         self.flip_error_delta_threshold_px = float(flip_error_delta_threshold_px)
         self.upper_back_sagittal_gain = float(upper_back_sagittal_gain)
         self.upper_back_pseudo_std_rad = float(upper_back_pseudo_std_rad)
+        self.ankle_bed_pseudo_obs = bool(ankle_bed_pseudo_obs)
+        self.ankle_bed_pseudo_std_m = float(ankle_bed_pseudo_std_m)
         self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
         self.nq = model.nbQ()
         self.nx = 3 * self.nq
         self.n_root = int(model.nbRoot()) if hasattr(model, "nbRoot") else 0
         self.root_indices = np.arange(self.n_root, dtype=int)
         self.joint_indices = np.arange(self.n_root, self.nq, dtype=int)
+        self.q_eye = np.eye(self.nq)
+        self.q_zero = np.zeros((self.nq, self.nq))
         self.identity_x = np.eye(self.nx)
+        self._transition_matrix = self._build_transition_matrix()
         self.marker_names = marker_name_list(model)
         self.marker_pairs = [
             (marker_idx, KP_INDEX[marker_name])
@@ -3331,6 +3602,9 @@ class MultiViewKinematicEKF:
             if marker_name in KP_INDEX
         ]
         self.marker_pair_keypoint_indices = np.asarray([kp_idx for _, kp_idx in self.marker_pairs], dtype=int)
+        self.marker_pair_index_by_keypoint = {
+            kp_idx: pair_idx for pair_idx, (_marker_idx, kp_idx) in enumerate(self.marker_pairs)
+        }
         self.camera_order = pose_data.camera_names
         self.camera_calibrations = [self.calibrations[cam_name] for cam_name in self.camera_order]
         self.coherence_method = canonical_coherence_method(reconstruction.coherence_method)
@@ -3350,7 +3624,17 @@ class MultiViewKinematicEKF:
         )
         self.q_names = self._make_q_names()
         self.lock_map = {name: i for i, name in enumerate(self.q_names)}
-        self.upper_back_rotx_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
+        self.upper_back_segment_name = back_pseudo_segment_name_for_q_names(self.q_names)
+        self.upper_back_sagittal_idx, self.hip_flexion_indices = self._resolve_upper_back_pseudo_observation_indices()
+        self.ankle_bed_pair_indices = self._resolve_ankle_bed_pair_indices()
+        self.upper_back_zero_prior_indices = tuple(
+            idx
+            for idx in (
+                self.lock_map.get(f"{self.upper_back_segment_name}:RotX") if self.upper_back_segment_name else None,
+                self.lock_map.get(f"{self.upper_back_segment_name}:RotZ") if self.upper_back_segment_name else None,
+            )
+            if idx is not None
+        )
         self.locked_q_indices: set[int] = set()
         base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
         self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
@@ -3377,6 +3661,8 @@ class MultiViewKinematicEKF:
             "flip_gate_s": 0.0,
         }
         self.previous_prediction_gate_nominal_rms_px = np.full(len(self.camera_calibrations), np.nan, dtype=float)
+        self.corrected_q_history: list[np.ndarray] = []
+        self.corrected_state_history: list[np.ndarray] = []
         self.effective_confidences, self.measurement_variances = self._precompute_measurement_variances()
 
     def _make_q_names(self) -> list[str]:
@@ -3430,7 +3716,9 @@ class MultiViewKinematicEKF:
         return frame_coherence, effective_confidences, measurement_variances
 
     def _resolve_upper_back_pseudo_observation_indices(self) -> tuple[int | None, tuple[int, ...]]:
-        upper_back_rotx_idx = self.lock_map.get("UPPER_BACK:RotX")
+        if not self.upper_back_segment_name:
+            return None, ()
+        upper_back_sagittal_idx = self.lock_map.get(f"{self.upper_back_segment_name}:RotY")
         hip_candidates = (
             "LEFT_THIGH:RotY",
             "RIGHT_THIGH:RotY",
@@ -3438,38 +3726,266 @@ class MultiViewKinematicEKF:
             "RIGHT_THIGH:RotX",
         )
         hip_indices = tuple(self.lock_map[name] for name in hip_candidates if name in self.lock_map)
-        if upper_back_rotx_idx is None or len(hip_indices) < 2:
+        if upper_back_sagittal_idx is None or len(hip_indices) < 2:
             return None, tuple()
-        return int(upper_back_rotx_idx), hip_indices
+        return int(upper_back_sagittal_idx), hip_indices
+
+    def _resolve_ankle_bed_pair_indices(self) -> tuple[tuple[int, int], ...]:
+        """Map ankle keypoints to the corresponding model-marker pair indices.
+
+        Returns:
+            Tuples ``(pair_index, keypoint_index)`` for each ankle marker that
+            exists both in the model markers and in the COCO keypoint set.
+        """
+
+        resolved: list[tuple[int, int]] = []
+        for keypoint_name in ("left_ankle", "right_ankle"):
+            keypoint_idx = KP_INDEX[keypoint_name]
+            pair_idx = self.marker_pair_index_by_keypoint.get(keypoint_idx)
+            if pair_idx is not None:
+                resolved.append((int(pair_idx), int(keypoint_idx)))
+        return tuple(resolved)
 
     def _upper_back_pseudo_measurement_block(
         self,
         reference_q: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-        if self.upper_back_rotx_idx is None or len(self.hip_flexion_indices) < 2:
+        if self.upper_back_sagittal_idx is None or len(self.hip_flexion_indices) < 2:
             return None
         hip_flexion = np.asarray(reference_q[list(self.hip_flexion_indices)], dtype=float)
         if not np.all(np.isfinite(hip_flexion)):
             return None
         target_value = self.upper_back_sagittal_gain * float(np.mean(hip_flexion))
         H_q = np.zeros((1, self.nq), dtype=float)
-        H_q[0, self.upper_back_rotx_idx] = 1.0
-        h = np.array([float(reference_q[self.upper_back_rotx_idx])], dtype=float)
+        H_q[0, self.upper_back_sagittal_idx] = 1.0
+        h = np.array([float(reference_q[self.upper_back_sagittal_idx])], dtype=float)
         z = np.array([target_value], dtype=float)
         variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
         return z, h, H_q, variance
 
-    def transition_matrix(self) -> np.ndarray:
-        """Matrice d'etat du modele discret a acceleration constante."""
+    def _upper_back_zero_prior_blocks(
+        self,
+        reference_q: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for q_idx in self.upper_back_zero_prior_indices:
+            if q_idx is None:
+                continue
+            current_value = float(reference_q[int(q_idx)])
+            if not np.isfinite(current_value):
+                continue
+            h_q = np.zeros((1, self.nq), dtype=float)
+            h_q[0, int(q_idx)] = 1.0
+            blocks.append(
+                (
+                    np.array([0.0], dtype=float),
+                    np.array([current_value], dtype=float),
+                    h_q,
+                    np.array([self.upper_back_pseudo_std_rad**2], dtype=float),
+                )
+            )
+        return blocks
+
+    def _is_airborne_frame(self, frame_idx: int) -> bool:
+        """Return whether one frame belongs to the airborne phase.
+
+        Args:
+            frame_idx: Frame index in the reconstruction support.
+
+        Returns:
+            ``True`` when every finite 3D support point is above the configured
+            flight-height threshold, ``False`` otherwise.
+        """
+
+        if frame_idx < 0 or frame_idx >= self.reconstruction.points_3d.shape[0]:
+            return False
+        frame_points = np.asarray(self.reconstruction.points_3d[frame_idx], dtype=float)
+        frame_z = frame_points[:, 2]
+        valid = np.isfinite(frame_z)
+        if not np.any(valid):
+            return False
+        return bool(np.all(frame_z[valid] > self.flight_height_threshold_m))
+
+    def _ankle_bed_pseudo_measurement_blocks(
+        self,
+        frame_idx: int,
+        marker_points_array: np.ndarray,
+        marker_jacobians_array: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Build pseudo-measurement blocks that keep ankle X/Z on the bed.
+
+        Args:
+            frame_idx: Frame index being corrected.
+            marker_points_array: Current model-marker positions for the frame.
+            marker_jacobians_array: Marker Jacobians evaluated at the predicted
+                state.
+
+        Returns:
+            A list of EKF measurement blocks constrained on ankle ``X`` and
+            ``Z`` coordinates during non-airborne phases.
+        """
+
+        if not self.ankle_bed_pseudo_obs or not self.ankle_bed_pair_indices or self._is_airborne_frame(frame_idx):
+            return []
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for pair_idx, keypoint_idx in self.ankle_bed_pair_indices:
+            target_point = np.asarray(self.reconstruction.points_3d[frame_idx, keypoint_idx], dtype=float)
+            current_point = np.asarray(marker_points_array[pair_idx], dtype=float)
+            current_jacobian = np.asarray(marker_jacobians_array[pair_idx], dtype=float)
+            if not (np.all(np.isfinite(target_point[[0, 2]])) and np.all(np.isfinite(current_point[[0, 2]]))):
+                continue
+            if not np.all(np.isfinite(current_jacobian[[0, 2], :])):
+                continue
+            blocks.append(
+                (
+                    target_point[[0, 2]].astype(float, copy=False),
+                    current_point[[0, 2]].astype(float, copy=False),
+                    current_jacobian[[0, 2], :].astype(float, copy=False),
+                    np.full(2, self.ankle_bed_pseudo_std_m**2, dtype=float),
+                )
+            )
+        return blocks
+
+    def _build_transition_matrix(self) -> np.ndarray:
+        """Build and cache the constant-acceleration state transition matrix."""
+
         dt = self.dt
-        eye = np.eye(self.nq)
         return np.block(
             [
-                [eye, dt * eye, 0.5 * dt * dt * eye],
-                [np.zeros_like(eye), eye, dt * eye],
-                [np.zeros_like(eye), np.zeros_like(eye), eye],
+                [self.q_eye, dt * self.q_eye, 0.5 * dt * dt * self.q_eye],
+                [self.q_zero, self.q_eye, dt * self.q_eye],
+                [self.q_zero, self.q_zero, self.q_eye],
             ]
         )
+
+    def transition_matrix(self) -> np.ndarray:
+        """Return the cached constant-acceleration state transition matrix."""
+
+        return self._transition_matrix
+
+    def _use_history3_prediction(self) -> bool:
+        return self.predictor_mode in {"history3", "dyn_history3"}
+
+    def _history3_q_indices(self) -> np.ndarray:
+        """Return the DoF indices controlled by the history-based predictor."""
+
+        if self.predictor_mode == "history3":
+            return np.arange(self.nq, dtype=int)
+        if self.predictor_mode == "dyn_history3":
+            return np.asarray(self.joint_indices, dtype=int)
+        return np.empty(0, dtype=int)
+
+    def _history3_state_components(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Return the state components needed by the history-based predictor.
+
+        Returns:
+            ``(q_t, qdot_t, qddot_t, qddot_tm1, qddot_tm2)`` from the three
+            most recent corrected EKF states, or ``None`` when the history is
+            incomplete.
+        """
+
+        if len(self.corrected_state_history) < 3:
+            return None
+        state_tm2 = np.asarray(self.corrected_state_history[-3], dtype=float)
+        state_tm1 = np.asarray(self.corrected_state_history[-2], dtype=float)
+        state_t = np.asarray(self.corrected_state_history[-1], dtype=float)
+        return (
+            np.asarray(state_t[: self.nq], dtype=float),
+            np.asarray(state_t[self.nq : 2 * self.nq], dtype=float),
+            np.asarray(state_t[2 * self.nq : 3 * self.nq], dtype=float),
+            np.asarray(state_tm1[2 * self.nq : 3 * self.nq], dtype=float),
+            np.asarray(state_tm2[2 * self.nq : 3 * self.nq], dtype=float),
+        )
+
+    @staticmethod
+    def _limited_acceleration_extrapolation(
+        accel_t: np.ndarray,
+        accel_tm1: np.ndarray,
+        accel_tm2: np.ndarray,
+        dt: float,
+        *,
+        anchor_accel: np.ndarray,
+    ) -> np.ndarray:
+        """Predict the next acceleration with a damped jerk extrapolation.
+
+        The raw jerk estimate is computed from ``a(t)``, ``a(t-1)``, and
+        ``a(t-2)``. Its effect is then limited by the recent acceleration
+        increments and blended with the base predictor acceleration so the
+        result stays smooth and numerically stable.
+        """
+
+        jerk_t = (3.0 * accel_t - 4.0 * accel_tm1 + accel_tm2) / (2.0 * dt)
+        raw_next = accel_t + dt * jerk_t
+        delta_recent = accel_t - accel_tm1
+        delta_previous = accel_tm1 - accel_tm2
+        delta_limit = np.maximum(np.abs(delta_recent), np.abs(delta_previous))
+        delta_limit = np.maximum(delta_limit, 1e-9)
+        limited_delta = np.clip(raw_next - accel_t, -delta_limit, delta_limit)
+        history_next = accel_t + limited_delta
+        return 0.5 * np.asarray(anchor_accel, dtype=float) + 0.5 * history_next
+
+    def _apply_history3_prediction(self, predicted_state: np.ndarray) -> np.ndarray:
+        """Apply a smooth higher-order prediction from recent corrected states.
+
+        Args:
+            predicted_state: State already predicted by the base ACC/DYN model.
+
+        Returns:
+            Updated state where the selected DoFs are re-predicted from the
+            latest corrected ``q(t)``, ``qdot(t)``, ``qddot(t)``,
+            ``qddot(t-1)``, and ``qddot(t-2)`` values.
+        """
+
+        q_indices = self._history3_q_indices()
+        state_components = self._history3_state_components()
+        if state_components is None or q_indices.size == 0:
+            return predicted_state
+        q_t, qdot_t, qddot_t, qddot_tm1, qddot_tm2 = state_components
+        required = np.concatenate(
+            (
+                q_t[q_indices],
+                qdot_t[q_indices],
+                qddot_t[q_indices],
+                qddot_tm1[q_indices],
+                qddot_tm2[q_indices],
+            )
+        )
+        if not np.all(np.isfinite(required)):
+            return predicted_state
+        dt = float(self.dt)
+        anchor_accel = np.asarray(predicted_state[2 * self.nq + q_indices], dtype=float)
+        qddot_next = self._limited_acceleration_extrapolation(
+            qddot_t[q_indices],
+            qddot_tm1[q_indices],
+            qddot_tm2[q_indices],
+            dt,
+            anchor_accel=anchor_accel,
+        )
+        qdot_next = qdot_t[q_indices] + 0.5 * dt * (qddot_t[q_indices] + qddot_next)
+        q_next = q_t[q_indices] + dt * qdot_t[q_indices] + (dt * dt / 6.0) * (2.0 * qddot_t[q_indices] + qddot_next)
+        updated = np.array(predicted_state, copy=True)
+        updated[q_indices] = q_next
+        updated[self.nq + q_indices] = qdot_next
+        updated[2 * self.nq + q_indices] = qddot_next
+        return updated
+
+    def record_corrected_state(self, state: np.ndarray) -> None:
+        """Store one corrected state so the next history-based prediction can use it.
+
+        Args:
+            state: Corrected EKF state ``[q, qdot, qddot]`` for the current
+                frame.
+        """
+
+        state_array = np.asarray(state, dtype=float).copy()
+        self.corrected_q_history.append(np.asarray(state_array[: self.nq], dtype=float))
+        self.corrected_state_history.append(state_array)
+        if len(self.corrected_q_history) > 3:
+            self.corrected_q_history = self.corrected_q_history[-3:]
+        if len(self.corrected_state_history) > 3:
+            self.corrected_state_history = self.corrected_state_history[-3:]
 
     def _is_airborne_from_previous_frame(self, frame_idx: int) -> bool:
         """Retourne vrai si le critere de vol est satisfait sur assez de frames precedentes."""
@@ -3574,6 +4090,8 @@ class MultiViewKinematicEKF:
                 + self.dt * qdot_prev[self.root_indices]
                 + 0.5 * self.dt * self.dt * qddot_root
             )
+        if self._use_history3_prediction():
+            predicted_state = self._apply_history3_prediction(predicted_state)
         self._update_locked_dofs(predicted_state)
         self._apply_lock_constraints(predicted_state, predicted_covariance)
         self.profiling["predict_s"] += time.perf_counter() - t_predict
@@ -3726,6 +4244,8 @@ class MultiViewKinematicEKF:
                     self.update_status["flip_prediction_gate_swapped"] += 1
                 else:
                     self.update_status["flip_prediction_gate_raw"] += 1
+                if bool(gate_diagnostics.get("used_swapped")):
+                    selected_variances = np.asarray(selected_variances, dtype=float) * 4.0
             else:
                 selected_mask = np.all(np.isfinite(frame_keypoints[keypoint_indices]), axis=1) & np.isfinite(
                     frame_variances[keypoint_indices]
@@ -3745,23 +4265,47 @@ class MultiViewKinematicEKF:
             )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
+        pseudo_block = self._upper_back_pseudo_measurement_block(q)
+        zero_prior_blocks = self._upper_back_zero_prior_blocks(q)
+        ankle_bed_blocks = self._ankle_bed_pseudo_measurement_blocks(
+            frame_idx=frame_idx,
+            marker_points_array=marker_points_array,
+            marker_jacobians_array=marker_jacobians_array,
+        )
+        has_pseudo_priors = pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks)
+        if pseudo_block is not None:
+            measurement_blocks.append(pseudo_block)
+        measurement_blocks.extend(zero_prior_blocks)
+        measurement_blocks.extend(ankle_bed_blocks)
+
         if not measurement_blocks:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
-        pseudo_block = self._upper_back_pseudo_measurement_block(q)
-        if pseudo_block is not None:
-            measurement_blocks.append(pseudo_block)
-
         t_solve = time.perf_counter()
-        update_result = apply_measurement_update_sequential(
-            predicted_state=predicted_state,
-            predicted_covariance=predicted_covariance,
-            measurement_blocks=measurement_blocks,
-            nq=self.nq,
-            identity_x=self.identity_x,
-        )
+        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_pseudo_priors else None
+        update_result = None
+        if stacked_measurements is not None:
+            z_batch, h_batch, hq_batch, r_batch = stacked_measurements
+            update_result = apply_measurement_update_batch(
+                predicted_state=predicted_state,
+                predicted_covariance=predicted_covariance,
+                z=z_batch,
+                h=h_batch,
+                H_q=hq_batch,
+                R_diag_array=r_batch,
+                nq=self.nq,
+                identity_x=self.identity_x,
+            )
+        if update_result is None:
+            update_result = apply_measurement_update_sequential(
+                predicted_state=predicted_state,
+                predicted_covariance=predicted_covariance,
+                measurement_blocks=measurement_blocks,
+                nq=self.nq,
+                identity_x=self.identity_x,
+            )
         if update_result is None:
             self.update_status["pred_only_no_measurement"] += 1
             self.profiling["solve_s"] += time.perf_counter() - t_solve
@@ -3786,7 +4330,8 @@ def initial_state_from_triangulation(model, reconstruction: ReconstructionResult
         q0 = np.asarray(biorbd.InverseKinematics(model, marker_positions).solve()).reshape(-1)
     except Exception:
         q0 = np.zeros(model.nbQ())
-    return np.concatenate((q0, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
+    state = np.concatenate((q0, np.zeros(model.nbQ()), np.zeros(model.nbQ())))
+    return canonicalize_state_q_rotation_branches(model, state)
 
 
 def q_names_from_model(model) -> list[str]:
@@ -3796,6 +4341,24 @@ def q_names_from_model(model) -> list[str]:
         for i_seg in range(model.nbSegment())
         for i_dof in range(model.segment(i_seg).nbDof())
     ]
+
+
+def root_translation_origin_for_q_names(q_names: list[str] | np.ndarray) -> str:
+    q_name_set = {str(name) for name in q_names}
+    return "upper_trunk" if any(name.startswith("LOWER_TRUNK:") for name in q_name_set) else "pelvis"
+
+
+def root_translation_origin_for_model(model) -> str:
+    return root_translation_origin_for_q_names(q_names_from_model(model))
+
+
+def back_pseudo_segment_name_for_q_names(q_names: list[str] | np.ndarray) -> str | None:
+    q_name_set = {str(name) for name in q_names}
+    if any(name.startswith("LOWER_TRUNK:") for name in q_name_set):
+        return "LOWER_TRUNK"
+    if any(name.startswith("UPPER_BACK:") for name in q_name_set):
+        return "UPPER_BACK"
+    return None
 
 
 def _segment_rotation_sequence_and_offsets(segment_dof_names: list[str]) -> tuple[str | None, np.ndarray]:
@@ -3867,21 +4430,29 @@ def canonicalize_model_q_rotation_branches(model, q_values: np.ndarray) -> np.nd
 
 def first_valid_root_translation_from_triangulation(
     reconstruction: ReconstructionResult,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> tuple[int | None, np.ndarray | None]:
-    """Estime `TransX/Y/Z` de la racine au milieu des hanches triangulees."""
-    left_idx = KP_INDEX["left_hip"]
-    right_idx = KP_INDEX["right_hip"]
+    """Estime `TransX/Y/Z` de la racine depuis le tronc triangulé."""
+    if str(root_translation_origin) == "upper_trunk":
+        left_idx = KP_INDEX["left_shoulder"]
+        right_idx = KP_INDEX["right_shoulder"]
+    else:
+        left_idx = KP_INDEX["left_hip"]
+        right_idx = KP_INDEX["right_hip"]
     for frame_idx in range(reconstruction.points_3d.shape[0]):
-        left_hip = reconstruction.points_3d[frame_idx, left_idx]
-        right_hip = reconstruction.points_3d[frame_idx, right_idx]
-        if np.all(np.isfinite(left_hip)) and np.all(np.isfinite(right_hip)):
-            return frame_idx, 0.5 * (left_hip + right_hip)
+        left_point = reconstruction.points_3d[frame_idx, left_idx]
+        right_point = reconstruction.points_3d[frame_idx, right_idx]
+        if np.all(np.isfinite(left_point)) and np.all(np.isfinite(right_point)):
+            return frame_idx, 0.5 * (left_point + right_point)
     return None, None
 
 
 def root_translation_from_triangulation_frame(
     reconstruction: ReconstructionResult,
     frame_idx: int,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> np.ndarray | None:
     """Estimate the root translation from one specific triangulated frame."""
 
@@ -3890,20 +4461,30 @@ def root_translation_from_triangulation_frame(
     frame_idx = int(frame_idx)
     if frame_idx < 0 or frame_idx >= reconstruction.points_3d.shape[0]:
         return None
-    left_idx = KP_INDEX["left_hip"]
-    right_idx = KP_INDEX["right_hip"]
-    left_hip = reconstruction.points_3d[frame_idx, left_idx]
-    right_hip = reconstruction.points_3d[frame_idx, right_idx]
-    if np.all(np.isfinite(left_hip)) and np.all(np.isfinite(right_hip)):
-        return 0.5 * (left_hip + right_hip)
+    if str(root_translation_origin) == "upper_trunk":
+        left_idx = KP_INDEX["left_shoulder"]
+        right_idx = KP_INDEX["right_shoulder"]
+    else:
+        left_idx = KP_INDEX["left_hip"]
+        right_idx = KP_INDEX["right_hip"]
+    left_point = reconstruction.points_3d[frame_idx, left_idx]
+    right_point = reconstruction.points_3d[frame_idx, right_idx]
+    if np.all(np.isfinite(left_point)) and np.all(np.isfinite(right_point)):
+        return 0.5 * (left_point + right_point)
     return None
 
 
 def first_valid_root_pose_from_triangulation(
     reconstruction: ReconstructionResult,
+    *,
+    root_translation_origin: str = "pelvis",
 ) -> tuple[int | None, np.ndarray | None]:
     """Estime les 6 DoF de la racine a partir du tronc triangule."""
-    root_q = compute_trunk_dofs_from_points(reconstruction.points_3d, unwrap_rotations=False)
+    root_q = compute_trunk_dofs_from_points(
+        reconstruction.points_3d,
+        unwrap_rotations=False,
+        translation_origin=root_translation_origin,
+    )
     for frame_idx in range(root_q.shape[0]):
         if np.all(np.isfinite(root_q[frame_idx])):
             return frame_idx, np.asarray(root_q[frame_idx], dtype=float)
@@ -3915,9 +4496,10 @@ def apply_root_translation_guess_to_state(model, state: np.ndarray, translation_
     if translation_xyz is None or not np.all(np.isfinite(translation_xyz)):
         return np.array(state, copy=True)
     q_names = q_names_from_model(model)
+    root_segment_name = "TRUNK"
     updated_state = np.array(state, copy=True)
     for axis_idx, axis_name in enumerate(("TransX", "TransY", "TransZ")):
-        target_name = f"TRUNK:{axis_name}"
+        target_name = f"{root_segment_name}:{axis_name}"
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(translation_xyz[axis_idx])
     return updated_state
@@ -3931,9 +4513,18 @@ def apply_root_pose_guess_to_state(model, state: np.ndarray, root_pose: np.ndarr
     if root_pose.size < 6 or not np.all(np.isfinite(root_pose[:6])):
         return np.array(state, copy=True)
     q_names = q_names_from_model(model)
+    root_segment_name = "TRUNK"
     updated_state = np.array(state, copy=True)
     for value, target_name in zip(
-        root_pose[:6], ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ", "TRUNK:RotY", "TRUNK:RotX", "TRUNK:RotZ")
+        root_pose[:6],
+        (
+            f"{root_segment_name}:TransX",
+            f"{root_segment_name}:TransY",
+            f"{root_segment_name}:TransZ",
+            f"{root_segment_name}:RotY",
+            f"{root_segment_name}:RotX",
+            f"{root_segment_name}:RotZ",
+        ),
     ):
         if target_name in q_names:
             updated_state[q_names.index(target_name)] = float(value)
@@ -3958,8 +4549,17 @@ def align_root_translation_guess_to_frame_zero(
 
     if source_frame_idx is None:
         return np.array(state, copy=True)
-    source_translation = root_translation_from_triangulation_frame(reconstruction, int(source_frame_idx))
-    target_translation = root_translation_from_triangulation_frame(reconstruction, 0)
+    root_translation_origin = root_translation_origin_for_model(model)
+    source_translation = root_translation_from_triangulation_frame(
+        reconstruction,
+        int(source_frame_idx),
+        root_translation_origin=root_translation_origin,
+    )
+    target_translation = root_translation_from_triangulation_frame(
+        reconstruction,
+        0,
+        root_translation_origin=root_translation_origin,
+    )
     if source_translation is None or target_translation is None:
         return np.array(state, copy=True)
     return apply_root_translation_guess_to_state(model, state, target_translation)
@@ -3975,6 +4575,7 @@ def compute_biorbd_kalman_initial_state(
         return None, {"method": "none", "used_init_state": False}
 
     state = initial_state_from_triangulation(model, reconstruction)
+    root_translation_origin = root_translation_origin_for_model(model)
     diagnostics: dict[str, object] = {
         "method": str(method),
         "used_init_state": True,
@@ -3991,9 +4592,12 @@ def compute_biorbd_kalman_initial_state(
             source_frame_idx=diagnostics["bootstrap_frame_idx"],
         )
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(aligned_state, state, equal_nan=True)
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "triangulation_ik_root_translation":
-        frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
+        frame_idx, root_translation = first_valid_root_translation_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
         updated_state = apply_root_translation_guess_to_state(model, state, root_translation)
@@ -4006,10 +4610,13 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "root_pose_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
-        frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+        frame_idx, root_pose = first_valid_root_pose_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_pose is not None)
@@ -4024,10 +4631,13 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     if method == "root_translation_zero_rest":
         zero_state = np.zeros(3 * model.nbQ())
-        frame_idx, root_translation = first_valid_root_translation_from_triangulation(reconstruction)
+        frame_idx, root_translation = first_valid_root_translation_from_triangulation(
+            reconstruction,
+            root_translation_origin=root_translation_origin,
+        )
         diagnostics["bootstrap_frame_idx"] = None if frame_idx is None else int(frame_idx)
         diagnostics["used_triangulation_ik"] = False
         diagnostics["used_root_translation_mid_hips"] = bool(root_translation is not None)
@@ -4041,7 +4651,7 @@ def compute_biorbd_kalman_initial_state(
         diagnostics["aligned_root_translation_to_frame_zero"] = not np.allclose(
             aligned_state, updated_state, equal_nan=True
         )
-        return aligned_state, diagnostics
+        return canonicalize_state_q_rotation_branches(model, aligned_state), diagnostics
     raise ValueError(f"Unsupported biorbd kalman init method: {method}")
 
 
@@ -4066,6 +4676,10 @@ def initial_state_from_ekf_bootstrap(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -4117,6 +4731,10 @@ def initial_state_from_ekf_bootstrap(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -4172,10 +4790,17 @@ def initial_state_from_root_pose_bootstrap(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
-    frame_idx, root_pose = first_valid_root_pose_from_triangulation(reconstruction)
+    frame_idx, root_pose = first_valid_root_pose_from_triangulation(
+        reconstruction,
+        root_translation_origin=root_translation_origin_for_model(model),
+    )
     diagnostics_seed = {
         "method": "root_pose_bootstrap",
         "root_pose_frame_idx": None if frame_idx is None else int(frame_idx),
@@ -4204,6 +4829,10 @@ def initial_state_from_root_pose_bootstrap(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -4227,6 +4856,10 @@ def initial_state_from_root_pose_bootstrap(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -4256,6 +4889,10 @@ def compute_ekf2d_initial_state(
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -4291,6 +4928,10 @@ def compute_ekf2d_initial_state(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -4312,6 +4953,10 @@ def compute_ekf2d_initial_state(
             flip_min_gain_px=flip_min_gain_px,
             flip_error_threshold_px=flip_error_threshold_px,
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+            upper_back_sagittal_gain=upper_back_sagittal_gain,
+            upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -4333,15 +4978,21 @@ def run_ekf(
     flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
     flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "off",
     debug_label: str | None = None,
     debug_console: bool = False,
     initial_state: np.ndarray | None = None,
     model=None,
+    predictor_mode: str = "acc",
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -4372,11 +5023,16 @@ def run_ekf(
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
+        predictor_mode=predictor_mode,
         flip_method=flip_method,
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=flip_error_threshold_px,
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -4401,6 +5057,7 @@ def run_ekf(
                 predicted_state, predicted_covariance, ekf.q_names, ekf.nq, frame_idx, "predict"
             )
         state, covariance, update_status = ekf.update(predicted_state, predicted_covariance, frame_idx)
+        ekf.record_corrected_state(state)
         if debug_console:
             print(
                 debug_state_summary(
@@ -4415,9 +5072,10 @@ def run_ekf(
         update_status_per_frame.append(update_status)
     timings["loop_s"] = time.perf_counter() - t_loop
     timings.update({key: float(value) for key, value in ekf.profiling.items()})
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q = (
-        unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names)
-        if unwrap_root
+        unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names, mode=effective_root_unwrap_mode)
+        if effective_root_unwrap_mode != "off"
         else np.array(states[:, : ekf.nq], copy=True)
     )
     return (
@@ -4468,6 +5126,8 @@ def warmup_ekf_runtime(
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
     initial_state: np.ndarray,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> float:
     """Execute une frame jetable pour externaliser le warm-up du premier EKF.
 
@@ -4492,6 +5152,8 @@ def warmup_ekf_runtime(
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
     )
     covariance = np.eye(ekf.nx) * 1e-2
     state = np.array(initial_state, copy=True)
@@ -4607,6 +5269,7 @@ def compare_kalman_filters(
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     classic_result: dict[str, np.ndarray] | None = None,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "off",
 ) -> ComparisonResult:
     """Compare les `q` du nouvel EKF avec ceux du Kalman `biorbd`."""
     import biorbd
@@ -4620,6 +5283,7 @@ def compare_kalman_filters(
             noise_factor=biorbd_kalman_noise_factor,
             error_factor=biorbd_kalman_error_factor,
             unwrap_root=unwrap_root,
+            root_unwrap_mode=root_unwrap_mode,
             initial_state_method=biorbd_kalman_init_method,
         )
     else:
@@ -4653,7 +5317,7 @@ def compare_kalman_filters(
 
 def reconstruction_cache_metadata(
     pose_data: PoseData,
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     triangulation_method: str,
@@ -4670,7 +5334,7 @@ def reconstruction_cache_metadata(
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
         "pose_data_signature": pose_data_signature(pose_data),
-        "reprojection_threshold_px": float(error_threshold_px),
+        "reprojection_threshold_px": None if error_threshold_px is None else float(error_threshold_px),
         "min_cameras_for_triangulation": int(min_cameras_for_triangulation),
         "epipolar_threshold_px": float(epipolar_threshold_px),
         "triangulation_method": triangulation_method,
@@ -4690,6 +5354,7 @@ def model_stage_metadata(
     subject_mass_kg: float,
     initial_rotation_correction: bool,
     model_variant: str = DEFAULT_MODEL_VARIANT,
+    symmetrize_limbs: bool = True,
 ) -> dict[str, object]:
     """Metadonnees de validite du stage modele."""
     return {
@@ -4701,6 +5366,7 @@ def model_stage_metadata(
         "subject_mass_kg": float(subject_mass_kg),
         "initial_rotation_correction": bool(initial_rotation_correction),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
     }
 
 
@@ -4744,6 +5410,10 @@ def metadata_cache_matches(cache_path: Path, expected_metadata: dict[str, object
         return False
     for key, expected_value in expected_metadata.items():
         cached_value = cached_metadata.get(key)
+        if expected_value is None:
+            if cached_value is not None:
+                return False
+            continue
         if cached_value is None:
             return False
         if isinstance(expected_value, float):
@@ -4862,6 +5532,7 @@ def run_biorbd_marker_kalman_with_parameters(
     noise_factor: float,
     error_factor: float,
     unwrap_root: bool = True,
+    root_unwrap_mode: str = "off",
     initial_state_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
 ) -> dict[str, np.ndarray]:
     """Version parametree du Kalman `biorbd` pour faciliter le tuning du lissage."""
@@ -4900,7 +5571,12 @@ def run_biorbd_marker_kalman_with_parameters(
         qddot_all[frame_idx, :] = qddot.to_array()
 
     q_names = q_names_from_model(model)
-    q_all = unwrap_root_rotations(q_all, q_names) if unwrap_root else q_all
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
+    q_all = (
+        unwrap_root_rotations(q_all, q_names, mode=effective_root_unwrap_mode)
+        if effective_root_unwrap_mode != "off"
+        else q_all
+    )
 
     return {
         "q": q_all,
@@ -5228,7 +5904,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pose-data-mode",
-        choices=("raw", "filtered", "cleaned"),
+        choices=("raw", "filtered", "cleaned", "annotated"),
         default="cleaned",
         help="Source 2D utilisee apres chargement: brut, filtre lisse, ou nettoye avec rejet des outliers.",
     )
@@ -5281,6 +5957,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("output") / "vitpose_ekf")
     parser.add_argument("--biomod", type=Path, default=Path("output") / "vitpose_ekf" / "vitpose_chain.bioMod")
     parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
+    parser.add_argument(
+        "--no-symmetrize-limbs",
+        action="store_true",
+        help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
+    )
     parser.add_argument("--model-cache", type=Path, default=None, help="Cache NPZ du stage modele.")
     parser.add_argument("--biorbd-kalman-cache", type=Path, default=None, help="Cache NPZ du Kalman marqueurs biorbd.")
     parser.add_argument(
@@ -5395,6 +6076,17 @@ def parse_args() -> argparse.Namespace:
         help="Active le verrouillage automatique de certains DoF pres de singularites.",
     )
     parser.add_argument(
+        "--ankle-bed-pseudo-obs",
+        action="store_true",
+        help="En phase toile (hors aerien), ajoute une pseudo-observation 3D sur X/Z des chevilles pour aider l'EKF 2D.",
+    )
+    parser.add_argument(
+        "--ankle-bed-pseudo-std-m",
+        type=float,
+        default=DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+        help="Ecart-type (m) de la pseudo-observation 3D X/Z des chevilles sur la toile. Plus petit = contrainte plus forte.",
+    )
+    parser.add_argument(
         "--root-flight-dynamics",
         action="store_true",
         help="En phase aerienne, utilise une prediction dynamique de la racine basee sur la matrice de masse et les effets non lineaires.",
@@ -5499,6 +6191,12 @@ def parse_args() -> argparse.Namespace:
         help="Strategie de warm-start du Kalman marqueurs `biorbd` via setInitState.",
     )
     parser.add_argument(
+        "--root-unwrap-mode",
+        choices=SUPPORTED_ROOT_UNWRAP_MODES,
+        default="off",
+        help="Stabilisation des angles de racine: off, single, ou double (reextract+unwrap).",
+    )
+    parser.add_argument(
         "--no-root-unwrap",
         action="store_true",
         help="Desactive l'unwrap temporel des trois rotations de la racine dans EKF 2D et EKF 3D.",
@@ -5518,6 +6216,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     """Point d'entree CLI."""
     args = parse_args()
+    root_unwrap_mode = normalize_root_unwrap_mode(
+        ("off" if args.no_root_unwrap else args.root_unwrap_mode),
+    )
     stage_timings_s: dict[str, float] = {}
     calibrations = load_calibrations(args.calib)
     selected_camera_names = parse_camera_names(args.camera_names)
@@ -5727,6 +6428,7 @@ def main() -> None:
         args.subject_mass_kg,
         args.initial_rotation_correction,
         model_variant=args.model_variant,
+        symmetrize_limbs=not args.no_symmetrize_limbs,
     )
     if metadata_cache_matches(model_cache_path, model_metadata) and args.biomod.exists():
         t0 = time.perf_counter()
@@ -5743,6 +6445,7 @@ def main() -> None:
             reconstruction=reconstruction,
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
         model_compute_time_s = time.perf_counter() - t0
         save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=model_compute_time_s)
@@ -5795,6 +6498,8 @@ def main() -> None:
         enable_dof_locking=args.enable_dof_locking,
         method=args.ekf2d_initial_state_method,
         bootstrap_passes=args.ekf2d_bootstrap_passes,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
     stage_timings_s["ekf_initial_state_s"] = time.perf_counter() - t0
     shared_initial_state_flip_acc = shared_initial_state
@@ -5815,6 +6520,8 @@ def main() -> None:
             enable_dof_locking=args.enable_dof_locking,
             method=args.ekf2d_initial_state_method,
             bootstrap_passes=args.ekf2d_bootstrap_passes,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         stage_timings_s["ekf_initial_state_flip_acc_s"] = time.perf_counter() - t0
 
@@ -5834,6 +6541,8 @@ def main() -> None:
         flight_height_threshold_m=args.flight_height_threshold_m,
         flight_min_consecutive_frames=args.flight_min_consecutive_frames,
         initial_state=shared_initial_state,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
 
     ekf_result_acc, ekf_acc_timings = run_ekf(
@@ -5851,9 +6560,12 @@ def main() -> None:
         root_flight_dynamics=False,
         flight_height_threshold_m=args.flight_height_threshold_m,
         flight_min_consecutive_frames=args.flight_min_consecutive_frames,
-        unwrap_root=not args.no_root_unwrap,
+        unwrap_root=(root_unwrap_mode != "off"),
+        root_unwrap_mode=root_unwrap_mode,
         initial_state=shared_initial_state,
         model=shared_biorbd_model,
+        ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
     )
     stage_timings_s["ekf_2d_acc_init_s"] = ekf_acc_timings["init_s"]
     stage_timings_s["ekf_2d_acc_loop_s"] = ekf_acc_timings["loop_s"]
@@ -5886,6 +6598,8 @@ def main() -> None:
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             initial_state=shared_initial_state_flip_acc,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         ekf_result_flip_acc, ekf_flip_acc_timings = run_ekf(
             biomod_path=None,
@@ -5902,9 +6616,12 @@ def main() -> None:
             root_flight_dynamics=False,
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
             initial_state=shared_initial_state_flip_acc,
             model=shared_biorbd_model,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
         )
         stage_timings_s["ekf_2d_flip_acc_init_s"] = ekf_flip_acc_timings["init_s"]
         stage_timings_s["ekf_2d_flip_acc_loop_s"] = ekf_flip_acc_timings["loop_s"]
@@ -5945,7 +6662,8 @@ def main() -> None:
                 args.fps,
                 noise_factor=args.biorbd_kalman_noise_factor,
                 error_factor=args.biorbd_kalman_error_factor,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
                 initial_state_method=args.biorbd_kalman_init_method,
             )
             save_biorbd_kalman_cache(biorbd_kalman_cache_path, classic_result, biorbd_metadata)
@@ -5962,7 +6680,8 @@ def main() -> None:
             biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
             classic_result=classic_result,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
         )
         if ekf_result_dyn is not None:
             comparison_dyn = compare_kalman_filters(
@@ -5975,7 +6694,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
         if ekf_result_flip_acc is not None:
             comparison_flip_acc = compare_kalman_filters(
@@ -5988,7 +6708,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
         if ekf_result_flip_dyn is not None:
             comparison_flip_dyn = compare_kalman_filters(
@@ -6001,7 +6722,8 @@ def main() -> None:
                 biorbd_kalman_noise_factor=args.biorbd_kalman_noise_factor,
                 biorbd_kalman_error_factor=args.biorbd_kalman_error_factor,
                 classic_result=classic_result,
-                unwrap_root=not args.no_root_unwrap,
+                unwrap_root=(root_unwrap_mode != "off"),
+                root_unwrap_mode=root_unwrap_mode,
             )
     animation_target = (
         try_export_pyorerun_animation(biomod_path, ekf_result_acc["q"], args.fps, args.output_dir)

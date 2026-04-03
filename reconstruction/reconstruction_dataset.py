@@ -70,6 +70,8 @@ PREFERRED_TRIANGULATION_NAMES = (
 
 
 def load_json_if_exists(path: Path) -> dict[str, object]:
+    """Load one JSON file when it exists, else return an empty mapping."""
+
     if not path.exists():
         return {}
     try:
@@ -79,6 +81,8 @@ def load_json_if_exists(path: Path) -> dict[str, object]:
 
 
 def resolve_dataset_dir(path: Path) -> Path:
+    """Normalize a dataset-or-bundle path to the enclosing dataset directory."""
+
     path = Path(path)
     if (path / "reconstruction_bundle.npz").exists():
         return path.parent
@@ -86,6 +90,8 @@ def resolve_dataset_dir(path: Path) -> Path:
 
 
 def reconstruction_dirs_for_path(path: Path) -> list[Path]:
+    """Return bundle directories reachable from one dataset or bundle path."""
+
     path = Path(path)
     if (path / "reconstruction_bundle.npz").exists():
         return [path]
@@ -97,10 +103,14 @@ def reconstruction_dirs_for_path(path: Path) -> list[Path]:
 
 
 def dataset_manifest(dataset_dir: Path) -> dict[str, object]:
+    """Load the dataset-level manifest when available."""
+
     return load_json_if_exists(Path(dataset_dir) / "manifest.json")
 
 
 def dataset_name_from_dir(dataset_dir: Path) -> str:
+    """Resolve the canonical dataset name for one dataset directory."""
+
     manifest = dataset_manifest(dataset_dir)
     return str(manifest.get("dataset_name", Path(dataset_dir).name))
 
@@ -112,6 +122,8 @@ def dataset_source_paths(
     keypoints: Path | None = None,
     pose2sim_trc: Path | None = None,
 ) -> dict[str, Path]:
+    """Infer the canonical source paths associated with one dataset directory."""
+
     dataset_dir = Path(dataset_dir)
     dataset_name = dataset_name_from_dir(dataset_dir)
     manifest = dataset_manifest(dataset_dir)
@@ -128,12 +140,16 @@ def dataset_source_paths(
 
 
 def reconstruction_label(name: str) -> str:
+    """Return a user-facing label for one reconstruction family/name."""
+
     if name in KNOWN_RECONSTRUCTION_LABELS:
         return KNOWN_RECONSTRUCTION_LABELS[name]
     return name.replace("_", " ").strip()
 
 
 def reconstruction_color(name: str) -> str:
+    """Return the display color associated with one reconstruction name."""
+
     if name in KNOWN_RECONSTRUCTION_COLORS:
         return KNOWN_RECONSTRUCTION_COLORS[name]
     color_idx = sum(name.encode("utf-8")) % len(FALLBACK_COLORS)
@@ -141,6 +157,8 @@ def reconstruction_color(name: str) -> str:
 
 
 def preferred_triangulation_name(available_names: list[str]) -> str | None:
+    """Return the preferred triangulation reconstruction among available names."""
+
     available = set(available_names)
     for candidate in PREFERRED_TRIANGULATION_NAMES:
         if candidate in available:
@@ -149,6 +167,8 @@ def preferred_triangulation_name(available_names: list[str]) -> str | None:
 
 
 def preferred_master_name(available_names: list[str]) -> str | None:
+    """Return the preferred master reconstruction for multi-view comparisons."""
+
     available = set(available_names)
     for candidate in PREFERRED_MASTER_NAMES:
         if candidate in available:
@@ -157,6 +177,8 @@ def preferred_master_name(available_names: list[str]) -> str | None:
 
 
 def default_show_names(available_names: list[str]) -> list[str]:
+    """Return the default subset to display when no explicit names are requested."""
+
     preferred = []
     for candidate in (
         preferred_triangulation_name(available_names),
@@ -173,6 +195,8 @@ def default_show_names(available_names: list[str]) -> list[str]:
 
 
 def resolve_requested_names(requested: list[str] | tuple[str, ...] | None, available_names: list[str]) -> list[str]:
+    """Resolve aliases like ``triangulation`` or ``ekf_2d`` to concrete names."""
+
     if not requested:
         return default_show_names(available_names)
 
@@ -194,6 +218,8 @@ def resolve_requested_names(requested: list[str] | tuple[str, ...] | None, avail
 def align_array_to_frames(
     array: np.ndarray, source_frames: np.ndarray, target_frames: np.ndarray, fill_value: float = np.nan
 ) -> np.ndarray:
+    """Align one frame-indexed array onto a new frame axis."""
+
     source_frames = np.asarray(source_frames, dtype=int)
     target_frames = np.asarray(target_frames, dtype=int)
     aligned_shape = (len(target_frames),) + tuple(array.shape[1:])
@@ -207,6 +233,8 @@ def align_array_to_frames(
 
 
 def load_bundle_entries(path: Path) -> list[dict[str, object]]:
+    """Load lightweight bundle entries for one dataset preview/comparison view."""
+
     entries: list[dict[str, object]] = []
     for bundle_dir in reconstruction_dirs_for_path(path):
         bundle_path = bundle_dir / "reconstruction_bundle.npz"

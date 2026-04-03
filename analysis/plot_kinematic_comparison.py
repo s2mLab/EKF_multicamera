@@ -12,15 +12,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from math import ceil
 from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
