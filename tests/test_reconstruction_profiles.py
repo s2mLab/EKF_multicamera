@@ -253,6 +253,19 @@ def test_build_pipeline_command_includes_upper_back_prior_parameters_for_ekf2d()
     assert cmd[cmd.index("--ankle-bed-pseudo-std-m") + 1] == "0.015"
 
 
+def test_validate_profile_accepts_history3_predictors():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_history",
+            family="ekf_2d",
+            predictor="dyn_history3",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+        )
+    )
+
+    assert profile.predictor == "dyn_history3"
+
+
 def test_canonical_profile_name_marks_asymmetric_auto_built_models():
     profile = validate_profile(
         ReconstructionProfile(

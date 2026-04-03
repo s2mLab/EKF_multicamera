@@ -2177,6 +2177,8 @@ def apply_left_right_flip_corrections(pose_data: PoseData, suspect_mask: np.ndar
     """
     corrected_keypoints = apply_left_right_flip_to_points(pose_data.keypoints, suspect_mask)
     corrected_scores = apply_left_right_flip_to_points(pose_data.scores[..., np.newaxis], suspect_mask)[..., 0]
+    corrected_scores = np.asarray(corrected_scores, dtype=float)
+    corrected_scores[suspect_mask] *= 0.5
     return PoseData(
         camera_names=list(pose_data.camera_names),
         frames=np.array(pose_data.frames, copy=True),
@@ -3543,6 +3545,7 @@ class MultiViewKinematicEKF:
         root_flight_dynamics: bool = False,
         flight_height_threshold_m: float = DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
         flight_min_consecutive_frames: int = DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
+        predictor_mode: str = "acc",
         flip_method: str | None = None,
         flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
         flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
@@ -3567,6 +3570,7 @@ class MultiViewKinematicEKF:
         self.epipolar_threshold_px = float(epipolar_threshold_px)
         self.enable_dof_locking = enable_dof_locking
         self.root_flight_dynamics = root_flight_dynamics
+        self.predictor_mode = str(predictor_mode or "acc")
         self.flight_height_threshold_m = flight_height_threshold_m
         self.flight_min_consecutive_frames = max(1, int(flight_min_consecutive_frames))
         self.flip_method = None if flip_method is None else str(flip_method)
@@ -3652,6 +3656,7 @@ class MultiViewKinematicEKF:
             "flip_gate_s": 0.0,
         }
         self.previous_prediction_gate_nominal_rms_px = np.full(len(self.camera_calibrations), np.nan, dtype=float)
+        self.corrected_q_history: list[np.ndarray] = []
         self.effective_confidences, self.measurement_variances = self._precompute_measurement_variances()
 
     def _make_q_names(self) -> list[str]:
@@ -3817,6 +3822,37 @@ class MultiViewKinematicEKF:
             ]
         )
 
+    def _use_history3_prediction(self) -> bool:
+        return self.predictor_mode in {"history3", "dyn_history3"}
+
+    def _apply_history3_prediction(self, predicted_state: np.ndarray) -> np.ndarray:
+        if len(self.corrected_q_history) < 3 or self.joint_indices.size == 0:
+            return predicted_state
+        q_tm2 = np.asarray(self.corrected_q_history[-3], dtype=float)
+        q_tm1 = np.asarray(self.corrected_q_history[-2], dtype=float)
+        q_t = np.asarray(self.corrected_q_history[-1], dtype=float)
+        required = np.concatenate((q_tm2[self.joint_indices], q_tm1[self.joint_indices], q_t[self.joint_indices]))
+        if not np.all(np.isfinite(required)):
+            return predicted_state
+        dt = float(self.dt)
+        second_diff = q_t[self.joint_indices] - 2.0 * q_tm1[self.joint_indices] + q_tm2[self.joint_indices]
+        delta_next = q_t[self.joint_indices] - q_tm1[self.joint_indices] + second_diff
+        q_next = q_t[self.joint_indices] + delta_next
+        qdot_next = delta_next / dt
+        qddot_next = second_diff / (dt * dt)
+        updated = np.array(predicted_state, copy=True)
+        updated[self.joint_indices] = q_next
+        updated[self.nq + self.joint_indices] = qdot_next
+        updated[2 * self.nq + self.joint_indices] = qddot_next
+        updated[: self.nq] = canonicalize_model_q_rotation_branches(self.model, updated[: self.nq])
+        return updated
+
+    def record_corrected_state(self, state: np.ndarray) -> None:
+        q = np.asarray(state[: self.nq], dtype=float)
+        self.corrected_q_history.append(canonicalize_model_q_rotation_branches(self.model, q))
+        if len(self.corrected_q_history) > 3:
+            self.corrected_q_history = self.corrected_q_history[-3:]
+
     def _is_airborne_from_previous_frame(self, frame_idx: int) -> bool:
         """Retourne vrai si le critere de vol est satisfait sur assez de frames precedentes."""
         if frame_idx <= 0:
@@ -3920,6 +3956,8 @@ class MultiViewKinematicEKF:
                 + self.dt * qdot_prev[self.root_indices]
                 + 0.5 * self.dt * self.dt * qddot_root
             )
+        if self._use_history3_prediction():
+            predicted_state = self._apply_history3_prediction(predicted_state)
         self._update_locked_dofs(predicted_state)
         self._apply_lock_constraints(predicted_state, predicted_covariance)
         self.profiling["predict_s"] += time.perf_counter() - t_predict
@@ -4072,6 +4110,8 @@ class MultiViewKinematicEKF:
                     self.update_status["flip_prediction_gate_swapped"] += 1
                 else:
                     self.update_status["flip_prediction_gate_raw"] += 1
+                if bool(gate_diagnostics.get("used_swapped")):
+                    selected_variances = np.asarray(selected_variances, dtype=float) * 4.0
             else:
                 selected_mask = np.all(np.isfinite(frame_keypoints[keypoint_indices]), axis=1) & np.isfinite(
                     frame_variances[keypoint_indices]
@@ -4809,6 +4849,7 @@ def run_ekf(
     debug_console: bool = False,
     initial_state: np.ndarray | None = None,
     model=None,
+    predictor_mode: str = "acc",
     flip_method: str | None = None,
     flip_improvement_ratio: float = DEFAULT_FLIP_IMPROVEMENT_RATIO,
     flip_min_gain_px: float = DEFAULT_FLIP_MIN_GAIN_PX,
@@ -4848,6 +4889,7 @@ def run_ekf(
         root_flight_dynamics=root_flight_dynamics,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
+        predictor_mode=predictor_mode,
         flip_method=flip_method,
         flip_improvement_ratio=flip_improvement_ratio,
         flip_min_gain_px=flip_min_gain_px,
@@ -4881,6 +4923,7 @@ def run_ekf(
                 predicted_state, predicted_covariance, ekf.q_names, ekf.nq, frame_idx, "predict"
             )
         state, covariance, update_status = ekf.update(predicted_state, predicted_covariance, frame_idx)
+        ekf.record_corrected_state(state)
         if debug_console:
             print(
                 debug_state_summary(

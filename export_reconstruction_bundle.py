@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         ),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     )
-    parser.add_argument("--predictor", choices=("acc", "dyn"), default="acc")
+    parser.add_argument("--predictor", choices=("acc", "dyn", "history3", "dyn_history3"), default="acc")
     parser.add_argument("--ekf2d-3d-source", choices=SUPPORTED_EKF2D_3D_SOURCE_MODES, default="full_triangulation")
     parser.add_argument(
         "--ekf2d-initial-state-method",

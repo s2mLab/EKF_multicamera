@@ -27,7 +27,7 @@ from reconstruction.reconstruction_registry import (
 )
 
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
-SUPPORTED_PREDICTORS = ("acc", "dyn")
+SUPPORTED_PREDICTORS = ("acc", "dyn", "history3", "dyn_history3")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",

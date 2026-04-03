@@ -1222,6 +1222,48 @@ def test_ankle_bed_pseudo_measurement_blocks_are_disabled_in_airborne_frames():
     assert blocks == []
 
 
+def test_apply_left_right_flip_corrections_halves_scores_for_swapped_views():
+    keypoints = np.zeros((1, 2, 17, 2), dtype=float)
+    scores = np.ones((1, 2, 17), dtype=float)
+    pose_data = vitpose_ekf_pipeline.PoseData(
+        camera_names=["cam0"],
+        frames=np.array([0, 1], dtype=int),
+        keypoints=keypoints,
+        scores=scores,
+    )
+    suspect_mask = np.array([[False, True]], dtype=bool)
+
+    corrected = vitpose_ekf_pipeline.apply_left_right_flip_corrections(pose_data, suspect_mask)
+
+    np.testing.assert_allclose(corrected.scores[0, 0], np.ones(17, dtype=float))
+    np.testing.assert_allclose(corrected.scores[0, 1], 0.5 * np.ones(17, dtype=float))
+
+
+def test_history3_prediction_updates_joint_dofs_from_last_three_states():
+    class _Model:
+        def nbSegment(self):
+            return 0
+
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.model = _Model()
+    ekf.nq = 4
+    ekf.dt = 0.1
+    ekf.joint_indices = np.array([2, 3], dtype=int)
+    ekf.corrected_q_history = [
+        np.array([0.0, 0.0, 1.0, 2.0], dtype=float),
+        np.array([0.0, 0.0, 2.0, 4.0], dtype=float),
+        np.array([0.0, 0.0, 4.0, 8.0], dtype=float),
+    ]
+    predicted_state = np.zeros(12, dtype=float)
+    predicted_state[:4] = np.array([10.0, 20.0, -1.0, -1.0], dtype=float)
+
+    updated = ekf._apply_history3_prediction(predicted_state)
+
+    np.testing.assert_allclose(updated[:4], np.array([10.0, 20.0, 7.0, 14.0], dtype=float))
+    np.testing.assert_allclose(updated[4:8], np.array([0.0, 0.0, 30.0, 60.0], dtype=float))
+    np.testing.assert_allclose(updated[8:12], np.array([0.0, 0.0, 100.0, 200.0], dtype=float))
+
+
 def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():
     q_names = np.asarray(["TRUNK:RotY", "LOWER_TRUNK:RotY", "LEFT_THIGH:RotY", "RIGHT_THIGH:RotY"], dtype=object)
 

@@ -360,8 +360,12 @@ RECONSTRUCTION_ORDER = [
     "triangulation_fast",
     "ekf_2d_acc",
     "ekf_2d_flip_acc",
+    "ekf_2d_history3",
+    "ekf_2d_flip_history3",
     "ekf_2d_dyn",
     "ekf_2d_flip_dyn",
+    "ekf_2d_dyn_history3",
+    "ekf_2d_flip_dyn_history3",
     "ekf_3d_flip",
     "ekf_3d",
 ]
@@ -372,8 +376,12 @@ RECONSTRUCTION_LABELS = {
     "triangulation_fast": "Triangulation fast",
     "ekf_2d_acc": "EKF 2D ACC",
     "ekf_2d_flip_acc": "EKF 2D FLIP ACC",
+    "ekf_2d_history3": "EKF 2D HISTORY3",
+    "ekf_2d_flip_history3": "EKF 2D FLIP HISTORY3",
     "ekf_2d_dyn": "EKF 2D DYN",
     "ekf_2d_flip_dyn": "EKF 2D FLIP DYN",
+    "ekf_2d_dyn_history3": "EKF 2D DYN+HISTORY3",
+    "ekf_2d_flip_dyn_history3": "EKF 2D FLIP DYN+HISTORY3",
     "ekf_3d_flip": "EKF 3D FLIP",
     "ekf_3d": "EKF 3D",
 }
@@ -384,8 +392,12 @@ RECONSTRUCTION_COLORS = {
     "triangulation_fast": "#f2a104",
     "ekf_2d_acc": "#c44e52",
     "ekf_2d_flip_acc": "#937860",
+    "ekf_2d_history3": "#b55d60",
+    "ekf_2d_flip_history3": "#9a6c5a",
     "ekf_2d_dyn": "#8172b3",
     "ekf_2d_flip_dyn": "#da8bc3",
+    "ekf_2d_dyn_history3": "#6b63a8",
+    "ekf_2d_flip_dyn_history3": "#c67ab4",
     "ekf_3d_flip": "#4c9f70",
     "ekf_3d": "#55a868",
 }
@@ -543,30 +555,17 @@ def read_q_variant(
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     ekf = np.load(ekf_states_path, allow_pickle=True) if ekf_states_path.exists() else None
     comparison = np.load(kalman_comparison_path, allow_pickle=True) if kalman_comparison_path.exists() else None
-    if variant == "ekf_2d_acc" and ekf is not None:
-        q = (
-            np.asarray(ekf["q_ekf_2d_acc"], dtype=float)
-            if "q_ekf_2d_acc" in ekf
-            else (np.asarray(ekf["q"], dtype=float) if "q" in ekf else None)
-        )
-        qdot = (
-            np.asarray(ekf["qdot_ekf_2d_acc"], dtype=float)
-            if "qdot_ekf_2d_acc" in ekf
-            else (np.asarray(ekf["qdot"], dtype=float) if "qdot" in ekf else None)
-        )
-        return q, qdot
-    if variant == "ekf_2d_flip_acc" and ekf is not None and "q_ekf_2d_flip_acc" in ekf:
-        q = np.asarray(ekf["q_ekf_2d_flip_acc"], dtype=float)
-        qdot = np.asarray(ekf["qdot_ekf_2d_flip_acc"], dtype=float) if "qdot_ekf_2d_flip_acc" in ekf else None
-        return q, qdot
-    if variant == "ekf_2d_dyn" and ekf is not None and "q_ekf_2d_dyn" in ekf:
-        q = np.asarray(ekf["q_ekf_2d_dyn"], dtype=float)
-        qdot = np.asarray(ekf["qdot_ekf_2d_dyn"], dtype=float) if "qdot_ekf_2d_dyn" in ekf else None
-        return q, qdot
-    if variant == "ekf_2d_flip_dyn" and ekf is not None and "q_ekf_2d_flip_dyn" in ekf:
-        q = np.asarray(ekf["q_ekf_2d_flip_dyn"], dtype=float)
-        qdot = np.asarray(ekf["qdot_ekf_2d_flip_dyn"], dtype=float) if "qdot_ekf_2d_flip_dyn" in ekf else None
-        return q, qdot
+    if variant.startswith("ekf_2d") and ekf is not None:
+        q_key = f"q_{variant}"
+        qdot_key = f"qdot_{variant}"
+        if q_key in ekf:
+            q = np.asarray(ekf[q_key], dtype=float)
+            qdot = np.asarray(ekf[qdot_key], dtype=float) if qdot_key in ekf else None
+            return q, qdot
+        if variant == "ekf_2d_acc":
+            q = np.asarray(ekf["q"], dtype=float) if "q" in ekf else None
+            qdot = np.asarray(ekf["qdot"], dtype=float) if "qdot" in ekf else None
+            return q, qdot
     if variant == "ekf_3d" and comparison is not None:
         q = (
             np.asarray(comparison["q_ekf_3d"], dtype=float)
@@ -699,8 +698,12 @@ def discover_reconstruction_catalog(output_dir: Path, pose2sim_trc: Path | None 
     for variant, comparison_path in [
         ("ekf_2d_acc", kalman_path),
         ("ekf_2d_flip_acc", kalman_flip_acc_path),
+        ("ekf_2d_history3", kalman_path),
+        ("ekf_2d_flip_history3", kalman_flip_acc_path),
         ("ekf_2d_dyn", kalman_path),
+        ("ekf_2d_dyn_history3", kalman_path),
         ("ekf_2d_flip_dyn", output_dir / "kalman_comparison_flip_dyn.npz"),
+        ("ekf_2d_flip_dyn_history3", output_dir / "kalman_comparison_flip_dyn.npz"),
         ("ekf_3d", kalman_path),
     ]:
         q, _ = read_q_variant(ekf_states_path, comparison_path, variant)
@@ -758,8 +761,12 @@ def available_dual_show_options(output_dir: Path, pose2sim_trc: Path | None = No
         "ekf_3d": "ekf_3d",
         "ekf_2d_acc": "ekf_2d_acc",
         "ekf_2d_flip_acc": "ekf_2d_flip_acc",
+        "ekf_2d_history3": "ekf_2d_history3",
+        "ekf_2d_flip_history3": "ekf_2d_flip_history3",
         "ekf_2d_dyn": "ekf_2d_dyn",
         "ekf_2d_flip_dyn": "ekf_2d_flip_dyn",
+        "ekf_2d_dyn_history3": "ekf_2d_dyn_history3",
+        "ekf_2d_flip_dyn_history3": "ekf_2d_flip_dyn_history3",
     }
     options = []
     for row in catalog:
@@ -9505,7 +9512,11 @@ class ProfilesTab(CommandTab):
         predictor_label.pack(side=tk.LEFT)
         self.predictor = tk.StringVar(value="acc")
         predictor_box = ttk.Combobox(
-            self.ekf2d_frame, textvariable=self.predictor, values=["acc", "dyn"], width=8, state="readonly"
+            self.ekf2d_frame,
+            textvariable=self.predictor,
+            values=["acc", "dyn", "history3", "dyn_history3"],
+            width=12,
+            state="readonly",
         )
         predictor_box.pack(side=tk.LEFT, padx=(0, 8))
         self.measurement_noise = LabeledEntry(
