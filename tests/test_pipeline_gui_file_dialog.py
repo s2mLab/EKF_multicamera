@@ -151,6 +151,37 @@ def test_annotation_sync_dataset_defaults_requests_one_load(monkeypatch, tmp_pat
     assert tab._images_root_set.endswith("inputs/images")
 
 
+def test_2d_analysis_on_keypoints_changed_sets_shared_images_root(monkeypatch, tmp_path):
+    keypoints_path = tmp_path / "inputs" / "keypoints" / "trial_keypoints.json"
+    keypoints_path.parent.mkdir(parents=True)
+    keypoints_path.write_text("{}", encoding="utf-8")
+    inferred_images_root = tmp_path / "inputs" / "images" / "trial"
+    inferred_images_root.mkdir(parents=True)
+    shared_images_root = {"value": ""}
+
+    monkeypatch.setattr(pipeline_gui, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline_gui, "display_path", lambda path: str(path))
+    monkeypatch.setattr(pipeline_gui, "infer_execution_images_root", lambda _path: inferred_images_root)
+    monkeypatch.setattr(pipeline_gui, "infer_pose2sim_trc_from_keypoints", lambda _path: None)
+
+    tab = pipeline_gui.DataExplorer2DTab.__new__(pipeline_gui.DataExplorer2DTab)
+    tab.keypoints = SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json")
+    tab.state = SimpleNamespace(
+        pose2sim_trc_var=SimpleNamespace(get=lambda: "", set=lambda _value: None),
+        shared_images_root_var=SimpleNamespace(
+            get=lambda: shared_images_root["value"],
+            set=lambda value: shared_images_root.__setitem__("value", value),
+        ),
+    )
+    tab.trc_status_var = SimpleNamespace(set=lambda _value: None)
+    tab.update_dataset_summary = lambda: None
+    tab.update_flip_status_text = lambda: None
+
+    pipeline_gui.DataExplorer2DTab.on_keypoints_changed(tab)
+
+    assert shared_images_root["value"] == str(inferred_images_root)
+
+
 def test_append_default_pose2sim_profile_adds_pose2sim_when_trc_exists():
     triangulation = pipeline_gui.ReconstructionProfile(name="tri", family="triangulation")
     pose2sim = pipeline_gui.ReconstructionProfile(name="p2s", family="pose2sim")
@@ -3529,12 +3560,12 @@ def test_multiview_tab_build_command_uses_selected_cameras_and_images_root(monke
         fps_var=SimpleNamespace(get=lambda: "120"),
         workers_var=SimpleNamespace(get=lambda: "6"),
         pose2sim_trc_var=SimpleNamespace(get=lambda: ""),
+        shared_images_root_var=SimpleNamespace(get=lambda: "inputs/images/trial"),
     )
     tab.output_gif = _FakeEntryField("trial.gif")
     tab.gif_fps = _FakeEntryField("10")
     tab.stride = _FakeEntryField("5")
     tab.marker_size = _FakeEntryField("18")
-    tab.images_root_entry = _FakeEntryField("inputs/images/trial")
     tab.crop_var = SimpleNamespace(get=lambda: True)
     tab.show_images_var = SimpleNamespace(get=lambda: True)
     tab.extra = _FakeEntryField("")
@@ -4479,9 +4510,15 @@ def test_load_preview_bundle_accepts_missing_pose2sim_trc(tmp_path):
 
 
 def test_camera_tools_tab_sync_dataset_dir_infers_images_root(monkeypatch, tmp_path):
+    shared_images_root = {"value": ""}
     tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
-    tab.state = SimpleNamespace(keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"))
-    tab.images_root_entry = _FakeEntryField("")
+    tab.state = SimpleNamespace(
+        keypoints_var=SimpleNamespace(get=lambda: "inputs/keypoints/trial_keypoints.json"),
+        shared_images_root_var=SimpleNamespace(
+            get=lambda: shared_images_root["value"],
+            set=lambda value: shared_images_root.__setitem__("value", value),
+        ),
+    )
     tab.refresh_available_reconstructions = lambda: None
     tab.update_camera_filter_status = lambda: None
     tab.load_resources = lambda: None
@@ -4495,7 +4532,7 @@ def test_camera_tools_tab_sync_dataset_dir_infers_images_root(monkeypatch, tmp_p
     pipeline_gui.CameraToolsTab.sync_dataset_dir(tab)
 
     assert tab.images_root == inferred_root
-    assert tab.images_root_entry.get() == str(inferred_root)
+    assert shared_images_root["value"] == str(inferred_root)
 
 
 def test_camera_tools_render_flip_preview_uses_image_frame_number_before_overlay(monkeypatch, tmp_path):
@@ -4514,7 +4551,7 @@ def test_camera_tools_render_flip_preview_uses_image_frame_number_before_overlay
     tab.flip_canvas = _FakeCanvas()
     tab.flip_details = _FakeText()
     tab.flip_status_var = SimpleNamespace(set=lambda _value: None)
-    tab.images_root_entry = _FakeEntryField(str(tmp_path))
+    tab.state = SimpleNamespace(shared_images_root_var=SimpleNamespace(get=lambda: str(tmp_path)))
     tab.images_root = tmp_path
     tab.show_images_var = SimpleNamespace(get=lambda: True)
     tab.flip_masks = {"epipolar": np.zeros((1, 1), dtype=bool)}
@@ -4562,6 +4599,26 @@ def test_camera_tools_selected_inspector_camera_prefers_metrics_tree_focus():
     assert pipeline_gui.CameraToolsTab._selected_inspector_camera_name(tab) == "cam2"
 
 
+def test_camera_tools_step_flip_frame_moves_by_one():
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    current = {"value": 1.0}
+    tab.base_pose_data = SimpleNamespace(frames=np.array([10, 11, 12, 13], dtype=int))
+    tab.flip_frame_var = SimpleNamespace(
+        get=lambda: current["value"],
+        set=lambda value: current.__setitem__("value", float(value)),
+    )
+    tab.flip_frame_list = _FakeListbox()
+    tab.flip_frame_local_indices = []
+    calls = []
+    tab._on_flip_frame_scale_changed = lambda _value: calls.append(current["value"])
+
+    result = pipeline_gui.CameraToolsTab.step_flip_frame(tab, 1)
+
+    assert result == "break"
+    assert current["value"] == 2.0
+    assert calls == [2.0]
+
+
 def test_camera_tools_show_specific_frame_updates_slider_and_preview():
     tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
     tab.base_pose_data = SimpleNamespace(camera_names=["cam0"], frames=np.array([100, 120], dtype=int))
@@ -4581,6 +4638,52 @@ def test_camera_tools_show_specific_frame_updates_slider_and_preview():
 
     assert slider_value["value"] == 1.0
     assert tab.flip_frame_list.items == ["manual | frame 120 | cam0"]
+    assert rendered == [True]
+
+
+def test_camera_tools_flip_frame_list_selection_updates_slider():
+    current = {"value": 0.0}
+    labels = []
+    rendered = []
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.flip_frame_list = _FakeListbox()
+    tab.flip_frame_list.insert("end", "flip | frame 120 | cam0")
+    tab.flip_frame_list.selection_set(0)
+    tab.flip_frame_local_indices = [7]
+    tab.flip_frame_var = SimpleNamespace(
+        get=lambda: current["value"],
+        set=lambda value: current.__setitem__("value", float(value)),
+    )
+    tab._update_flip_frame_label = lambda: labels.append(current["value"])
+    tab.render_flip_preview = lambda: rendered.append(True)
+
+    pipeline_gui.CameraToolsTab._on_flip_frame_list_selection_changed(tab)
+
+    assert current["value"] == 7.0
+    assert labels == [7.0]
+    assert rendered == [True]
+
+
+def test_camera_tools_slider_change_overrides_selected_list_frame():
+    current = {"value": 3.0}
+    rendered = []
+    tab = pipeline_gui.CameraToolsTab.__new__(pipeline_gui.CameraToolsTab)
+    tab.base_pose_data = SimpleNamespace(frames=np.array([100, 101, 102, 103, 104], dtype=int))
+    tab.flip_frame_list = _FakeListbox()
+    tab.flip_frame_list.insert("end", "flip | frame 101 | cam0")
+    tab.flip_frame_list.selection_set(0)
+    tab.flip_frame_local_indices = [1]
+    tab.flip_frame_var = SimpleNamespace(
+        get=lambda: current["value"],
+        set=lambda value: current.__setitem__("value", float(value)),
+    )
+    tab._update_flip_frame_label = lambda: None
+    tab.render_flip_preview = lambda: rendered.append(True)
+
+    pipeline_gui.CameraToolsTab._on_flip_frame_scale_changed(tab, None)
+
+    assert tab.flip_frame_list.curselection() == ()
+    assert current["value"] == 3.0
     assert rendered == [True]
 
 

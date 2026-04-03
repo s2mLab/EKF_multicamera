@@ -2591,6 +2591,7 @@ class SharedAppState:
     flip_temporal_weight_var: tk.StringVar
     flip_temporal_tau_px_var: tk.StringVar
     calibration_correction_var: tk.StringVar
+    shared_images_root_var: tk.StringVar
     initial_rotation_correction_var: tk.BooleanVar
     selected_camera_names_var: tk.StringVar
     output_root_var: tk.StringVar
@@ -2805,6 +2806,33 @@ def current_dataset_name(state: SharedAppState) -> str:
 
 def current_dataset_dir(state: SharedAppState) -> Path:
     return normalize_output_root(ROOT / state.output_root_var.get()) / current_dataset_name(state)
+
+
+def shared_images_root_path(state: SharedAppState) -> Path | None:
+    """Return the shared images root selected in the first 2D-analysis tab."""
+
+    raw_value = str(getattr(state, "shared_images_root_var", "").get() if hasattr(state, "shared_images_root_var") else "")
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return None
+    return Path(raw_value)
+
+
+def sync_shared_images_root_from_keypoints(
+    state: SharedAppState,
+    keypoints_path: Path,
+    *,
+    set_if_empty_only: bool = True,
+) -> Path | None:
+    """Infer and optionally publish the shared images root for one keypoints file."""
+
+    inferred_images_root = infer_execution_images_root(keypoints_path)
+    if inferred_images_root is None:
+        return None
+    current_value = str(state.shared_images_root_var.get()).strip()
+    if (not set_if_empty_only) or (not current_value):
+        state.shared_images_root_var.set(display_path(inferred_images_root))
+    return inferred_images_root
 
 
 def current_selected_camera_names(state: SharedAppState) -> list[str]:
@@ -4339,6 +4367,7 @@ class DualAnimationTab(CommandTab):
         )
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_defaults())
+        self.state.shared_images_root_var.trace_add("write", lambda *_args: self.refresh_preview())
         self.state.register_reconstruction_listener(self.refresh_available_reconstructions)
         self.refresh_available_reconstructions()
 
@@ -4747,8 +4776,6 @@ class MultiViewTab(CommandTab):
             state="readonly",
         )
         self.qa_overlay_box.pack(side=tk.LEFT)
-        self.images_root_entry = LabeledEntry(images_box, "Images root", "", browse=True, directory=True)
-        self.images_root_entry.pack(fill=tk.X, padx=8, pady=(0, 6))
 
         preview_box = ttk.LabelFrame(right, text="Preview 2D multivues")
         preview_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
@@ -4789,7 +4816,10 @@ class MultiViewTab(CommandTab):
             self.generate_button, "Genere le GIF 2D multivues, puis devient STOP tant que l'export est en cours."
         )
         attach_tooltip(self.multiview_cameras_list, "Choisissez les caméras visibles dans le preview et le GIF.")
-        self.images_root_entry.set_tooltip("Dossier d'images utilisé comme fond des vues 2D, par caméra si disponible.")
+        attach_tooltip(
+            images_box,
+            "Le fond image utilise le chemin partagé 'Images root' défini dans l'onglet 2D analysis.",
+        )
         attach_tooltip(
             self.qa_overlay_box,
             "Overlay QA rapide dans le preview 2D: erreur épipolaire 2D ou diagnostics 3D de la reconstruction sélectionnée.",
@@ -4945,9 +4975,12 @@ class MultiViewTab(CommandTab):
 
     def sync_dataset_defaults(self) -> None:
         self.output_gif.var.set(self.default_gif_name())
-        inferred_images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+        inferred_images_root = sync_shared_images_root_from_keypoints(
+            self.state,
+            ROOT / self.state.keypoints_var.get(),
+            set_if_empty_only=True,
+        )
         self.images_root = inferred_images_root
-        self.images_root_entry.var.set("" if inferred_images_root is None else display_path(inferred_images_root))
         self.refresh_available_reconstructions()
 
     def refresh_available_reconstructions(self) -> None:
@@ -5004,7 +5037,7 @@ class MultiViewTab(CommandTab):
         selected_cameras = self.selected_multiview_camera_names()
         if selected_cameras:
             cmd.extend(["--camera-names", ",".join(selected_cameras)])
-        images_root = self.images_root_entry.get().strip()
+        images_root = str(self.state.shared_images_root_var.get()).strip()
         if self.show_images_var.get():
             cmd.append("--show-images")
             if images_root:
@@ -5050,12 +5083,13 @@ class MultiViewTab(CommandTab):
             )
             self.preview_bundle = preview_load.bundle
             self.refresh_multiview_camera_choices()
-            inferred_images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
-            if not self.images_root_entry.get().strip() or inferred_images_root is not None:
+            inferred_images_root = sync_shared_images_root_from_keypoints(
+                self.state,
+                ROOT / self.state.keypoints_var.get(),
+                set_if_empty_only=True,
+            )
+            if inferred_images_root is not None:
                 self.images_root = inferred_images_root
-                self.images_root_entry.var.set(
-                    "" if inferred_images_root is None else display_path(inferred_images_root)
-                )
             self._publish_reconstruction_rows(preview_load.preview_state.rows, preview_load.preview_state.defaults)
             bundle_frames = (
                 np.asarray(self.preview_bundle["frames"], dtype=int)
@@ -5152,9 +5186,7 @@ class MultiViewTab(CommandTab):
             else {}
         )
         frame_number = int(self.preview_frame_numbers[frame_idx]) if self.preview_frame_numbers.size else int(frame_idx)
-        images_root = (
-            Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
-        )
+        images_root = shared_images_root_path(self.state) or self.images_root
 
         for ax_idx, ax in enumerate(axes):
             if ax_idx >= len(camera_names):
@@ -7682,6 +7714,10 @@ class DataExplorer2DTab(ttk.Frame):
         ttk.Label(row_shared, textvariable=self.selected_cameras_label_var, foreground="#4f5b66").pack(
             side=tk.LEFT, padx=(8, 0)
         )
+        self.images_root = LabeledEntry(controls, "Images root", "", browse=True, directory=True)
+        self.images_root.var = state.shared_images_root_var
+        self.images_root.entry_widget.configure(textvariable=self.images_root.var)
+        self.images_root.pack(fill=tk.X, padx=8, pady=4)
         ttk.Label(controls, textvariable=self.dataset_summary_var, foreground="#4f5b66", justify=tk.LEFT).pack(
             fill=tk.X, padx=8, pady=(0, 4)
         )
@@ -7841,6 +7877,9 @@ class DataExplorer2DTab(ttk.Frame):
         self.pose2sim_trc.set_tooltip("TRC file used for direct 3D import. It is auto-detected from the 2D JSON.")
         self.fps.set_tooltip("FPS partage pour les derives temporelles et les animations.")
         self.workers.set_tooltip("Nombre de workers partage pour les rendus et les calculs paralleles.")
+        self.images_root.set_tooltip(
+            "Dossier d'images partagé utilisé comme fond dans les onglets 2D multiview et Caméras."
+        )
         attach_tooltip(
             self.root_rotfix_check,
             "Si coché, la racine est réalignée en lacet autour de Z à partir de l'axe médio-latéral du tronc à t0. L'angle est arrondi au multiple de pi/2 le plus proche, puis partagé par le modèle, les reconstructions et les analyses.",
@@ -7937,6 +7976,7 @@ class DataExplorer2DTab(ttk.Frame):
 
     def on_keypoints_changed(self) -> None:
         keypoints_path = ROOT / self.keypoints.get()
+        sync_shared_images_root_from_keypoints(self.state, keypoints_path, set_if_empty_only=True)
         trc_path = infer_pose2sim_trc_from_keypoints(keypoints_path) if keypoints_path.exists() else None
         if trc_path is not None:
             rel = display_path(trc_path)
@@ -12764,7 +12804,11 @@ class ExecutionTab(ttk.Frame):
                     )
                 except Exception:
                     self.calibrations, self.pose_data = None, None
-                self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
+                self.images_root = sync_shared_images_root_from_keypoints(
+                    self.state,
+                    ROOT / self.state.keypoints_var.get(),
+                    set_if_empty_only=True,
+                )
                 self._update_camera_choices()
                 self._populate_jump_list()
                 self._populate_deduction_tree()
@@ -13624,6 +13668,7 @@ class CameraToolsTab(ttk.Frame):
         self.flip_detail_arrays: dict[str, dict[str, np.ndarray]] = {}
         self.flip_frame_local_indices: list[int] = []
         self.images_root: Path | None = None
+        self._dragging_flip_frame_scale = False
         self._scheduled_camera_load_id = None
         self._scheduled_camera_recon_id = None
         self.uses_shared_reconstruction_panel = True
@@ -13769,10 +13814,8 @@ class CameraToolsTab(ttk.Frame):
             variable=self.show_images_var,
             command=self.render_flip_preview,
         ).pack(side=tk.LEFT, padx=(0, 8))
-        self.images_root_entry = LabeledEntry(image_controls, "Images root", "", browse=True, directory=True)
-        self.images_root_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         overlay_label = ttk.Label(image_controls, text="QA overlay", width=10)
-        overlay_label.pack(side=tk.LEFT, padx=(8, 0))
+        overlay_label.pack(side=tk.LEFT, padx=(0, 0))
         self.qa_overlay_var = tk.StringVar(value="none")
         self.qa_overlay_box = ttk.Combobox(
             image_controls,
@@ -13783,6 +13826,8 @@ class CameraToolsTab(ttk.Frame):
         )
         self.qa_overlay_box.pack(side=tk.LEFT, padx=(0, 8))
 
+        frame_slider_box = ttk.Frame(inspector_box)
+        frame_slider_box.pack(fill=tk.X, padx=8, pady=(0, 8))
         inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
         inspector_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         frame_panel = ttk.Frame(inspector_body)
@@ -13790,7 +13835,7 @@ class CameraToolsTab(ttk.Frame):
         inspector_body.add(frame_panel, weight=1)
         inspector_body.add(preview_panel, weight=2)
 
-        frame_slider_row = ttk.Frame(frame_panel)
+        frame_slider_row = ttk.Frame(frame_slider_box)
         frame_slider_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Label(frame_slider_row, text="Frame", width=8).pack(side=tk.LEFT)
         self.flip_frame_var = tk.DoubleVar(value=0.0)
@@ -13805,8 +13850,13 @@ class CameraToolsTab(ttk.Frame):
         self.flip_frame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
         self.flip_frame_label = ttk.Label(frame_slider_row, text="frame -", width=10)
         self.flip_frame_label.pack(side=tk.LEFT)
-        self.flip_frame_marks = tk.Canvas(frame_panel, height=10, highlightthickness=0, bd=0)
-        self.flip_frame_marks.pack(fill=tk.X, pady=(0, 6))
+        frame_marks_row = ttk.Frame(frame_slider_box)
+        frame_marks_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(frame_marks_row, text="", width=8).pack(side=tk.LEFT)
+        self.flip_frame_marks = tk.Canvas(frame_marks_row, height=10, highlightthickness=0, bd=0)
+        self.flip_frame_marks.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        ttk.Label(frame_marks_row, text="", width=10).pack(side=tk.LEFT)
+        self._bind_flip_frame_navigation(self.flip_frame_scale)
 
         ttk.Label(frame_panel, text="Frames suspectes / candidates").pack(anchor="w", pady=(0, 4))
         self.flip_frame_list = tk.Listbox(frame_panel, exportselection=False, height=12)
@@ -13840,7 +13890,10 @@ class CameraToolsTab(ttk.Frame):
         attach_tooltip(
             self.flip_check, "Permute gauche/droite sur les données 2D brutes affichées. Raccourci clavier: F."
         )
-        attach_tooltip(self.images_root_entry, "Dossier d'images utilisé comme fond du preview caméra, si disponible.")
+        attach_tooltip(
+            image_controls,
+            "Le fond image utilise le chemin partagé 'Images root' défini dans l'onglet 2D analysis.",
+        )
         attach_tooltip(
             self.qa_overlay_box,
             "Overlay calibration QA on the 2D image: local 2D epipolar error, selected 3D reprojection error, or 3D excluded keypoints.",
@@ -13857,7 +13910,7 @@ class CameraToolsTab(ttk.Frame):
 
         self.flip_method_var.trace_add("write", lambda *_args: self.refresh_flip_frame_list())
         self.qa_overlay_var.trace_add("write", lambda *_args: self.render_flip_preview())
-        self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self.render_flip_preview())
+        self.flip_frame_list.bind("<<ListboxSelect>>", lambda _event: self._on_flip_frame_list_selection_changed())
         self.flip_frame_marks.bind("<Configure>", lambda _event: self._render_flip_frame_markers())
         self.metrics_tree.bind("<<TreeviewSelect>>", lambda _event: self._on_metrics_tree_selection_changed())
         for widget in (self.flip_frame_list, self.flip_canvas_widget, self.flip_method_box, self.metrics_tree):
@@ -13865,6 +13918,7 @@ class CameraToolsTab(ttk.Frame):
             widget.bind("<Enter>", lambda _event, w=widget: w.focus_set())
         self.state.keypoints_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
         self.state.output_root_var.trace_add("write", lambda *_args: self.sync_dataset_dir())
+        self.state.shared_images_root_var.trace_add("write", lambda *_args: self.render_flip_preview())
         self.state.pose_data_mode_var.trace_add("write", lambda *_args: self.request_load_resources())
         self.state.calibration_correction_var.trace_add("write", lambda *_args: self.request_load_resources())
         self.state.register_reconstruction_listener(self.request_refresh_available_reconstructions)
@@ -13884,8 +13938,11 @@ class CameraToolsTab(ttk.Frame):
         return "break"
 
     def sync_dataset_dir(self) -> None:
-        self.images_root = infer_execution_images_root(ROOT / self.state.keypoints_var.get())
-        self.images_root_entry.var.set("" if self.images_root is None else display_path(self.images_root))
+        self.images_root = sync_shared_images_root_from_keypoints(
+            self.state,
+            ROOT / self.state.keypoints_var.get(),
+            set_if_empty_only=True,
+        )
         self.request_refresh_available_reconstructions()
         self.update_camera_filter_status()
         self.request_load_resources()
@@ -13915,6 +13972,17 @@ class CameraToolsTab(ttk.Frame):
 
         self._sync_inspector_camera_name()
         self.refresh_flip_frame_list()
+
+    def _on_flip_frame_list_selection_changed(self) -> None:
+        """Synchronize the camera-frame slider when the suspect-frame list changes."""
+
+        selection = self.flip_frame_list.curselection()
+        if selection:
+            list_idx = int(selection[0])
+            if 0 <= list_idx < len(self.flip_frame_local_indices):
+                self.flip_frame_var.set(float(self.flip_frame_local_indices[list_idx]))
+        self._update_flip_frame_label()
+        self.render_flip_preview()
 
     def configure_shared_reconstruction_panel(self, panel: SharedReconstructionPanel) -> None:
         panel.configure_for_consumer(
@@ -14202,23 +14270,93 @@ class CameraToolsTab(ttk.Frame):
         self.flip_frame_var.set(float(clamp_frame_index(current, max_frame) if n_frames else 0))
         self._update_flip_frame_label()
 
+    def _bind_flip_frame_navigation(self, widget: tk.Widget) -> None:
+        """Attach click, drag, and keyboard navigation to the camera-frame slider."""
+
+        if widget is self.flip_frame_scale:
+            widget.bind("<Button-1>", self._on_flip_frame_scale_click)
+            widget.bind("<B1-Motion>", self._on_flip_frame_scale_drag)
+            widget.bind("<ButtonRelease-1>", self._on_flip_frame_scale_release)
+        widget.bind("<Enter>", lambda _event: widget.focus_set())
+        widget.bind("<Left>", lambda _event: self.step_flip_frame(-1))
+        widget.bind("<Right>", lambda _event: self.step_flip_frame(1))
+
+    def _flip_frame_from_scale_event(self, event) -> int:
+        """Map a mouse event on the camera slider to one local frame index."""
+
+        return frame_from_slider_click(
+            x=event.x,
+            width=self.flip_frame_scale.winfo_width(),
+            from_value=self.flip_frame_scale.cget("from"),
+            to_value=self.flip_frame_scale.cget("to"),
+        )
+
+    def _on_flip_frame_scale_click(self, event) -> str:
+        """Jump the camera inspector to the clicked frame position."""
+
+        self._dragging_flip_frame_scale = True
+        self.flip_frame_scale.focus_set()
+        self.flip_frame_var.set(float(self._flip_frame_from_scale_event(event)))
+        self._on_flip_frame_scale_changed(None)
+        return "break"
+
+    def _on_flip_frame_scale_drag(self, event) -> str:
+        """Drag the camera inspector continuously across frames."""
+
+        if not self._dragging_flip_frame_scale:
+            return "break"
+        self.flip_frame_var.set(float(self._flip_frame_from_scale_event(event)))
+        self._on_flip_frame_scale_changed(None)
+        return "break"
+
+    def _on_flip_frame_scale_release(self, event) -> str:
+        """End one drag interaction on the camera-frame slider."""
+
+        if not self._dragging_flip_frame_scale:
+            return "break"
+        self._dragging_flip_frame_scale = False
+        self.flip_frame_var.set(float(self._flip_frame_from_scale_event(event)))
+        self._on_flip_frame_scale_changed(None)
+        return "break"
+
     def _on_flip_frame_scale_changed(self, _value) -> None:
         """Refresh the camera preview when the user scrubs the frame slider."""
 
         if self.base_pose_data is None:
             return
-        local_idx = self._selected_flip_frame_local_idx()
-        self._update_flip_frame_label()
-        if local_idx is None:
-            return
-        if local_idx in self.flip_frame_local_indices:
-            list_idx = self.flip_frame_local_indices.index(local_idx)
+        slider_idx = clamp_frame_index(
+            int(round(float(self.flip_frame_var.get()))),
+            len(self.base_pose_data.frames) - 1,
+        )
+        self.flip_frame_var.set(float(slider_idx))
+        if slider_idx in self.flip_frame_local_indices:
+            list_idx = self.flip_frame_local_indices.index(slider_idx)
             self.flip_frame_list.selection_clear(0, tk.END)
             self.flip_frame_list.selection_set(list_idx)
             self.flip_frame_list.see(list_idx)
         else:
             self.flip_frame_list.selection_clear(0, tk.END)
+        self._update_flip_frame_label()
+        if slider_idx is None:
+            return
         self.render_flip_preview()
+
+    def step_flip_frame(self, delta: int) -> str:
+        """Move the camera inspector backward or forward by one frame."""
+
+        if self.base_pose_data is None or len(getattr(self.base_pose_data, "frames", [])) == 0:
+            return "break"
+        current_idx = self._selected_flip_frame_local_idx()
+        if current_idx is None:
+            return "break"
+        next_idx = step_frame_index(
+            current=int(current_idx),
+            delta=int(delta),
+            max_frame=len(self.base_pose_data.frames) - 1,
+        )
+        self.flip_frame_var.set(float(next_idx))
+        self._on_flip_frame_scale_changed(None)
+        return "break"
 
     def _update_flip_frame_label(self) -> None:
         """Display the current frame number beside the slider."""
@@ -14405,9 +14543,7 @@ class CameraToolsTab(ttk.Frame):
         x_limits, y_limits = crop_limits_from_points(finite, width=float(width), height=float(height), margin=0.2)
 
         ax = self.flip_figure.subplots(1, 1)
-        images_root = (
-            Path(self.images_root_entry.get().strip()) if self.images_root_entry.get().strip() else self.images_root
-        )
+        images_root = shared_images_root_path(self.state) or self.images_root
         background_image = (
             load_camera_background_image(
                 images_root,
@@ -15606,6 +15742,7 @@ class LauncherApp(tk.Tk):
             flip_temporal_weight_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_WEIGHT)),
             flip_temporal_tau_px_var=tk.StringVar(value=str(DEFAULT_FLIP_TEMPORAL_TAU_PX)),
             calibration_correction_var=tk.StringVar(value="none"),
+            shared_images_root_var=tk.StringVar(value=""),
             initial_rotation_correction_var=tk.BooleanVar(value=True),
             selected_camera_names_var=tk.StringVar(value=""),
             output_root_var=tk.StringVar(value="output"),
