@@ -4348,6 +4348,86 @@ def test_clear_reconstructions_deletes_only_selected_rows(monkeypatch, tmp_path)
     assert info_messages
 
 
+def test_annotation_tab_reports_unsaved_changes_from_payload_signature():
+    tab = pipeline_gui.AnnotationTab.__new__(pipeline_gui.AnnotationTab)
+    tab.annotation_payload = {"cameras": {"cam0": {"0": {"nose": [10.0, 20.0]}}}}
+    tab._last_saved_annotation_signature = pipeline_gui.annotation_payload_signature(tab.annotation_payload)
+
+    assert pipeline_gui.AnnotationTab.has_unsaved_changes(tab) is False
+
+    pipeline_gui.set_annotation_point(
+        tab.annotation_payload,
+        camera_name="cam0",
+        frame_number=0,
+        keypoint_name="left_eye",
+        xy=[11.0, 21.0],
+    )
+
+    assert pipeline_gui.AnnotationTab.has_unsaved_changes(tab) is True
+
+
+def test_launcher_app_unsaved_change_sources_collect_profiles_and_tabs():
+    app = pipeline_gui.LauncherApp.__new__(pipeline_gui.LauncherApp)
+    app.state = SimpleNamespace(profiles_dirty=True)
+
+    annotation_tab = SimpleNamespace(
+        unsaved_changes_label="annotations",
+        has_unsaved_changes=lambda: True,
+    )
+    clean_tab = SimpleNamespace(
+        unsaved_changes_label="clean tab",
+        has_unsaved_changes=lambda: False,
+    )
+    app.notebook = SimpleNamespace(tabs=lambda: ("annotation", "clean"))
+    tab_lookup = {"annotation": annotation_tab, "clean": clean_tab}
+    app.nametowidget = lambda tab_id: tab_lookup[tab_id]
+
+    assert pipeline_gui.LauncherApp._unsaved_change_sources(app) == [
+        "reconstruction profiles",
+        "annotations",
+    ]
+
+
+def test_launcher_app_close_is_cancelled_when_unsaved_changes_are_declined(monkeypatch):
+    app = pipeline_gui.LauncherApp.__new__(pipeline_gui.LauncherApp)
+    app.state = SimpleNamespace(profiles_dirty=True)
+    app.notebook = SimpleNamespace(tabs=lambda: ())
+    destroyed = []
+    prompts = []
+    app.destroy = lambda: destroyed.append("destroyed")
+
+    monkeypatch.setattr(
+        pipeline_gui.messagebox,
+        "askyesno",
+        lambda title, message, parent=None: prompts.append((title, message, parent)) or False,
+    )
+
+    pipeline_gui.LauncherApp._on_request_close(app)
+
+    assert destroyed == []
+    assert prompts
+    assert prompts[0][0] == "Quit GUI"
+    assert "reconstruction profiles" in prompts[0][1]
+
+
+def test_launcher_app_close_allows_shutdown_after_confirmation(monkeypatch):
+    app = pipeline_gui.LauncherApp.__new__(pipeline_gui.LauncherApp)
+    app.state = SimpleNamespace(profiles_dirty=False)
+    app.notebook = SimpleNamespace(tabs=lambda: ("annotation",))
+    app.nametowidget = lambda _tab_id: SimpleNamespace(
+        unsaved_changes_label="annotations",
+        has_unsaved_changes=lambda: True,
+    )
+    destroyed = []
+    app.destroy = lambda: destroyed.append("destroyed")
+
+    monkeypatch.setattr(pipeline_gui.messagebox, "askyesno", lambda *args, **kwargs: True)
+
+    pipeline_gui.LauncherApp._on_request_close(app)
+
+    assert destroyed == ["destroyed"]
+
+
 def test_load_preview_bundle_accepts_missing_pose2sim_trc(tmp_path):
     output_dir = tmp_path / "empty_dataset"
     output_dir.mkdir(parents=True)

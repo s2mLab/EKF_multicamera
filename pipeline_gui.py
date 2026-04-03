@@ -2498,6 +2498,13 @@ def attach_tooltip(widget: tk.Widget, text: str) -> ToolTip:
 
 @dataclass
 class SharedAppState:
+    """Mutable application state shared across all GUI tabs.
+
+    Attributes:
+        profiles_dirty: Whether the in-memory reconstruction profiles differ
+            from the last saved or loaded profiles JSON on disk.
+    """
+
     calib_var: tk.StringVar
     keypoints_var: tk.StringVar
     annotation_path_var: tk.StringVar
@@ -2536,20 +2543,40 @@ class SharedAppState:
     clean_trial_outputs_callback: callable | None = None
     clean_trial_caches_callback: callable | None = None
     startup_status_callback: callable | None = None
+    profiles_dirty: bool = False
 
-    def set_profiles(self, profiles: list[ReconstructionProfile]) -> None:
+    def set_profiles(self, profiles: list[ReconstructionProfile], *, mark_dirty: bool = True) -> None:
+        """Replace the in-memory reconstruction profiles and notify listeners.
+
+        Args:
+            profiles: New list of reconstruction profiles to expose in the GUI.
+            mark_dirty: When ``True``, mark the profiles configuration as having
+                unsaved changes. Callers should pass ``False`` after loading
+                profiles from disk or restoring startup defaults.
+        """
         self.profiles = list(profiles)
+        if mark_dirty:
+            self.profiles_dirty = True
         for callback in list(self.profile_listeners):
             try:
                 callback()
             except Exception:
                 pass
 
+    def clear_profiles_dirty(self) -> None:
+        """Mark the current in-memory profiles as saved."""
+
+        self.profiles_dirty = False
+
     def register_profile_listener(self, callback) -> None:
+        """Register a callback invoked whenever the profile list changes."""
+
         if callback not in self.profile_listeners:
             self.profile_listeners.append(callback)
 
     def notify_reconstructions_updated(self) -> None:
+        """Invalidate reconstruction-derived caches and notify dependent tabs."""
+
         self.preview_bundle_cache.clear()
         self.jump_analysis_cache.clear()
         for callback in list(self.reconstruction_listeners):
@@ -2559,10 +2586,19 @@ class SharedAppState:
                 pass
 
     def register_reconstruction_listener(self, callback) -> None:
+        """Register a callback triggered after reconstruction outputs change."""
+
         if callback not in self.reconstruction_listeners:
             self.reconstruction_listeners.append(callback)
 
     def set_shared_reconstruction_selection(self, names: list[str]) -> None:
+        """Store the shared reconstruction selection and notify listeners.
+
+        Args:
+            names: Ordered reconstruction names currently selected in the
+                shared selector.
+        """
+
         self.shared_reconstruction_selection = list(names)
         for callback in list(self.shared_reconstruction_selection_listeners):
             try:
@@ -2571,6 +2607,8 @@ class SharedAppState:
                 pass
 
     def register_shared_reconstruction_selection_listener(self, callback) -> None:
+        """Register a callback for shared reconstruction-selection changes."""
+
         if callback not in self.shared_reconstruction_selection_listeners:
             self.shared_reconstruction_selection_listeners.append(callback)
 
@@ -2620,6 +2658,8 @@ class BusyStatusWindow(tk.Toplevel):
             pass
 
     def set_status(self, message: str) -> None:
+        """Update the message displayed in the long-running-task popup."""
+
         self.message_var.set(str(message))
         self.update_idletasks()
 
@@ -2908,7 +2948,7 @@ def synchronize_profiles_initial_rotation_correction(state: SharedAppState) -> N
             updated = True
         profiles.append(profile)
     if updated:
-        state.set_profiles(profiles)
+        state.set_profiles(profiles, mark_dirty=True)
 
 
 def ensure_dataset_layout(state: SharedAppState) -> None:
@@ -3214,6 +3254,20 @@ def annotation_only_pose_data(
         payload=payload,
     )
     return replace(pose_data, keypoints=sparse_keypoints, scores=sparse_scores)
+
+
+def annotation_payload_signature(payload: dict[str, object]) -> str:
+    """Return a deterministic serialized signature for one annotation payload.
+
+    Args:
+        payload: Sparse manual-annotation payload organized by camera, frame,
+            and marker.
+
+    Returns:
+        Stable JSON text suitable for unsaved-change detection.
+    """
+
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
 def available_model_pose_modes(state: SharedAppState, keypoints_path: Path) -> list[str]:
@@ -5264,6 +5318,7 @@ class AnnotationTab(ttk.Frame):
     def __init__(self, master, state: SharedAppState):
         super().__init__(master)
         self.state = state
+        self.unsaved_changes_label = "annotations"
         self.uses_shared_reconstruction_panel = True
         self.shared_reconstruction_selectmode = "browse"
         self.calibrations = None
@@ -5296,6 +5351,7 @@ class AnnotationTab(ttk.Frame):
         self.kinematic_projected_points: np.ndarray | None = None
         self.kinematic_segmented_back_projected: dict[str, np.ndarray] = {}
         self.annotation_jump_analysis: DDSessionAnalysis | None = None
+        self._last_saved_annotation_signature = annotation_payload_signature(self.annotation_payload)
 
         body = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -6074,6 +6130,7 @@ class AnnotationTab(ttk.Frame):
                 )
                 popup.set_status("Chargement des annotations et des modèles existants...")
                 self.annotation_payload = load_annotation_payload(self.annotation_path, keypoints_path=keypoints_path)
+                self._last_saved_annotation_signature = annotation_payload_signature(self.annotation_payload)
                 self.refresh_kinematic_model_choices()
                 self.annotation_cameras_list.delete(0, tk.END)
                 for camera_name in self.pose_data.camera_names:
@@ -6094,9 +6151,17 @@ class AnnotationTab(ttk.Frame):
             messagebox.showerror("Annotation", str(exc))
 
     def save_annotations(self) -> None:
+        """Write the current sparse annotation payload to disk."""
+
         if self.annotation_path is None:
             return
         save_annotation_payload(self.annotation_path, self.annotation_payload)
+        self._last_saved_annotation_signature = annotation_payload_signature(self.annotation_payload)
+
+    def has_unsaved_changes(self) -> bool:
+        """Return whether the annotation payload differs from the last saved state."""
+
+        return annotation_payload_signature(self.annotation_payload) != self._last_saved_annotation_signature
 
     def _clear_kinematic_assist_preview(self) -> None:
         self.kinematic_q_current = None
@@ -10419,7 +10484,7 @@ class ProfilesTab(CommandTab):
         profiles = [existing for existing in self.state.profiles if existing.name != profile.name]
         profiles.append(profile)
         profiles.sort(key=lambda item: item.name)
-        self.state.set_profiles(profiles)
+        self.state.set_profiles(profiles, mark_dirty=True)
 
     def remove_selected_profiles(self) -> None:
         selected = self.profile_tree.selection()
@@ -10430,20 +10495,21 @@ class ProfilesTab(CommandTab):
         for idx in indices:
             if 0 <= idx < len(profiles):
                 del profiles[idx]
-        self.state.set_profiles(profiles)
+        self.state.set_profiles(profiles, mark_dirty=True)
 
     def generate_examples(self) -> None:
-        self.state.set_profiles(example_profiles())
+        self.state.set_profiles(example_profiles(), mark_dirty=True)
         synchronize_profiles_initial_rotation_correction(self.state)
 
     def generate_all_supported(self) -> None:
-        self.state.set_profiles(generate_supported_profiles())
+        self.state.set_profiles(generate_supported_profiles(), mark_dirty=True)
         synchronize_profiles_initial_rotation_correction(self.state)
 
     def load_profiles_from_json(self) -> None:
         try:
-            self.state.set_profiles(load_profiles_json(ROOT / self.config_path.get()))
+            self.state.set_profiles(load_profiles_json(ROOT / self.config_path.get()), mark_dirty=False)
             synchronize_profiles_initial_rotation_correction(self.state)
+            self.state.clear_profiles_dirty()
         except Exception as exc:
             messagebox.showerror("Profiles", str(exc))
 
@@ -10454,6 +10520,7 @@ class ProfilesTab(CommandTab):
         try:
             synchronize_profiles_initial_rotation_correction(self.state)
             save_profiles_json(ROOT / self.config_path.get(), self.state.profiles)
+            self.state.clear_profiles_dirty()
         except Exception as exc:
             messagebox.showerror("Profiles", str(exc))
 
@@ -15235,11 +15302,14 @@ class StartupStatusWindow(tk.Toplevel):
 
 
 class LauncherApp(tk.Tk):
+    """Main Tk application hosting the full VitPose / EKF GUI."""
+
     def __init__(self):
         super().__init__()
         self.withdraw()
         self.title("VitPose / EKF launcher")
         self.geometry("1450x950")
+        self.protocol("WM_DELETE_WINDOW", self._on_request_close)
         self.startup_window = StartupStatusWindow(self)
         tab_specs = [
             ("2D analysis", DataExplorer2DTab),
@@ -15303,11 +15373,12 @@ class LauncherApp(tk.Tk):
         profiles_path = ROOT / state.profiles_config_var.get()
         if profiles_path.exists():
             try:
-                state.set_profiles(load_profiles_json(profiles_path))
+                state.set_profiles(load_profiles_json(profiles_path), mark_dirty=False)
             except Exception:
-                state.set_profiles(example_profiles())
+                state.set_profiles(example_profiles(), mark_dirty=False)
         else:
-            state.set_profiles(example_profiles())
+            state.set_profiles(example_profiles(), mark_dirty=False)
+        state.clear_profiles_dirty()
         synchronize_profiles_initial_rotation_correction(state)
         self.state = state
 
@@ -15331,6 +15402,8 @@ class LauncherApp(tk.Tk):
         self.after_idle(self._finish_startup)
 
     def _set_startup_status(self, message: str, progress_ratio: float | None = None) -> None:
+        """Update the startup splash message while the GUI is still loading."""
+
         startup_window = getattr(self, "startup_window", None)
         if startup_window is None or not startup_window.winfo_exists():
             return
@@ -15338,6 +15411,8 @@ class LauncherApp(tk.Tk):
         self.update_idletasks()
 
     def _finish_startup(self) -> None:
+        """Close the splash window and reveal the fully initialized GUI."""
+
         self.state.startup_status_callback = None
         startup_window = getattr(self, "startup_window", None)
         if startup_window is not None and startup_window.winfo_exists():
@@ -15361,6 +15436,45 @@ class LauncherApp(tk.Tk):
 
     def _on_tab_changed(self, _event=None) -> None:
         self._refresh_active_reconstruction_panel()
+
+    def _unsaved_change_sources(self) -> list[str]:
+        """Return the list of unsaved logical resources currently open in the GUI."""
+
+        sources: list[str] = []
+        if bool(getattr(self.state, "profiles_dirty", False)):
+            sources.append("reconstruction profiles")
+        notebook = getattr(self, "notebook", None)
+        if notebook is None:
+            return sources
+        for tab_id in notebook.tabs():
+            try:
+                tab = self.nametowidget(tab_id)
+            except Exception:
+                continue
+            if hasattr(tab, "has_unsaved_changes"):
+                try:
+                    if bool(tab.has_unsaved_changes()):
+                        label = getattr(tab, "unsaved_changes_label", "annotations")
+                        if label not in sources:
+                            sources.append(str(label))
+                except Exception:
+                    continue
+        return sources
+
+    def _on_request_close(self) -> None:
+        """Confirm application shutdown when unsaved changes are detected."""
+
+        unsaved_sources = self._unsaved_change_sources()
+        if unsaved_sources:
+            summary = ", ".join(unsaved_sources)
+            should_quit = messagebox.askyesno(
+                "Quit GUI",
+                f"Unsaved changes were detected in: {summary}.\n\nDo you want to quit without saving?",
+                parent=self,
+            )
+            if not should_quit:
+                return
+        self.destroy()
 
 
 def main() -> None:

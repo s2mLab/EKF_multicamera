@@ -2174,6 +2174,8 @@ def apply_left_right_flip_corrections(pose_data: PoseData, suspect_mask: np.ndar
 
     La correction s'applique camera par camera et frame par frame, uniquement
     quand le diagnostic epipolaire juge le swap gauche/droite plus coherent.
+    Les scores 2D de ces vues sont aussi divises par deux afin de reduire leur
+    poids dans les etapes suivantes du filtre.
     """
     corrected_keypoints = apply_left_right_flip_to_points(pose_data.keypoints, suspect_mask)
     corrected_scores = apply_left_right_flip_to_points(pose_data.scores[..., np.newaxis], suspect_mask)[..., 0]
@@ -3725,6 +3727,13 @@ class MultiViewKinematicEKF:
         return int(upper_back_sagittal_idx), hip_indices
 
     def _resolve_ankle_bed_pair_indices(self) -> tuple[tuple[int, int], ...]:
+        """Map ankle keypoints to the corresponding model-marker pair indices.
+
+        Returns:
+            Tuples ``(pair_index, keypoint_index)`` for each ankle marker that
+            exists both in the model markers and in the COCO keypoint set.
+        """
+
         resolved: list[tuple[int, int]] = []
         for keypoint_name in ("left_ankle", "right_ankle"):
             keypoint_idx = KP_INDEX[keypoint_name]
@@ -3774,6 +3783,16 @@ class MultiViewKinematicEKF:
         return blocks
 
     def _is_airborne_frame(self, frame_idx: int) -> bool:
+        """Return whether one frame belongs to the airborne phase.
+
+        Args:
+            frame_idx: Frame index in the reconstruction support.
+
+        Returns:
+            ``True`` when every finite 3D support point is above the configured
+            flight-height threshold, ``False`` otherwise.
+        """
+
         if frame_idx < 0 or frame_idx >= self.reconstruction.points_3d.shape[0]:
             return False
         frame_points = np.asarray(self.reconstruction.points_3d[frame_idx], dtype=float)
@@ -3789,6 +3808,19 @@ class MultiViewKinematicEKF:
         marker_points_array: np.ndarray,
         marker_jacobians_array: np.ndarray,
     ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Build pseudo-measurement blocks that keep ankle X/Z on the bed.
+
+        Args:
+            frame_idx: Frame index being corrected.
+            marker_points_array: Current model-marker positions for the frame.
+            marker_jacobians_array: Marker Jacobians evaluated at the predicted
+                state.
+
+        Returns:
+            A list of EKF measurement blocks constrained on ankle ``X`` and
+            ``Z`` coordinates during non-airborne phases.
+        """
+
         if not self.ankle_bed_pseudo_obs or not self.ankle_bed_pair_indices or self._is_airborne_frame(frame_idx):
             return []
         blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -3825,29 +3857,57 @@ class MultiViewKinematicEKF:
     def _use_history3_prediction(self) -> bool:
         return self.predictor_mode in {"history3", "dyn_history3"}
 
+    def _history3_q_indices(self) -> np.ndarray:
+        """Return the DoF indices controlled by the history-based predictor."""
+
+        if self.predictor_mode == "history3":
+            return np.arange(self.nq, dtype=int)
+        if self.predictor_mode == "dyn_history3":
+            return np.asarray(self.joint_indices, dtype=int)
+        return np.empty(0, dtype=int)
+
     def _apply_history3_prediction(self, predicted_state: np.ndarray) -> np.ndarray:
-        if len(self.corrected_q_history) < 3 or self.joint_indices.size == 0:
+        """Apply quadratic extrapolation from ``t-2``, ``t-1``, and ``t``.
+
+        Args:
+            predicted_state: State already predicted by the base ACC/DYN model.
+
+        Returns:
+            Updated state where the selected DoFs are replaced by a quadratic
+            extrapolation inferred from the three most recent corrected
+            generalized-coordinate vectors.
+        """
+
+        q_indices = self._history3_q_indices()
+        if len(self.corrected_q_history) < 3 or q_indices.size == 0:
             return predicted_state
         q_tm2 = np.asarray(self.corrected_q_history[-3], dtype=float)
         q_tm1 = np.asarray(self.corrected_q_history[-2], dtype=float)
         q_t = np.asarray(self.corrected_q_history[-1], dtype=float)
-        required = np.concatenate((q_tm2[self.joint_indices], q_tm1[self.joint_indices], q_t[self.joint_indices]))
+        required = np.concatenate((q_tm2[q_indices], q_tm1[q_indices], q_t[q_indices]))
         if not np.all(np.isfinite(required)):
             return predicted_state
         dt = float(self.dt)
-        second_diff = q_t[self.joint_indices] - 2.0 * q_tm1[self.joint_indices] + q_tm2[self.joint_indices]
-        delta_next = q_t[self.joint_indices] - q_tm1[self.joint_indices] + second_diff
-        q_next = q_t[self.joint_indices] + delta_next
+        second_diff = q_t[q_indices] - 2.0 * q_tm1[q_indices] + q_tm2[q_indices]
+        delta_next = q_t[q_indices] - q_tm1[q_indices] + second_diff
+        q_next = q_t[q_indices] + delta_next
         qdot_next = delta_next / dt
         qddot_next = second_diff / (dt * dt)
         updated = np.array(predicted_state, copy=True)
-        updated[self.joint_indices] = q_next
-        updated[self.nq + self.joint_indices] = qdot_next
-        updated[2 * self.nq + self.joint_indices] = qddot_next
+        updated[q_indices] = q_next
+        updated[self.nq + q_indices] = qdot_next
+        updated[2 * self.nq + q_indices] = qddot_next
         updated[: self.nq] = canonicalize_model_q_rotation_branches(self.model, updated[: self.nq])
         return updated
 
     def record_corrected_state(self, state: np.ndarray) -> None:
+        """Store one corrected state so the next history-based prediction can use it.
+
+        Args:
+            state: Corrected EKF state ``[q, qdot, qddot]`` for the current
+                frame.
+        """
+
         q = np.asarray(state[: self.nq], dtype=float)
         self.corrected_q_history.append(canonicalize_model_q_rotation_branches(self.model, q))
         if len(self.corrected_q_history) > 3:

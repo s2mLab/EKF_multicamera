@@ -131,6 +131,9 @@ The GUI now uses a shared reconstruction selector at the top of the window. Most
 
 At startup, the GUI shows a small splash/status window while shared caches and preview resources are loaded.
 
+If you try to quit while annotations or reconstruction profiles contain unsaved
+changes, the GUI now asks for confirmation before closing.
+
 Typical workflow:
 
 1. Choose the 2D input in `2D analysis`
@@ -298,7 +301,7 @@ The 2D EKF combines:
 - the articulated model
 - 2D observations in all cameras
 - multiview coherence weighting
-- configurable predictor (`acc` or `dyn`)
+- configurable predictor (`acc`, `dyn`, `history3`, or `dyn_history3`)
 
 Important improvements already integrated in the codebase:
 
@@ -309,6 +312,10 @@ Important improvements already integrated in the codebase:
 - runtime left/right gate mode inside the EKF2D loop (`ekf_prediction_gate`)
 - optional segmented-back model variants, including upper-trunk-root variants
 - storage of excluded views for later QA overlays in the GUI
+- higher-order history-based prediction from the last three corrected states
+- optional trampoline-contact pseudo-observations for the ankles
+- lower confidence on views detected as left/right-flipped so they still help
+  the filter without dominating it
 
 ### 7. Model building
 
@@ -328,6 +335,7 @@ The `Annotation` tab provides:
 - epipolar guides, triangulated reprojection hints, and reprojection from the selected reconstruction
 - frame subsets such as `Flipped L/R` and `Worst reproj 5%`
 - `Reproject -> Confirm` replacement of already annotated points only
+- drag editing of existing 2D points with optional snap to reprojection or epipolar guides
 - a first `Kinematic assist` mode:
   - choose an existing `.bioMod`
   - estimate an initial `q` on the current frame
