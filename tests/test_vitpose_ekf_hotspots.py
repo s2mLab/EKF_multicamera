@@ -1309,6 +1309,30 @@ def test_history3_predicts_root_but_dyn_history3_keeps_root_from_base_predictor(
     np.testing.assert_allclose(updated_dyn_history3[:4], np.array([100.0, 200.0, 6.225, 12.45], dtype=float))
 
 
+def test_record_corrected_state_keeps_raw_q_without_absolute_canonicalization(monkeypatch):
+    class _Model:
+        def nbSegment(self):
+            return 1
+
+    ekf = vitpose_ekf_pipeline.MultiViewKinematicEKF.__new__(vitpose_ekf_pipeline.MultiViewKinematicEKF)
+    ekf.model = _Model()
+    ekf.nq = 3
+    ekf.corrected_q_history = []
+    ekf.corrected_state_history = []
+
+    monkeypatch.setattr(
+        vitpose_ekf_pipeline,
+        "canonicalize_model_q_rotation_branches",
+        lambda _model, _q: (_ for _ in ()).throw(AssertionError("Should not be called during sequential history3")),
+    )
+
+    state = np.array([3.4, -6.2, 9.1, 0.5, 0.6, 0.7, -0.1, -0.2, -0.3], dtype=float)
+    ekf.record_corrected_state(state)
+
+    np.testing.assert_allclose(ekf.corrected_q_history[-1], state[:3])
+    np.testing.assert_allclose(ekf.corrected_state_history[-1], state)
+
+
 def test_back_pseudo_segment_name_for_q_names_prefers_lower_trunk_when_present():
     q_names = np.asarray(["TRUNK:RotY", "LOWER_TRUNK:RotY", "LEFT_THIGH:RotY", "RIGHT_THIGH:RotY"], dtype=object)
 

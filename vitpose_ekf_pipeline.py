@@ -3969,7 +3969,6 @@ class MultiViewKinematicEKF:
         updated[q_indices] = q_next
         updated[self.nq + q_indices] = qdot_next
         updated[2 * self.nq + q_indices] = qddot_next
-        updated[: self.nq] = canonicalize_model_q_rotation_branches(self.model, updated[: self.nq])
         return updated
 
     def record_corrected_state(self, state: np.ndarray) -> None:
@@ -3980,12 +3979,9 @@ class MultiViewKinematicEKF:
                 frame.
         """
 
-        q = np.asarray(state[: self.nq], dtype=float)
-        canonical_q = canonicalize_model_q_rotation_branches(self.model, q)
-        canonical_state = np.asarray(state, dtype=float).copy()
-        canonical_state[: self.nq] = canonical_q
-        self.corrected_q_history.append(canonical_q)
-        self.corrected_state_history.append(canonical_state)
+        state_array = np.asarray(state, dtype=float).copy()
+        self.corrected_q_history.append(np.asarray(state_array[: self.nq], dtype=float))
+        self.corrected_state_history.append(state_array)
         if len(self.corrected_q_history) > 3:
             self.corrected_q_history = self.corrected_q_history[-3:]
         if len(self.corrected_state_history) > 3:
