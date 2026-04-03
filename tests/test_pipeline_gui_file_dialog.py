@@ -606,6 +606,13 @@ def test_multiview_tab_qa_overlay_data_reads_reprojection_and_excluded_payload(m
     assert cmap is None
 
 
+def test_multiview_tab_selected_reconstruction_uses_shared_selection():
+    tab = pipeline_gui.MultiViewTab.__new__(pipeline_gui.MultiViewTab)
+    tab.state = SimpleNamespace(shared_reconstruction_selection=["raw", "demo"])
+
+    assert pipeline_gui.MultiViewTab._selected_reconstruction(tab) == "demo"
+
+
 def test_get_cached_calibrations_reports_startup_status(monkeypatch, tmp_path):
     messages = []
     state = SimpleNamespace(calibration_cache={}, startup_status_callback=messages.append)

@@ -11,6 +11,18 @@ from reconstruction.reconstruction_bundle import summarize_reprojection_errors, 
 from vitpose_ekf_pipeline import COCO17, CameraCalibration, PoseData, sampson_error_pixels_vectorized
 
 
+def _nanmean_without_warning(values: np.ndarray, axis: int) -> np.ndarray:
+    """Return a NaN-aware mean without emitting warnings on empty slices."""
+
+    values = np.asarray(values, dtype=float)
+    finite_counts = np.sum(np.isfinite(values), axis=axis)
+    sums = np.nansum(values, axis=axis)
+    means = np.full(sums.shape, np.nan, dtype=float)
+    valid = finite_counts > 0
+    means[valid] = sums[valid] / finite_counts[valid]
+    return means
+
+
 @dataclass
 class Calibration2DQC:
     trim_fraction: float
@@ -253,7 +265,7 @@ def compute_3d_calibration_qc(
     reprojection_summary = summarize_reprojection_errors(reprojection_error_per_view, camera_names)
     view_usage_summary = summarize_view_usage(excluded_views, camera_names)
 
-    point_error = np.nanmean(reprojection_error_per_view, axis=2)
+    point_error = _nanmean_without_warning(reprojection_error_per_view, axis=2)
     valid = np.all(np.isfinite(points_3d), axis=2) & np.isfinite(point_error)
     if not np.any(valid):
         empty_bins = np.full((1, 1, 1), np.nan, dtype=float)
@@ -274,7 +286,7 @@ def compute_3d_calibration_qc(
 
     positions = points_3d[valid]
     errors = point_error[valid]
-    per_frame_mean = np.nanmean(point_error, axis=1)
+    per_frame_mean = _nanmean_without_warning(point_error, axis=1)
     x_idx, n_x = _quantile_bin_indices(positions[:, 0], spatial_bins)
     y_idx, n_y = _quantile_bin_indices(positions[:, 1], spatial_bins)
     z_idx, n_z = _quantile_bin_indices(positions[:, 2], spatial_bins)

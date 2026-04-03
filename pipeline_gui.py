@@ -4806,6 +4806,12 @@ class MultiViewTab(CommandTab):
     def selected_reconstruction_names(self) -> list[str]:
         return list(self.state.shared_reconstruction_selection)
 
+    def _selected_reconstruction(self) -> str | None:
+        """Return the last selected reconstruction from the shared selector."""
+
+        selected = self.selected_reconstruction_names()
+        return str(selected[-1]) if selected else None
+
     def _publish_reconstruction_rows(self, rows: list[dict[str, object]], defaults: list[str]) -> None:
         panel = self.state.shared_reconstruction_panel
         if panel is not None and self.state.active_reconstruction_consumer is self:

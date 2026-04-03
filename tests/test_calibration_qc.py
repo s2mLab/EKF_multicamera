@@ -1,4 +1,5 @@
 import numpy as np
+import warnings
 
 import calibration_qc
 from vitpose_ekf_pipeline import CameraCalibration, PoseData
@@ -76,6 +77,25 @@ def test_compute_3d_calibration_qc_reports_spatial_non_uniformity():
     np.testing.assert_allclose(finite_spatial, np.array([1.0, 10.0]))
     np.testing.assert_array_equal(np.sort(qc.spatial_xz_count[qc.spatial_xz_count > 0]), np.array([51, 51]))
     assert qc.view_usage_summary["per_camera"]["cam0"]["excluded_ratio"] == 0.0
+
+
+def test_compute_3d_calibration_qc_ignores_empty_slices_without_warning():
+    points_3d = np.full((3, 17, 3), np.nan, dtype=float)
+    reproj = np.full((3, 17, 2), np.nan, dtype=float)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        qc = calibration_qc.compute_3d_calibration_qc(
+            {
+                "points_3d": points_3d,
+                "reprojection_error_per_view": reproj,
+            },
+            camera_names=["cam0", "cam1"],
+            spatial_bins=2,
+        )
+
+    assert qc is not None
+    assert np.all(np.isnan(qc.per_frame_mean_px))
 
 
 def test_frame_camera_epipolar_errors_averages_other_views(monkeypatch):

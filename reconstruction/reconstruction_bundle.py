@@ -1240,11 +1240,33 @@ def compute_model_marker_points_3d(model, q_trajectory: np.ndarray) -> np.ndarra
 def summarize_reprojection_errors(errors: np.ndarray, camera_names: list[str]) -> dict[str, object]:
     """Aggregate reprojection errors by keypoint and by camera."""
 
+    def _nanmean_without_warning(values: np.ndarray, axis: tuple[int, ...]) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        finite_counts = np.sum(np.isfinite(values), axis=axis)
+        sums = np.nansum(values, axis=axis)
+        means = np.full(sums.shape, np.nan, dtype=float)
+        valid = finite_counts > 0
+        means[valid] = sums[valid] / finite_counts[valid]
+        return means
+
+    def _nanstd_without_warning(values: np.ndarray, axis: tuple[int, ...]) -> np.ndarray:
+        means = _nanmean_without_warning(values, axis=axis)
+        expanded_means = means
+        for current_axis in sorted(axis):
+            expanded_means = np.expand_dims(expanded_means, axis=current_axis)
+        centered = np.asarray(values, dtype=float) - expanded_means
+        squared = np.where(np.isfinite(values), centered**2, np.nan)
+        variances = _nanmean_without_warning(squared, axis=axis)
+        std = np.full(variances.shape, np.nan, dtype=float)
+        finite = np.isfinite(variances)
+        std[finite] = np.sqrt(variances[finite])
+        return std
+
     finite = errors[np.isfinite(errors)]
-    per_key_mean = np.nanmean(errors, axis=(0, 2))
-    per_key_std = np.nanstd(errors, axis=(0, 2))
-    per_camera_mean = np.nanmean(errors, axis=(0, 1))
-    per_camera_std = np.nanstd(errors, axis=(0, 1))
+    per_key_mean = _nanmean_without_warning(errors, axis=(0, 2))
+    per_key_std = _nanstd_without_warning(errors, axis=(0, 2))
+    per_camera_mean = _nanmean_without_warning(errors, axis=(0, 1))
+    per_camera_std = _nanstd_without_warning(errors, axis=(0, 1))
     per_keypoint = {
         keypoint_name: {
             "mean_px": float(per_key_mean[idx]) if np.isfinite(per_key_mean[idx]) else None,
