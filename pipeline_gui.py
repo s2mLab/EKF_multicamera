@@ -13828,6 +13828,7 @@ class CameraToolsTab(ttk.Frame):
 
         frame_slider_box = ttk.Frame(inspector_box)
         frame_slider_box.pack(fill=tk.X, padx=8, pady=(0, 8))
+        frame_slider_box.columnconfigure(1, weight=1)
         inspector_body = ttk.Panedwindow(inspector_box, orient=tk.HORIZONTAL)
         inspector_body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         frame_panel = ttk.Frame(inspector_body)
@@ -13835,28 +13836,24 @@ class CameraToolsTab(ttk.Frame):
         inspector_body.add(frame_panel, weight=1)
         inspector_body.add(preview_panel, weight=2)
 
-        frame_slider_row = ttk.Frame(frame_slider_box)
-        frame_slider_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(frame_slider_row, text="Frame", width=8).pack(side=tk.LEFT)
+        ttk.Label(frame_slider_box, text="Frame", width=8).grid(row=0, column=0, sticky="w", pady=(0, 6))
         self.flip_frame_var = tk.DoubleVar(value=0.0)
         self.flip_frame_scale = ttk.Scale(
-            frame_slider_row,
+            frame_slider_box,
             from_=0,
             to=0,
             variable=self.flip_frame_var,
             orient=tk.HORIZONTAL,
             command=self._on_flip_frame_scale_changed,
+            takefocus=True,
         )
-        self.flip_frame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        self.flip_frame_label = ttk.Label(frame_slider_row, text="frame -", width=10)
-        self.flip_frame_label.pack(side=tk.LEFT)
-        frame_marks_row = ttk.Frame(frame_slider_box)
-        frame_marks_row.pack(fill=tk.X, pady=(0, 6))
-        ttk.Label(frame_marks_row, text="", width=8).pack(side=tk.LEFT)
-        self.flip_frame_marks = tk.Canvas(frame_marks_row, height=10, highlightthickness=0, bd=0)
-        self.flip_frame_marks.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-        ttk.Label(frame_marks_row, text="", width=10).pack(side=tk.LEFT)
+        self.flip_frame_scale.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=(0, 6))
+        self.flip_frame_label = ttk.Label(frame_slider_box, text="frame -", width=10)
+        self.flip_frame_label.grid(row=0, column=2, sticky="e", pady=(0, 6))
+        self.flip_frame_marks = tk.Canvas(frame_slider_box, height=10, highlightthickness=0, bd=0)
+        self.flip_frame_marks.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(0, 6))
         self._bind_flip_frame_navigation(self.flip_frame_scale)
+        self._bind_flip_frame_navigation(self.flip_frame_marks)
 
         ttk.Label(frame_panel, text="Frames suspectes / candidates").pack(anchor="w", pady=(0, 4))
         self.flip_frame_list = tk.Listbox(frame_panel, exportselection=False, height=12)
