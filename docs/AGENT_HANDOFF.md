@@ -113,6 +113,33 @@ python run_reconstruction_profiles.py --help
 Ne lancer une reconstruction complete sur une sequence reelle qu'apres avoir
 confirme les fichiers d'entree, les options du profil et le dossier de sortie.
 
+Options numeriques de l'EKF 2D (detail dans `OVERVIEW.md`, section EKF 2D) :
+`--ekf2d-update-method {woodbury,legacy}` (defaut `woodbury`, equivalent a
+l'arrondi pres a `legacy`). Test cible :
+`pytest -q tests/test_ekf2d_woodbury_update.py`.
+`--undistort-keypoints` (opt-in, toutes familles sauf `pose2sim`) dedistord les
+keypoints 2D au chargement et invalide les caches geometriques. Test cible :
+`pytest -q tests/test_keypoint_undistortion.py`.
+`--flight-detection {triangulation,ekf_state}` (defaut `triangulation`),
+`--flight-hysteresis-m`, `--flight-com-accel-tolerance` pilotent l'activation
+du predicteur `dyn`. Test cible : `pytest -q tests/test_ekf2d_flight_detection.py`.
+`--process-noise-model {legacy,white_jerk}` (defaut `legacy`) et
+`--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` choisissent la matrice `Q`.
+Test cible : `pytest -q tests/test_ekf2d_process_noise.py`.
+`--ekf2d-joint-prior` (opt-in) et `--ekf2d-joint-prior-axial-std-deg` (defaut 30)
+activent limites coude/genou, a priori axial et export canonique. Test cible :
+`pytest -q tests/test_ekf2d_joint_prior.py`.
+`--ekf2d-robust-mixture` (opt-in) et `--ekf2d-robust-outlier-prob` (defaut 0.03)
+activent la ponderation inlier/outlier. Test cible :
+`pytest -q tests/test_ekf2d_robust_mixture.py`.
+Les modes `*_fast*` (coherence et flip) utilisent la distance epipolaire
+symetrique (+3,7 % d'erreur vs Sampson mesuree en reel) ; l'equivalent Sampson
+est le meme nom sans `_fast`. Les profils existants restent inchanges ; la CLI
+affiche une note. Test cible : `pytest -q tests/test_epipolar_fast_notice.py`. Les tests EKF 2D
+construisant un modele exigent `biorbd` et `biobuddy` (sinon ils sont sautes) ;
+depuis un worktree, definir `BIOBUDDY_ROOT` si le depot frere `../biobuddy`
+n'existe pas a cote du worktree.
+
 ## Livraison d'un changement
 
 Executer d'abord le test cible de la matrice, puis les controles adequats a la

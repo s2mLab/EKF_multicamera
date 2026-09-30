@@ -42,8 +42,11 @@ from vitpose_ekf_pipeline import (
     DEFAULT_CAMERA_FPS,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     DEFAULT_COHERENCE_METHOD,
+    DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    DEFAULT_FLIGHT_DETECTION,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
+    DEFAULT_FLIGHT_HYSTERESIS_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
@@ -54,11 +57,15 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     DEFAULT_KEYPOINTS,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
+    DEFAULT_PROCESS_NOISE_JERK_PSD,
+    DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
+    DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
@@ -1559,8 +1566,14 @@ def build_pose_data(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
     annotations_path: Path | None = None,
+    undistort_keypoints: bool = False,
 ) -> PoseData:
-    """Load one ``PoseData`` object from keypoints, smoothing, and annotations settings."""
+    """Load one ``PoseData`` object from keypoints, smoothing, and annotations settings.
+
+    With ``undistort_keypoints``, callers must also use calibrations returned by
+    ``calibrations_with_undistorted_keypoints`` so that geometric caches are keyed
+    on this mode (see ``calibration_signature``).
+    """
 
     return load_pose_data(
         keypoints_path,
@@ -1573,7 +1586,14 @@ def build_pose_data(
         lower_percentile=pose_amplitude_lower_percentile,
         upper_percentile=pose_amplitude_upper_percentile,
         annotations_path=annotations_path,
+        undistort_keypoints=undistort_keypoints,
     )
+
+
+def keypoints_undistorted(calibrations: dict[str, CameraCalibration]) -> bool:
+    """Return whether the calibrations are flagged for keypoints undistorted at load time."""
+
+    return any(bool(getattr(calibration, "keypoints_undistorted", False)) for calibration in calibrations.values())
 
 
 def pose_effective_fps(pose_data: PoseData, source_fps: float) -> float:
@@ -1882,6 +1902,7 @@ def build_triangulation_bundle(
         "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "left_right_flip_diagnostics": flip_diagnostics,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -2189,6 +2210,7 @@ def build_ekf_3d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": effective_triangulation_method,
         "reprojection_threshold_px": reprojection_threshold_px,
@@ -2310,6 +2332,16 @@ def build_ekf_2d_bundle(
     upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: list[float] | tuple[float, ...] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+    flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+    flight_com_accel_tolerance: float | None = None,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
@@ -2500,6 +2532,13 @@ def build_ekf_2d_bundle(
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2534,6 +2573,16 @@ def build_ekf_2d_bundle(
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        flight_detection=flight_detection,
+        flight_hysteresis_m=flight_hysteresis_m,
+        flight_com_accel_tolerance=flight_com_accel_tolerance,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
@@ -2730,6 +2779,7 @@ def build_ekf_2d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "triangulation_method": effective_triangulation_method,
         "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
@@ -2757,16 +2807,38 @@ def build_ekf_2d_bundle(
             "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
             "ankle_bed_pseudo_obs": bool(ankle_bed_pseudo_obs),
             "ankle_bed_pseudo_std_m": float(ankle_bed_pseudo_std_m),
+            "update_method": str(result.get("update_method", ekf2d_update_method)),
+            "process_noise_model": str(process_noise_model),
+            "process_noise_jerk_psd": [
+                float(value) for value in (process_noise_jerk_psd or DEFAULT_PROCESS_NOISE_JERK_PSD)
+            ],
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
             "flight_min_consecutive_frames": int(flight_min_consecutive_frames),
+            "flight_detection": str(flight_detection),
+            "flight_hysteresis_m": float(flight_hysteresis_m),
+            "flight_com_accel_tolerance": (
+                None if flight_com_accel_tolerance is None else float(flight_com_accel_tolerance)
+            ),
+            "joint_prior": bool(joint_prior),
+            "joint_prior_axial_std_deg": float(joint_prior_axial_std_deg),
+            "robust_mixture": bool(robust_mixture),
+            "robust_mixture_outlier_prob": float(robust_mixture_outlier_prob),
             "flip_method": str(flip_method or "epipolar"),
         },
+        "joint_prior_counts": result.get("joint_prior_counts"),
+        "robust_mixture_stats": result.get("robust_mixture_stats"),
         "bootstrap_frame_idx": int(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
         ),
         "update_status_counts": {str(key): int(value) for key, value in result.get("update_status_counts", {}).items()},
+        "update_solver_counts": {str(key): int(value) for key, value in result.get("update_solver_counts", {}).items()},
+        "dyn_active_frames": (
+            None
+            if result.get("dyn_active_per_frame") is None
+            else int(np.count_nonzero(np.asarray(result["dyn_active_per_frame"], dtype=bool)))
+        ),
         "left_right_flip_diagnostics": flip_diagnostics,
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],
