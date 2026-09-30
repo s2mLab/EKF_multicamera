@@ -2885,7 +2885,7 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
     from biobuddy.characteristics.de_leva import DeLevaTable, SegmentName, Sex
 
     shoulder_height = lengths.shank_length + lengths.thigh_length + lengths.trunk_height
-    hip_height = lengths.shank_length + lengths.thigh_length
+    pelvis_height = lengths.shank_length + lengths.thigh_length
     knee_height = lengths.shank_length
     ankle_height = 0.0
     total_height = shoulder_height + lengths.head_length
@@ -2902,7 +2902,7 @@ def female_deleva_inertia_parameters(lengths: SegmentLengths, total_mass_kg: flo
         total_height=total_height,
         ankle_height=ankle_height,
         knee_height=knee_height,
-        hip_height=hip_height,
+        pelvis_height=pelvis_height,
         shoulder_height=shoulder_height,
         finger_span=finger_span,
         wrist_span=wrist_span,

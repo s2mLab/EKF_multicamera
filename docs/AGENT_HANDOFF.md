@@ -42,11 +42,11 @@ de l'environnement. Ne pas committer une adaptation de chemin propre a une
 machine.
 
 La version de `biobuddy` requise n'est pas epinglee. `build_biomod` appelle
-`DeLevaTable.from_measurements(..., hip_height=...)`, alors que les tags
-`v0.1.0` et `v0.2.0` et la branche `main` de `biobuddy` exposent
-`pelvis_height` a la place : les tests `tests/test_model_variants.py` qui
-construisent un `.bioMod` echouent avec ces versions (`TypeError`). `biobuddy`
-importe aussi `plotly`, a installer dans l'environnement.
+`DeLevaTable.from_measurements(..., pelvis_height=...)`, nom de parametre des
+tags `v0.1.0` et `v0.2.0` et de la branche `main` de `biobuddy`. Une version
+plus ancienne exposant `hip_height` provoque un `TypeError` dans
+`tests/test_model_variants.py`. `biobuddy` importe aussi `plotly`, a installer
+dans l'environnement.
 
 L'installation minimale `pip install -e .[test]` suffit aux tests CI. Les
 reconstructions biomecaniques et certaines vues du GUI exigent aussi les
