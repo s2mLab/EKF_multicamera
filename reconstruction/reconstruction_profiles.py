@@ -120,6 +120,8 @@ class ReconstructionProfile:
     process_noise_scale: float = 1.0
     process_noise_model: str = "legacy"
     process_noise_jerk_psd: list[float] | None = None
+    joint_prior: bool = False
+    joint_prior_axial_std_deg: float = 30.0
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
@@ -165,6 +167,11 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("qjerk")
             if getattr(profile, "process_noise_jerk_psd", None):
                 parts.append("qc" + "_".join(slugify(f"{float(value):g}") for value in profile.process_noise_jerk_psd))
+        if bool(getattr(profile, "joint_prior", False)):
+            parts.append("jprior")
+            axial_std = float(getattr(profile, "joint_prior_axial_std_deg", 30.0))
+            if not math.isclose(axial_std, 30.0, rel_tol=0.0, abs_tol=1e-9):
+                parts.append(f"ax{slugify(f'{axial_std:g}')}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -335,6 +342,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             profile.process_noise_jerk_psd = psd
         if profile.process_noise_model != "white_jerk":
             profile.process_noise_jerk_psd = None
+        profile.joint_prior = bool(profile.joint_prior)
+        if float(profile.joint_prior_axial_std_deg) <= 0.0:
+            raise ValueError("joint_prior_axial_std_deg must be > 0.")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -353,6 +363,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.flight_detection = "triangulation"
         profile.process_noise_model = "legacy"
         profile.process_noise_jerk_psd = None
+        profile.joint_prior = False
+        profile.joint_prior_axial_std_deg = 30.0
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -683,6 +695,9 @@ def build_pipeline_command(
             if profile.process_noise_jerk_psd:
                 cmd.append("--process-noise-jerk-psd")
                 cmd.extend(str(float(value)) for value in profile.process_noise_jerk_psd)
+        if profile.joint_prior:
+            cmd.append("--ekf2d-joint-prior")
+            cmd.extend(["--ekf2d-joint-prior-axial-std-deg", str(float(profile.joint_prior_axial_std_deg))])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])

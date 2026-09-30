@@ -42,6 +42,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     DEFAULT_KEYPOINTS,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
@@ -195,6 +196,15 @@ def parse_args() -> argparse.Namespace:
         default=list(DEFAULT_PROCESS_NOISE_JERK_PSD),
         help="Densites spectrales q_c du jerk (m^2/s^5, rad^2/s^5, rad^2/s^5) pour --process-noise-model white_jerk.",
     )
+    parser.add_argument(
+        "--ekf2d-joint-prior",
+        action="store_true",
+        help=(
+            "Active les limites de signe coude/genou (branche miroir RotZ+pi/-RotY), l'a priori axial "
+            "FOREARM:RotZ/THIGH:RotZ ~ N(0, sigma) et l'export en branche canonique (defaut: desactive)."
+        ),
+    )
+    parser.add_argument("--ekf2d-joint-prior-axial-std-deg", type=float, default=DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG)
     parser.add_argument("--coherence-confidence-floor", type=float, default=DEFAULT_COHERENCE_CONFIDENCE_FLOOR)
     parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
     parser.add_argument(
@@ -403,6 +413,8 @@ def main() -> None:
             ekf2d_update_method=args.ekf2d_update_method,
             process_noise_model=args.process_noise_model,
             process_noise_jerk_psd=args.process_noise_jerk_psd,
+            joint_prior=args.ekf2d_joint_prior,
+            joint_prior_axial_std_deg=args.ekf2d_joint_prior_axial_std_deg,
             flight_detection=args.flight_detection,
             flight_hysteresis_m=args.flight_hysteresis_m,
             flight_com_accel_tolerance=args.flight_com_accel_tolerance,

@@ -127,6 +127,29 @@ profil, trace dans `summary.filter_parameters`) :
   passe de 12,91 px (`legacy`) a 12,26 px (l'ancien defaut `6 6 6` donnait
   21,86 px).
 
+A priori articulaire (`joint_prior`, `--ekf2d-joint-prior`, opt-in ; convention
+du modele : genou flechi `SHANK:RotY > 0`, coude flechi `FOREARM:RotY < 0`).
+Les marqueurs distaux etant sur l'axe du segment, `(RotZ + pi, -RotY)` pour
+`FOREARM` et `(THIGH:RotZ + pi, -SHANK:RotY)` pour le genou donnent exactement les
+memes marqueurs : ces branches miroir sont inobservables.
+
+1. Apres chaque correction : une flexion du mauvais cote de plus de 5 deg est
+   reflechie dans l'autre branche (symetrie exacte, `x <- T x + c`,
+   `P <- T P T^T`) ; une violation residuelle de la borne (coude <= -1 deg,
+   genou >= +1 deg) declenche une pseudo-observation d'inegalite
+   `RotY = borne` (sigma 0,5 deg), active seulement si violee.
+2. Pseudo-observations lineaires `FOREARM:RotZ` et `THIGH:RotZ ~ N(0, sigma^2)`
+   (`--ekf2d-joint-prior-axial-std-deg`, defaut 30 deg), ajoutees aux blocs de
+   pseudo-observations (chemin Woodbury par defaut ; `legacy` bascule en batch).
+3. Export (`run_ekf`) : `canonicalize_joint_mirror_branches` ramene q (et le
+   signe de qdot/qddot de la flexion) dans la branche canonique et replie
+   `RotZ` dans `[-pi, pi)` ; formats et formes inchanges.
+
+Sur `1_partie_0429` (900 frames, triangulation exhaustive, `acc`) : frames en
+miroir (au moins un membre) 98,3 % -> 0 % (par membre ~48 % -> 0 %), amplitude
+max de `FOREARM:RotZ` 2115 -> 251 deg (45 deg : 356 deg), reprojection mediane
+11,86 -> 12,07 px.
+
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc

@@ -125,7 +125,10 @@ keypoints 2D au chargement et invalide les caches geometriques. Test cible :
 du predicteur `dyn`. Test cible : `pytest -q tests/test_ekf2d_flight_detection.py`.
 `--process-noise-model {legacy,white_jerk}` (defaut `legacy`) et
 `--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` choisissent la matrice `Q`.
-Test cible : `pytest -q tests/test_ekf2d_process_noise.py`. Les tests EKF 2D
+Test cible : `pytest -q tests/test_ekf2d_process_noise.py`.
+`--ekf2d-joint-prior` (opt-in) et `--ekf2d-joint-prior-axial-std-deg` (defaut 30)
+activent limites coude/genou, a priori axial et export canonique. Test cible :
+`pytest -q tests/test_ekf2d_joint_prior.py`. Les tests EKF 2D
 construisant un modele exigent `biorbd` et `biobuddy` (sinon ils sont sautes) ;
 depuis un worktree, definir `BIOBUDDY_ROOT` si le depot frere `../biobuddy`
 n'existe pas a cote du worktree.

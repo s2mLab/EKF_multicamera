@@ -382,6 +382,14 @@ Process noise (`--process-noise-model`, profile field `process_noise_model`):
   240 frames of `1_partie_0429` the median reprojection error is 12.26 px versus
   12.91 px with `legacy`).
 
+Joint prior (`--ekf2d-joint-prior`, opt-in, profile field `joint_prior`): the
+elbow and knee have an unobservable mirror branch (`RotZ + pi`, `-RotY`). The
+option reflects the state into the anatomical branch, enforces the flexion sign
+(elbow <= -1 deg, knee >= +1 deg), adds `FOREARM:RotZ` / `THIGH:RotZ ~ N(0, sigma)`
+pseudo-observations (`--ekf2d-joint-prior-axial-std-deg`, default 30) and
+exports q in the canonical branch. On 900 real frames, mirrored frames drop from
+about 48 % per limb to 0 % and the forearm axial range from 2115 to 251 deg.
+
 Known limitation: in `dyn`/`history3` modes the covariance is still propagated
 with the constant-acceleration transition matrix.
 

@@ -129,6 +129,12 @@ DEFAULT_PROCESS_NOISE_MODEL = "legacy"
 # Calibrated by an independent analysis (synthetic 3 seeds + real 1_partie_0429 in leave-one-camera-out):
 # root translation 200 m^2/s^5, root rotation 1000 rad^2/s^5, joints 10000 rad^2/s^5.
 DEFAULT_PROCESS_NOISE_JERK_PSD = (200.0, 1000.0, 10000.0)
+# Opt-in joint prior (``joint_prior``): elbow/knee flexion sign limits + axial pseudo-observations.
+# Model convention: flexed knee = SHANK:RotY > 0, flexed elbow = FOREARM:RotY < 0.
+DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG = 30.0
+DEFAULT_JOINT_LIMIT_DEG = 1.0
+DEFAULT_JOINT_LIMIT_STD_DEG = 0.5
+DEFAULT_JOINT_REFLECT_MARGIN_DEG = 5.0
 DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
@@ -1253,6 +1259,63 @@ def normalize_process_noise_model(process_noise_model: str | None) -> str:
     if model not in SUPPORTED_PROCESS_NOISE_MODELS:
         raise ValueError(f"Unsupported process noise model: {process_noise_model}")
     return model
+
+
+def wrap_to_pi(values):
+    """Wrap angles (rad) into ``[-pi, pi)``."""
+
+    return (np.asarray(values, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def joint_mirror_pair_indices(q_names: Iterable[str]) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(axial_idx, flexion_idx, sign)`` for the elbow and knee mirror symmetries.
+
+    ``sign * q[flexion_idx] > 0`` is the canonical (anatomical) branch: ``sign=-1``
+    for the elbow (``FOREARM:RotZ`` / ``FOREARM:RotY``) and ``sign=+1`` for the knee
+    (``THIGH:RotZ`` / ``SHANK:RotY``). ``(RotZ + pi, -RotY)`` leaves the distal
+    marker unchanged, which is why the image measurements cannot tell the branches apart.
+    """
+
+    index = {str(name): idx for idx, name in enumerate(q_names)}
+    pairs: list[tuple[int, int, int]] = []
+    for side in ("LEFT", "RIGHT"):
+        for axial_name, flexion_name, sign in (
+            (f"{side}_FOREARM:RotZ", f"{side}_FOREARM:RotY", -1),
+            (f"{side}_THIGH:RotZ", f"{side}_SHANK:RotY", 1),
+        ):
+            if axial_name in index and flexion_name in index:
+                pairs.append((index[axial_name], index[flexion_name], sign))
+    return tuple(pairs)
+
+
+def canonicalize_joint_mirror_branches(
+    q_names: Iterable[str],
+    q: np.ndarray,
+    qdot: np.ndarray | None = None,
+    qddot: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Move elbow/knee angles into the canonical branch (export-time helper).
+
+    Frames where ``sign * RotY < 0`` are mapped with the exact symmetry
+    ``(RotZ + pi, -RotY)`` (``qdot``/``qddot`` of ``RotY`` are negated
+    consistently), then the axial angle is wrapped into ``[-pi, pi)``. Shapes are
+    preserved (``(n_frames, nq)``); NaN values stay NaN.
+    """
+
+    names = list(q_names)
+    q = np.array(q, dtype=float, copy=True)
+    qdot = None if qdot is None else np.array(qdot, dtype=float, copy=True)
+    qddot = None if qddot is None else np.array(qddot, dtype=float, copy=True)
+    for axial_idx, flex_idx, sign in joint_mirror_pair_indices(names):
+        mirrored = sign * q[:, flex_idx] < 0.0
+        q[mirrored, axial_idx] += np.pi
+        q[mirrored, flex_idx] *= -1.0
+        for derivative in (qdot, qddot):
+            if derivative is not None:
+                derivative[mirrored, flex_idx] *= -1.0
+        finite = np.isfinite(q[:, axial_idx])
+        q[finite, axial_idx] = wrap_to_pi(q[finite, axial_idx])
+    return q, qdot, qddot
 
 
 def legacy_process_noise(nq: int, process_noise_scale: float = 1.0) -> np.ndarray:
@@ -3976,8 +4039,18 @@ class MultiViewKinematicEKF:
         flight_com_accel_tolerance: float | None = None,
         process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
         process_noise_jerk_psd: Iterable[float] | None = None,
+        joint_prior: bool = False,
+        joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     ):
         self.model = model
+        self.joint_prior = bool(joint_prior)
+        if float(joint_prior_axial_std_deg) <= 0.0:
+            raise ValueError("joint_prior_axial_std_deg must be > 0.")
+        self.joint_prior_axial_std_rad = float(np.deg2rad(float(joint_prior_axial_std_deg)))
+        self.joint_limit_rad = float(np.deg2rad(DEFAULT_JOINT_LIMIT_DEG))
+        self.joint_limit_std_rad = float(np.deg2rad(DEFAULT_JOINT_LIMIT_STD_DEG))
+        self.joint_reflect_rad = float(np.deg2rad(DEFAULT_JOINT_REFLECT_MARGIN_DEG))
+        self.joint_prior_counts = {"axial_prior_blocks": 0, "mirror_reflections": 0, "limit_projections": 0}
         self.process_noise_model = normalize_process_noise_model(process_noise_model)
         self.process_noise_jerk_psd = tuple(
             float(value)
@@ -4069,6 +4142,8 @@ class MultiViewKinematicEKF:
             if idx is not None
         )
         self.locked_q_indices: set[int] = set()
+        self.joint_mirror_pairs = joint_mirror_pair_indices(self.q_names)
+        self.joint_axial_indices = tuple(axial_idx for axial_idx, _flex_idx, _sign in self.joint_mirror_pairs)
         if self.process_noise_model == "white_jerk":
             self.process_noise = white_jerk_process_noise(
                 self.dt,
@@ -4226,6 +4301,82 @@ class MultiViewKinematicEKF:
                 )
             )
         return blocks
+
+    def _joint_axial_prior_blocks(
+        self,
+        reference_q: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Linear pseudo-observations ``FOREARM:RotZ ~ N(0, s^2)`` and ``THIGH:RotZ ~ N(0, s^2)``."""
+
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for q_idx in self.joint_axial_indices:
+            if q_idx in self.locked_q_indices:
+                continue
+            current_value = float(reference_q[int(q_idx)])
+            if not np.isfinite(current_value):
+                continue
+            h_q = np.zeros((1, self.nq), dtype=float)
+            h_q[0, int(q_idx)] = 1.0
+            blocks.append(
+                (
+                    np.array([0.0], dtype=float),
+                    np.array([current_value], dtype=float),
+                    h_q,
+                    np.array([self.joint_prior_axial_std_rad**2], dtype=float),
+                )
+            )
+        self.joint_prior_counts["axial_prior_blocks"] += len(blocks)
+        return blocks
+
+    def _apply_joint_limit_constraints(
+        self, state: np.ndarray, covariance: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Enforce the elbow/knee flexion sign after the measurement update.
+
+        1. A flexion on the wrong side by more than the reflection margin is
+           moved to the mirror branch ``(RotZ + pi, -RotY)``, an exact symmetry of
+           the marker model (the distal marker lies on the rotation axis); the
+           state and covariance are transformed with the same linear map
+           ``T`` (``P <- T P T^T``), so ``P`` stays SPD.
+        2. A remaining violation of the bound (elbow ``<= -1 deg``, knee
+           ``>= +1 deg``) triggers an inequality pseudo-observation
+           ``RotY = bound`` (std ``DEFAULT_JOINT_LIMIT_STD_DEG``), active only
+           when violated and applied with the same exact Kalman update.
+        """
+
+        state = np.array(state, dtype=float, copy=True)
+        covariance = np.array(covariance, dtype=float, copy=True)
+        nq = self.nq
+        for axial_idx, flex_idx, sign in self.joint_mirror_pairs:
+            if flex_idx in self.locked_q_indices or axial_idx in self.locked_q_indices:
+                continue
+            if sign * state[flex_idx] < -self.joint_reflect_rad:
+                state[axial_idx] = float(wrap_to_pi(state[axial_idx] + np.pi))
+                flip = [flex_idx, nq + flex_idx, 2 * nq + flex_idx]
+                state[flip] *= -1.0
+                covariance[flip, :] *= -1.0
+                covariance[:, flip] *= -1.0
+                self.joint_prior_counts["mirror_reflections"] += 1
+        violated = [
+            (flex_idx, sign)
+            for _axial_idx, flex_idx, sign in self.joint_mirror_pairs
+            if flex_idx not in self.locked_q_indices and sign * state[flex_idx] < self.joint_limit_rad
+        ]
+        if not violated:
+            return state, covariance
+        H_q = np.zeros((len(violated), nq), dtype=float)
+        for row, (flex_idx, _sign) in enumerate(violated):
+            H_q[row, flex_idx] = 1.0
+        z = np.array([sign * self.joint_limit_rad for _flex_idx, sign in violated], dtype=float)
+        h = np.array([state[flex_idx] for flex_idx, _sign in violated], dtype=float)
+        R_diag = np.full(len(violated), self.joint_limit_std_rad**2, dtype=float)
+        result = apply_measurement_update_woodbury(state, covariance, z, h, H_q, R_diag, nq)
+        if result is None:
+            result = apply_measurement_update_batch(state, covariance, z, h, H_q, R_diag, nq, self.identity_x)
+        if result is None:
+            return state, covariance
+        self.joint_prior_counts["limit_projections"] += len(violated)
+        return result
 
     def _is_airborne_frame(self, frame_idx: int) -> bool:
         """Return whether one frame belongs to the airborne phase.
@@ -4784,7 +4935,11 @@ class MultiViewKinematicEKF:
             marker_points_array=marker_points_array,
             marker_jacobians_array=marker_jacobians_array,
         )
-        has_pseudo_priors = pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks)
+        axial_prior_blocks = self._joint_axial_prior_blocks(q) if self.joint_prior else []
+        has_pseudo_priors = (
+            pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks) or bool(axial_prior_blocks)
+        )
+        measurement_blocks.extend(axial_prior_blocks)
         if pseudo_block is not None:
             measurement_blocks.append(pseudo_block)
         measurement_blocks.extend(zero_prior_blocks)
@@ -4845,6 +5000,8 @@ class MultiViewKinematicEKF:
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
         updated_state, updated_covariance = update_result
+        if self.joint_prior:
+            updated_state, updated_covariance = self._apply_joint_limit_constraints(updated_state, updated_covariance)
         self.profiling["solve_s"] += time.perf_counter() - t_solve
         self._apply_lock_constraints(updated_state, updated_covariance)
         self.update_status["corrected"] += 1
@@ -5216,6 +5373,8 @@ def initial_state_from_ekf_bootstrap(
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
     process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -5274,6 +5433,8 @@ def initial_state_from_ekf_bootstrap(
         update_method=update_method,
         process_noise_model=process_noise_model,
         process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -5336,6 +5497,8 @@ def initial_state_from_root_pose_bootstrap(
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
     process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -5378,6 +5541,8 @@ def initial_state_from_root_pose_bootstrap(
             update_method=update_method,
             process_noise_model=process_noise_model,
             process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -5408,6 +5573,8 @@ def initial_state_from_root_pose_bootstrap(
         update_method=update_method,
         process_noise_model=process_noise_model,
         process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -5444,6 +5611,8 @@ def compute_ekf2d_initial_state(
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
     process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -5486,6 +5655,8 @@ def compute_ekf2d_initial_state(
             update_method=update_method,
             process_noise_model=process_noise_model,
             process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5514,6 +5685,8 @@ def compute_ekf2d_initial_state(
             update_method=update_method,
             process_noise_model=process_noise_model,
             process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5556,6 +5729,8 @@ def run_ekf(
     flight_com_accel_tolerance: float | None = None,
     process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
     process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5599,6 +5774,8 @@ def run_ekf(
         update_method=update_method,
         process_noise_model=process_noise_model,
         process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,
@@ -5641,6 +5818,15 @@ def run_ekf(
         update_status_per_frame.append(update_status)
     timings["loop_s"] = time.perf_counter() - t_loop
     timings.update({key: float(value) for key, value in ekf.profiling.items()})
+    if ekf.joint_prior:
+        # Export in the canonical elbow/knee branch (exact marker symmetry, root untouched).
+        q_canonical, qdot_canonical, qddot_canonical = canonicalize_joint_mirror_branches(
+            ekf.q_names,
+            states[:, : ekf.nq],
+            states[:, ekf.nq : 2 * ekf.nq],
+            states[:, 2 * ekf.nq :],
+        )
+        states = np.concatenate((q_canonical, qdot_canonical, qddot_canonical), axis=1)
     effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q = (
         unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names, mode=effective_root_unwrap_mode)
@@ -5658,6 +5844,7 @@ def run_ekf(
             "update_method": str(ekf.update_method),
             "update_solver_counts": dict(ekf.solver_counts),
             "flight_detection": str(ekf.flight_detection),
+            "joint_prior_counts": dict(ekf.joint_prior_counts) if ekf.joint_prior else None,
             "dyn_active_per_frame": (
                 np.asarray(ekf.flight_active_history, dtype=bool) if root_flight_dynamics else None
             ),
