@@ -122,6 +122,8 @@ class ReconstructionProfile:
     process_noise_jerk_psd: list[float] | None = None
     joint_prior: bool = False
     joint_prior_axial_std_deg: float = 30.0
+    robust_mixture: bool = False
+    robust_mixture_outlier_prob: float = 0.03
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
@@ -172,6 +174,11 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             axial_std = float(getattr(profile, "joint_prior_axial_std_deg", 30.0))
             if not math.isclose(axial_std, 30.0, rel_tol=0.0, abs_tol=1e-9):
                 parts.append(f"ax{slugify(f'{axial_std:g}')}")
+        if bool(getattr(profile, "robust_mixture", False)):
+            parts.append("robust")
+            outlier_prob = float(getattr(profile, "robust_mixture_outlier_prob", 0.03))
+            if not math.isclose(outlier_prob, 0.03, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"po{slugify(f'{outlier_prob:g}')}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -345,6 +352,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.joint_prior = bool(profile.joint_prior)
         if float(profile.joint_prior_axial_std_deg) <= 0.0:
             raise ValueError("joint_prior_axial_std_deg must be > 0.")
+        profile.robust_mixture = bool(profile.robust_mixture)
+        if not 0.0 < float(profile.robust_mixture_outlier_prob) < 1.0:
+            raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -365,6 +375,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.process_noise_jerk_psd = None
         profile.joint_prior = False
         profile.joint_prior_axial_std_deg = 30.0
+        profile.robust_mixture = False
+        profile.robust_mixture_outlier_prob = 0.03
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -698,6 +710,9 @@ def build_pipeline_command(
         if profile.joint_prior:
             cmd.append("--ekf2d-joint-prior")
             cmd.extend(["--ekf2d-joint-prior-axial-std-deg", str(float(profile.joint_prior_axial_std_deg))])
+        if profile.robust_mixture:
+            cmd.append("--ekf2d-robust-mixture")
+            cmd.extend(["--ekf2d-robust-outlier-prob", str(float(profile.robust_mixture_outlier_prob))])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])

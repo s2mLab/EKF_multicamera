@@ -65,6 +65,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_PROCESS_NOISE_JERK_PSD,
     DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
+    DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
@@ -2336,6 +2337,8 @@ def build_ekf_2d_bundle(
     process_noise_jerk_psd: list[float] | tuple[float, ...] | None = None,
     joint_prior: bool = False,
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
     flight_detection: str = DEFAULT_FLIGHT_DETECTION,
     flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
     flight_com_accel_tolerance: float | None = None,
@@ -2534,6 +2537,8 @@ def build_ekf_2d_bundle(
         process_noise_jerk_psd=process_noise_jerk_psd,
         joint_prior=joint_prior,
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2573,6 +2578,8 @@ def build_ekf_2d_bundle(
         process_noise_jerk_psd=process_noise_jerk_psd,
         joint_prior=joint_prior,
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,
@@ -2816,9 +2823,12 @@ def build_ekf_2d_bundle(
             ),
             "joint_prior": bool(joint_prior),
             "joint_prior_axial_std_deg": float(joint_prior_axial_std_deg),
+            "robust_mixture": bool(robust_mixture),
+            "robust_mixture_outlier_prob": float(robust_mixture_outlier_prob),
             "flip_method": str(flip_method or "epipolar"),
         },
         "joint_prior_counts": result.get("joint_prior_counts"),
+        "robust_mixture_stats": result.get("robust_mixture_stats"),
         "bootstrap_frame_idx": int(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
         ),

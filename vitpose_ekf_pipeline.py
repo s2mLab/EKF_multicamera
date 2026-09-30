@@ -135,6 +135,9 @@ DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG = 30.0
 DEFAULT_JOINT_LIMIT_DEG = 1.0
 DEFAULT_JOINT_LIMIT_STD_DEG = 0.5
 DEFAULT_JOINT_REFLECT_MARGIN_DEG = 5.0
+# Opt-in robust inlier/outlier mixture on 2D keypoints (``robust_mixture``).
+DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB = 0.03
+ROBUST_MIXTURE_MIN_WEIGHT = 1e-6
 DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
@@ -1316,6 +1319,57 @@ def canonicalize_joint_mirror_branches(
         finite = np.isfinite(q[:, axial_idx])
         q[finite, axial_idx] = wrap_to_pi(q[finite, axial_idx])
     return q, qdot, qddot
+
+
+def robust_mixture_measurement_variances(
+    innovations: np.ndarray,
+    H_blocks: np.ndarray,
+    predicted_q_covariance: np.ndarray,
+    variances: np.ndarray,
+    outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    image_area_px2: float = 1920.0 * 1080.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inflate 2D keypoint variances with an inlier (Gaussian) / outlier (uniform) mixture.
+
+    For each keypoint ``k`` with innovation ``y_k`` (px), Jacobian ``H_k``
+    (``2 x nq``) and isotropic variance ``r_k`` (px^2):
+    ``S_k = H_k P_qq H_k^T + r_k I``,
+    ``w_k = pi_in N(y_k; 0, S_k) / (pi_in N(y_k; 0, S_k) + pi_out / A_img)``
+    and the effective variance is the diagonal of ``S_k / w_k - H_k P_qq H_k^T``,
+    i.e. ``r_k / w_k + diag(H_k P_qq H_k^T) (1 / w_k - 1)``: diagonal (as
+    required by the solvers), SPD and ``>= r_k``. ``w_k`` is floored at
+    ``ROBUST_MIXTURE_MIN_WEIGHT``. Everything is computed from the predicted
+    state, so the result does not depend on the camera order or on the solver.
+
+    Returns:
+        ``(variances_xy (m, 2), weights (m,))``.
+    """
+
+    innovations = np.asarray(innovations, dtype=float).reshape(-1, 2)
+    H_blocks = np.asarray(H_blocks, dtype=float)
+    variances = np.asarray(variances, dtype=float).reshape(-1)
+    hph = np.einsum("mai,ij,mbj->mab", H_blocks, np.asarray(predicted_q_covariance, dtype=float), H_blocks)
+    hph = 0.5 * (hph + np.transpose(hph, (0, 2, 1)))
+    S = hph + variances[:, np.newaxis, np.newaxis] * np.eye(2)[np.newaxis]
+    det = S[:, 0, 0] * S[:, 1, 1] - S[:, 0, 1] * S[:, 1, 0]
+    det = np.maximum(det, 1e-300)
+    inv_S = (
+        np.stack((np.stack((S[:, 1, 1], -S[:, 0, 1]), axis=-1), np.stack((-S[:, 1, 0], S[:, 0, 0]), axis=-1)), axis=-2)
+        / det[:, np.newaxis, np.newaxis]
+    )
+    mahalanobis = np.einsum("ma,mab,mb->m", innovations, inv_S, innovations)
+    outlier_prob = float(np.clip(outlier_prob, 0.0, 1.0))
+    log_inlier = np.log(max(1.0 - outlier_prob, 1e-300)) - 0.5 * mahalanobis - np.log(2.0 * np.pi) - 0.5 * np.log(det)
+    log_outlier = np.log(max(outlier_prob, 1e-300)) - np.log(float(image_area_px2))
+    weights = 1.0 / (1.0 + np.exp(np.clip(log_outlier - log_inlier, -700.0, 700.0)))
+    weights = np.where(np.isfinite(weights), weights, ROBUST_MIXTURE_MIN_WEIGHT)
+    weights = np.clip(weights, ROBUST_MIXTURE_MIN_WEIGHT, 1.0)
+    diag_hph = np.stack((hph[:, 0, 0], hph[:, 1, 1]), axis=-1)
+    inflated = variances[:, np.newaxis] / weights[:, np.newaxis] + np.maximum(diag_hph, 0.0) * (
+        1.0 / weights[:, np.newaxis] - 1.0
+    )
+    inflated = np.maximum(inflated, variances[:, np.newaxis])
+    return inflated, weights
 
 
 def legacy_process_noise(nq: int, process_noise_scale: float = 1.0) -> np.ndarray:
@@ -4041,8 +4095,15 @@ class MultiViewKinematicEKF:
         process_noise_jerk_psd: Iterable[float] | None = None,
         joint_prior: bool = False,
         joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+        robust_mixture: bool = False,
+        robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
     ):
         self.model = model
+        self.robust_mixture = bool(robust_mixture)
+        self.robust_mixture_outlier_prob = float(robust_mixture_outlier_prob)
+        if not 0.0 < self.robust_mixture_outlier_prob < 1.0:
+            raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
+        self.robust_mixture_stats = {"keypoints": 0, "weight_sum": 0.0, "downweighted_below_0_5": 0}
         self.joint_prior = bool(joint_prior)
         if float(joint_prior_axial_std_deg) <= 0.0:
             raise ValueError("joint_prior_axial_std_deg must be > 0.")
@@ -4918,12 +4979,27 @@ class MultiViewKinematicEKF:
                 selected_variances = frame_variances[keypoint_indices]
             if not np.any(selected_mask):
                 continue
+            block_variances = np.repeat(selected_variances[selected_mask], 2).astype(float, copy=False)
+            if self.robust_mixture:
+                image_width, image_height = (float(value) for value in calibration.image_size)
+                inflated, weights = robust_mixture_measurement_variances(
+                    selected_points[selected_mask] - projected_uv[selected_mask],
+                    H_q_blocks[selected_mask],
+                    predicted_covariance[: self.nq, : self.nq],
+                    selected_variances[selected_mask],
+                    outlier_prob=self.robust_mixture_outlier_prob,
+                    image_area_px2=image_width * image_height,
+                )
+                block_variances = inflated.reshape(-1)
+                self.robust_mixture_stats["keypoints"] += int(weights.size)
+                self.robust_mixture_stats["weight_sum"] += float(np.sum(weights))
+                self.robust_mixture_stats["downweighted_below_0_5"] += int(np.count_nonzero(weights < 0.5))
             measurement_blocks.append(
                 (
                     selected_points[selected_mask].reshape(-1),
                     projected_uv[selected_mask].reshape(-1),
                     H_q_blocks[selected_mask].reshape(-1, self.nq),
-                    np.repeat(selected_variances[selected_mask], 2).astype(float, copy=False),
+                    block_variances,
                 )
             )
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
@@ -5375,6 +5451,8 @@ def initial_state_from_ekf_bootstrap(
     process_noise_jerk_psd: Iterable[float] | None = None,
     joint_prior: bool = False,
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -5435,6 +5513,8 @@ def initial_state_from_ekf_bootstrap(
         process_noise_jerk_psd=process_noise_jerk_psd,
         joint_prior=joint_prior,
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -5499,6 +5579,8 @@ def initial_state_from_root_pose_bootstrap(
     process_noise_jerk_psd: Iterable[float] | None = None,
     joint_prior: bool = False,
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -5543,6 +5625,8 @@ def initial_state_from_root_pose_bootstrap(
             process_noise_jerk_psd=process_noise_jerk_psd,
             joint_prior=joint_prior,
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -5575,6 +5659,8 @@ def initial_state_from_root_pose_bootstrap(
         process_noise_jerk_psd=process_noise_jerk_psd,
         joint_prior=joint_prior,
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -5613,6 +5699,8 @@ def compute_ekf2d_initial_state(
     process_noise_jerk_psd: Iterable[float] | None = None,
     joint_prior: bool = False,
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -5657,6 +5745,8 @@ def compute_ekf2d_initial_state(
             process_noise_jerk_psd=process_noise_jerk_psd,
             joint_prior=joint_prior,
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5687,6 +5777,8 @@ def compute_ekf2d_initial_state(
             process_noise_jerk_psd=process_noise_jerk_psd,
             joint_prior=joint_prior,
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5731,6 +5823,8 @@ def run_ekf(
     process_noise_jerk_psd: Iterable[float] | None = None,
     joint_prior: bool = False,
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5776,6 +5870,8 @@ def run_ekf(
         process_noise_jerk_psd=process_noise_jerk_psd,
         joint_prior=joint_prior,
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,
@@ -5845,6 +5941,7 @@ def run_ekf(
             "update_solver_counts": dict(ekf.solver_counts),
             "flight_detection": str(ekf.flight_detection),
             "joint_prior_counts": dict(ekf.joint_prior_counts) if ekf.joint_prior else None,
+            "robust_mixture_stats": dict(ekf.robust_mixture_stats) if ekf.robust_mixture else None,
             "dyn_active_per_frame": (
                 np.asarray(ekf.flight_active_history, dtype=bool) if root_flight_dynamics else None
             ),

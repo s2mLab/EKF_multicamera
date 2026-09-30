@@ -390,6 +390,12 @@ pseudo-observations (`--ekf2d-joint-prior-axial-std-deg`, default 30) and
 exports q in the canonical branch. On 900 real frames, mirrored frames drop from
 about 48 % per limb to 0 % and the forearm axial range from 2115 to 251 deg.
 
+Robust measurements (`--ekf2d-robust-mixture`, opt-in, profile field
+`robust_mixture`): each 2D keypoint gets an inlier/outlier weight from a
+Gaussian-plus-uniform mixture (`--ekf2d-robust-outlier-prob`, default 0.03,
+uniform over the image area) and its variance is inflated accordingly, so gross
+detection errors are neutralized.
+
 Known limitation: in `dyn`/`history3` modes the covariance is still propagated
 with the constant-acceleration transition matrix.
 

@@ -150,6 +150,17 @@ miroir (au moins un membre) 98,3 % -> 0 % (par membre ~48 % -> 0 %), amplitude
 max de `FOREARM:RotZ` 2115 -> 251 deg (45 deg : 356 deg), reprojection mediane
 11,86 -> 12,07 px.
 
+Melange robuste (`robust_mixture`, `--ekf2d-robust-mixture`, opt-in) : pour
+chaque keypoint, `S_k = H_k P_qq H_k^T + r_k I` (2x2, etat predit),
+`w_k = pi_in N(y_k; 0, S_k) / (pi_in N + pi_out / A_img)` avec
+`pi_out = 0.03` (`--ekf2d-robust-outlier-prob`) et `A_img` = largeur x hauteur de
+la calibration ; variance effective = diagonale de `S_k / w_k - H_k P_qq H_k^T`
+(diagonale pour les solveurs, >= `r_k`, `w_k >= 1e-6`). Independant de l'ordre
+des cameras et identique pour `woodbury` et `legacy`. Statistiques dans
+`robust_mixture_stats`. Sur 900 frames reelles : 6,3 % des keypoints ont
+`w < 0,5`, reprojection mediane 11,86 -> 11,66 px (moyenne 20,43 -> 22,36 px :
+les outliers ne sont plus suivis).
+
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc
