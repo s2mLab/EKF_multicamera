@@ -131,7 +131,11 @@ activent limites coude/genou, a priori axial et export canonique. Test cible :
 `pytest -q tests/test_ekf2d_joint_prior.py`.
 `--ekf2d-robust-mixture` (opt-in) et `--ekf2d-robust-outlier-prob` (defaut 0.03)
 activent la ponderation inlier/outlier. Test cible :
-`pytest -q tests/test_ekf2d_robust_mixture.py`. Les tests EKF 2D
+`pytest -q tests/test_ekf2d_robust_mixture.py`.
+Les modes `*_fast*` (coherence et flip) utilisent la distance epipolaire
+symetrique (+3,7 % d'erreur vs Sampson mesuree en reel) ; l'equivalent Sampson
+est le meme nom sans `_fast`. Les profils existants restent inchanges ; la CLI
+affiche une note. Test cible : `pytest -q tests/test_epipolar_fast_notice.py`. Les tests EKF 2D
 construisant un modele exigent `biorbd` et `biobuddy` (sinon ils sont sautes) ;
 depuis un worktree, definir `BIOBUDDY_ROOT` si le depot frere `../biobuddy`
 n'existe pas a cote du worktree.

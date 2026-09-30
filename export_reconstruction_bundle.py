@@ -65,6 +65,7 @@ from vitpose_ekf_pipeline import (
     SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
     calibrations_with_undistorted_keypoints,
+    epipolar_fast_notice,
     load_calibrations,
     normalize_root_unwrap_mode,
 )
@@ -121,7 +122,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--epipolar-threshold-px", type=float, default=DEFAULT_EPIPOLAR_THRESHOLD_PX)
     parser.add_argument("--min-cameras-for-triangulation", type=int, default=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION)
-    parser.add_argument("--coherence-method", choices=SUPPORTED_COHERENCE_METHODS, default=DEFAULT_COHERENCE_METHOD)
+    parser.add_argument(
+        "--coherence-method",
+        choices=SUPPORTED_COHERENCE_METHODS,
+        default=DEFAULT_COHERENCE_METHOD,
+        help=(
+            "Les modes epipolar_fast* utilisent la distance epipolaire symetrique (+3.7%% d'erreur vs Sampson "
+            "mesure sur donnees reelles); leurs equivalents Sampson sont epipolar / epipolar_framewise."
+        ),
+    )
     parser.add_argument("--subject-mass-kg", type=float, default=DEFAULT_SUBJECT_MASS_KG)
     parser.add_argument("--biorbd-kalman-noise-factor", type=float, default=DEFAULT_BIORBD_KALMAN_NOISE_FACTOR)
     parser.add_argument("--biorbd-kalman-error-factor", type=float, default=DEFAULT_BIORBD_KALMAN_ERROR_FACTOR)
@@ -248,6 +257,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    notice = epipolar_fast_notice(args.coherence_method, args.flip_method if args.flip_left_right else None)
+    if notice:
+        print(notice, flush=True)
     root_unwrap_mode = normalize_root_unwrap_mode(("off" if args.no_root_unwrap else args.root_unwrap_mode))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     calibrations = load_calibrations(args.calib)

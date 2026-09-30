@@ -1237,6 +1237,39 @@ def apply_measurement_update_batch(
     )
 
 
+def epipolar_distance_mode_for_method(method: str | None) -> str | None:
+    """Return the epipolar distance used by a coherence/flip method (``None`` if not epipolar).
+
+    The ``*_fast*`` variants differ from their Sampson counterparts only by the
+    symmetric epipolar distance (measured +3.7 % worse than Sampson on
+    ``1_partie_0429``); the Sampson equivalent of ``epipolar_fast[_framewise|_viterbi]``
+    is ``epipolar[_framewise|_viterbi]``.
+    """
+
+    name = "" if method is None else str(method).strip().lower()
+    if not name.startswith("epipolar"):
+        return None
+    return "symmetric" if "fast" in name else "sampson"
+
+
+def epipolar_fast_notice(coherence_method: str | None, flip_method: str | None = None) -> str | None:
+    """Return a user-facing note when a symmetric-distance (``*_fast*``) epipolar mode is selected."""
+
+    selected = [
+        (label, str(method))
+        for label, method in (("coherence", coherence_method), ("flip", flip_method))
+        if epipolar_distance_mode_for_method(method) == "symmetric"
+    ]
+    if not selected:
+        return None
+    parts = [f"{label}={method} (Sampson: {method.replace('_fast', '')})" for label, method in selected]
+    return (
+        "[NOTE] "
+        + ", ".join(parts)
+        + " uses the symmetric epipolar distance, measured +3.7% worse than Sampson on real data."
+    )
+
+
 def normalize_ekf2d_update_method(update_method: str | None) -> str:
     """Validate the EKF2D measurement-update solver name (``None`` -> default)."""
 

@@ -73,6 +73,15 @@ par `reconstruction.reconstruction_bundle`; elles sont des entrees logiques des
 stages suivants. La coherence epipolaire utilise des matrices fondamentales et
 des erreurs de Sampson ou une distance symetrique selon la methode selectionnee.
 
+Les variantes `epipolar_fast`, `epipolar_fast_framewise` (coherence) et
+`epipolar_fast`, `epipolar_fast_viterbi` (flip) ne different de leurs
+equivalents Sampson (`epipolar`, `epipolar_framewise`, `epipolar_viterbi`) que
+par la distance epipolaire symetrique, mesuree +3,7 % pire que Sampson sur
+donnees reelles. Les profils existants ne sont pas modifies ; utiliser le mode
+sans `_fast` pour Sampson (aucune option supplementaire necessaire).
+`export_reconstruction_bundle.py` affiche une note (`epipolar_fast_notice`)
+quand un mode symetrique est choisi.
+
 La triangulation propose `once`, `greedy` et `exhaustive`; le cout augmente avec
 le nombre de cameras, particulierement pour `exhaustive`. Les bundles portent
 des erreurs de reprojection par vue, des coherences et des masques d'exclusion.
