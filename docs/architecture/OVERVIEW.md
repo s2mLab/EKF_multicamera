@@ -111,6 +111,20 @@ dynamique flottante quand un critere de vol est vrai (`flight_detection`,
   optionnelle `|CoMddot_z - g_z| <= flight_com_accel_tolerance`. Le masque
   d'activation reel est exporte (`dyn_active_per_frame`, `dyn_active_frames`).
 
+Bruit de processus (`process_noise_model`, `--process-noise-model`, champ de
+profil, trace dans `summary.filter_parameters`) :
+
+- `legacy` (defaut) : `diag(1e-4, 5e-3, 5e-2) * process_noise_scale` pour
+  `(q, qdot, qddot)`, independant de `dt` (donc du stride/FPS effectif).
+- `white_jerk` (opt-in) : jerk blanc continu discretise exactement,
+  `Q(dt) = q_c [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2],
+  [dt^3/6, dt^2/2, dt]]` par DoF, avec `q_c` par groupe (translation racine
+  m^2/s^5, rotation racine et articulations rad^2/s^5 ;
+  `--process-noise-jerk-psd`, defaut `6 6 6`, soit `q_c dt = 5e-2` a 120 Hz,
+  non cale). Aucun calage automatique ; sur 240 frames reelles, ce defaut
+  augmente l'erreur de reprojection (mediane 12.9 -> 21.9 px) : il doit etre
+  cale avant usage scientifique.
+
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc

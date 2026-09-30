@@ -123,6 +123,12 @@ keypoints 2D au chargement et invalide les caches geometriques. Test cible :
 `--flight-detection {triangulation,ekf_state}` (defaut `triangulation`),
 `--flight-hysteresis-m`, `--flight-com-accel-tolerance` pilotent l'activation
 du predicteur `dyn`. Test cible : `pytest -q tests/test_ekf2d_flight_detection.py`.
+`--process-noise-model {legacy,white_jerk}` (defaut `legacy`) et
+`--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` choisissent la matrice `Q`.
+Test cible : `pytest -q tests/test_ekf2d_process_noise.py`. Les tests EKF 2D
+construisant un modele exigent `biorbd` et `biobuddy` (sinon ils sont sautes) ;
+depuis un worktree, definir `BIOBUDDY_ROOT` si le depot frere `../biobuddy`
+n'existe pas a cote du worktree.
 
 ## Livraison d'un changement
 

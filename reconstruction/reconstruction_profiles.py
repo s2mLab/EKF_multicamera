@@ -32,6 +32,7 @@ SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
 DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",
     "back_flexion_1d",
@@ -117,6 +118,8 @@ class ReconstructionProfile:
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
+    process_noise_model: str = "legacy"
+    process_noise_jerk_psd: list[float] | None = None
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
@@ -158,6 +161,10 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"upd_{profile.ekf2d_update_method}")
         if str(getattr(profile, "flight_detection", "triangulation")) == "ekf_state":
             parts.append("flightekf")
+        if str(getattr(profile, "process_noise_model", "legacy")) == "white_jerk":
+            parts.append("qjerk")
+            if getattr(profile, "process_noise_jerk_psd", None):
+                parts.append("qc" + "_".join(slugify(f"{float(value):g}") for value in profile.process_noise_jerk_psd))
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -318,6 +325,16 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.flight_detection = str(profile.flight_detection or "triangulation").strip().lower()
         if profile.flight_detection not in SUPPORTED_FLIGHT_DETECTIONS:
             raise ValueError(f"Unsupported flight_detection: {profile.flight_detection}")
+        profile.process_noise_model = str(profile.process_noise_model or "legacy").strip().lower()
+        if profile.process_noise_model not in SUPPORTED_PROCESS_NOISE_MODELS:
+            raise ValueError(f"Unsupported process_noise_model: {profile.process_noise_model}")
+        if profile.process_noise_jerk_psd is not None:
+            psd = [float(value) for value in profile.process_noise_jerk_psd]
+            if len(psd) != 3 or any((not math.isfinite(value)) or value <= 0.0 for value in psd):
+                raise ValueError("process_noise_jerk_psd must contain three positive values.")
+            profile.process_noise_jerk_psd = psd
+        if profile.process_noise_model != "white_jerk":
+            profile.process_noise_jerk_psd = None
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -334,6 +351,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_bootstrap_passes = 5
         profile.ekf2d_update_method = DEFAULT_EKF2D_UPDATE_METHOD
         profile.flight_detection = "triangulation"
+        profile.process_noise_model = "legacy"
+        profile.process_noise_jerk_psd = None
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -659,6 +678,11 @@ def build_pipeline_command(
             cmd.extend(["--ekf2d-update-method", profile.ekf2d_update_method])
         if profile.flight_detection != "triangulation":
             cmd.extend(["--flight-detection", profile.flight_detection])
+        if profile.process_noise_model != "legacy":
+            cmd.extend(["--process-noise-model", profile.process_noise_model])
+            if profile.process_noise_jerk_psd:
+                cmd.append("--process-noise-jerk-psd")
+                cmd.extend(str(float(value)) for value in profile.process_noise_jerk_psd)
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])

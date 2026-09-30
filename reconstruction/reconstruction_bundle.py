@@ -61,6 +61,8 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
+    DEFAULT_PROCESS_NOISE_JERK_PSD,
+    DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
@@ -2329,6 +2331,8 @@ def build_ekf_2d_bundle(
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: list[float] | tuple[float, ...] | None = None,
     flight_detection: str = DEFAULT_FLIGHT_DETECTION,
     flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
     flight_com_accel_tolerance: float | None = None,
@@ -2523,6 +2527,8 @@ def build_ekf_2d_bundle(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2558,6 +2564,8 @@ def build_ekf_2d_bundle(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,
@@ -2786,6 +2794,10 @@ def build_ekf_2d_bundle(
             "ankle_bed_pseudo_obs": bool(ankle_bed_pseudo_obs),
             "ankle_bed_pseudo_std_m": float(ankle_bed_pseudo_std_m),
             "update_method": str(result.get("update_method", ekf2d_update_method)),
+            "process_noise_model": str(process_noise_model),
+            "process_noise_jerk_psd": [
+                float(value) for value in (process_noise_jerk_psd or DEFAULT_PROCESS_NOISE_JERK_PSD)
+            ],
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),

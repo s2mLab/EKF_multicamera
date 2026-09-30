@@ -47,6 +47,8 @@ from vitpose_ekf_pipeline import (
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
     DEFAULT_MODEL_VARIANT,
+    DEFAULT_PROCESS_NOISE_JERK_PSD,
+    DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
@@ -57,6 +59,7 @@ from vitpose_ekf_pipeline import (
     SUPPORTED_EKF2D_UPDATE_METHODS,
     SUPPORTED_FLIGHT_DETECTIONS,
     SUPPORTED_MODEL_VARIANTS,
+    SUPPORTED_PROCESS_NOISE_MODELS,
     SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
     calibrations_with_undistorted_keypoints,
@@ -178,6 +181,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable-dof-locking", action="store_true")
     parser.add_argument("--measurement-noise-scale", type=float, default=DEFAULT_MEASUREMENT_NOISE_SCALE)
     parser.add_argument("--process-noise-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--process-noise-model",
+        choices=SUPPORTED_PROCESS_NOISE_MODELS,
+        default=DEFAULT_PROCESS_NOISE_MODEL,
+        help="Bruit de processus EKF2D: 'legacy' (diagonal historique) ou 'white_jerk' (jerk blanc discretise en dt).",
+    )
+    parser.add_argument(
+        "--process-noise-jerk-psd",
+        type=float,
+        nargs=3,
+        metavar=("ROOT_TRANS", "ROOT_ROT", "JOINTS"),
+        default=list(DEFAULT_PROCESS_NOISE_JERK_PSD),
+        help="Densites spectrales q_c du jerk (m^2/s^5, rad^2/s^5, rad^2/s^5) pour --process-noise-model white_jerk.",
+    )
     parser.add_argument("--coherence-confidence-floor", type=float, default=DEFAULT_COHERENCE_CONFIDENCE_FLOOR)
     parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
     parser.add_argument(
@@ -384,6 +401,8 @@ def main() -> None:
             ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
             ekf2d_update_method=args.ekf2d_update_method,
+            process_noise_model=args.process_noise_model,
+            process_noise_jerk_psd=args.process_noise_jerk_psd,
             flight_detection=args.flight_detection,
             flight_hysteresis_m=args.flight_hysteresis_m,
             flight_com_accel_tolerance=args.flight_com_accel_tolerance,

@@ -371,6 +371,16 @@ Flight criterion of the `dyn` / `dyn_history3` predictors
   frames of `1_partie_0429` in `first_frame_only`-like mode, `dyn` becomes active
   on 740 frames instead of 0.
 
+Process noise (`--process-noise-model`, profile field `process_noise_model`):
+
+- `legacy` (default): diagonal `Q` independent of the time step.
+- `white_jerk`: exact discretization of continuous white jerk,
+  `Q(dt) = q_c * [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2], [dt^3/6, dt^2/2, dt]]`
+  per DoF, with one density per group given by
+  `--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` (default `6 6 6`, not
+  calibrated; it currently degrades the reprojection error on real data and
+  must be tuned before scientific use).
+
 Known limitation: in `dyn`/`history3` modes the covariance is still propagated
 with the constant-acceleration transition matrix.
 

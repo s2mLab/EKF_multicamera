@@ -120,6 +120,14 @@ DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 # "triangulation": every finite triangulated point of the previous frames above the threshold (historical);
 # "ekf_state": lowest model marker of the previous corrected EKF state above the threshold, with hysteresis.
 SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+# Process noise Q of the EKF2D constant-acceleration model:
+# "legacy": diag(1e-4, 5e-3, 5e-2) per DoF for (q, qdot, qddot), independent of dt (historical);
+# "white_jerk": discretized continuous white jerk, Q(dt) = q_c * M(dt) per DoF, with one spectral
+# density q_c per group (root translation [m^2/s^5], root rotation and joints [rad^2/s^5]).
+SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
+DEFAULT_PROCESS_NOISE_MODEL = "legacy"
+# Not calibrated: q_c * dt equals the legacy qddot variance (5e-2) at 120 Hz.
+DEFAULT_PROCESS_NOISE_JERK_PSD = (6.0, 6.0, 6.0)
 DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
@@ -1235,6 +1243,72 @@ def normalize_flight_detection(flight_detection: str | None) -> str:
     if method not in SUPPORTED_FLIGHT_DETECTIONS:
         raise ValueError(f"Unsupported flight detection: {flight_detection}")
     return method
+
+
+def normalize_process_noise_model(process_noise_model: str | None) -> str:
+    """Validate the EKF2D process-noise model name (``None`` -> default)."""
+
+    model = DEFAULT_PROCESS_NOISE_MODEL if process_noise_model is None else str(process_noise_model).strip().lower()
+    if model not in SUPPORTED_PROCESS_NOISE_MODELS:
+        raise ValueError(f"Unsupported process noise model: {process_noise_model}")
+    return model
+
+
+def legacy_process_noise(nq: int, process_noise_scale: float = 1.0) -> np.ndarray:
+    """Historical diagonal EKF2D process noise (independent of ``dt``)."""
+
+    base_process_noise = np.concatenate((1e-4 * np.ones(nq), 5e-3 * np.ones(nq), 5e-2 * np.ones(nq)))
+    return np.diag(base_process_noise * process_noise_scale)
+
+
+def white_jerk_noise_block(dt: float) -> np.ndarray:
+    """Return ``M(dt)`` such that ``Q = q_c M(dt)`` for one ``(q, qdot, qddot)`` triplet.
+
+    It is the exact discretization ``int_0^dt Phi(s) b b^T Phi(s)^T ds`` of a
+    constant-acceleration model driven by continuous white jerk of spectral
+    density ``q_c`` (``b = [0, 0, 1]``), consistent with the transition matrix
+    used by :class:`MultiViewKinematicEKF`.
+    """
+
+    dt = float(dt)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("dt must be a positive finite time step.")
+    return np.array(
+        [
+            [dt**5 / 20.0, dt**4 / 8.0, dt**3 / 6.0],
+            [dt**4 / 8.0, dt**3 / 3.0, dt**2 / 2.0],
+            [dt**3 / 6.0, dt**2 / 2.0, dt],
+        ],
+        dtype=float,
+    )
+
+
+def white_jerk_process_noise(
+    dt: float,
+    q_names: Iterable[str],
+    n_root: int,
+    jerk_psd: Iterable[float] = DEFAULT_PROCESS_NOISE_JERK_PSD,
+    process_noise_scale: float = 1.0,
+) -> np.ndarray:
+    """Build the white-jerk process noise ``Q(dt) = M(dt) kron diag(q_c)`` for ``[q, qdot, qddot]``.
+
+    Args:
+        dt: Time step (s), i.e. ``1 / effective FPS``.
+        q_names: Generalized-coordinate names (``SEGMENT:DoF``) in state order.
+        n_root: Number of root DoFs; root DoFs whose name contains ``Trans`` use
+            the translation density, the other root DoFs the rotation density.
+        jerk_psd: ``(q_c_root_translation, q_c_root_rotation, q_c_joints)``.
+        process_noise_scale: Global multiplier, as for the legacy model.
+    """
+
+    names = [str(name) for name in q_names]
+    psd = np.asarray(list(jerk_psd), dtype=float).reshape(-1)
+    if psd.size != 3 or np.any(~np.isfinite(psd)) or np.any(psd <= 0.0):
+        raise ValueError("jerk_psd must contain three positive values (root translation, root rotation, joints).")
+    per_dof = np.full(len(names), psd[2], dtype=float)
+    for dof_idx in range(min(int(n_root), len(names))):
+        per_dof[dof_idx] = psd[0] if "trans" in names[dof_idx].lower() else psd[1]
+    return float(process_noise_scale) * np.kron(white_jerk_noise_block(dt), np.diag(per_dof))
 
 
 def apply_measurement_update_woodbury(
@@ -3899,8 +3973,15 @@ class MultiViewKinematicEKF:
         flight_detection: str = DEFAULT_FLIGHT_DETECTION,
         flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
         flight_com_accel_tolerance: float | None = None,
+        process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+        process_noise_jerk_psd: Iterable[float] | None = None,
     ):
         self.model = model
+        self.process_noise_model = normalize_process_noise_model(process_noise_model)
+        self.process_noise_jerk_psd = tuple(
+            float(value)
+            for value in (DEFAULT_PROCESS_NOISE_JERK_PSD if process_noise_jerk_psd is None else process_noise_jerk_psd)
+        )
         self.update_method = normalize_ekf2d_update_method(update_method)
         self.solver_counts = {"woodbury": 0, "woodbury_fallback_legacy": 0}
         self.flight_detection = normalize_flight_detection(flight_detection)
@@ -3987,8 +4068,16 @@ class MultiViewKinematicEKF:
             if idx is not None
         )
         self.locked_q_indices: set[int] = set()
-        base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
-        self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
+        if self.process_noise_model == "white_jerk":
+            self.process_noise = white_jerk_process_noise(
+                self.dt,
+                self.q_names,
+                self.n_root,
+                jerk_psd=self.process_noise_jerk_psd,
+                process_noise_scale=self.process_noise_scale,
+            )
+        else:
+            self.process_noise = legacy_process_noise(self.nq, self.process_noise_scale)
         self.multiview_coherence: np.ndarray | None = (
             None if self.use_framewise_coherence else reconstruction.multiview_coherence
         )
@@ -5124,6 +5213,8 @@ def initial_state_from_ekf_bootstrap(
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -5180,6 +5271,8 @@ def initial_state_from_ekf_bootstrap(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -5238,8 +5331,10 @@ def initial_state_from_root_pose_bootstrap(
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
-    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -5280,6 +5375,8 @@ def initial_state_from_root_pose_bootstrap(
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -5308,6 +5405,8 @@ def initial_state_from_root_pose_bootstrap(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -5338,10 +5437,12 @@ def compute_ekf2d_initial_state(
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
-    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -5382,6 +5483,8 @@ def compute_ekf2d_initial_state(
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5408,6 +5511,8 @@ def compute_ekf2d_initial_state(
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5448,6 +5553,8 @@ def run_ekf(
     flight_detection: str = DEFAULT_FLIGHT_DETECTION,
     flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
     flight_com_accel_tolerance: float | None = None,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5489,6 +5596,8 @@ def run_ekf(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,
