@@ -338,6 +338,18 @@ Important improvements already integrated in the codebase:
 - lower confidence on views detected as left/right-flipped so they still help
   the filter without dominating it
 
+Measurement update solver (`--ekf2d-update-method`, profile field
+`ekf2d_update_method`):
+
+- `woodbury` (default): information-form batch update that only solves
+  `Q x Q` systems (`G = H_q^T R^-1 H_q`) and keeps the Joseph covariance form.
+  It is algebraically identical to the historical solver (relative differences
+  around `1e-14` on a real 240-frame sequence) and about 4x faster on the whole
+  EKF2D loop. It falls back to `legacy` automatically if the reduced system is
+  not solvable.
+- `legacy`: innovation-space update (sequential per camera, batch when
+  pseudo-observations are active).
+
 ### 6.b Complexity overview
 
 The dominant asymptotic costs below use:
@@ -357,6 +369,9 @@ The dominant asymptotic costs below use:
 | EKF2D `dyn` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`, with a larger constant when root flight dynamics are active. |
 | EKF2D `history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`; the higher-order predictor adds only `O(Q)` state-history work. |
 | EKF2D `dyn_history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `dyn`; root uses `dyn`, joints use the smoothed history-based predictor. |
+
+With the default `woodbury` update, the `L^3 + L^2 * Q` update terms become
+`O(L * Q^2 + Q^3)`; the table keeps the `legacy` costs.
 
 In practice:
 

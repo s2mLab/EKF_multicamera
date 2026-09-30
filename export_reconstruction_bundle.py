@@ -33,6 +33,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_CAMERA_FPS,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     DEFAULT_COHERENCE_METHOD,
+    DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
@@ -51,6 +52,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     SUPPORTED_COHERENCE_METHODS,
+    SUPPORTED_EKF2D_UPDATE_METHODS,
     SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
@@ -128,6 +130,12 @@ def parse_args() -> argparse.Namespace:
         default="ekf_bootstrap",
     )
     parser.add_argument("--ekf2d-bootstrap-passes", type=int, default=5)
+    parser.add_argument(
+        "--ekf2d-update-method",
+        choices=SUPPORTED_EKF2D_UPDATE_METHODS,
+        default=DEFAULT_EKF2D_UPDATE_METHOD,
+        help="Solveur de correction EKF2D: 'woodbury' (forme information, exacte) ou 'legacy' (espace innovation).",
+    )
     parser.add_argument("--flip-left-right", action="store_true")
     parser.add_argument(
         "--flip-method",
@@ -346,6 +354,7 @@ def main() -> None:
             upper_back_pseudo_std_deg=args.upper_back_pseudo_std_deg,
             ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
+            ekf2d_update_method=args.ekf2d_update_method,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,

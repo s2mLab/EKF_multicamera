@@ -113,6 +113,11 @@ python run_reconstruction_profiles.py --help
 Ne lancer une reconstruction complete sur une sequence reelle qu'apres avoir
 confirme les fichiers d'entree, les options du profil et le dossier de sortie.
 
+Options numeriques de l'EKF 2D (detail dans `OVERVIEW.md`, section EKF 2D) :
+`--ekf2d-update-method {woodbury,legacy}` (defaut `woodbury`, equivalent a
+l'arrondi pres a `legacy`). Test cible :
+`pytest -q tests/test_ekf2d_woodbury_update.py`.
+
 ## Livraison d'un changement
 
 Executer d'abord le test cible de la matrice, puis les controles adequats a la

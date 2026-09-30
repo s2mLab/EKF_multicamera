@@ -42,6 +42,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_CAMERA_FPS,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     DEFAULT_COHERENCE_METHOD,
+    DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
@@ -2310,6 +2311,7 @@ def build_ekf_2d_bundle(
     upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
@@ -2500,6 +2502,7 @@ def build_ekf_2d_bundle(
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2534,6 +2537,7 @@ def build_ekf_2d_bundle(
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
@@ -2757,6 +2761,7 @@ def build_ekf_2d_bundle(
             "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
             "ankle_bed_pseudo_obs": bool(ankle_bed_pseudo_obs),
             "ankle_bed_pseudo_std_m": float(ankle_bed_pseudo_std_m),
+            "update_method": str(result.get("update_method", ekf2d_update_method)),
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
@@ -2767,6 +2772,7 @@ def build_ekf_2d_bundle(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
         ),
         "update_status_counts": {str(key): int(value) for key, value in result.get("update_status_counts", {}).items()},
+        "update_solver_counts": {str(key): int(value) for key, value in result.get("update_solver_counts", {}).items()},
         "left_right_flip_diagnostics": flip_diagnostics,
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],

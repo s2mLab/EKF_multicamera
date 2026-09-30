@@ -112,6 +112,10 @@ DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
 DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES = 1
 DEFAULT_EKF2D_INITIAL_STATE_METHOD = "ekf_bootstrap"
 DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
+# "woodbury": information-form batch update (exact, falls back to "legacy" on failure).
+# "legacy": innovation-space update (sequential per camera, batch with pseudo-priors).
+SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
+DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
 DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
@@ -1030,6 +1034,96 @@ def apply_measurement_update_batch(
         nq=nq,
         identity_x=identity_x,
     )
+
+
+def normalize_ekf2d_update_method(update_method: str | None) -> str:
+    """Validate the EKF2D measurement-update solver name (``None`` -> default)."""
+
+    method = DEFAULT_EKF2D_UPDATE_METHOD if update_method is None else str(update_method).strip().lower()
+    if method not in SUPPORTED_EKF2D_UPDATE_METHODS:
+        raise ValueError(f"Unsupported EKF2D update method: {update_method}")
+    return method
+
+
+def apply_measurement_update_woodbury(
+    predicted_state: np.ndarray,
+    predicted_covariance: np.ndarray,
+    z: np.ndarray,
+    h: np.ndarray,
+    H_q: np.ndarray,
+    R_diag_array: np.ndarray,
+    nq: int,
+    identity_x: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Apply the batch Kalman correction in information (Woodbury) form.
+
+    The measurement Jacobian is ``H = [H_q, 0, 0]`` (image measurements only
+    depend on ``q``) and ``R`` is diagonal. With ``P_q = P[:, :nq]``,
+    ``P_qq = P[:nq, :nq]``, ``G = H_q^T R^-1 H_q`` and ``g = H_q^T R^-1 y``,
+    the push-through identity ``H_q^T S^-1 = (I + G P_qq)^-1 H_q^T R^-1``
+    (``S = H_q P_qq H_q^T + R``) gives, with ``C = (I + G P_qq)^-1``:
+
+    - ``x+ = x + P_q C g``;
+    - ``K H = [P_q C G, 0]`` and ``K R K^T = P_q (C G) C^T P_q^T``;
+    - Joseph form ``P+ = (I - K H) P (I - K H)^T + K R K^T``.
+
+    Only ``nq x nq`` systems are solved instead of the ``m x m`` innovation
+    covariance, and ``P_qq`` is never inverted, so locked DoFs (tiny variance)
+    and a singular ``P_qq`` are handled. Rows with non-finite values or an
+    infinite variance carry no information and are dropped; a non-positive
+    variance makes the update undefined and returns ``None`` so the caller can
+    fall back to the innovation-space solver. The result equals
+    :func:`apply_measurement_update_batch` (and the sequential update, which is
+    the same linear update) up to round-off.
+    """
+
+    del identity_x  # kept for signature compatibility with the other solvers
+    z_array = np.asarray(z, dtype=float).reshape(-1)
+    h_array = np.asarray(h, dtype=float).reshape(-1)
+    r_array = np.asarray(R_diag_array, dtype=float).reshape(-1)
+    if z_array.size == 0 or np.asarray(H_q).size == 0:
+        return None
+    hq_array = np.asarray(H_q, dtype=float).reshape((-1, nq))
+    if not (z_array.shape[0] == h_array.shape[0] == hq_array.shape[0] == r_array.shape[0]):
+        return None
+    if np.any(r_array <= 0.0) or np.any(np.isnan(r_array)):
+        return None
+    valid_rows = np.isfinite(z_array) & np.isfinite(h_array) & np.all(np.isfinite(hq_array), axis=1)
+    valid_rows &= np.isfinite(r_array)
+    if not np.any(valid_rows):
+        return None
+    innovation = z_array[valid_rows] - h_array[valid_rows]
+    hq_valid = hq_array[valid_rows]
+    weighted_hq = hq_valid / r_array[valid_rows, np.newaxis]
+    information = hq_valid.T @ weighted_hq
+    information = 0.5 * (information + information.T)
+    information_vector = weighted_hq.T @ innovation
+
+    predicted_covariance = np.asarray(predicted_covariance, dtype=float)
+    P_q = predicted_covariance[:, :nq]
+    P_qq = predicted_covariance[:nq, :nq]
+    system = np.eye(nq, dtype=float) + information @ P_qq
+    rhs = np.concatenate((np.eye(nq, dtype=float), information, information_vector[:, np.newaxis]), axis=1)
+    try:
+        solution = np.linalg.solve(system, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(solution)):
+        return None
+    C = solution[:, :nq]
+    CG = solution[:, nq : 2 * nq]
+    Cg = solution[:, 2 * nq]
+
+    updated_state = np.asarray(predicted_state, dtype=float) + P_q @ Cg
+    KH_q = P_q @ CG
+    # (I - K H) P (I - K H)^T with K H nonzero only on the first nq columns.
+    left = predicted_covariance - KH_q @ predicted_covariance[:nq, :]
+    updated_covariance = left - left[:, :nq] @ KH_q.T
+    updated_covariance += KH_q @ C.T @ P_q.T
+    updated_covariance = 0.5 * (updated_covariance + updated_covariance.T)
+    if not (np.all(np.isfinite(updated_state)) and np.all(np.isfinite(updated_covariance))):
+        return None
+    return updated_state, updated_covariance
 
 
 def stack_measurement_blocks(
@@ -3609,8 +3703,11 @@ class MultiViewKinematicEKF:
         upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
         ankle_bed_pseudo_obs: bool = False,
         ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+        update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     ):
         self.model = model
+        self.update_method = normalize_ekf2d_update_method(update_method)
+        self.solver_counts = {"woodbury": 0, "woodbury_fallback_legacy": 0}
         self.calibrations = calibrations
         self.pose_data = pose_data
         self.reconstruction = reconstruction
@@ -4335,8 +4432,29 @@ class MultiViewKinematicEKF:
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
         t_solve = time.perf_counter()
-        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_pseudo_priors else None
         update_result = None
+        if self.update_method == "woodbury":
+            stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq)
+            if stacked_measurements is not None:
+                z_batch, h_batch, hq_batch, r_batch = stacked_measurements
+                update_result = apply_measurement_update_woodbury(
+                    predicted_state=predicted_state,
+                    predicted_covariance=predicted_covariance,
+                    z=z_batch,
+                    h=h_batch,
+                    H_q=hq_batch,
+                    R_diag_array=r_batch,
+                    nq=self.nq,
+                )
+            if update_result is not None:
+                self.solver_counts["woodbury"] += 1
+            else:
+                self.solver_counts["woodbury_fallback_legacy"] += 1
+        stacked_measurements = (
+            stack_measurement_blocks(measurement_blocks, self.nq)
+            if (update_result is None and has_pseudo_priors)
+            else None
+        )
         if stacked_measurements is not None:
             z_batch, h_batch, hq_batch, r_batch = stacked_measurements
             update_result = apply_measurement_update_batch(
@@ -4731,6 +4849,7 @@ def initial_state_from_ekf_bootstrap(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -4786,6 +4905,7 @@ def initial_state_from_ekf_bootstrap(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -4844,6 +4964,7 @@ def initial_state_from_root_pose_bootstrap(
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
@@ -4884,6 +5005,7 @@ def initial_state_from_root_pose_bootstrap(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -4911,6 +5033,7 @@ def initial_state_from_root_pose_bootstrap(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -4941,6 +5064,7 @@ def compute_ekf2d_initial_state(
     flip_error_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_THRESHOLD_PX,
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
@@ -4983,6 +5107,7 @@ def compute_ekf2d_initial_state(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5008,6 +5133,7 @@ def compute_ekf2d_initial_state(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5044,6 +5170,7 @@ def run_ekf(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5084,6 +5211,7 @@ def run_ekf(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -5137,6 +5265,8 @@ def run_ekf(
             "q_names": np.asarray(ekf.q_names, dtype=object),
             "update_status_per_frame": np.asarray(update_status_per_frame, dtype=object),
             "update_status_counts": dict(ekf.update_status),
+            "update_method": str(ekf.update_method),
+            "update_solver_counts": dict(ekf.solver_counts),
             "flip_diagnostics": (
                 {
                     "method": str(flip_method),

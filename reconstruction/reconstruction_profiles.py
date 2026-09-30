@@ -29,6 +29,8 @@ from reconstruction.reconstruction_registry import (
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn", "history3", "dyn_history3")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
+SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
+DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",
     "back_flexion_1d",
@@ -86,6 +88,7 @@ class ReconstructionProfile:
     ekf2d_3d_source: str = "full_triangulation"
     ekf2d_initial_state_method: str = "ekf_bootstrap"
     ekf2d_bootstrap_passes: int = 5
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD
     flip: bool = False
     flip_method: str = "epipolar"
     flip_improvement_ratio: float = 0.7
@@ -148,6 +151,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("rootq0")
         if int(profile.ekf2d_bootstrap_passes) != 5:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
+        if str(getattr(profile, "ekf2d_update_method", DEFAULT_EKF2D_UPDATE_METHOD)) != DEFAULT_EKF2D_UPDATE_METHOD:
+            parts.append(f"upd_{profile.ekf2d_update_method}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -298,6 +303,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"):
             raise ValueError(f"Unsupported ekf2d_initial_state_method: {profile.ekf2d_initial_state_method}")
         profile.ekf2d_bootstrap_passes = max(1, int(profile.ekf2d_bootstrap_passes))
+        profile.ekf2d_update_method = str(profile.ekf2d_update_method or DEFAULT_EKF2D_UPDATE_METHOD).strip().lower()
+        if profile.ekf2d_update_method not in SUPPORTED_EKF2D_UPDATE_METHODS:
+            raise ValueError(f"Unsupported ekf2d_update_method: {profile.ekf2d_update_method}")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -312,6 +320,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_3d_source = "full_triangulation"
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
+        profile.ekf2d_update_method = DEFAULT_EKF2D_UPDATE_METHOD
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -631,6 +640,8 @@ def build_pipeline_command(
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
         cmd.extend(["--ekf2d-bootstrap-passes", str(profile.ekf2d_bootstrap_passes)])
+        if profile.ekf2d_update_method != DEFAULT_EKF2D_UPDATE_METHOD:
+            cmd.extend(["--ekf2d-update-method", profile.ekf2d_update_method])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])

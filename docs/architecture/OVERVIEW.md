@@ -79,6 +79,23 @@ des erreurs de reprojection par vue, des coherences et des masques d'exclusion.
 Les profils de reconstruction sont donc des parametres scientifiques, pas de la
 simple configuration d'interface.
 
+## EKF 2D
+
+`MultiViewKinematicEKF` (etat `[q, qdot, qddot]`, `nx = 3 nq`) corrige dans
+l'espace image avec `H = [H_q, 0, 0]` et `R` diagonal (variances en px^2,
+`inf` pour une mesure exclue, qui n'entre pas dans les blocs). Le solveur de
+correction est choisi par `update_method` (`--ekf2d-update-method`, champ de
+profil `ekf2d_update_method`, trace dans `summary.filter_parameters` et
+`update_solver_counts`) :
+
+- `woodbury` (defaut) : forme information, `G = H_q^T R^-1 H_q`,
+  `C = (I + G P_qq)^-1`, `x+ = x + P_q C g`, Joseph reduit ; aucun inverse de
+  `P_qq` (DoF verrouilles et `P_qq` singulier geres). Equivalent a `legacy` a
+  l'arrondi pres (tests `tests/test_ekf2d_woodbury_update.py`), repli
+  automatique sur `legacy` si le systeme reduit echoue.
+- `legacy` : espace innovation, sequentiel par camera, ou batch si des
+  pseudo-observations sont actives.
+
 ## Caches et effets de bord
 
 Les caches de pose corrigee, flip, coherence epipolaire, triangulation, modele
