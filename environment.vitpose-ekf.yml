@@ -18,5 +18,5 @@ dependencies:
   - isort
   - flake8
   - pip:
-      - -e ../GIT/biobuddy
+      - -e ../biobuddy
       - pyorerun

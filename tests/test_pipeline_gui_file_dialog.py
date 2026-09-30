@@ -236,8 +236,8 @@ def test_annotation_sync_dataset_defaults_requests_one_load(monkeypatch, tmp_pat
     pipeline_gui.AnnotationTab.sync_dataset_defaults(tab)
 
     assert calls == ["load"]
-    assert tab._annotation_path_set.endswith("inputs/annotations.json")
-    assert tab._images_root_set.endswith("inputs/images")
+    assert Path(tab._annotation_path_set).as_posix().endswith("inputs/annotations.json")
+    assert Path(tab._images_root_set).as_posix().endswith("inputs/images")
 
 
 def test_2d_analysis_on_keypoints_changed_sets_shared_images_root(monkeypatch, tmp_path):
@@ -3389,7 +3389,7 @@ def test_profiles_tab_build_command_uses_runtime_profiles_cache(monkeypatch):
 
     cmd = pipeline_gui.ProfilesTab.build_command(tab)
 
-    assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
+    assert Path(cmd[cmd.index("--config") + 1]) == Path(".cache/runtime_profiles.json")
 
 
 def test_profiles_tab_build_command_passes_annotations_path_for_annotated_profiles(monkeypatch):
@@ -3441,7 +3441,7 @@ def test_reconstructions_tab_build_command_uses_runtime_profiles_cache(monkeypat
 
     cmd = pipeline_gui.ReconstructionsTab.build_command(tab)
 
-    assert cmd[cmd.index("--config") + 1] == ".cache/runtime_profiles.json"
+    assert Path(cmd[cmd.index("--config") + 1]) == Path(".cache/runtime_profiles.json")
 
 
 def test_batch_tab_scan_keypoints_files_populates_tree(monkeypatch, tmp_path):
@@ -3520,7 +3520,7 @@ def test_batch_tab_build_command_uses_selected_datasets_and_profiles():
     assert cmd[cmd.index("--config") + 1] == "reconstruction_profiles.json"
     assert cmd[cmd.index("--excel-output") + 1] == "output/batch_summary.xlsx"
     assert cmd[cmd.index("--batch-name") + 1] == "demo_batch"
-    assert cmd[cmd.index("--keypoints-glob") + 1] == keypoints_b
+    assert Path(cmd[cmd.index("--keypoints-glob") + 1]) == Path(keypoints_b)
     assert cmd[cmd.index("--profile") + 1] == "ekf"
     assert "--continue-on-error" in cmd
 
