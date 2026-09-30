@@ -72,6 +72,16 @@ def test_white_jerk_process_noise_groups_root_translation_rotation_and_joints():
         white_jerk_process_noise(dt, q_names, n_root=6, jerk_psd=(1.0, -1.0, 1.0))
 
 
+def test_default_jerk_psd_is_the_calibrated_value():
+    from vitpose_ekf_pipeline import DEFAULT_PROCESS_NOISE_JERK_PSD, DEFAULT_PROCESS_NOISE_MODEL
+
+    assert DEFAULT_PROCESS_NOISE_MODEL == "legacy"
+    assert DEFAULT_PROCESS_NOISE_JERK_PSD == (200.0, 1000.0, 10000.0)
+    q_names = ["PELVIS:TransZ", "PELVIS:RotY", "ARM:RotY"]
+    Q = white_jerk_process_noise(0.01, q_names, n_root=2)
+    np.testing.assert_allclose(np.diag(Q)[6:], [200.0 * 0.01, 1000.0 * 0.01, 10000.0 * 0.01])
+
+
 def test_normalize_process_noise_model():
     assert normalize_process_noise_model(None) == "legacy"
     assert normalize_process_noise_model("White_Jerk") == "white_jerk"

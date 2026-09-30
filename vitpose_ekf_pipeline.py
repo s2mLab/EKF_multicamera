@@ -126,8 +126,9 @@ SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
 # density q_c per group (root translation [m^2/s^5], root rotation and joints [rad^2/s^5]).
 SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
 DEFAULT_PROCESS_NOISE_MODEL = "legacy"
-# Not calibrated: q_c * dt equals the legacy qddot variance (5e-2) at 120 Hz.
-DEFAULT_PROCESS_NOISE_JERK_PSD = (6.0, 6.0, 6.0)
+# Calibrated by an independent analysis (synthetic 3 seeds + real 1_partie_0429 in leave-one-camera-out):
+# root translation 200 m^2/s^5, root rotation 1000 rad^2/s^5, joints 10000 rad^2/s^5.
+DEFAULT_PROCESS_NOISE_JERK_PSD = (200.0, 1000.0, 10000.0)
 DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2

@@ -120,10 +120,12 @@ profil, trace dans `summary.filter_parameters`) :
   `Q(dt) = q_c [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2],
   [dt^3/6, dt^2/2, dt]]` par DoF, avec `q_c` par groupe (translation racine
   m^2/s^5, rotation racine et articulations rad^2/s^5 ;
-  `--process-noise-jerk-psd`, defaut `6 6 6`, soit `q_c dt = 5e-2` a 120 Hz,
-  non cale). Aucun calage automatique ; sur 240 frames reelles, ce defaut
-  augmente l'erreur de reprojection (mediane 12.9 -> 21.9 px) : il doit etre
-  cale avant usage scientifique.
+  `--process-noise-jerk-psd`, defaut `200 1000 10000`, valeur calee par une
+  analyse independante : synthetique 3 graines -13,4 % d'erreur marqueurs,
+  reel `1_partie_0429` en leave-one-camera-out -3 %). Aucun calage automatique
+  dans le code. Sur les 240 premieres frames reelles, la reprojection mediane
+  passe de 12,91 px (`legacy`) a 12,26 px (l'ancien defaut `6 6 6` donnait
+  21,86 px).
 
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la

@@ -377,9 +377,10 @@ Process noise (`--process-noise-model`, profile field `process_noise_model`):
 - `white_jerk`: exact discretization of continuous white jerk,
   `Q(dt) = q_c * [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2], [dt^3/6, dt^2/2, dt]]`
   per DoF, with one density per group given by
-  `--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` (default `6 6 6`, not
-  calibrated; it currently degrades the reprojection error on real data and
-  must be tuned before scientific use).
+  `--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` (default
+  `200 1000 10000`, in m^2/s^5 and rad^2/s^5, calibrated offline; on the first
+  240 frames of `1_partie_0429` the median reprojection error is 12.26 px versus
+  12.91 px with `legacy`).
 
 Known limitation: in `dyn`/`history3` modes the covariance is still propagated
 with the constant-acceleration transition matrix.
