@@ -123,8 +123,19 @@ QA calibration, annotations, preview et GUI. Les smoke tests GUI necessitent
   sont pas toutes declarees dans `pyproject.toml`; la CI n'exerce donc pas tout
   le workflow de reconstruction scientifique.
 - Les projections et Jacobiennes suivent le modele pinhole alors que les
-  calibrations chargent aussi une distortion. Avant de modifier geometrie ou
-  reprojection, confirmer que les detections 2D sont deja undistorted.
+  calibrations chargent aussi une distortion (OpenCV `k1, k2, p1, p2[, k3..k6]`).
+  Par defaut les keypoints ne sont pas dedistordus (comportement historique).
+  L'option opt-in `undistort_keypoints` (`--undistort-keypoints`, champ de
+  profil, `load_pose_data(..., undistort_keypoints=True)`) dedistord une fois au
+  chargement (Newton vectorise, equivalent `cv2.undistortPoints(..., P=K)`)
+  les keypoints bruts et annotes avant nettoyage, coherence, triangulation et
+  EKF. Les calibrations sont alors marquees `keypoints_undistorted=True` via
+  `calibrations_with_undistorted_keypoints`, ce qui modifie
+  `calibration_signature` (qui contient deja `dist`) et invalide les caches
+  geometriques; la signature par defaut est inchangee. Les overlays 2D sur les
+  images brutes (GUI) restent en coordonnees distordues et ne sont pas
+  compatibles avec des bundles produits avec cette option; le GUI n'expose pas
+  encore l'option.
 - Les metadonnees des caches geometriques (epipolaire, flip, pose corrigee par
   flip, triangulation) exigent les calibrations et stockent
   `calibration_signature`, calculee sur les parametres parses de chaque camera.

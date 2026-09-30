@@ -124,6 +124,7 @@ class ReconstructionProfile:
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
     pose_amplitude_upper_percentile: float = 95.0
+    undistort_keypoints: bool = False
     enabled: bool = True
     extra_args: list[str] | None = None
 
@@ -218,6 +219,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if bool(getattr(profile, "undistort_keypoints", False)):
+        parts.append("undist")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
     if profile.use_all_cameras:
@@ -294,6 +297,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.triangulation_method = "exhaustive"
         profile.reprojection_threshold_px = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
         profile.frame_stride = 1
+        profile.undistort_keypoints = False
+    profile.undistort_keypoints = bool(profile.undistort_keypoints)
     if profile.family == "ekf_2d":
         profile.predictor = profile.predictor or "acc"
         if profile.predictor not in SUPPORTED_PREDICTORS:
@@ -624,6 +629,8 @@ def build_pipeline_command(
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
+    if profile.undistort_keypoints:
+        cmd.append("--undistort-keypoints")
     cmd.extend(["--root-unwrap-mode", "off"])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:

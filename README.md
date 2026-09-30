@@ -214,6 +214,15 @@ Supported families:
 
 The CLI and GUI both support `raw`, `cleaned`, and, when available, `annotated` 2D inputs.
 
+`--undistort-keypoints` (opt-in, profile field `undistort_keypoints`, not for
+`pose2sim`) undistorts the 2D keypoints once at load time with the
+`distortions` coefficients of `Calib.toml`, so that coherence, triangulation
+and EKF use an exact pinhole model. By default the keypoints are used as
+detected (historical behavior). Toggling the option invalidates the geometric
+caches. On the first 300 frames of `1_partie_0429` the keypoints move by 2.5 px
+on average and the exhaustive triangulation reprojection error drops from
+9.55 to 9.38 px (mean).
+
 ### Run a list of named profiles
 
 Example:

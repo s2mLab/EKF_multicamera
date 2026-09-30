@@ -56,6 +56,7 @@ from vitpose_ekf_pipeline import (
     SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
+    calibrations_with_undistorted_keypoints,
     load_calibrations,
     normalize_root_unwrap_mode,
 )
@@ -95,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10)
     parser.add_argument("--pose-amplitude-lower-percentile", type=float, default=5.0)
     parser.add_argument("--pose-amplitude-upper-percentile", type=float, default=95.0)
+    parser.add_argument(
+        "--undistort-keypoints",
+        action="store_true",
+        help="Dedistord les keypoints 2D au chargement (coefficients 'distortions' de Calib.toml). Defaut: desactive.",
+    )
     parser.add_argument("--initial-rotation-correction", action="store_true")
     parser.add_argument(
         "--triangulation-method", choices=SUPPORTED_TRIANGULATION_METHODS, default=DEFAULT_TRIANGULATION_METHOD
@@ -193,6 +199,9 @@ def main() -> None:
     selected_camera_names = parse_camera_names(args.camera_names)
     if selected_camera_names:
         calibrations = subset_calibrations(calibrations, selected_camera_names)
+    undistort_keypoints = bool(args.undistort_keypoints and args.family != "pose2sim")
+    if undistort_keypoints:
+        calibrations = calibrations_with_undistorted_keypoints(calibrations)
     if args.family == "pose2sim":
         if args.pose2sim_trc is None:
             raise ValueError("TRC-file reconstruction requires --trc-file.")
@@ -213,6 +222,7 @@ def main() -> None:
         pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile=args.pose_amplitude_upper_percentile,
         annotations_path=args.annotations_path,
+        undistort_keypoints=undistort_keypoints,
     )
     pose_data_compute_time_s = time.perf_counter() - pose_data_start
 

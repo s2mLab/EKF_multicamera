@@ -117,6 +117,9 @@ Options numeriques de l'EKF 2D (detail dans `OVERVIEW.md`, section EKF 2D) :
 `--ekf2d-update-method {woodbury,legacy}` (defaut `woodbury`, equivalent a
 l'arrondi pres a `legacy`). Test cible :
 `pytest -q tests/test_ekf2d_woodbury_update.py`.
+`--undistort-keypoints` (opt-in, toutes familles sauf `pose2sim`) dedistord les
+keypoints 2D au chargement et invalide les caches geometriques. Test cible :
+`pytest -q tests/test_keypoint_undistortion.py`.
 
 ## Livraison d'un changement
 

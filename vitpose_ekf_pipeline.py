@@ -227,6 +227,10 @@ class CameraCalibration:
     tvec: np.ndarray
     R: np.ndarray
     P: np.ndarray
+    # True when the 2D keypoints used with this calibration were undistorted at
+    # load time (``undistort_keypoints``): the pinhole model below is then exact
+    # and ``dist`` is kept only for traceability and cache signatures.
+    keypoints_undistorted: bool = False
 
     def project_point(self, point_world: np.ndarray) -> np.ndarray:
         """Projette un point 3D monde en coordonnees pixels sans distortion explicite."""
@@ -465,6 +469,9 @@ def calibration_signature(calibrations: dict[str, CameraCalibration], camera_nam
             calibration.P,
         ):
             _update_signature_with_array(hasher, values, "<f8")
+        if bool(getattr(calibration, "keypoints_undistorted", False)):
+            # Only hashed when enabled so that signatures of existing caches are unchanged.
+            hasher.update(b"keypoints_undistorted\0")
     return hasher.hexdigest()[:16]
 
 
@@ -646,6 +653,153 @@ def ensure_local_imports() -> None:
         sys.path.insert(0, str(LOCAL_BIOBUDDY))
 
 
+def _opencv_distortion_coefficients(dist: np.ndarray) -> np.ndarray:
+    """Return ``(k1, k2, p1, p2, k3, k4, k5, k6)`` from an OpenCV coefficient vector.
+
+    Thin-prism and tilt terms (more than 8 coefficients) are not supported and
+    raise ``ValueError`` when non-zero.
+    """
+
+    dist = np.asarray(dist, dtype=float).reshape(-1)
+    if dist.size > 8 and np.any(dist[8:] != 0.0):
+        raise ValueError("Only OpenCV radial/tangential distortion (up to 8 coefficients) is supported.")
+    coefficients = np.zeros(8, dtype=float)
+    coefficients[: min(8, dist.size)] = dist[:8]
+    return coefficients
+
+
+def distort_normalized_points(points: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Apply the OpenCV (Brown-Conrady, rational) distortion to normalized coordinates.
+
+    Args:
+        points: Ideal normalized image coordinates ``(..., 2)`` (``x = X/Z``).
+        dist: OpenCV coefficients ``(k1, k2, p1, p2[, k3[, k4, k5, k6]])``.
+
+    Returns:
+        Distorted normalized coordinates with the same shape (``NaN`` preserved).
+    """
+
+    k1, k2, p1, p2, k3, k4, k5, k6 = _opencv_distortion_coefficients(dist)
+    points = np.asarray(points, dtype=float)
+    x = points[..., 0]
+    y = points[..., 1]
+    r2 = x * x + y * y
+    radial = (1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1.0 + r2 * (k4 + r2 * (k5 + r2 * k6)))
+    xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return np.stack((xd, yd), axis=-1)
+
+
+def undistort_normalized_points(
+    distorted: np.ndarray,
+    dist: np.ndarray,
+    max_iterations: int = 30,
+    tolerance: float = 1e-14,
+    max_residual: float = 1e-9,
+) -> np.ndarray:
+    """Invert :func:`distort_normalized_points` with vectorized Newton iterations.
+
+    Points whose final forward residual exceeds ``max_residual`` (normalized
+    units, i.e. about ``1e-6`` px for a 1000 px focal length) are returned as
+    ``NaN`` rather than at a wrong position; this only happens far outside the
+    calibrated field of view.
+    """
+
+    k1, k2, p1, p2, k3, k4, k5, k6 = _opencv_distortion_coefficients(dist)
+    target = np.asarray(distorted, dtype=float)
+    flat = target.reshape(-1, 2)
+    result = np.full(flat.shape, np.nan, dtype=float)
+    finite = np.all(np.isfinite(flat), axis=1)
+    if not np.any(finite):
+        return result.reshape(target.shape)
+    goal = flat[finite]
+    x = goal[:, 0].copy()
+    y = goal[:, 1].copy()
+    for _iteration in range(max(1, int(max_iterations))):
+        r2 = x * x + y * y
+        num = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+        den = 1.0 + r2 * (k4 + r2 * (k5 + r2 * k6))
+        radial = num / den
+        d_num = k1 + r2 * (2.0 * k2 + 3.0 * k3 * r2)
+        d_den = k4 + r2 * (2.0 * k5 + 3.0 * k6 * r2)
+        d_radial = (d_num * den - num * d_den) / (den * den)
+        fx = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - goal[:, 0]
+        fy = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - goal[:, 1]
+        j_xx = radial + 2.0 * x * x * d_radial + 2.0 * p1 * y + 6.0 * p2 * x
+        j_xy = 2.0 * x * y * d_radial + 2.0 * p1 * x + 2.0 * p2 * y
+        j_yy = radial + 2.0 * y * y * d_radial + 6.0 * p1 * y + 2.0 * p2 * x
+        det = j_xx * j_yy - j_xy * j_xy
+        safe = np.abs(det) > 1e-12
+        step_x = np.where(safe, (j_yy * fx - j_xy * fy) / np.where(safe, det, 1.0), 0.0)
+        step_y = np.where(safe, (j_xx * fy - j_xy * fx) / np.where(safe, det, 1.0), 0.0)
+        x = x - step_x
+        y = y - step_y
+        if float(np.max(np.abs(np.concatenate((step_x, step_y))))) <= tolerance:
+            break
+    undistorted = np.column_stack((x, y))
+    residual = np.max(np.abs(distort_normalized_points(undistorted, dist) - goal), axis=1)
+    undistorted[~(residual <= max_residual)] = np.nan
+    result[finite] = undistorted
+    return result.reshape(target.shape)
+
+
+def undistort_pixel_points(points_px: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Undistort pixel coordinates ``(..., 2)`` and re-project them with the same ``K``.
+
+    This is the equivalent of ``cv2.undistortPoints(points, K, dist, P=K)`` with
+    a converged iterative inverse. ``NaN`` points stay ``NaN``; with all-zero
+    coefficients the input is returned unchanged (copy).
+    """
+
+    points_px = np.asarray(points_px, dtype=float)
+    coefficients = _opencv_distortion_coefficients(dist)
+    if not np.any(coefficients):
+        return np.array(points_px, copy=True)
+    K = np.asarray(K, dtype=float)
+    fx, skew, cx = K[0, 0], K[0, 1], K[0, 2]
+    fy, cy = K[1, 1], K[1, 2]
+    y_distorted = (points_px[..., 1] - cy) / fy
+    x_distorted = (points_px[..., 0] - cx - skew * y_distorted) / fx
+    ideal = undistort_normalized_points(np.stack((x_distorted, y_distorted), axis=-1), coefficients)
+    u = fx * ideal[..., 0] + skew * ideal[..., 1] + cx
+    v = fy * ideal[..., 1] + cy
+    return np.stack((u, v), axis=-1)
+
+
+def undistort_pose_keypoints(
+    keypoints: np.ndarray,
+    calibrations: dict[str, CameraCalibration],
+    camera_names: Iterable[str],
+) -> np.ndarray:
+    """Undistort ``(n_cam, n_frames, n_kp, 2)`` pixel keypoints camera by camera."""
+
+    keypoints = np.asarray(keypoints, dtype=float)
+    undistorted = np.array(keypoints, copy=True)
+    for cam_idx, camera_name in enumerate(camera_names):
+        calibration = calibrations[str(camera_name)]
+        undistorted[cam_idx] = undistort_pixel_points(keypoints[cam_idx], calibration.K, calibration.dist)
+    return undistorted
+
+
+def calibrations_with_undistorted_keypoints(
+    calibrations: dict[str, CameraCalibration],
+    enabled: bool = True,
+) -> dict[str, CameraCalibration]:
+    """Return calibration copies flagged for keypoints undistorted at load time.
+
+    The flag changes :func:`calibration_signature`, so every geometric cache
+    (epipolar, flip, pose variants, triangulation) keyed on the calibration is
+    invalidated when the option is toggled; the distortion coefficients were
+    already part of that signature.
+    """
+
+    from dataclasses import replace as _replace
+
+    return {
+        name: _replace(calibration, keypoints_undistorted=bool(enabled)) for name, calibration in calibrations.items()
+    }
+
+
 def load_calibrations(calib_path: Path) -> dict[str, CameraCalibration]:
     """Charge le fichier TOML de calibration et construit les matrices utiles.
 
@@ -699,6 +853,7 @@ def load_pose_data(
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
     annotations_path: Path | None = None,
+    undistort_keypoints: bool = False,
 ) -> PoseData:
     """Charge les keypoints 2D et les aligne camera par camera.
 
@@ -706,6 +861,15 @@ def load_pose_data(
     differentes vues. Une camera absente sur une frame donnee est remplie avec
     des `NaN` et des scores nuls, afin de conserver toute la timeline sans
     supprimer des frames entieres du pipeline.
+
+    Avec ``undistort_keypoints=True``, les keypoints bruts et annotes (pixels
+    de l'image distordue) sont dedistordus une seule fois avec ``K`` et
+    ``dist`` de chaque camera (equivalent ``cv2.undistortPoints(..., P=K)``)
+    avant le nettoyage temporel; toutes les etapes suivantes (coherence,
+    triangulation, EKF, reprojection) utilisent alors un modele pinhole exact.
+    Utiliser les calibrations de
+    :func:`calibrations_with_undistorted_keypoints` en aval pour que les caches
+    geometriques distinguent ce mode.
     """
     if keypoints_path.suffix.lower() != ".json":
         raise ValueError(
@@ -792,6 +956,19 @@ def load_pose_data(
         keypoint_names=COCO17,
         payload=annotation_payload,
     )
+    if undistort_keypoints:
+        loaded_camera_names = [name for name, _ in ordered_items]
+        was_finite = np.all(np.isfinite(keypoints), axis=-1)
+        annotated_was_finite = np.all(np.isfinite(annotated_keypoints), axis=-1)
+        keypoints = undistort_pose_keypoints(keypoints, calibrations, loaded_camera_names)
+        raw_keypoints = np.array(keypoints, copy=True)
+        annotated_keypoints = undistort_pose_keypoints(annotated_keypoints, calibrations, loaded_camera_names)
+        # A point outside the invertible distortion domain becomes NaN: keep the NaN/score-0 contract.
+        scores = np.where(was_finite & ~np.all(np.isfinite(keypoints), axis=-1), 0.0, scores)
+        raw_scores = np.array(scores, copy=True)
+        annotated_scores = np.where(
+            annotated_was_finite & ~np.all(np.isfinite(annotated_keypoints), axis=-1), 0.0, annotated_scores
+        )
     cleaned_keypoints, cleaned_scores, filtered_keypoints = filter_pose_keypoints(
         keypoints,
         scores,
@@ -6415,6 +6592,11 @@ def parse_args() -> argparse.Namespace:
         "--compare-biorbd-kalman", action="store_true", help="Lance aussi le Kalman marqueurs classique de biorbd."
     )
     parser.add_argument("--animate", action="store_true", help="Exporte/lance une animation pyorerun si disponible.")
+    parser.add_argument(
+        "--undistort-keypoints",
+        action="store_true",
+        help="Dedistord les keypoints 2D au chargement avec les coefficients de Calib.toml (defaut: desactive).",
+    )
     return parser.parse_args()
 
 
@@ -6429,6 +6611,8 @@ def main() -> None:
     selected_camera_names = parse_camera_names(args.camera_names)
     if selected_camera_names:
         calibrations = subset_calibrations(calibrations, selected_camera_names)
+    if args.undistort_keypoints:
+        calibrations = calibrations_with_undistorted_keypoints(calibrations)
     pose_data = load_pose_data(
         args.keypoints,
         calibrations,
@@ -6440,6 +6624,7 @@ def main() -> None:
         outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
         lower_percentile=args.pose_amplitude_lower_percentile,
         upper_percentile=args.pose_amplitude_upper_percentile,
+        undistort_keypoints=args.undistort_keypoints,
     )
     if args.pose_correction_mode != "none":
         if args.pose_correction_mode == "flip_epipolar":

@@ -1560,8 +1560,14 @@ def build_pose_data(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
     annotations_path: Path | None = None,
+    undistort_keypoints: bool = False,
 ) -> PoseData:
-    """Load one ``PoseData`` object from keypoints, smoothing, and annotations settings."""
+    """Load one ``PoseData`` object from keypoints, smoothing, and annotations settings.
+
+    With ``undistort_keypoints``, callers must also use calibrations returned by
+    ``calibrations_with_undistorted_keypoints`` so that geometric caches are keyed
+    on this mode (see ``calibration_signature``).
+    """
 
     return load_pose_data(
         keypoints_path,
@@ -1574,7 +1580,14 @@ def build_pose_data(
         lower_percentile=pose_amplitude_lower_percentile,
         upper_percentile=pose_amplitude_upper_percentile,
         annotations_path=annotations_path,
+        undistort_keypoints=undistort_keypoints,
     )
+
+
+def keypoints_undistorted(calibrations: dict[str, CameraCalibration]) -> bool:
+    """Return whether the calibrations are flagged for keypoints undistorted at load time."""
+
+    return any(bool(getattr(calibration, "keypoints_undistorted", False)) for calibration in calibrations.values())
 
 
 def pose_effective_fps(pose_data: PoseData, source_fps: float) -> float:
@@ -1883,6 +1896,7 @@ def build_triangulation_bundle(
         "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "left_right_flip_diagnostics": flip_diagnostics,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -2190,6 +2204,7 @@ def build_ekf_3d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": effective_triangulation_method,
         "reprojection_threshold_px": reprojection_threshold_px,
@@ -2734,6 +2749,7 @@ def build_ekf_2d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "triangulation_method": effective_triangulation_method,
         "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
