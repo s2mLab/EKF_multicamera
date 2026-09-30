@@ -14,9 +14,10 @@ dependencies:
   - ezc3d
   - matplotlib
   - pandas
+  - plotly
   - black
-  - isort
+  - isort=9.0.2
   - flake8
   - pip:
-      - -e ../biobuddy
+      - git+https://github.com/pyomeca/biobuddy.git@85ec552f4c73152590336ca571c1a32ed911c75a
       - pyorerun
