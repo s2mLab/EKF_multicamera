@@ -13,6 +13,12 @@ def test_default_model_stem_includes_pose_correction_mode() -> None:
     assert flip_tri == "model_2d_cleaned_exhaustive_flip_triangulation"
 
 
+def test_default_model_stem_includes_asym_suffix_when_limbs_are_not_symmetrized() -> None:
+    asym = default_model_stem("cleaned", "exhaustive", symmetrize_limbs=False)
+
+    assert asym == "model_2d_cleaned_exhaustive_asym"
+
+
 def test_model_output_dir_changes_with_pose_correction_mode() -> None:
     output_root = Path("outputs")
     dataset_name = "demo"

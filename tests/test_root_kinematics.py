@@ -99,6 +99,68 @@ def test_extract_root_from_q_can_skip_unwrap_but_keep_rotation_reextraction():
     assert root_q[1, 5] < -3.0
 
 
+def test_extract_root_from_q_applies_second_reextract_unwrap_pass_for_root_rotations():
+    q_names = np.asarray(
+        [
+            "TRUNK:TransX",
+            "TRUNK:TransY",
+            "TRUNK:TransZ",
+            "TRUNK:RotY",
+            "TRUNK:RotX",
+            "TRUNK:RotZ",
+        ],
+        dtype=object,
+    )
+    q = np.array(
+        [
+            [0.0, 0.0, 0.0, math.pi + 0.25, -0.15, 2.0 * math.pi + 0.30],
+            [0.0, 0.0, 0.0, math.pi + 0.27, -0.14, 4.0 * math.pi + 0.32],
+        ],
+        dtype=float,
+    )
+
+    root_q = extract_root_from_q(q_names, q, unwrap_rotations=True, renormalize_rotations=True)
+
+    for frame_idx in range(q.shape[0]):
+        np.testing.assert_allclose(
+            Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, root_q[frame_idx, ROOT_ROTATION_SLICE]).as_matrix(),
+            Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, q[frame_idx, 3:6]).as_matrix(),
+            atol=1e-12,
+        )
+    assert abs(root_q[0, 5]) < abs(q[0, 5])
+    assert abs(root_q[1, 5] - root_q[0, 5]) < math.pi
+
+
+def test_extract_root_from_q_accepts_single_unwrap_mode():
+    q_names = np.asarray(
+        [
+            "TRUNK:TransX",
+            "TRUNK:TransY",
+            "TRUNK:TransZ",
+            "TRUNK:RotY",
+            "TRUNK:RotX",
+            "TRUNK:RotZ",
+        ],
+        dtype=object,
+    )
+    q = np.array(
+        [
+            [0.0, 0.0, 0.0, math.pi + 0.20, -0.12, 2.0 * math.pi + 0.10],
+            [0.0, 0.0, 0.0, math.pi + 0.22, -0.11, 2.0 * math.pi + 0.12],
+        ],
+        dtype=float,
+    )
+
+    root_q = extract_root_from_q(q_names, q, unwrap_rotations=True, renormalize_rotations=True, unwrap_mode="single")
+
+    for frame_idx in range(q.shape[0]):
+        np.testing.assert_allclose(
+            Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, root_q[frame_idx, ROOT_ROTATION_SLICE]).as_matrix(),
+            Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, q[frame_idx, 3:6]).as_matrix(),
+            atol=1e-12,
+        )
+
+
 def test_centered_finite_difference_handles_edges_and_nans():
     values = np.array(
         [

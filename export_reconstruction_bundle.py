@@ -8,6 +8,8 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent
 LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
@@ -23,6 +25,7 @@ from reconstruction.reconstruction_bundle import (
     build_triangulation_bundle,
 )
 from vitpose_ekf_pipeline import (
+    DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
@@ -45,11 +48,22 @@ from vitpose_ekf_pipeline import (
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_MODEL_VARIANTS,
+    SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
     load_calibrations,
+    normalize_root_unwrap_mode,
 )
+
+
+def parse_optional_reprojection_threshold(value: str) -> float | None:
+    raw = str(value).strip().lower()
+    if raw in {"none", "off", ""}:
+        return None
+    return float(raw)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,16 +73,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB)
     parser.add_argument("--keypoints", type=Path, default=DEFAULT_KEYPOINTS)
+    parser.add_argument("--annotations-path", type=Path, default=None)
     parser.add_argument("--trc-file", "--pose2sim-trc", dest="pose2sim_trc", type=Path, default=None)
     parser.add_argument("--biomod", type=Path, default=None)
     parser.add_argument("--model-variant", choices=SUPPORTED_MODEL_VARIANTS, default=DEFAULT_MODEL_VARIANT)
+    parser.add_argument(
+        "--no-symmetrize-limbs",
+        action="store_true",
+        help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
+    )
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
         "--camera-names", type=str, default="", help="Liste de cameras a utiliser, separees par des virgules."
     )
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, choices=(1, 2, 3, 4), default=1)
-    parser.add_argument("--pose-data-mode", choices=("raw", "filtered", "cleaned"), default="cleaned")
+    parser.add_argument("--pose-data-mode", choices=("raw", "filtered", "cleaned", "annotated"), default="cleaned")
     parser.add_argument("--pose-filter-window", type=int, default=9)
     parser.add_argument("--pose-outlier-threshold-ratio", type=float, default=0.10)
     parser.add_argument("--pose-amplitude-lower-percentile", type=float, default=5.0)
@@ -78,7 +98,11 @@ def parse_args() -> argparse.Namespace:
         "--triangulation-method", choices=SUPPORTED_TRIANGULATION_METHODS, default=DEFAULT_TRIANGULATION_METHOD
     )
     parser.add_argument("--triangulation-workers", type=int, default=DEFAULT_TRIANGULATION_WORKERS)
-    parser.add_argument("--reprojection-threshold-px", type=float, default=DEFAULT_REPROJECTION_THRESHOLD_PX)
+    parser.add_argument(
+        "--reprojection-threshold-px",
+        type=parse_optional_reprojection_threshold,
+        default=DEFAULT_REPROJECTION_THRESHOLD_PX,
+    )
     parser.add_argument("--epipolar-threshold-px", type=float, default=DEFAULT_EPIPOLAR_THRESHOLD_PX)
     parser.add_argument("--min-cameras-for-triangulation", type=int, default=DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION)
     parser.add_argument("--coherence-method", choices=SUPPORTED_COHERENCE_METHODS, default=DEFAULT_COHERENCE_METHOD)
@@ -96,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         ),
         default=DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     )
-    parser.add_argument("--predictor", choices=("acc", "dyn"), default="acc")
+    parser.add_argument("--predictor", choices=("acc", "dyn", "history3", "dyn_history3"), default="acc")
     parser.add_argument("--ekf2d-3d-source", choices=SUPPORTED_EKF2D_3D_SOURCE_MODES, default="full_triangulation")
     parser.add_argument(
         "--ekf2d-initial-state-method",
@@ -138,16 +162,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--measurement-noise-scale", type=float, default=DEFAULT_MEASUREMENT_NOISE_SCALE)
     parser.add_argument("--process-noise-scale", type=float, default=1.0)
     parser.add_argument("--coherence-confidence-floor", type=float, default=DEFAULT_COHERENCE_CONFIDENCE_FLOOR)
+    parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
+    parser.add_argument(
+        "--upper-back-pseudo-std-deg", type=float, default=np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD)
+    )
+    parser.add_argument("--ankle-bed-pseudo-obs", action="store_true")
+    parser.add_argument("--ankle-bed-pseudo-std-m", type=float, default=DEFAULT_ANKLE_BED_PSEUDO_STD_M)
     parser.add_argument("--min-frame-coherence-for-update", type=float, default=DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE)
     parser.add_argument("--skip-low-coherence-updates", action="store_true")
     parser.add_argument("--flight-height-threshold-m", type=float, default=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M)
     parser.add_argument("--flight-min-consecutive-frames", type=int, default=DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES)
+    parser.add_argument("--root-unwrap-mode", choices=SUPPORTED_ROOT_UNWRAP_MODES, default="off")
     parser.add_argument("--no-root-unwrap", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    root_unwrap_mode = normalize_root_unwrap_mode(("off" if args.no_root_unwrap else args.root_unwrap_mode))
     args.output_dir.mkdir(parents=True, exist_ok=True)
     calibrations = load_calibrations(args.calib)
     selected_camera_names = parse_camera_names(args.camera_names)
@@ -172,6 +204,7 @@ def main() -> None:
         pose_outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile=args.pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile=args.pose_amplitude_upper_percentile,
+        annotations_path=args.annotations_path,
     )
     pose_data_compute_time_s = time.perf_counter() - pose_data_start
 
@@ -185,7 +218,8 @@ def main() -> None:
             pose_data_compute_time_s=pose_data_compute_time_s,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
         )
     elif args.family == "triangulation":
         build_triangulation_bundle(
@@ -196,7 +230,8 @@ def main() -> None:
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
             triangulation_method=args.triangulation_method,
             reprojection_threshold_px=args.reprojection_threshold_px,
             min_cameras_for_triangulation=args.min_cameras_for_triangulation,
@@ -229,7 +264,8 @@ def main() -> None:
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
             triangulation_method=args.triangulation_method,
             reprojection_threshold_px=args.reprojection_threshold_px,
             min_cameras_for_triangulation=args.min_cameras_for_triangulation,
@@ -258,6 +294,7 @@ def main() -> None:
             biorbd_kalman_init_method=args.biorbd_kalman_init_method,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
     else:
         build_ekf_2d_bundle(
@@ -268,7 +305,8 @@ def main() -> None:
             calibrations=calibrations,
             fps=args.fps,
             initial_rotation_correction=args.initial_rotation_correction,
-            unwrap_root=not args.no_root_unwrap,
+            unwrap_root=(root_unwrap_mode != "off"),
+            root_unwrap_mode=root_unwrap_mode,
             triangulation_method=args.triangulation_method,
             reprojection_threshold_px=args.reprojection_threshold_px,
             min_cameras_for_triangulation=args.min_cameras_for_triangulation,
@@ -304,8 +342,13 @@ def main() -> None:
             skip_low_coherence_updates=args.skip_low_coherence_updates,
             flight_height_threshold_m=args.flight_height_threshold_m,
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
+            upper_back_sagittal_gain=args.upper_back_sagittal_gain,
+            upper_back_pseudo_std_deg=args.upper_back_pseudo_std_deg,
+            ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
+            ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
+            symmetrize_limbs=not args.no_symmetrize_limbs,
         )
 
     print(f"Bundle ecrit dans {args.output_dir}", flush=True)

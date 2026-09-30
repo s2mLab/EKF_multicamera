@@ -22,6 +22,19 @@ def test_canonical_profile_name_includes_camera_names():
     assert canonical_profile_name(profile) == "ekf_2d_acc_cams_m11139_m11140"
 
 
+def test_canonical_profile_name_uses_all_cameras_token():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_2d",
+            predictor="acc",
+            use_all_cameras=True,
+            camera_names=["M11139", "M11140"],
+        )
+    )
+    assert canonical_profile_name(profile) == "ekf_2d_acc_all_cameras"
+
+
 def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     profile = validate_profile(
         ReconstructionProfile(
@@ -42,6 +55,48 @@ def test_build_pipeline_command_prefers_profile_camera_names_over_override():
     assert "--camera-names" in cmd
     camera_names_arg = cmd[cmd.index("--camera-names") + 1]
     assert camera_names_arg == "M11139,M11140"
+
+
+def test_build_pipeline_command_omits_camera_names_for_all_cameras_profile():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf_all_cameras",
+            family="ekf_2d",
+            predictor="acc",
+            use_all_cameras=True,
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        camera_names_override=["M11141", "M11458"],
+        python_executable="python",
+    )
+    assert "--camera-names" not in cmd
+
+
+def test_build_pipeline_command_forces_root_unwrap_off():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf_single_unwrap",
+            family="ekf_2d",
+            predictor="acc",
+            root_unwrap_mode="single",
+        )
+    )
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+    assert "--root-unwrap-mode" in cmd
+    assert cmd[cmd.index("--root-unwrap-mode") + 1] == "off"
 
 
 def test_canonical_profile_name_includes_root_pose_bootstrap_flag():
@@ -169,6 +224,81 @@ def test_build_pipeline_command_includes_model_variant_for_auto_built_ekf_profil
     assert cmd[cmd.index("--model-variant") + 1] == "back_3dof"
 
 
+def test_build_pipeline_command_includes_upper_back_prior_parameters_for_ekf2d():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_back",
+            family="ekf_2d",
+            predictor="acc",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+            upper_back_sagittal_gain=0.35,
+            upper_back_pseudo_std_deg=8.0,
+            ankle_bed_pseudo_obs=True,
+            ankle_bed_pseudo_std_m=0.015,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert cmd[cmd.index("--upper-back-sagittal-gain") + 1] == "0.35"
+    assert cmd[cmd.index("--upper-back-pseudo-std-deg") + 1] == "8.0"
+    assert "--ankle-bed-pseudo-obs" in cmd
+    assert cmd[cmd.index("--ankle-bed-pseudo-std-m") + 1] == "0.015"
+
+
+def test_validate_profile_accepts_history3_predictors():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf2d_history",
+            family="ekf_2d",
+            predictor="dyn_history3",
+            ekf_model_path="output/1_partie_0429/models/model_demo/model_demo.bioMod",
+        )
+    )
+
+    assert profile.predictor == "dyn_history3"
+
+
+def test_canonical_profile_name_marks_asymmetric_auto_built_models():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="ekf_3d",
+            symmetrize_limbs=False,
+        )
+    )
+
+    assert canonical_profile_name(profile).startswith("ekf_3d_asym")
+
+
+def test_build_pipeline_command_disables_limb_symmetrization_when_requested():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="ekf3d_asym",
+            family="ekf_3d",
+            symmetrize_limbs=False,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert "--no-symmetrize-limbs" in cmd
+
+
 def test_build_pipeline_command_includes_frame_stride():
     profile = validate_profile(
         ReconstructionProfile(
@@ -208,6 +338,40 @@ def test_build_pipeline_command_includes_frame_stride_for_ekf2d():
     )
     assert "--frame-stride" in cmd
     assert cmd[cmd.index("--frame-stride") + 1] == "4"
+
+
+def test_canonical_profile_name_includes_non_default_reprojection_threshold():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="",
+            family="triangulation",
+            reprojection_threshold_px=10.0,
+        )
+    )
+
+    assert canonical_profile_name(profile) == "triangulation_exhaustive_tau10"
+
+
+def test_build_pipeline_command_supports_none_reprojection_threshold():
+    profile = validate_profile(
+        ReconstructionProfile(
+            name="tri_once_none",
+            family="triangulation",
+            triangulation_method="once",
+            reprojection_threshold_px=None,
+        )
+    )
+
+    cmd = build_pipeline_command(
+        profile=profile,
+        output_root=Path("outputs"),
+        calib=Path("inputs/calibration/Calib.toml"),
+        keypoints=Path("inputs/keypoints/1_partie_0429_keypoints.json"),
+        pose2sim_trc=Path("inputs/trc/1_partie_0429.trc"),
+        python_executable="python",
+    )
+
+    assert cmd[cmd.index("--reprojection-threshold-px") + 1] == "none"
 
 
 def test_validate_profile_pose2sim_forces_frame_stride_to_one():
