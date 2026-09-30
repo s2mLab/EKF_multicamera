@@ -1,11 +1,13 @@
 import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 
 from reconstruction.reconstruction_bundle import (
     build_bundle_payload,
+    build_triangulation_bundle,
     epipolar_cache_metadata,
     load_or_build_model_cache,
     load_or_compute_pose_data_variant_cache,
@@ -13,10 +15,14 @@ from reconstruction.reconstruction_bundle import (
 )
 from vitpose_ekf_pipeline import (
     KP_INDEX,
+    CameraCalibration,
     PoseData,
     SegmentLengths,
     apply_left_right_flip_corrections,
+    biorbd_kalman_cache_metadata,
+    calibration_signature,
     metadata_cache_matches,
+    model_stage_metadata,
     reconstruction_cache_metadata,
 )
 
@@ -44,6 +50,67 @@ def _make_pose_data() -> PoseData:
         raw_keypoints=raw_keypoints,
         filtered_keypoints=filtered_keypoints,
     )
+
+
+def _make_synthetic_camera(name: str, tx_m: float) -> CameraCalibration:
+    intrinsics = np.array([[1000.0, 0.0, 640.0], [0.0, 1000.0, 480.0], [0.0, 0.0, 1.0]], dtype=float)
+    rotation = np.eye(3, dtype=float)
+    translation = np.array([[tx_m], [0.0], [0.0]], dtype=float)
+    return CameraCalibration(
+        name=name,
+        image_size=(1280, 960),
+        K=intrinsics,
+        dist=np.zeros(5, dtype=float),
+        rvec=np.zeros(3, dtype=float),
+        tvec=translation,
+        R=rotation,
+        P=intrinsics @ np.hstack((rotation, translation)),
+    )
+
+
+def _make_synthetic_bundle_inputs() -> tuple[PoseData, dict[str, CameraCalibration], np.ndarray]:
+    cameras = [
+        _make_synthetic_camera("cam0", 0.0),
+        _make_synthetic_camera("cam1", 1.0),
+        _make_synthetic_camera("cam2", -0.8),
+    ]
+    frame_zero = np.array(
+        [
+            [0.00, 0.00, 5.60],
+            [0.02, 0.05, 5.58],
+            [0.02, -0.05, 5.58],
+            [0.03, 0.12, 5.54],
+            [0.03, -0.12, 5.54],
+            [0.00, 0.35, 5.00],
+            [0.00, -0.35, 5.00],
+            [0.08, 0.68, 4.72],
+            [0.08, -0.68, 4.72],
+            [0.14, 0.92, 4.48],
+            [0.14, -0.92, 4.48],
+            [0.00, 0.20, 4.00],
+            [0.00, -0.20, 4.00],
+            [0.06, 0.22, 3.05],
+            [0.06, -0.22, 3.05],
+            [0.12, 0.23, 2.10],
+            [0.12, -0.23, 2.10],
+        ],
+        dtype=float,
+    )
+    expected_points = np.stack([frame_zero + np.array([0.02 * frame_idx, 0.0, 0.0]) for frame_idx in range(3)])
+    keypoints = np.stack(
+        [
+            np.stack([[camera.project_point(point) for point in frame_points] for frame_points in expected_points])
+            for camera in cameras
+        ]
+    )
+    pose_data = PoseData(
+        camera_names=[camera.name for camera in cameras],
+        frames=np.array([0, 2, 4], dtype=int),
+        keypoints=keypoints,
+        scores=np.ones((len(cameras), len(expected_points), len(KP_INDEX)), dtype=float),
+        frame_stride=2,
+    )
+    return pose_data, {camera.name: camera for camera in cameras}, expected_points
 
 
 def test_apply_left_right_flip_corrections_preserves_raw_and_filtered_variants():
@@ -143,8 +210,107 @@ def test_epipolar_cache_metadata_distinguishes_fast_distance_mode():
     assert fast_metadata["distance_mode"] == "symmetric"
 
 
+def test_calibration_signatures_invalidate_epipolar_and_triangulation_metadata():
+    pose_data, calibrations, _expected_points = _make_synthetic_bundle_inputs()
+    modified_calibrations = dict(calibrations)
+    original = calibrations["cam1"]
+    modified_intrinsics = np.array(original.K, copy=True)
+    modified_intrinsics[0, 0] += 1.0
+    modified_calibrations["cam1"] = CameraCalibration(
+        name=original.name,
+        image_size=original.image_size,
+        K=modified_intrinsics,
+        dist=np.array(original.dist, copy=True),
+        rvec=np.array(original.rvec, copy=True),
+        tvec=np.array(original.tvec, copy=True),
+        R=np.array(original.R, copy=True),
+        P=modified_intrinsics @ np.hstack((original.R, original.tvec)),
+    )
+
+    assert calibration_signature(calibrations, pose_data.camera_names) != calibration_signature(
+        modified_calibrations, pose_data.camera_names
+    )
+    epipolar_metadata = epipolar_cache_metadata(
+        pose_data,
+        epipolar_threshold_px=15.0,
+        distance_mode="sampson",
+        pose_data_mode="raw",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+        calibrations=calibrations,
+    )
+    modified_epipolar_metadata = epipolar_cache_metadata(
+        pose_data,
+        epipolar_threshold_px=15.0,
+        distance_mode="sampson",
+        pose_data_mode="raw",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+        calibrations=modified_calibrations,
+    )
+    triangulation_metadata = reconstruction_cache_metadata(
+        pose_data,
+        error_threshold_px=15.0,
+        min_cameras_for_triangulation=2,
+        epipolar_threshold_px=15.0,
+        triangulation_method="once",
+        pose_data_mode="raw",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+        calibrations=calibrations,
+    )
+    modified_triangulation_metadata = reconstruction_cache_metadata(
+        pose_data,
+        error_threshold_px=15.0,
+        min_cameras_for_triangulation=2,
+        epipolar_threshold_px=15.0,
+        triangulation_method="once",
+        pose_data_mode="raw",
+        pose_filter_window=9,
+        pose_outlier_threshold_ratio=0.1,
+        pose_amplitude_lower_percentile=5.0,
+        pose_amplitude_upper_percentile=95.0,
+        calibrations=modified_calibrations,
+    )
+
+    assert epipolar_metadata["calibration_signature"] != modified_epipolar_metadata["calibration_signature"]
+    assert triangulation_metadata["calibration_signature"] != modified_triangulation_metadata["calibration_signature"]
+
+
+def test_model_and_biorbd_cache_metadata_track_content_changes(tmp_path):
+    reconstruction = SimpleNamespace(
+        frames=np.array([0, 1], dtype=int), points_3d=np.zeros((2, len(KP_INDEX), 3), dtype=float)
+    )
+    changed_reconstruction = SimpleNamespace(
+        frames=np.array([0, 1], dtype=int), points_3d=np.ones((2, len(KP_INDEX), 3), dtype=float)
+    )
+    model_metadata = model_stage_metadata(tmp_path / "triangulation.npz", reconstruction, 120.0, 55.0, False)
+    changed_model_metadata = model_stage_metadata(
+        tmp_path / "triangulation.npz", changed_reconstruction, 120.0, 55.0, False
+    )
+    assert model_metadata["reconstruction_signature"] != changed_model_metadata["reconstruction_signature"]
+
+    biomod_path = tmp_path / "model.bioMod"
+    biomod_path.write_text("version 4", encoding="utf-8")
+    first_kalman_metadata = biorbd_kalman_cache_metadata(
+        tmp_path / "triangulation.npz", reconstruction, biomod_path, 120.0, 1e-8, 1e-4
+    )
+    biomod_path.write_text("version 4\nsegment trunk", encoding="utf-8")
+    second_kalman_metadata = biorbd_kalman_cache_metadata(
+        tmp_path / "triangulation.npz", reconstruction, biomod_path, 120.0, 1e-8, 1e-4
+    )
+    assert first_kalman_metadata["biomod_signature"] != second_kalman_metadata["biomod_signature"]
+
+
 def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeypatch):
     pose_data = _make_pose_data()
+    calibrations = {"cam0": _make_synthetic_camera("cam0", 0.0)}
     call_count = {"count": 0}
 
     def fake_flip_cache(**_kwargs):
@@ -158,7 +324,7 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
     corrected_a, diagnostics_a, compute_time_a, cache_path, source_a = load_or_compute_pose_data_variant_cache(
         output_dir=tmp_path,
         pose_data=pose_data,
-        calibrations={},
+        calibrations=calibrations,
         correction_mode="flip",
         flip_method="epipolar",
         pose_data_mode="cleaned",
@@ -170,7 +336,7 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
     corrected_b, diagnostics_b, compute_time_b, cache_path_b, source_b = load_or_compute_pose_data_variant_cache(
         output_dir=tmp_path,
         pose_data=pose_data,
-        calibrations={},
+        calibrations=calibrations,
         correction_mode="flip",
         flip_method="epipolar",
         pose_data_mode="cleaned",
@@ -197,7 +363,9 @@ def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeyp
 
 
 def test_load_or_build_model_cache_records_full_model_stage_time(tmp_path, monkeypatch):
-    reconstruction = SimpleNamespace(frames=np.array([0, 1, 2], dtype=int))
+    reconstruction = SimpleNamespace(
+        frames=np.array([0, 1, 2], dtype=int), points_3d=np.zeros((3, len(KP_INDEX), 3), dtype=float)
+    )
     lengths = SegmentLengths(
         trunk_height=0.6,
         head_length=0.2,
@@ -288,6 +456,69 @@ def test_build_bundle_payload_includes_excluded_views():
     )
 
     np.testing.assert_array_equal(payload["excluded_views"], excluded_views)
+
+
+def test_synthetic_triangulation_bundle_writes_outputs_and_reuses_caches(tmp_path):
+    pose_data, calibrations, expected_points = _make_synthetic_bundle_inputs()
+    bundle_kwargs = {
+        "name": "synthetic_once",
+        "output_dir": tmp_path / "reconstruction",
+        "pose_data": pose_data,
+        "calibrations": calibrations,
+        "fps": 120.0,
+        "initial_rotation_correction": False,
+        "unwrap_root": False,
+        "triangulation_method": "once",
+        "reprojection_threshold_px": 1e-6,
+        "min_cameras_for_triangulation": 2,
+        "epipolar_threshold_px": 15.0,
+        "coherence_method": "epipolar",
+        "triangulation_workers": 1,
+        "pose_data_mode": "raw",
+        "pose_filter_window": 9,
+        "pose_outlier_threshold_ratio": 0.1,
+        "pose_amplitude_lower_percentile": 5.0,
+        "pose_amplitude_upper_percentile": 95.0,
+        "flip_left_right": False,
+        "flip_improvement_ratio": 0.7,
+        "flip_min_gain_px": 3.0,
+        "flip_min_other_cameras": 2,
+        "flip_restrict_to_outliers": True,
+        "flip_outlier_percentile": 85.0,
+        "flip_outlier_floor_px": 5.0,
+        "flip_temporal_weight": 0.35,
+        "flip_temporal_tau_px": 20.0,
+        "flip_temporal_min_valid_keypoints": 4,
+    }
+
+    first_bundle, first_reconstruction = build_triangulation_bundle(**bundle_kwargs)
+    second_bundle, second_reconstruction = build_triangulation_bundle(**bundle_kwargs)
+
+    np.testing.assert_allclose(first_reconstruction.points_3d, expected_points, atol=1e-8)
+    np.testing.assert_allclose(second_reconstruction.points_3d, expected_points, atol=1e-8)
+    assert np.all(first_reconstruction.reprojection_error_per_view < 1e-8)
+    assert not np.any(first_reconstruction.excluded_views)
+    np.testing.assert_allclose(
+        first_bundle.payload["q_root"][:, :3],
+        expected_points[:, [KP_INDEX["left_hip"], KP_INDEX["right_hip"]]].mean(axis=1),
+        atol=1e-8,
+    )
+    assert first_bundle.summary["family"] == "triangulation"
+    assert first_bundle.summary["fps"] == 60.0
+    assert first_bundle.summary["source_fps"] == 120.0
+    assert first_bundle.summary["frame_stride"] == 2
+    assert (bundle_kwargs["output_dir"] / "reconstruction_bundle.npz").exists()
+    assert (bundle_kwargs["output_dir"] / "bundle_summary.json").exists()
+    assert Path(first_bundle.summary["cache_paths"]["epipolar"]).exists()
+    assert Path(first_bundle.summary["cache_paths"]["triangulation"]).exists()
+    first_triangulation_stage = next(
+        stage for stage in first_bundle.summary["pipeline_timing"]["stages"] if stage["id"] == "triangulation"
+    )
+    second_triangulation_stage = next(
+        stage for stage in second_bundle.summary["pipeline_timing"]["stages"] if stage["id"] == "triangulation"
+    )
+    assert first_triangulation_stage["source"] == "computed_now"
+    assert second_triangulation_stage["source"] == "cache"
 
 
 def test_summarize_view_usage_reports_included_and_excluded_ratios():

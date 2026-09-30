@@ -269,6 +269,7 @@ from vitpose_ekf_pipeline import (
     ReconstructionResult,
     apply_left_right_flip_to_points,
     canonicalize_model_q_rotation_branches,
+    file_content_signature,
     fundamental_matrix,
     initial_state_from_triangulation,
     load_calibrations,
@@ -2811,7 +2812,9 @@ def current_dataset_dir(state: SharedAppState) -> Path:
 def shared_images_root_path(state: SharedAppState) -> Path | None:
     """Return the shared images root selected in the first 2D-analysis tab."""
 
-    raw_value = str(getattr(state, "shared_images_root_var", "").get() if hasattr(state, "shared_images_root_var") else "")
+    raw_value = str(
+        getattr(state, "shared_images_root_var", "").get() if hasattr(state, "shared_images_root_var") else ""
+    )
     raw_value = raw_value.strip()
     if not raw_value:
         return None
@@ -3202,7 +3205,7 @@ def write_runtime_profiles_config(state: SharedAppState) -> Path:
 
 
 def calibration_cache_key(calib_path: Path) -> str:
-    return str(calib_path.resolve())
+    return f"{calib_path.resolve()}:{file_content_signature(calib_path)}"
 
 
 def pose_data_cache_key(
@@ -3223,6 +3226,7 @@ def pose_data_cache_key(
     return (
         str(keypoints_path.resolve()),
         str(calib_path.resolve()),
+        file_content_signature(calib_path),
         None if max_frames is None else int(max_frames),
         None if frame_start is None else int(frame_start),
         None if frame_end is None else int(frame_end),
@@ -9180,7 +9184,7 @@ class ModelTab(CommandTab):
             return None
         return load_model_preview_cache(cache_path)
 
-    def _try_load_existing_triangulation_cache(self, pose_data, model_dir: Path):
+    def _try_load_existing_triangulation_cache(self, calibrations, pose_data, model_dir: Path):
         cache_name = (
             "triangulation_pose2sim_like_fast.npz"
             if self.triang_method.get() == "greedy"
@@ -9201,13 +9205,14 @@ class ModelTab(CommandTab):
             pose_amplitude_lower_percentile=float(self.state.pose_p_low_var.get()),
             pose_amplitude_upper_percentile=float(self.state.pose_p_high_var.get()),
             pose_correction_mode=self.current_pose_correction_mode(),
+            calibrations=calibrations,
         )
         if not metadata_cache_matches(cache_path, metadata):
             return None
         return load_reconstruction_cache(cache_path, coherence_method=DEFAULT_COHERENCE_METHOD)
 
     def _first_valid_preview_reconstruction(self, calibrations, pose_data, model_dir: Path):
-        existing = self._try_load_existing_triangulation_cache(pose_data, model_dir)
+        existing = self._try_load_existing_triangulation_cache(calibrations, pose_data, model_dir)
         if existing is not None:
             for frame_idx in range(existing.points_3d.shape[0]):
                 if np.any(np.isfinite(existing.points_3d[frame_idx])):
@@ -12514,9 +12519,7 @@ class Analysis3DTab(ttk.Frame):
 
             if momentum_plotted:
                 title_suffix = (
-                    f" | jump phases from {reconstruction_label(momentum_jump_source)}"
-                    if momentum_jump_source
-                    else ""
+                    f" | jump phases from {reconstruction_label(momentum_jump_source)}" if momentum_jump_source else ""
                 )
                 comp_ax.set_title(f"3D angular momentum components{title_suffix}")
                 comp_ax.set_ylabel("kg.m²/s")

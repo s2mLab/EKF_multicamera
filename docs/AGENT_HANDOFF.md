@@ -1,0 +1,124 @@
+# Transfert et demarrage d'un agent sur une autre machine
+
+Ce guide permet a un agent de reprendre ce depot sans dependre des chemins,
+caches ou sorties de la machine d'origine. Il complete les instructions locales
+dans `AGENTS.md`, la vue d'architecture et la matrice de validation.
+
+## Objectif et limites du depot
+
+Ce projet reconstruit des mouvements de trampoline a partir de poses 2D
+multi-camera. Les entrees experimentales, les profils de reconstruction et les
+sorties peuvent etre locaux ou en cours de travail. Un agent ne doit donc pas
+les modifier, les reformatter ou les committer sans demande explicite.
+
+Les caches et resultats sont regenerables sous `output/` et `.cache/`; ils ne
+doivent pas etre transferes pour developper ou lancer les tests. Les donnees
+necessaires a un essai scientifique doivent en revanche etre transferees par
+un canal choisi par le proprietaire du projet, en conservant les chemins
+relatifs attendus sous `inputs/`.
+
+## Installation reproductible
+
+Depuis le repertoire dans lequel le depot a ete clone :
+
+```bash
+conda env create -f environment.vitpose-ekf.yml
+conda activate vitpose-ekf
+pip install -e .[test]
+```
+
+La reference est `environment.vitpose-ekf.yml` avec Python 3.11. Ne pas utiliser
+`environment.yml` comme substitut : il a le meme nom d'environnement mais un
+ensemble de dependances different.
+
+Le fichier de reference contient un lien editable historique vers un depot
+frere `../GIT/biobuddy`. Sur une autre machine, placer ce depot a un chemin
+equivalent ou retirer uniquement cette ligne du fichier local si les fonctions
+qui l'utilisent ne sont pas requises. Ne pas committer une adaptation de chemin
+propre a une machine.
+
+L'installation minimale `pip install -e .[test]` suffit aux tests CI. Les
+reconstructions biomecaniques et certaines vues du GUI exigent aussi les
+dependances Conda, notamment `biorbd`; le GUI requiert une installation Python
+avec Tk. L'export Excel requiert `openpyxl`, qui n'est pas une dependance de
+base du paquet.
+
+## Verification initiale
+
+Apres l'installation, confirmer l'environnement sans lancer de reconstruction
+sur des donnees de production :
+
+```bash
+python --version
+git status --short --branch
+pytest -q tests/test_reconstruction_bundle_pose_cache.py
+pytest -q tests/test_pipeline_gui_file_dialog.py
+```
+
+Le premier resultat doit utiliser Python 3.11. Un arbre de travail non vide au
+depart est un fait a preserver et non une invitation a nettoyer ou a committer.
+Pour valider toute la couche commune, lancer ensuite `pytest -q`. Sur une
+machine munie de Tk et d'un affichage, le smoke test GUI est :
+
+```bash
+RUN_PIPELINE_GUI_SMOKE=1 pytest -q tests/test_pipeline_gui_launch.py
+```
+
+## Premiere lecture avant une modification
+
+Lire dans cet ordre :
+
+1. `AGENTS.md` pour les regles locales et scientifiques.
+2. `docs/architecture/OVERVIEW.md` pour le flux de donnees, les invariants et
+   les caches.
+3. `docs/architecture/LLM_CONTEXT.md` pour choisir le test cible correspondant
+   a la zone modifiee.
+4. Le module concerne et son test avant toute modification.
+
+Les contrats critiques sont l'ordre COCO17, les formes de `PoseData`, le
+traitement des `NaN`, les unites (pixels, metres, radians), le FPS et le repere
+de calibration. Une modification de filtrage, de flip gauche/droite, de
+coherence, de triangulation ou d'EKF doit aussi verifier l'invalidation des
+caches et fournir un test numerique cible.
+
+## Reprendre un travail en cours
+
+Avant d'editer, inspecter `git status --short --branch` et `git diff`. Isoler
+les fichiers du travail courant de ceux qui etaient deja modifies. En
+particulier, ne pas toucher sans instruction explicite :
+
+- `inputs/` : donnees experimentales suivies par Git ;
+- `reconstruction_profiles*.json` : reglages scientifiques potentiellement en
+  cours ;
+- `output/` et `.cache/` : artefacts locaux regenerables.
+
+Les entrees principales sont `pipeline_gui.py` pour le GUI,
+`vitpose_ekf_pipeline.py` pour les algorithmes centraux, et
+`reconstruction/` pour les bundles, profils et caches. Les commandes de base
+sont :
+
+```bash
+python pipeline_gui.py
+python export_reconstruction_bundle.py --help
+python run_reconstruction_profiles.py --help
+```
+
+Ne lancer une reconstruction complete sur une sequence reelle qu'apres avoir
+confirme les fichiers d'entree, les options du profil et le dossier de sortie.
+
+## Livraison d'un changement
+
+Executer d'abord le test cible de la matrice, puis les controles adequats a la
+portee du changement. Pour les fichiers Python modifies, la CI attend :
+
+```bash
+isort <fichiers_modifies> --check-only --profile black
+black <fichiers_modifies> --check
+flake8 <fichiers_modifies>
+```
+
+Avant de remettre le travail, verifier `git diff --check`, `git diff` et
+`git status --short --branch`. Rapporter distinctement les controles executes,
+ceux non executes, les dependances indisponibles et tout impact scientifique
+observable. Ne pas committer, pousser, fusionner ou modifier la CI sans une
+demande explicite.

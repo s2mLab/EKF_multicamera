@@ -435,6 +435,57 @@ def pose_data_signature(pose_data: PoseData) -> str:
     return hasher.hexdigest()[:16]
 
 
+def _update_signature_with_array(hasher, values: np.ndarray, dtype: str) -> None:
+    """Add one shape-preserving, canonical numeric array to a content signature."""
+
+    array = np.ascontiguousarray(np.asarray(values, dtype=np.dtype(dtype)))
+    hasher.update(np.asarray(array.shape, dtype="<i8").tobytes())
+    hasher.update(array.tobytes())
+
+
+def calibration_signature(calibrations: dict[str, CameraCalibration], camera_names: Iterable[str]) -> str:
+    """Return a stable signature for the calibration parameters used by one computation."""
+
+    hasher = hashlib.sha1()
+    for camera_name in camera_names:
+        calibration = calibrations[str(camera_name)]
+        hasher.update(str(camera_name).encode("utf-8"))
+        hasher.update(b"\0")
+        _update_signature_with_array(hasher, np.asarray(calibration.image_size), "<i8")
+        for values in (
+            calibration.K,
+            calibration.dist,
+            calibration.rvec,
+            calibration.tvec,
+            calibration.R,
+            calibration.P,
+        ):
+            _update_signature_with_array(hasher, values, "<f8")
+    return hasher.hexdigest()[:16]
+
+
+def reconstruction_signature(reconstruction: ReconstructionResult) -> str:
+    """Return a stable signature for the geometric content consumed by a model stage."""
+
+    hasher = hashlib.sha1()
+    _update_signature_with_array(hasher, reconstruction.frames, "<i8")
+    _update_signature_with_array(hasher, reconstruction.points_3d, "<f8")
+    return hasher.hexdigest()[:16]
+
+
+def file_content_signature(path: Path, chunk_size: int = 1024 * 1024) -> str | None:
+    """Return a short SHA-1 signature for an existing file, or ``None`` when absent."""
+
+    path = Path(path)
+    if not path.is_file():
+        return None
+    hasher = hashlib.sha1()
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            hasher.update(chunk)
+    return hasher.hexdigest()[:16]
+
+
 def select_active_coherence(
     epipolar_coherence: np.ndarray,
     triangulation_coherence: np.ndarray,
@@ -5327,9 +5378,10 @@ def reconstruction_cache_metadata(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
     pose_correction_mode: str = "none",
+    calibrations: dict[str, CameraCalibration] | None = None,
 ) -> dict[str, object]:
     """Construit les metadonnees necessaires pour valider un cache de triangulation."""
-    return {
+    metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
@@ -5345,6 +5397,9 @@ def reconstruction_cache_metadata(
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
         "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
     }
+    if calibrations is not None:
+        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    return metadata
 
 
 def model_stage_metadata(
@@ -5362,6 +5417,7 @@ def model_stage_metadata(
         "reconstruction_cache_path": str(reconstruction_cache_path),
         "reconstruction_n_frames": int(reconstruction.frames.shape[0]),
         "reconstruction_frame_signature": frame_signature(reconstruction.frames),
+        "reconstruction_signature": reconstruction_signature(reconstruction),
         "fps": float(fps),
         "subject_mass_kg": float(subject_mass_kg),
         "initial_rotation_correction": bool(initial_rotation_correction),
@@ -5379,12 +5435,14 @@ def save_model_stage(
 ) -> None:
     """Sauvegarde les longueurs et le chemin du biomod dans un cache dedie."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    stored_metadata = dict(metadata)
+    stored_metadata["biomod_signature"] = file_content_signature(biomod_path)
     np.savez(
         cache_path,
         lengths=np.asarray(json.dumps(lengths.__dict__), dtype=object),
         biomod_path=np.asarray(str(biomod_path), dtype=object),
         compute_time_s=np.asarray(float(compute_time_s), dtype=float),
-        metadata=np.asarray(json.dumps(metadata), dtype=object),
+        metadata=np.asarray(json.dumps(stored_metadata), dtype=object),
     )
 
 
@@ -5423,6 +5481,19 @@ def metadata_cache_matches(cache_path: Path, expected_metadata: dict[str, object
             if cached_value != expected_value:
                 return False
     return True
+
+
+def model_stage_cache_matches(cache_path: Path, expected_metadata: dict[str, object], biomod_path: Path) -> bool:
+    """Return whether one cached model matches metadata and its current bioMod content."""
+
+    if not metadata_cache_matches(cache_path, expected_metadata):
+        return False
+    try:
+        with np.load(cache_path, allow_pickle=True) as data:
+            cached_metadata = json.loads(data["metadata"].item())
+    except Exception:
+        return False
+    return cached_metadata.get("biomod_signature") == file_content_signature(biomod_path)
 
 
 def save_reconstruction_cache(
@@ -5602,6 +5673,7 @@ def biorbd_kalman_cache_metadata(
         "reconstruction_n_frames": int(reconstruction.frames.shape[0]),
         "reconstruction_frame_signature": frame_signature(reconstruction.frames),
         "biomod_path": str(biomod_path),
+        "biomod_signature": file_content_signature(biomod_path),
         "fps": float(fps),
         "noise_factor": float(noise_factor),
         "error_factor": float(error_factor),
@@ -6282,6 +6354,7 @@ def main() -> None:
     biorbd_kalman_cache_path = args.biorbd_kalman_cache or (output_dir / "biorbd_kalman_states.npz")
     reconstruction_once_metadata_dict = reconstruction_cache_metadata(
         pose_data=pose_data,
+        calibrations=calibrations,
         error_threshold_px=args.reprojection_threshold_px,
         min_cameras_for_triangulation=args.min_cameras_for_triangulation,
         epipolar_threshold_px=args.epipolar_threshold_px,
@@ -6295,6 +6368,7 @@ def main() -> None:
     )
     reconstruction_metadata_dict = reconstruction_cache_metadata(
         pose_data=pose_data,
+        calibrations=calibrations,
         error_threshold_px=args.reprojection_threshold_px,
         min_cameras_for_triangulation=args.min_cameras_for_triangulation,
         epipolar_threshold_px=args.epipolar_threshold_px,
@@ -6308,6 +6382,7 @@ def main() -> None:
     )
     reconstruction_fast_metadata_dict = reconstruction_cache_metadata(
         pose_data=pose_data,
+        calibrations=calibrations,
         error_threshold_px=args.reprojection_threshold_px,
         min_cameras_for_triangulation=args.min_cameras_for_triangulation,
         epipolar_threshold_px=args.epipolar_threshold_px,
@@ -6430,7 +6505,7 @@ def main() -> None:
         model_variant=args.model_variant,
         symmetrize_limbs=not args.no_symmetrize_limbs,
     )
-    if metadata_cache_matches(model_cache_path, model_metadata) and args.biomod.exists():
+    if model_stage_cache_matches(model_cache_path, model_metadata, args.biomod):
         t0 = time.perf_counter()
         lengths, biomod_path, _compute_time_s = load_model_stage(model_cache_path)
         biomod_path = args.biomod

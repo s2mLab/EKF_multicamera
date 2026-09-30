@@ -14,22 +14,26 @@ This repository contains:
 
 Main entry points:
 
-- [pipeline_gui.py](/Users/mickaelbegon/Documents/Playground/pipeline_gui.py): main graphical interface
-- [vitpose_ekf_pipeline.py](/Users/mickaelbegon/Documents/Playground/vitpose_ekf_pipeline.py): end-to-end pipeline and core algorithms
-- [export_reconstruction_bundle.py](/Users/mickaelbegon/Documents/Playground/export_reconstruction_bundle.py): generate one standardized reconstruction bundle
-- [run_reconstruction_profiles.py](/Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py): run a set of named reconstruction profiles
+- [pipeline_gui.py](./pipeline_gui.py): main graphical interface
+- [vitpose_ekf_pipeline.py](./vitpose_ekf_pipeline.py): end-to-end pipeline and core algorithms
+- [export_reconstruction_bundle.py](./export_reconstruction_bundle.py): generate one standardized reconstruction bundle
+- [run_reconstruction_profiles.py](./run_reconstruction_profiles.py): run a set of named reconstruction profiles
 
 Main packages:
 
-- [annotation](/Users/mickaelbegon/Documents/Playground/annotation): sparse 2D annotation storage, navigation, kinematic assist, preview rendering
-- [reconstruction](/Users/mickaelbegon/Documents/Playground/reconstruction): bundle generation, dataset handling, timings, profiles, naming
-- [kinematics](/Users/mickaelbegon/Documents/Playground/kinematics): root kinematics and 3D analysis
-- [camera_tools](/Users/mickaelbegon/Documents/Playground/camera_tools): camera metrics and camera selection helpers
-- [judging](/Users/mickaelbegon/Documents/Playground/judging): DD analysis, trampoline displacement, reference codes
-- [preview](/Users/mickaelbegon/Documents/Playground/preview): preview bundle loading and frame navigation
-- [observability](/Users/mickaelbegon/Documents/Playground/observability): Jacobian-rank analysis
-- [analysis](/Users/mickaelbegon/Documents/Playground/analysis): standalone plotting and exploration scripts
-- [animation](/Users/mickaelbegon/Documents/Playground/animation): GIF export scripts
+- [annotation](./annotation): sparse 2D annotation storage, navigation, kinematic assist, preview rendering
+- [reconstruction](./reconstruction): bundle generation, dataset handling, timings, profiles, naming
+- [kinematics](./kinematics): root kinematics and 3D analysis
+- [camera_tools](./camera_tools): camera metrics and camera selection helpers
+- [judging](./judging): DD analysis, trampoline displacement, reference codes
+- [preview](./preview): preview bundle loading and frame navigation
+- [observability](./observability): Jacobian-rank analysis
+- [analysis](./analysis): standalone plotting and exploration scripts
+- [animation](./animation): GIF export scripts
+
+For contributors and coding agents, see [the handoff guide](./docs/AGENT_HANDOFF.md),
+[the architecture overview](./docs/architecture/OVERVIEW.md), [the task-to-validation matrix](./docs/architecture/LLM_CONTEXT.md),
+and the local [instructions](./AGENTS.md).
 
 ## Installation
 
@@ -38,7 +42,7 @@ Main packages:
 The simplest setup is:
 
 ```bash
-cd /Users/mickaelbegon/Documents/Playground
+cd /Users/mickaelbegon/Documents/GIT/EKF_multicamera
 conda env create -f environment.vitpose-ekf.yml
 conda activate vitpose-ekf
 ```
@@ -76,6 +80,23 @@ With a few extra utilities:
 pip install -e .[full]
 ```
 
+Installation levels:
+
+| Usage | Supported installation |
+| --- | --- |
+| Core modules and CI test suite | `pip install -e .[test]` |
+| GUI and biomechanical reconstruction | `conda env create -f environment.vitpose-ekf.yml`, then `pip install -e .[test]` |
+| Batch Excel export | Full Conda environment with `openpyxl` available |
+| Pyorerun visualization | Full Conda environment |
+
+`.[full]` only provides the PyPI extras (`opencv-python`, `pandas`, and
+`plotly`). It does not install `biorbd`, `pyorerun`, `bioviz`, `rerun-sdk`, Tk,
+or `openpyxl`.
+
+`environment.vitpose-ekf.yml` is the reference environment for this repository.
+`environment.yml` is a historical alternative with the same Conda environment
+name and a different dependency set; do not treat the two files as equivalent.
+
 ### 3. Optional: install non-PyPI dependencies manually
 
 Some parts of the project depend on `biorbd`, and optionally on OpenSim-related tooling depending on your workflow.
@@ -109,9 +130,9 @@ Typical inputs are organized under `inputs/`:
 
 Example:
 
-- [inputs/keypoints/1_partie_0429_keypoints.json](/Users/mickaelbegon/Documents/Playground/inputs/keypoints/1_partie_0429_keypoints.json)
-- [inputs/trc/1_partie_0429.trc](/Users/mickaelbegon/Documents/Playground/inputs/trc/1_partie_0429.trc)
-- [inputs/dd/1_partie_0429_DD.json](/Users/mickaelbegon/Documents/Playground/inputs/dd/1_partie_0429_DD.json)
+- [inputs/keypoints/1_partie_0429_keypoints.json](./inputs/keypoints/1_partie_0429_keypoints.json)
+- [inputs/trc/1_partie_0429.trc](./inputs/trc/1_partie_0429.trc)
+- [inputs/dd/1_partie_0429_DD.json](./inputs/dd/1_partie_0429_DD.json)
 
 Outputs are typically written under:
 
@@ -124,7 +145,7 @@ Outputs are typically written under:
 Run:
 
 ```bash
-python /Users/mickaelbegon/Documents/Playground/pipeline_gui.py
+python pipeline_gui.py
 ```
 
 The GUI now uses a shared reconstruction selector at the top of the window. Most analysis tabs reuse that selector instead of maintaining their own reconstruction table.
@@ -169,7 +190,7 @@ Main analysis tabs:
 Example:
 
 ```bash
-python /Users/mickaelbegon/Documents/Playground/export_reconstruction_bundle.py \
+python export_reconstruction_bundle.py \
   --name triangulation_exhaustive_flip_rotfix \
   --family triangulation \
   --calib inputs/calibration/Calib.toml \
@@ -198,7 +219,7 @@ The CLI and GUI both support `raw`, `cleaned`, and, when available, `annotated` 
 Example:
 
 ```bash
-python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
+python run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
@@ -211,7 +232,7 @@ python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
 To run only some profiles:
 
 ```bash
-python /Users/mickaelbegon/Documents/Playground/run_reconstruction_profiles.py \
+python run_reconstruction_profiles.py \
   --config reconstruction_profiles.json \
   --dataset-name 1_partie_0429 \
   --calib inputs/calibration/Calib.toml \
@@ -384,7 +405,7 @@ The `Calibration` tab provides:
 
 ### 10. DD estimation
 
-The `DD` tab and [judging/dd_analysis.py](/Users/mickaelbegon/Documents/Playground/judging/dd_analysis.py) provide:
+The `DD` tab and [judging/dd_analysis.py](./judging/dd_analysis.py) provide:
 
 - jump segmentation from root height
 - salto / tilt / twist analysis
@@ -394,7 +415,7 @@ The `DD` tab and [judging/dd_analysis.py](/Users/mickaelbegon/Documents/Playgrou
 
 ### 11. Execution deductions
 
-The `Execution` tab and [judging/execution.py](/Users/mickaelbegon/Documents/Playground/judging/execution.py) provide:
+The `Execution` tab and [judging/execution.py](./judging/execution.py) provide:
 
 - per-jump localized deductions
 - a synchronized 3D view and 2D camera overlay
@@ -437,7 +458,7 @@ This helps visualize when the marker or image Jacobians lose rank.
 - default output root is `output/`
 - formatting uses `isort` + `black`
 - linting uses `flake8`
-- tests live in [tests](/Users/mickaelbegon/Documents/Playground/tests)
+- tests live in [tests](./tests)
 - the project uses a local Matplotlib cache under `.cache/matplotlib`
 
 ## Development
@@ -463,7 +484,7 @@ flake8 .
 
 The repository contains a single CI workflow under:
 
-- [.github/workflows/ci.yml](/Users/mickaelbegon/Documents/Playground/.github/workflows/ci.yml)
+- [.github/workflows/ci.yml](./.github/workflows/ci.yml)
 
 ## TODO
 

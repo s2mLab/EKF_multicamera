@@ -72,6 +72,7 @@ from vitpose_ekf_pipeline import (
     apply_left_right_flip_corrections,
     apply_left_right_flip_to_points,
     build_biomod,
+    calibration_signature,
     canonical_coherence_method,
     canonical_triangulation_method,
     compute_ekf2d_initial_state,
@@ -86,6 +87,7 @@ from vitpose_ekf_pipeline import (
     load_reconstruction_cache,
     marker_name_list,
     metadata_cache_matches,
+    model_stage_cache_matches,
     model_stage_metadata,
     pose_data_signature,
     reconstruction_cache_metadata,
@@ -154,10 +156,11 @@ def epipolar_cache_metadata(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
+    calibrations: dict[str, CameraCalibration] | None = None,
 ) -> dict[str, object]:
     """Build the cache metadata describing one epipolar-coherence computation."""
 
-    return {
+    metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
@@ -170,6 +173,9 @@ def epipolar_cache_metadata(
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
         "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
     }
+    if calibrations is not None:
+        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    return metadata
 
 
 def save_epipolar_cache(
@@ -222,6 +228,7 @@ def load_or_compute_epipolar_cache(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "epipolar", metadata, prefix="epipolar")
     cache_path = cache_dir / "epipolar_coherence.npz"
@@ -267,10 +274,11 @@ def flip_cache_metadata(
     temporal_weight: float,
     temporal_tau_px: float,
     temporal_min_valid_keypoints: int,
+    calibrations: dict[str, CameraCalibration] | None = None,
 ) -> dict[str, object]:
     """Build the cache metadata describing one left/right flip-detection run."""
 
-    return {
+    metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
@@ -303,6 +311,9 @@ def flip_cache_metadata(
             5 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
         ),
     }
+    if calibrations is not None:
+        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    return metadata
 
 
 def save_flip_cache(
@@ -380,6 +391,7 @@ def load_or_compute_left_right_flip_cache(
         temporal_weight=float(temporal_weight),
         temporal_tau_px=float(temporal_tau_px),
         temporal_min_valid_keypoints=int(temporal_min_valid_keypoints),
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "flip", metadata, prefix=f"flip_{method}")
     cache_path = cache_dir / "flip_diagnostics.npz"
@@ -454,6 +466,7 @@ def pose_variant_cache_metadata(
     temporal_weight: float | None = None,
     temporal_tau_px: float | None = None,
     temporal_min_valid_keypoints: int | None = None,
+    calibrations: dict[str, CameraCalibration] | None = None,
 ) -> dict[str, object]:
     """Build the cache metadata for one corrected or annotated pose-data variant."""
 
@@ -486,6 +499,8 @@ def pose_variant_cache_metadata(
         )
         if tau_px is not None:
             metadata["tau_px"] = float(tau_px)
+        if calibrations is not None:
+            metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -585,6 +600,7 @@ def load_or_compute_pose_data_variant_cache(
         temporal_weight=temporal_weight if flip_method is not None else None,
         temporal_tau_px=temporal_tau_px if flip_method is not None else None,
         temporal_min_valid_keypoints=temporal_min_valid_keypoints if flip_method is not None else None,
+        calibrations=calibrations if correction_mode == "flip" else None,
     )
     cache_dir = cache_entry_dir(output_dir, "pose2d", metadata, prefix=f"pose2d_{correction_mode}")
     cache_path = cache_dir / "pose_data_variant.npz"
@@ -767,6 +783,7 @@ def load_or_compute_triangulation_cache(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(
         output_dir, "triangulation", metadata, prefix=f"triang_{effective_triangulation_method}"
@@ -842,7 +859,7 @@ def load_or_build_model_cache(
     cache_dir = cache_entry_dir(output_dir, "model", metadata, prefix="model")
     cache_path = cache_dir / "model_stage.npz"
     biomod_cache_path = cache_dir / "vitpose_chain.bioMod"
-    if metadata_cache_matches(cache_path, metadata) and biomod_cache_path.exists():
+    if model_stage_cache_matches(cache_path, metadata, biomod_cache_path):
         cached_lengths, _biomod_path, compute_time_s = load_model_stage(cache_path)
         return cached_lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx), float(compute_time_s), "cache"
 
@@ -1434,6 +1451,7 @@ def save_legacy_triangulation(
     output_dir: Path,
     reconstruction: ReconstructionResult,
     pose_data: PoseData,
+    calibrations: dict[str, CameraCalibration],
     *,
     triangulation_method: str,
     error_threshold_px: float | None,
@@ -1466,6 +1484,7 @@ def save_legacy_triangulation(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations=calibrations,
     )
     save_reconstruction_cache(cache_path, reconstruction, metadata)
     return cache_path
@@ -1768,6 +1787,7 @@ def build_triangulation_bundle(
         output_dir,
         reconstruction,
         pose_data_used,
+        calibrations,
         triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2014,6 +2034,7 @@ def build_ekf_3d_bundle(
         output_dir,
         reconstruction,
         pose_data_used,
+        calibrations,
         triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2366,6 +2387,7 @@ def build_ekf_2d_bundle(
             output_dir,
             reconstruction,
             pose_data_used,
+            calibrations,
             triangulation_method=effective_triangulation_method,
             error_threshold_px=reprojection_threshold_px,
             min_cameras_for_triangulation=min_cameras_for_triangulation,

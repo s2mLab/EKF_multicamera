@@ -47,6 +47,8 @@ include = [
     "analysis.*",
     "animation",
     "animation.*",
+    "annotation",
+    "annotation.*",
     "camera_tools",
     "camera_tools.*",
     "judging",

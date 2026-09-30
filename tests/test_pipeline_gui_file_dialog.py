@@ -85,6 +85,43 @@ def test_normalize_pose_correction_mode_falls_back_to_none():
     assert pipeline_gui.normalize_pose_correction_mode("unexpected_mode") == "none"
 
 
+def test_gui_calibration_cache_keys_track_file_content(tmp_path):
+    calibration_path = tmp_path / "Calib.toml"
+    calibration_path.write_text("[cam0]", encoding="utf-8")
+    first_calibration_key = pipeline_gui.calibration_cache_key(calibration_path)
+    first_pose_key = pipeline_gui.pose_data_cache_key(
+        keypoints_path=tmp_path / "keypoints.json",
+        calib_path=calibration_path,
+        max_frames=None,
+        frame_start=None,
+        frame_end=None,
+        data_mode="raw",
+        smoothing_window=9,
+        outlier_threshold_ratio=0.1,
+        lower_percentile=5.0,
+        upper_percentile=95.0,
+    )
+
+    calibration_path.write_text("[cam0]\nwidth = 1280", encoding="utf-8")
+
+    assert pipeline_gui.calibration_cache_key(calibration_path) != first_calibration_key
+    assert (
+        pipeline_gui.pose_data_cache_key(
+            keypoints_path=tmp_path / "keypoints.json",
+            calib_path=calibration_path,
+            max_frames=None,
+            frame_start=None,
+            frame_end=None,
+            data_mode="raw",
+            smoothing_window=9,
+            outlier_threshold_ratio=0.1,
+            lower_percentile=5.0,
+            upper_percentile=95.0,
+        )
+        != first_pose_key
+    )
+
+
 def test_schedule_after_idle_once_coalesces_multiple_requests():
     calls = []
 
@@ -4709,9 +4746,7 @@ def test_camera_tools_render_flip_frame_markers_draws_suspects_and_candidates():
     tab.flip_camera_var = SimpleNamespace(get=lambda: "cam0")
     tab.flip_method_var = SimpleNamespace(get=lambda: "epipolar")
     tab.flip_masks = {"epipolar": np.array([[False, True, False, False, True]], dtype=bool)}
-    tab.flip_detail_arrays = {
-        "epipolar": {"candidate_mask": np.array([[True, False, False, True, False]], dtype=bool)}
-    }
+    tab.flip_detail_arrays = {"epipolar": {"candidate_mask": np.array([[True, False, False, True, False]], dtype=bool)}}
 
     pipeline_gui.CameraToolsTab._render_flip_frame_markers(tab)
 
