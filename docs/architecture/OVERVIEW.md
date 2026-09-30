@@ -96,6 +96,26 @@ profil `ekf2d_update_method`, trace dans `summary.filter_parameters` et
 - `legacy` : espace innovation, sequentiel par camera, ou batch si des
   pseudo-observations sont actives.
 
+Le predicteur `dyn`/`dyn_history3` remplace l'acceleration racine par la
+dynamique flottante quand un critere de vol est vrai (`flight_detection`,
+`--flight-detection`, champ de profil) :
+
+- `triangulation` (defaut, historique) : tous les points 3D triangules finis
+  des `flight_min_consecutive_frames` frames precedentes au-dessus de
+  `flight_height_threshold_m`. Avec `ekf2d_3d_source=first_frame_only` les
+  points sont `NaN` apres la frame 0 et `dyn` ne s'active jamais (0/900 frames
+  mesurees sur `1_partie_0429`).
+- `ekf_state` (opt-in) : plus bas marqueur du modele a l'etat EKF corrige de la
+  frame precedente au-dessus du seuil pendant `flight_min_consecutive_frames`
+  frames, sortie sous `seuil - flight_hysteresis_m` (defaut 0.05 m), garde
+  optionnelle `|CoMddot_z - g_z| <= flight_com_accel_tolerance`. Le masque
+  d'activation reel est exporte (`dyn_active_per_frame`, `dyn_active_frames`).
+
+Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
+predite est recalculee (dynamique ou extrapolation d'historique) mais la
+covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc
+pas coherente avec la prediction de la moyenne.
+
 ## Caches et effets de bord
 
 Les caches de pose corrigee, flip, coherence epipolaire, triangulation, modele

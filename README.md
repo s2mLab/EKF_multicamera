@@ -359,6 +359,21 @@ Measurement update solver (`--ekf2d-update-method`, profile field
 - `legacy`: innovation-space update (sequential per camera, batch when
   pseudo-observations are active).
 
+Flight criterion of the `dyn` / `dyn_history3` predictors
+(`--flight-detection`, profile field `flight_detection`):
+
+- `triangulation` (default): every triangulated point of the previous frames
+  above `--flight-height-threshold-m`. With `--ekf2d-3d-source first_frame_only`
+  there is no 3D support after frame 0, so `dyn` never activates.
+- `ekf_state`: the lowest model marker of the previous corrected EKF state is
+  above the threshold (with `--flight-hysteresis-m`, default 0.05 m, and an
+  optional ballistic gate `--flight-com-accel-tolerance`). On the first 900
+  frames of `1_partie_0429` in `first_frame_only`-like mode, `dyn` becomes active
+  on 740 frames instead of 0.
+
+Known limitation: in `dyn`/`history3` modes the covariance is still propagated
+with the constant-acceleration transition matrix.
+
 ### 6.b Complexity overview
 
 The dominant asymptotic costs below use:

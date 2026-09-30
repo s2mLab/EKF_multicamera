@@ -120,6 +120,9 @@ l'arrondi pres a `legacy`). Test cible :
 `--undistort-keypoints` (opt-in, toutes familles sauf `pose2sim`) dedistord les
 keypoints 2D au chargement et invalide les caches geometriques. Test cible :
 `pytest -q tests/test_keypoint_undistortion.py`.
+`--flight-detection {triangulation,ekf_state}` (defaut `triangulation`),
+`--flight-hysteresis-m`, `--flight-com-accel-tolerance` pilotent l'activation
+du predicteur `dyn`. Test cible : `pytest -q tests/test_ekf2d_flight_detection.py`.
 
 ## Livraison d'un changement
 

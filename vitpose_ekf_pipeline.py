@@ -116,6 +116,12 @@ DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
 # "legacy": innovation-space update (sequential per camera, batch with pseudo-priors).
 SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
 DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
+# Flight criterion activating the ``dyn`` root predictor:
+# "triangulation": every finite triangulated point of the previous frames above the threshold (historical);
+# "ekf_state": lowest model marker of the previous corrected EKF state above the threshold, with hysteresis.
+SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+DEFAULT_FLIGHT_DETECTION = "triangulation"
+DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
 DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
@@ -1219,6 +1225,15 @@ def normalize_ekf2d_update_method(update_method: str | None) -> str:
     method = DEFAULT_EKF2D_UPDATE_METHOD if update_method is None else str(update_method).strip().lower()
     if method not in SUPPORTED_EKF2D_UPDATE_METHODS:
         raise ValueError(f"Unsupported EKF2D update method: {update_method}")
+    return method
+
+
+def normalize_flight_detection(flight_detection: str | None) -> str:
+    """Validate the flight criterion used by the ``dyn`` predictor (``None`` -> default)."""
+
+    method = DEFAULT_FLIGHT_DETECTION if flight_detection is None else str(flight_detection).strip().lower()
+    if method not in SUPPORTED_FLIGHT_DETECTIONS:
+        raise ValueError(f"Unsupported flight detection: {flight_detection}")
     return method
 
 
@@ -3881,10 +3896,21 @@ class MultiViewKinematicEKF:
         ankle_bed_pseudo_obs: bool = False,
         ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
         update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+        flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+        flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+        flight_com_accel_tolerance: float | None = None,
     ):
         self.model = model
         self.update_method = normalize_ekf2d_update_method(update_method)
         self.solver_counts = {"woodbury": 0, "woodbury_fallback_legacy": 0}
+        self.flight_detection = normalize_flight_detection(flight_detection)
+        self.flight_hysteresis_m = max(0.0, float(flight_hysteresis_m))
+        self.flight_com_accel_tolerance = (
+            None if flight_com_accel_tolerance is None else abs(float(flight_com_accel_tolerance))
+        )
+        self._state_flight_active = False
+        self._state_flight_candidate_frames = 0
+        self.flight_active_history: list[bool] = []
         self.calibrations = calibrations
         self.pose_data = pose_data
         self.reconstruction = reconstruction
@@ -4327,6 +4353,71 @@ class MultiViewKinematicEKF:
                 return False
         return (frame_idx - start_idx) >= self.flight_min_consecutive_frames
 
+    def _lowest_model_marker_height(self, q: np.ndarray) -> float:
+        """Return the minimum world ``z`` (m) of the COCO model markers for one ``q``."""
+
+        marker_positions = self.model.markers(np.asarray(q, dtype=float))
+        heights = [float(marker_positions[marker_idx].to_array()[2]) for marker_idx, _kp_idx in self.marker_pairs]
+        heights = np.asarray(heights, dtype=float)
+        heights = heights[np.isfinite(heights)]
+        return float(np.min(heights)) if heights.size else float("nan")
+
+    def _com_vertical_acceleration(self, state: np.ndarray) -> float:
+        """Return the model centre-of-mass vertical acceleration (m/s^2) for one state."""
+
+        q = self._build_biorbd_state_vector("GeneralizedCoordinates", state[: self.nq])
+        qdot = self._build_biorbd_state_vector("GeneralizedVelocity", state[self.nq : 2 * self.nq])
+        qddot = self._build_biorbd_state_vector("GeneralizedAcceleration", state[2 * self.nq : 3 * self.nq])
+        return float(self._biorbd_to_numpy(self.model.CoMddot(q, qdot, qddot))[2])
+
+    def _is_airborne_from_previous_state(self, state: np.ndarray, frame_idx: int) -> bool:
+        """Flight criterion based on the previous corrected EKF state (``flight_detection='ekf_state'``).
+
+        Unlike :meth:`_is_airborne_from_previous_frame`, it does not need
+        triangulated 3D points, so it also works with
+        ``ekf2d_3d_source='first_frame_only'``. The lowest model marker height
+        of ``state`` (corrected estimate at ``frame_idx - 1``) must exceed
+        ``flight_height_threshold_m`` for ``flight_min_consecutive_frames``
+        consecutive frames to enter the flight phase; the phase is left when
+        it drops below ``flight_height_threshold_m - flight_hysteresis_m``.
+        When ``flight_com_accel_tolerance`` is set, entering the phase also
+        requires a ballistic centre-of-mass acceleration
+        ``|CoMddot_z - g_z| <= tolerance``.
+        """
+
+        if frame_idx <= 0:
+            self._state_flight_active = False
+            self._state_flight_candidate_frames = 0
+            return False
+        height = self._lowest_model_marker_height(state[: self.nq])
+        if not np.isfinite(height):
+            self._state_flight_active = False
+            self._state_flight_candidate_frames = 0
+            return False
+        if self._state_flight_active:
+            if height < self.flight_height_threshold_m - self.flight_hysteresis_m:
+                self._state_flight_active = False
+                self._state_flight_candidate_frames = 0
+            return self._state_flight_active
+        entering = height > self.flight_height_threshold_m
+        if entering and self.flight_com_accel_tolerance is not None:
+            gravity_z = float(self._biorbd_to_numpy(self.model.getGravity())[2])
+            com_accel_z = self._com_vertical_acceleration(state)
+            entering = bool(
+                np.isfinite(com_accel_z) and abs(com_accel_z - gravity_z) <= self.flight_com_accel_tolerance
+            )
+        self._state_flight_candidate_frames = self._state_flight_candidate_frames + 1 if entering else 0
+        if self._state_flight_candidate_frames >= self.flight_min_consecutive_frames:
+            self._state_flight_active = True
+        return self._state_flight_active
+
+    def _flight_dynamics_active(self, state: np.ndarray, frame_idx: int) -> bool:
+        """Return whether the ``dyn`` root predictor is active for the prediction of ``frame_idx``."""
+
+        if self.flight_detection == "ekf_state":
+            return self._is_airborne_from_previous_state(state, frame_idx)
+        return self._is_airborne_from_previous_frame(frame_idx)
+
     def _build_biorbd_state_vector(self, vector_type: str, values: np.ndarray):
         """Construit un vecteur d'etat `biorbd` a partir d'un tableau numpy.
 
@@ -4403,7 +4494,13 @@ class MultiViewKinematicEKF:
         F = self.transition_matrix()
         predicted_state = F @ state
         predicted_covariance = F @ covariance @ F.T + self.process_noise
-        if self.root_flight_dynamics and self._is_airborne_from_previous_frame(frame_idx):
+        # NOTE (known limitation, not corrected): in ``dyn``/``history3`` modes the state mean is
+        # re-predicted below, but the covariance is still propagated with the constant-acceleration
+        # ``F`` above, so ``P`` is not consistent with the non-linear mean prediction.
+        flight_active = bool(self.root_flight_dynamics and self._flight_dynamics_active(state, frame_idx))
+        if self.root_flight_dynamics:
+            self.flight_active_history.append(flight_active)
+        if flight_active:
             q_prev = state[: self.nq]
             qdot_prev = state[self.nq : 2 * self.nq]
             qddot_joint = predicted_state[2 * self.nq + self.n_root : 3 * self.nq]
@@ -5348,6 +5445,9 @@ def run_ekf(
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+    flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+    flight_com_accel_tolerance: float | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5389,6 +5489,9 @@ def run_ekf(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
+        flight_detection=flight_detection,
+        flight_hysteresis_m=flight_hysteresis_m,
+        flight_com_accel_tolerance=flight_com_accel_tolerance,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -5444,6 +5547,10 @@ def run_ekf(
             "update_status_counts": dict(ekf.update_status),
             "update_method": str(ekf.update_method),
             "update_solver_counts": dict(ekf.solver_counts),
+            "flight_detection": str(ekf.flight_detection),
+            "dyn_active_per_frame": (
+                np.asarray(ekf.flight_active_history, dtype=bool) if root_flight_dynamics else None
+            ),
             "flip_diagnostics": (
                 {
                     "method": str(flip_method),

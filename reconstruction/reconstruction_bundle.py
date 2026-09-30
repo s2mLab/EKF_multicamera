@@ -44,7 +44,9 @@ from vitpose_ekf_pipeline import (
     DEFAULT_COHERENCE_METHOD,
     DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    DEFAULT_FLIGHT_DETECTION,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
+    DEFAULT_FLIGHT_HYSTERESIS_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
@@ -2327,6 +2329,9 @@ def build_ekf_2d_bundle(
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+    flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+    flight_com_accel_tolerance: float | None = None,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
@@ -2553,6 +2558,9 @@ def build_ekf_2d_bundle(
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=ekf2d_update_method,
+        flight_detection=flight_detection,
+        flight_hysteresis_m=flight_hysteresis_m,
+        flight_com_accel_tolerance=flight_com_accel_tolerance,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
@@ -2782,6 +2790,11 @@ def build_ekf_2d_bundle(
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
             "flight_min_consecutive_frames": int(flight_min_consecutive_frames),
+            "flight_detection": str(flight_detection),
+            "flight_hysteresis_m": float(flight_hysteresis_m),
+            "flight_com_accel_tolerance": (
+                None if flight_com_accel_tolerance is None else float(flight_com_accel_tolerance)
+            ),
             "flip_method": str(flip_method or "epipolar"),
         },
         "bootstrap_frame_idx": int(
@@ -2789,6 +2802,11 @@ def build_ekf_2d_bundle(
         ),
         "update_status_counts": {str(key): int(value) for key, value in result.get("update_status_counts", {}).items()},
         "update_solver_counts": {str(key): int(value) for key, value in result.get("update_solver_counts", {}).items()},
+        "dyn_active_frames": (
+            None
+            if result.get("dyn_active_per_frame") is None
+            else int(np.count_nonzero(np.asarray(result["dyn_active_per_frame"], dtype=bool)))
+        ),
         "left_right_flip_diagnostics": flip_diagnostics,
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],

@@ -35,7 +35,9 @@ from vitpose_ekf_pipeline import (
     DEFAULT_COHERENCE_METHOD,
     DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    DEFAULT_FLIGHT_DETECTION,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
+    DEFAULT_FLIGHT_HYSTERESIS_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
@@ -53,6 +55,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_EKF2D_UPDATE_METHODS,
+    SUPPORTED_FLIGHT_DETECTIONS,
     SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_ROOT_UNWRAP_MODES,
     SUPPORTED_TRIANGULATION_METHODS,
@@ -186,6 +189,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-low-coherence-updates", action="store_true")
     parser.add_argument("--flight-height-threshold-m", type=float, default=DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M)
     parser.add_argument("--flight-min-consecutive-frames", type=int, default=DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES)
+    parser.add_argument(
+        "--flight-detection",
+        choices=SUPPORTED_FLIGHT_DETECTIONS,
+        default=DEFAULT_FLIGHT_DETECTION,
+        help=(
+            "Critere de vol du predicteur dyn: 'triangulation' (points 3D triangules, defaut) ou 'ekf_state' "
+            "(marqueurs du modele a l'etat EKF corrige precedent, compatible first_frame_only)."
+        ),
+    )
+    parser.add_argument("--flight-hysteresis-m", type=float, default=DEFAULT_FLIGHT_HYSTERESIS_M)
+    parser.add_argument(
+        "--flight-com-accel-tolerance",
+        type=float,
+        default=None,
+        help="Si fourni (m/s^2), exige |CoMddot_z - g_z| <= tolerance pour entrer en vol (mode ekf_state).",
+    )
     parser.add_argument("--root-unwrap-mode", choices=SUPPORTED_ROOT_UNWRAP_MODES, default="off")
     parser.add_argument("--no-root-unwrap", action="store_true")
     return parser.parse_args()
@@ -365,6 +384,9 @@ def main() -> None:
             ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
             ekf2d_update_method=args.ekf2d_update_method,
+            flight_detection=args.flight_detection,
+            flight_hysteresis_m=args.flight_hysteresis_m,
+            flight_com_accel_tolerance=args.flight_com_accel_tolerance,
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,
