@@ -156,7 +156,7 @@ def epipolar_cache_metadata(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
-    calibrations: dict[str, CameraCalibration] | None = None,
+    calibrations: dict[str, CameraCalibration],
 ) -> dict[str, object]:
     """Build the cache metadata describing one epipolar-coherence computation."""
 
@@ -173,8 +173,7 @@ def epipolar_cache_metadata(
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
         "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
     }
-    if calibrations is not None:
-        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -274,7 +273,7 @@ def flip_cache_metadata(
     temporal_weight: float,
     temporal_tau_px: float,
     temporal_min_valid_keypoints: int,
-    calibrations: dict[str, CameraCalibration] | None = None,
+    calibrations: dict[str, CameraCalibration],
 ) -> dict[str, object]:
     """Build the cache metadata describing one left/right flip-detection run."""
 
@@ -311,8 +310,7 @@ def flip_cache_metadata(
             5 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
         ),
     }
-    if calibrations is not None:
-        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -449,6 +447,7 @@ def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) 
 def pose_variant_cache_metadata(
     pose_data: PoseData,
     *,
+    calibrations: dict[str, CameraCalibration],
     correction_mode: str,
     pose_data_mode: str,
     pose_filter_window: int,
@@ -466,9 +465,12 @@ def pose_variant_cache_metadata(
     temporal_weight: float | None = None,
     temporal_tau_px: float | None = None,
     temporal_min_valid_keypoints: int | None = None,
-    calibrations: dict[str, CameraCalibration] | None = None,
 ) -> dict[str, object]:
-    """Build the cache metadata for one corrected or annotated pose-data variant."""
+    """Build the cache metadata for one corrected or annotated pose-data variant.
+
+    The calibration signature is recorded only for flip-corrected variants, the
+    only ones whose content depends on camera geometry.
+    """
 
     metadata = {
         "camera_names": list(pose_data.camera_names),
@@ -499,8 +501,7 @@ def pose_variant_cache_metadata(
         )
         if tau_px is not None:
             metadata["tau_px"] = float(tau_px)
-        if calibrations is not None:
-            metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -600,7 +601,7 @@ def load_or_compute_pose_data_variant_cache(
         temporal_weight=temporal_weight if flip_method is not None else None,
         temporal_tau_px=temporal_tau_px if flip_method is not None else None,
         temporal_min_valid_keypoints=temporal_min_valid_keypoints if flip_method is not None else None,
-        calibrations=calibrations if correction_mode == "flip" else None,
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "pose2d", metadata, prefix=f"pose2d_{correction_mode}")
     cache_path = cache_dir / "pose_data_variant.npz"

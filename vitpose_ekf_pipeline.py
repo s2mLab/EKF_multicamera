@@ -5378,7 +5378,8 @@ def reconstruction_cache_metadata(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
     pose_correction_mode: str = "none",
-    calibrations: dict[str, CameraCalibration] | None = None,
+    *,
+    calibrations: dict[str, CameraCalibration],
 ) -> dict[str, object]:
     """Construit les metadonnees necessaires pour valider un cache de triangulation."""
     metadata = {
@@ -5397,8 +5398,7 @@ def reconstruction_cache_metadata(
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
         "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
     }
-    if calibrations is not None:
-        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -5486,6 +5486,8 @@ def metadata_cache_matches(cache_path: Path, expected_metadata: dict[str, object
 def model_stage_cache_matches(cache_path: Path, expected_metadata: dict[str, object], biomod_path: Path) -> bool:
     """Return whether one cached model matches metadata and its current bioMod content."""
 
+    if not Path(biomod_path).is_file():
+        return False
     if not metadata_cache_matches(cache_path, expected_metadata):
         return False
     try:
@@ -5672,6 +5674,7 @@ def biorbd_kalman_cache_metadata(
         "reconstruction_cache_path": str(reconstruction_cache_path),
         "reconstruction_n_frames": int(reconstruction.frames.shape[0]),
         "reconstruction_frame_signature": frame_signature(reconstruction.frames),
+        "reconstruction_signature": reconstruction_signature(reconstruction),
         "biomod_path": str(biomod_path),
         "biomod_signature": file_content_signature(biomod_path),
         "fps": float(fps),

@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from reconstruction.reconstruction_bundle import (
     build_bundle_payload,
@@ -11,6 +12,7 @@ from reconstruction.reconstruction_bundle import (
     epipolar_cache_metadata,
     load_or_build_model_cache,
     load_or_compute_pose_data_variant_cache,
+    load_or_compute_triangulation_cache,
     summarize_view_usage,
 )
 from vitpose_ekf_pipeline import (
@@ -22,8 +24,10 @@ from vitpose_ekf_pipeline import (
     biorbd_kalman_cache_metadata,
     calibration_signature,
     metadata_cache_matches,
+    model_stage_cache_matches,
     model_stage_metadata,
     reconstruction_cache_metadata,
+    save_model_stage,
 )
 
 
@@ -66,6 +70,10 @@ def _make_synthetic_camera(name: str, tx_m: float) -> CameraCalibration:
         R=rotation,
         P=intrinsics @ np.hstack((rotation, translation)),
     )
+
+
+def _single_camera_calibrations() -> dict[str, CameraCalibration]:
+    return {"cam0": _make_synthetic_camera("cam0", 0.0)}
 
 
 def _make_synthetic_bundle_inputs() -> tuple[PoseData, dict[str, CameraCalibration], np.ndarray]:
@@ -144,6 +152,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     corrected_reconstruction_metadata = reconstruction_cache_metadata(
         corrected,
@@ -156,6 +165,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     assert reconstruction_metadata["pose_data_signature"] != corrected_reconstruction_metadata["pose_data_signature"]
 
@@ -168,6 +178,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     corrected_epipolar_metadata = epipolar_cache_metadata(
         corrected,
@@ -178,6 +189,7 @@ def test_cache_metadata_changes_after_pose_data_flip():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     assert epipolar_metadata["pose_data_signature"] != corrected_epipolar_metadata["pose_data_signature"]
 
@@ -194,6 +206,7 @@ def test_epipolar_cache_metadata_distinguishes_fast_distance_mode():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     fast_metadata = epipolar_cache_metadata(
         pose_data,
@@ -204,6 +217,7 @@ def test_epipolar_cache_metadata_distinguishes_fast_distance_mode():
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
 
     assert sampson_metadata["distance_mode"] == "sampson"
@@ -306,6 +320,167 @@ def test_model_and_biorbd_cache_metadata_track_content_changes(tmp_path):
         tmp_path / "triangulation.npz", reconstruction, biomod_path, 120.0, 1e-8, 1e-4
     )
     assert first_kalman_metadata["biomod_signature"] != second_kalman_metadata["biomod_signature"]
+
+
+def _with_modified_focal_length(
+    calibrations: dict[str, CameraCalibration], camera_name: str, delta_px: float
+) -> dict[str, CameraCalibration]:
+    original = calibrations[camera_name]
+    intrinsics = np.array(original.K, copy=True)
+    intrinsics[0, 0] += delta_px
+    modified = dict(calibrations)
+    modified[camera_name] = CameraCalibration(
+        name=original.name,
+        image_size=original.image_size,
+        K=intrinsics,
+        dist=np.array(original.dist, copy=True),
+        rvec=np.array(original.rvec, copy=True),
+        tvec=np.array(original.tvec, copy=True),
+        R=np.array(original.R, copy=True),
+        P=intrinsics @ np.hstack((original.R, original.tvec)),
+    )
+    return modified
+
+
+def test_geometric_cache_metadata_requires_calibrations():
+    pose_data = _make_pose_data()
+
+    with pytest.raises(TypeError):
+        reconstruction_cache_metadata(
+            pose_data,
+            error_threshold_px=10.0,
+            min_cameras_for_triangulation=2,
+            epipolar_threshold_px=15.0,
+            triangulation_method="once",
+            pose_data_mode="raw",
+            pose_filter_window=9,
+            pose_outlier_threshold_ratio=0.1,
+            pose_amplitude_lower_percentile=5.0,
+            pose_amplitude_upper_percentile=95.0,
+        )
+    with pytest.raises(TypeError):
+        epipolar_cache_metadata(
+            pose_data,
+            epipolar_threshold_px=15.0,
+            distance_mode="sampson",
+            pose_data_mode="raw",
+            pose_filter_window=9,
+            pose_outlier_threshold_ratio=0.1,
+            pose_amplitude_lower_percentile=5.0,
+            pose_amplitude_upper_percentile=95.0,
+        )
+
+
+def test_triangulation_cache_recomputes_after_calibration_change(tmp_path):
+    pose_data, calibrations, expected_points = _make_synthetic_bundle_inputs()
+    modified_calibrations = _with_modified_focal_length(calibrations, "cam1", 50.0)
+    triangulation_kwargs = {
+        "output_dir": tmp_path,
+        "pose_data": pose_data,
+        "coherence_method": "epipolar",
+        "triangulation_method": "once",
+        "reprojection_threshold_px": None,
+        "min_cameras_for_triangulation": 2,
+        "epipolar_threshold_px": 15.0,
+        "triangulation_workers": 1,
+        "pose_data_mode": "raw",
+        "pose_filter_window": 9,
+        "pose_outlier_threshold_ratio": 0.1,
+        "pose_amplitude_lower_percentile": 5.0,
+        "pose_amplitude_upper_percentile": 95.0,
+    }
+
+    first, first_path, first_epipolar_path, first_source = load_or_compute_triangulation_cache(
+        calibrations=calibrations, **triangulation_kwargs
+    )
+    reused, reused_path, _reused_epipolar_path, reused_source = load_or_compute_triangulation_cache(
+        calibrations=calibrations, **triangulation_kwargs
+    )
+    modified, modified_path, modified_epipolar_path, modified_source = load_or_compute_triangulation_cache(
+        calibrations=modified_calibrations, **triangulation_kwargs
+    )
+    _restored, restored_path, _restored_epipolar_path, restored_source = load_or_compute_triangulation_cache(
+        calibrations=calibrations, **triangulation_kwargs
+    )
+
+    assert (first_source, reused_source, modified_source, restored_source) == (
+        "computed_now",
+        "cache",
+        "computed_now",
+        "cache",
+    )
+    assert reused_path == first_path == restored_path
+    assert modified_path != first_path
+    assert modified_epipolar_path != first_epipolar_path
+    np.testing.assert_allclose(first.points_3d, expected_points, atol=1e-8)
+    np.testing.assert_allclose(reused.points_3d, expected_points, atol=1e-8)
+    assert np.nanmax(np.abs(modified.points_3d - expected_points)) > 1e-3
+
+
+def test_model_stage_cache_matches_requires_existing_unchanged_biomod(tmp_path):
+    lengths = SegmentLengths(
+        trunk_height=0.6,
+        head_length=0.2,
+        shoulder_half_width=0.18,
+        hip_half_width=0.12,
+        upper_arm_length=0.3,
+        forearm_length=0.25,
+        thigh_length=0.45,
+        shank_length=0.4,
+        eye_offset_x=0.03,
+        eye_offset_y=0.025,
+        ear_offset_y=0.06,
+    )
+    metadata = {"model_stage_version": 1, "model_variant": "single_trunk"}
+    biomod_path = tmp_path / "model.bioMod"
+    cache_path = tmp_path / "model_stage.npz"
+
+    biomod_path.write_text("version 4\n", encoding="utf-8")
+    save_model_stage(cache_path, lengths, biomod_path, metadata)
+    assert model_stage_cache_matches(cache_path, metadata, biomod_path)
+
+    biomod_path.write_text("version 4\nsegment trunk\n", encoding="utf-8")
+    assert not model_stage_cache_matches(cache_path, metadata, biomod_path)
+
+    biomod_path.unlink()
+    assert not model_stage_cache_matches(cache_path, metadata, biomod_path)
+
+    missing_biomod_cache_path = tmp_path / "model_stage_without_biomod.npz"
+    save_model_stage(missing_biomod_cache_path, lengths, biomod_path, metadata)
+    assert not model_stage_cache_matches(missing_biomod_cache_path, metadata, biomod_path)
+
+    biomod_path.write_text("version 4\n", encoding="utf-8")
+    legacy_cache_path = tmp_path / "legacy_model_stage.npz"
+    np.savez(legacy_cache_path, metadata=np.asarray(json.dumps(metadata), dtype=object))
+    assert metadata_cache_matches(legacy_cache_path, metadata)
+    assert not model_stage_cache_matches(legacy_cache_path, metadata, biomod_path)
+
+
+def test_biorbd_kalman_cache_rejects_changed_reconstruction_and_legacy_metadata(tmp_path):
+    reconstruction = SimpleNamespace(
+        frames=np.array([0, 1], dtype=int), points_3d=np.zeros((2, len(KP_INDEX), 3), dtype=float)
+    )
+    changed_reconstruction = SimpleNamespace(
+        frames=np.array([0, 1], dtype=int), points_3d=np.full((2, len(KP_INDEX), 3), 0.01, dtype=float)
+    )
+    biomod_path = tmp_path / "model.bioMod"
+    biomod_path.write_text("version 4", encoding="utf-8")
+    triangulation_path = tmp_path / "triangulation.npz"
+    metadata = biorbd_kalman_cache_metadata(triangulation_path, reconstruction, biomod_path, 120.0, 1e-8, 1e-4)
+    changed_metadata = biorbd_kalman_cache_metadata(
+        triangulation_path, changed_reconstruction, biomod_path, 120.0, 1e-8, 1e-4
+    )
+    cache_path = tmp_path / "biorbd_kalman_states.npz"
+    np.savez(cache_path, metadata=np.asarray(json.dumps(metadata), dtype=object))
+    legacy_metadata = {key: value for key, value in metadata.items() if key != "reconstruction_signature"}
+    legacy_cache_path = tmp_path / "legacy_biorbd_kalman_states.npz"
+    np.savez(legacy_cache_path, metadata=np.asarray(json.dumps(legacy_metadata), dtype=object))
+
+    assert metadata["reconstruction_frame_signature"] == changed_metadata["reconstruction_frame_signature"]
+    assert metadata["reconstruction_signature"] != changed_metadata["reconstruction_signature"]
+    assert metadata_cache_matches(cache_path, metadata)
+    assert not metadata_cache_matches(cache_path, changed_metadata)
+    assert not metadata_cache_matches(legacy_cache_path, metadata)
 
 
 def test_pose_data_variant_cache_reuses_corrected_flip_variant(tmp_path, monkeypatch):
@@ -427,6 +602,7 @@ def test_reconstruction_cache_metadata_and_match_support_none_threshold(tmp_path
         pose_outlier_threshold_ratio=0.1,
         pose_amplitude_lower_percentile=5.0,
         pose_amplitude_upper_percentile=95.0,
+        calibrations=_single_camera_calibrations(),
     )
     np.savez(tmp_path / "cache.npz", metadata=np.asarray(json.dumps(metadata), dtype=object))
 

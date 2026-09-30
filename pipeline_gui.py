@@ -3501,6 +3501,7 @@ def model_preview_cache_metadata(
         "biomod_size": int(stat.st_size),
         "keypoints_path": str(keypoints_path.resolve()),
         "calib_path": str(calib_path.resolve()),
+        "calib_signature": file_content_signature(calib_path),
         "pose_data_mode": pose_data_mode,
         "pose_correction_mode": pose_correction_mode,
         "triangulation_method": triangulation_method,

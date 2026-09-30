@@ -4,6 +4,7 @@
 _cache/
 __pycache__/
 *.pyc
+*.egg-info/
 
 outputs/
 output/

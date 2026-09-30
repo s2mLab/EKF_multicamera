@@ -42,7 +42,7 @@ and the local [instructions](./AGENTS.md).
 The simplest setup is:
 
 ```bash
-cd /Users/mickaelbegon/Documents/GIT/EKF_multicamera
+cd path/to/EKF_multicamera  # root of your clone
 conda env create -f environment.vitpose-ekf.yml
 conda activate vitpose-ekf
 ```

@@ -122,6 +122,58 @@ def test_gui_calibration_cache_keys_track_file_content(tmp_path):
     )
 
 
+def test_model_preview_cache_metadata_tracks_calibration_content(tmp_path):
+    calibration_path = tmp_path / "Calib.toml"
+    calibration_path.write_text("[cam0]", encoding="utf-8")
+    biomod_path = tmp_path / "model.bioMod"
+    biomod_path.write_text("version 4", encoding="utf-8")
+
+    def preview_metadata():
+        return pipeline_gui.model_preview_cache_metadata(
+            biomod_path=biomod_path,
+            keypoints_path=tmp_path / "keypoints.json",
+            calib_path=calibration_path,
+            pose_data_mode="cleaned",
+            pose_correction_mode="none",
+            triangulation_method="exhaustive",
+            max_frames=None,
+            frame_start=None,
+            frame_end=None,
+            smoothing_window=9,
+            outlier_threshold_ratio=0.1,
+            lower_percentile=5.0,
+            upper_percentile=95.0,
+        )
+
+    metadata = preview_metadata()
+    cache_path = tmp_path / "preview_q0_cache.npz"
+    pipeline_gui.save_model_preview_cache(
+        cache_path,
+        q_t0=np.zeros(3),
+        support_points=np.zeros((1, 17, 3)),
+        preview_frame_number=0,
+        metadata=metadata,
+    )
+    legacy_cache_path = tmp_path / "legacy_preview_q0_cache.npz"
+    pipeline_gui.save_model_preview_cache(
+        legacy_cache_path,
+        q_t0=np.zeros(3),
+        support_points=np.zeros((1, 17, 3)),
+        preview_frame_number=0,
+        metadata={key: value for key, value in metadata.items() if key != "calib_signature"},
+    )
+
+    assert pipeline_gui.metadata_cache_matches(cache_path, metadata)
+    assert not pipeline_gui.metadata_cache_matches(legacy_cache_path, metadata)
+
+    calibration_path.write_text("[cam0]\nwidth = 1280", encoding="utf-8")
+
+    changed_metadata = preview_metadata()
+    assert changed_metadata["calib_path"] == metadata["calib_path"]
+    assert changed_metadata["calib_signature"] != metadata["calib_signature"]
+    assert not pipeline_gui.metadata_cache_matches(cache_path, changed_metadata)
+
+
 def test_schedule_after_idle_once_coalesces_multiple_requests():
     calls = []
 

@@ -108,17 +108,23 @@ QA calibration, annotations, preview et GUI. Les smoke tests GUI necessitent
 - Les projections et Jacobiennes suivent le modele pinhole alors que les
   calibrations chargent aussi une distortion. Avant de modifier geometrie ou
   reprojection, confirmer que les detections 2D sont deja undistorted.
-- Les metadonnees de cache couvrent les observations, frames et options, mais
-  une modification du contenu de `Calib.toml` ou d'un `.bioMod` au meme chemin
-  doit etre traitee comme une invalidation a verifier explicitement.
-- Le cache GUI de calibration est indexe par chemin. Pendant une session, une
-  calibration modifiee au meme emplacement doit etre rechargee explicitement.
+- Les metadonnees des caches geometriques (epipolaire, flip, pose corrigee par
+  flip, triangulation) exigent les calibrations et stockent
+  `calibration_signature`, calculee sur les parametres parses de chaque camera.
+  Le stage modele stocke `reconstruction_signature` et `biomod_signature`, et
+  n'est reutilise que si le `.bioMod` existe et n'a pas change; le cache Kalman
+  `biorbd` stocke aussi ces deux signatures. Un ancien cache sans ces champs est
+  rejete et recalcule.
+- Cote GUI, la cle du cache de calibration, la cle du cache de pose et le cache
+  d'apercu q0 incluent une signature du contenu de `Calib.toml`. Le fichier de
+  keypoints reste identifie par son chemin seulement dans le cache de pose du
+  GUI : une modification en place pendant une session doit etre rechargee
+  explicitement.
 - Deux fichiers `environment*.yml` partagent le nom d'environnement
   `vitpose-ekf` mais different par leurs dependances. Ne pas les fusionner ou
   remplacer sans une demande dediee.
-- Le README contenait des chemins absolus historiques vers `Documents/Playground`.
-  Ils ont ete convertis en liens relatifs durant cet audit; conserver cette
-  convention pour ne pas orienter un agent hors de la racine Git courante.
+- Le README ne doit contenir que des chemins relatifs a la racine Git; ne pas
+  reintroduire de chemins absolus propres a une machine.
 - Les donnees versionnees de `inputs/` et `reconstruction_profiles*.json` peuvent
   contenir du travail experimental local. Les traiter comme des artefacts a
   proteger jusqu'a instruction contraire.

@@ -31,11 +31,22 @@ La reference est `environment.vitpose-ekf.yml` avec Python 3.11. Ne pas utiliser
 `environment.yml` comme substitut : il a le meme nom d'environnement mais un
 ensemble de dependances different.
 
-Le fichier de reference contient un lien editable historique vers un depot
-frere `../GIT/biobuddy`. Sur une autre machine, placer ce depot a un chemin
-equivalent ou retirer uniquement cette ligne du fichier local si les fonctions
-qui l'utilisent ne sont pas requises. Ne pas committer une adaptation de chemin
-propre a une machine.
+Le fichier de reference contient une ligne pip historique `-e ../GIT/biobuddy`.
+Resolue depuis la racine du depot, elle ne designe pas le depot frere et fait
+echouer `conda env create`. Le code n'en depend pas : `vitpose_ekf_pipeline.py`
+ajoute au `sys.path` le checkout designe par la variable `BIOBUDDY_ROOT`, ou a
+defaut le depot frere `../biobuddy` (a cote de la racine du clone). Sur une
+autre machine, cloner `biobuddy` a cet emplacement ou definir `BIOBUDDY_ROOT`,
+et retirer localement la ligne `-e ../GIT/biobuddy` si elle bloque la creation
+de l'environnement. Ne pas committer une adaptation de chemin propre a une
+machine.
+
+La version de `biobuddy` requise n'est pas epinglee. `build_biomod` appelle
+`DeLevaTable.from_measurements(..., hip_height=...)`, alors que les tags
+`v0.1.0` et `v0.2.0` et la branche `main` de `biobuddy` exposent
+`pelvis_height` a la place : les tests `tests/test_model_variants.py` qui
+construisent un `.bioMod` echouent avec ces versions (`TypeError`). `biobuddy`
+importe aussi `plotly`, a installer dans l'environnement.
 
 L'installation minimale `pip install -e .[test]` suffit aux tests CI. Les
 reconstructions biomecaniques et certaines vues du GUI exigent aussi les
