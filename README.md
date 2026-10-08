@@ -447,6 +447,16 @@ The `Models` tab and bundle generation code support:
 - optional left/right limb symmetrization (`Symmetrize limbs`)
 - model creation from `raw`, `cleaned`, or `annotated` 2D observations
 - preview of the segmented back with a dedicated `mid_back` marker and 2-triangle back geometry
+- head marker geometry (`--head-marker-model {legacy,anthropometric}` in
+  `export_reconstruction_bundle.py` and `vitpose_ekf_pipeline.py`, profile field
+  `head_marker_model`, `ekf_2d`/`ekf_3d` families, ignored with `--biomod`):
+  `legacy` (default) keeps the historical bioMod byte for byte (nose at
+  `(h, 0, h)`, i.e. `sqrt(2) h` from the shoulder-centre pivot, ears above the
+  pivot); `anthropometric` places nose, eyes and ears at fixed fractions of the
+  head length `h` calibrated on pose2sim triangulations of three sequences
+  (details and ground-truth validation in `docs/architecture/OVERVIEW.md`). The
+  option is part of the model-stage cache metadata only when it is not `legacy`,
+  so existing caches stay valid. Not exposed in the GUI.
 
 ### 8. Annotation workflow
 

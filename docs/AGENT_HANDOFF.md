@@ -138,6 +138,12 @@ demarre suspendu) et sur un keypoint rejete dans plus de la moitie de ses vues.
 `1 1` restaure l'ancien comportement, qui peut se verrouiller sur un etat faux
 (divergence reelle `white_jerk` + melange sur `1_partie_0429_001`). Test cible :
 `pytest -q tests/test_ekf2d_robust_mixture.py`.
+`--head-marker-model {legacy,anthropometric}` (defaut `legacy`, aussi dans
+`vitpose_ekf_pipeline.py` et le champ de profil `head_marker_model`, familles
+`ekf_2d`/`ekf_3d`) choisit la geometrie des marqueurs de tete du bioMod genere ;
+`legacy` produit le fichier historique octet pour octet et laisse les
+metadonnees/caches du stage modele inchanges. Test cible :
+`pytest -q tests/test_head_marker_model.py`.
 Les modes `*_fast*` (coherence et flip) utilisent la distance epipolaire
 symetrique (+3,7 % d'erreur vs Sampson mesuree en reel) ; l'equivalent Sampson
 est le meme nom sans `_fast`. Les profils existants restent inchanges ; la CLI
