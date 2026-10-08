@@ -1,6 +1,11 @@
 import numpy as np
 
-from preview.frame_2d_render import PointValueOverlay2D, SkeletonLayer2D, draw_point_value_overlay, render_camera_frame_2d
+from preview.frame_2d_render import (
+    PointValueOverlay2D,
+    SkeletonLayer2D,
+    draw_point_value_overlay,
+    render_camera_frame_2d,
+)
 
 
 class _FakeAxis:
