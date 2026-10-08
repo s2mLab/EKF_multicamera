@@ -112,6 +112,41 @@ DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M = 1.5
 DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES = 1
 DEFAULT_EKF2D_INITIAL_STATE_METHOD = "ekf_bootstrap"
 DEFAULT_EKF2D_BOOTSTRAP_PASSES = 5
+# "woodbury": information-form batch update (exact, falls back to "legacy" on failure).
+# "legacy": innovation-space update (sequential per camera, batch with pseudo-priors).
+SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
+DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
+# Flight criterion activating the ``dyn`` root predictor:
+# "triangulation": every finite triangulated point of the previous frames above the threshold (historical);
+# "ekf_state": lowest model marker of the previous corrected EKF state above the threshold, with hysteresis.
+SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+# Process noise Q of the EKF2D constant-acceleration model:
+# "legacy": diag(1e-4, 5e-3, 5e-2) per DoF for (q, qdot, qddot), independent of dt (historical);
+# "white_jerk": discretized continuous white jerk, Q(dt) = q_c * M(dt) per DoF, with one spectral
+# density q_c per group (root translation [m^2/s^5], root rotation and joints [rad^2/s^5]).
+SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
+DEFAULT_PROCESS_NOISE_MODEL = "legacy"
+# Calibrated by an independent analysis (synthetic 3 seeds + real 1_partie_0429 in leave-one-camera-out):
+# root translation 200 m^2/s^5, root rotation 1000 rad^2/s^5, joints 10000 rad^2/s^5.
+DEFAULT_PROCESS_NOISE_JERK_PSD = (200.0, 1000.0, 10000.0)
+# Opt-in joint prior (``joint_prior``): elbow/knee flexion sign limits + axial pseudo-observations.
+# Model convention: flexed knee = SHANK:RotY > 0, flexed elbow = FOREARM:RotY < 0.
+DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG = 30.0
+DEFAULT_JOINT_LIMIT_DEG = 1.0
+DEFAULT_JOINT_LIMIT_STD_DEG = 0.5
+DEFAULT_JOINT_REFLECT_MARGIN_DEG = 5.0
+# Opt-in robust inlier/outlier mixture on 2D keypoints (``robust_mixture``).
+DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB = 0.03
+ROBUST_MIXTURE_MIN_WEIGHT = 1e-6
+# Lock guard of the mixture: when more than ``lock_fraction`` of the 2D keypoints of a frame get a
+# weight < 0.5, the prediction (not the detections) is the likely outlier, so the frame is updated
+# with the nominal Gaussian variances; the mixture resumes once the fraction is <= ``resume_fraction``
+# (each EKF, bootstrap included, starts suspended). Likewise, a keypoint rejected in more than
+# ``lock_fraction`` of its views gets back its nominal variances. ``1, 1`` disables the guard.
+DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION = 0.5
+DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION = 0.25
+DEFAULT_FLIGHT_DETECTION = "triangulation"
+DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
 DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
@@ -223,6 +258,10 @@ class CameraCalibration:
     tvec: np.ndarray
     R: np.ndarray
     P: np.ndarray
+    # True when the 2D keypoints used with this calibration were undistorted at
+    # load time (``undistort_keypoints``): the pinhole model below is then exact
+    # and ``dist`` is kept only for traceability and cache signatures.
+    keypoints_undistorted: bool = False
 
     def project_point(self, point_world: np.ndarray) -> np.ndarray:
         """Projette un point 3D monde en coordonnees pixels sans distortion explicite."""
@@ -461,6 +500,9 @@ def calibration_signature(calibrations: dict[str, CameraCalibration], camera_nam
             calibration.P,
         ):
             _update_signature_with_array(hasher, values, "<f8")
+        if bool(getattr(calibration, "keypoints_undistorted", False)):
+            # Only hashed when enabled so that signatures of existing caches are unchanged.
+            hasher.update(b"keypoints_undistorted\0")
     return hasher.hexdigest()[:16]
 
 
@@ -642,6 +684,153 @@ def ensure_local_imports() -> None:
         sys.path.insert(0, str(LOCAL_BIOBUDDY))
 
 
+def _opencv_distortion_coefficients(dist: np.ndarray) -> np.ndarray:
+    """Return ``(k1, k2, p1, p2, k3, k4, k5, k6)`` from an OpenCV coefficient vector.
+
+    Thin-prism and tilt terms (more than 8 coefficients) are not supported and
+    raise ``ValueError`` when non-zero.
+    """
+
+    dist = np.asarray(dist, dtype=float).reshape(-1)
+    if dist.size > 8 and np.any(dist[8:] != 0.0):
+        raise ValueError("Only OpenCV radial/tangential distortion (up to 8 coefficients) is supported.")
+    coefficients = np.zeros(8, dtype=float)
+    coefficients[: min(8, dist.size)] = dist[:8]
+    return coefficients
+
+
+def distort_normalized_points(points: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Apply the OpenCV (Brown-Conrady, rational) distortion to normalized coordinates.
+
+    Args:
+        points: Ideal normalized image coordinates ``(..., 2)`` (``x = X/Z``).
+        dist: OpenCV coefficients ``(k1, k2, p1, p2[, k3[, k4, k5, k6]])``.
+
+    Returns:
+        Distorted normalized coordinates with the same shape (``NaN`` preserved).
+    """
+
+    k1, k2, p1, p2, k3, k4, k5, k6 = _opencv_distortion_coefficients(dist)
+    points = np.asarray(points, dtype=float)
+    x = points[..., 0]
+    y = points[..., 1]
+    r2 = x * x + y * y
+    radial = (1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1.0 + r2 * (k4 + r2 * (k5 + r2 * k6)))
+    xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x)
+    yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y
+    return np.stack((xd, yd), axis=-1)
+
+
+def undistort_normalized_points(
+    distorted: np.ndarray,
+    dist: np.ndarray,
+    max_iterations: int = 30,
+    tolerance: float = 1e-14,
+    max_residual: float = 1e-9,
+) -> np.ndarray:
+    """Invert :func:`distort_normalized_points` with vectorized Newton iterations.
+
+    Points whose final forward residual exceeds ``max_residual`` (normalized
+    units, i.e. about ``1e-6`` px for a 1000 px focal length) are returned as
+    ``NaN`` rather than at a wrong position; this only happens far outside the
+    calibrated field of view.
+    """
+
+    k1, k2, p1, p2, k3, k4, k5, k6 = _opencv_distortion_coefficients(dist)
+    target = np.asarray(distorted, dtype=float)
+    flat = target.reshape(-1, 2)
+    result = np.full(flat.shape, np.nan, dtype=float)
+    finite = np.all(np.isfinite(flat), axis=1)
+    if not np.any(finite):
+        return result.reshape(target.shape)
+    goal = flat[finite]
+    x = goal[:, 0].copy()
+    y = goal[:, 1].copy()
+    for _iteration in range(max(1, int(max_iterations))):
+        r2 = x * x + y * y
+        num = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+        den = 1.0 + r2 * (k4 + r2 * (k5 + r2 * k6))
+        radial = num / den
+        d_num = k1 + r2 * (2.0 * k2 + 3.0 * k3 * r2)
+        d_den = k4 + r2 * (2.0 * k5 + 3.0 * k6 * r2)
+        d_radial = (d_num * den - num * d_den) / (den * den)
+        fx = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x) - goal[:, 0]
+        fy = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y - goal[:, 1]
+        j_xx = radial + 2.0 * x * x * d_radial + 2.0 * p1 * y + 6.0 * p2 * x
+        j_xy = 2.0 * x * y * d_radial + 2.0 * p1 * x + 2.0 * p2 * y
+        j_yy = radial + 2.0 * y * y * d_radial + 6.0 * p1 * y + 2.0 * p2 * x
+        det = j_xx * j_yy - j_xy * j_xy
+        safe = np.abs(det) > 1e-12
+        step_x = np.where(safe, (j_yy * fx - j_xy * fy) / np.where(safe, det, 1.0), 0.0)
+        step_y = np.where(safe, (j_xx * fy - j_xy * fx) / np.where(safe, det, 1.0), 0.0)
+        x = x - step_x
+        y = y - step_y
+        if float(np.max(np.abs(np.concatenate((step_x, step_y))))) <= tolerance:
+            break
+    undistorted = np.column_stack((x, y))
+    residual = np.max(np.abs(distort_normalized_points(undistorted, dist) - goal), axis=1)
+    undistorted[~(residual <= max_residual)] = np.nan
+    result[finite] = undistorted
+    return result.reshape(target.shape)
+
+
+def undistort_pixel_points(points_px: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+    """Undistort pixel coordinates ``(..., 2)`` and re-project them with the same ``K``.
+
+    This is the equivalent of ``cv2.undistortPoints(points, K, dist, P=K)`` with
+    a converged iterative inverse. ``NaN`` points stay ``NaN``; with all-zero
+    coefficients the input is returned unchanged (copy).
+    """
+
+    points_px = np.asarray(points_px, dtype=float)
+    coefficients = _opencv_distortion_coefficients(dist)
+    if not np.any(coefficients):
+        return np.array(points_px, copy=True)
+    K = np.asarray(K, dtype=float)
+    fx, skew, cx = K[0, 0], K[0, 1], K[0, 2]
+    fy, cy = K[1, 1], K[1, 2]
+    y_distorted = (points_px[..., 1] - cy) / fy
+    x_distorted = (points_px[..., 0] - cx - skew * y_distorted) / fx
+    ideal = undistort_normalized_points(np.stack((x_distorted, y_distorted), axis=-1), coefficients)
+    u = fx * ideal[..., 0] + skew * ideal[..., 1] + cx
+    v = fy * ideal[..., 1] + cy
+    return np.stack((u, v), axis=-1)
+
+
+def undistort_pose_keypoints(
+    keypoints: np.ndarray,
+    calibrations: dict[str, CameraCalibration],
+    camera_names: Iterable[str],
+) -> np.ndarray:
+    """Undistort ``(n_cam, n_frames, n_kp, 2)`` pixel keypoints camera by camera."""
+
+    keypoints = np.asarray(keypoints, dtype=float)
+    undistorted = np.array(keypoints, copy=True)
+    for cam_idx, camera_name in enumerate(camera_names):
+        calibration = calibrations[str(camera_name)]
+        undistorted[cam_idx] = undistort_pixel_points(keypoints[cam_idx], calibration.K, calibration.dist)
+    return undistorted
+
+
+def calibrations_with_undistorted_keypoints(
+    calibrations: dict[str, CameraCalibration],
+    enabled: bool = True,
+) -> dict[str, CameraCalibration]:
+    """Return calibration copies flagged for keypoints undistorted at load time.
+
+    The flag changes :func:`calibration_signature`, so every geometric cache
+    (epipolar, flip, pose variants, triangulation) keyed on the calibration is
+    invalidated when the option is toggled; the distortion coefficients were
+    already part of that signature.
+    """
+
+    from dataclasses import replace as _replace
+
+    return {
+        name: _replace(calibration, keypoints_undistorted=bool(enabled)) for name, calibration in calibrations.items()
+    }
+
+
 def load_calibrations(calib_path: Path) -> dict[str, CameraCalibration]:
     """Charge le fichier TOML de calibration et construit les matrices utiles.
 
@@ -695,6 +884,7 @@ def load_pose_data(
     lower_percentile: float = 5.0,
     upper_percentile: float = 95.0,
     annotations_path: Path | None = None,
+    undistort_keypoints: bool = False,
 ) -> PoseData:
     """Charge les keypoints 2D et les aligne camera par camera.
 
@@ -702,6 +892,15 @@ def load_pose_data(
     differentes vues. Une camera absente sur une frame donnee est remplie avec
     des `NaN` et des scores nuls, afin de conserver toute la timeline sans
     supprimer des frames entieres du pipeline.
+
+    Avec ``undistort_keypoints=True``, les keypoints bruts et annotes (pixels
+    de l'image distordue) sont dedistordus une seule fois avec ``K`` et
+    ``dist`` de chaque camera (equivalent ``cv2.undistortPoints(..., P=K)``)
+    avant le nettoyage temporel; toutes les etapes suivantes (coherence,
+    triangulation, EKF, reprojection) utilisent alors un modele pinhole exact.
+    Utiliser les calibrations de
+    :func:`calibrations_with_undistorted_keypoints` en aval pour que les caches
+    geometriques distinguent ce mode.
     """
     if keypoints_path.suffix.lower() != ".json":
         raise ValueError(
@@ -788,6 +987,19 @@ def load_pose_data(
         keypoint_names=COCO17,
         payload=annotation_payload,
     )
+    if undistort_keypoints:
+        loaded_camera_names = [name for name, _ in ordered_items]
+        was_finite = np.all(np.isfinite(keypoints), axis=-1)
+        annotated_was_finite = np.all(np.isfinite(annotated_keypoints), axis=-1)
+        keypoints = undistort_pose_keypoints(keypoints, calibrations, loaded_camera_names)
+        raw_keypoints = np.array(keypoints, copy=True)
+        annotated_keypoints = undistort_pose_keypoints(annotated_keypoints, calibrations, loaded_camera_names)
+        # A point outside the invertible distortion domain becomes NaN: keep the NaN/score-0 contract.
+        scores = np.where(was_finite & ~np.all(np.isfinite(keypoints), axis=-1), 0.0, scores)
+        raw_scores = np.array(scores, copy=True)
+        annotated_scores = np.where(
+            annotated_was_finite & ~np.all(np.isfinite(annotated_keypoints), axis=-1), 0.0, annotated_scores
+        )
     cleaned_keypoints, cleaned_scores, filtered_keypoints = filter_pose_keypoints(
         keypoints,
         scores,
@@ -1030,6 +1242,392 @@ def apply_measurement_update_batch(
         nq=nq,
         identity_x=identity_x,
     )
+
+
+def epipolar_distance_mode_for_method(method: str | None) -> str | None:
+    """Return the epipolar distance used by a coherence/flip method (``None`` if not epipolar).
+
+    The ``*_fast*`` variants differ from their Sampson counterparts only by the
+    symmetric epipolar distance (measured +3.7 % worse than Sampson on
+    ``1_partie_0429``); the Sampson equivalent of ``epipolar_fast[_framewise|_viterbi]``
+    is ``epipolar[_framewise|_viterbi]``.
+    """
+
+    name = "" if method is None else str(method).strip().lower()
+    if not name.startswith("epipolar"):
+        return None
+    return "symmetric" if "fast" in name else "sampson"
+
+
+def epipolar_fast_notice(coherence_method: str | None, flip_method: str | None = None) -> str | None:
+    """Return a user-facing note when a symmetric-distance (``*_fast*``) epipolar mode is selected."""
+
+    selected = [
+        (label, str(method))
+        for label, method in (("coherence", coherence_method), ("flip", flip_method))
+        if epipolar_distance_mode_for_method(method) == "symmetric"
+    ]
+    if not selected:
+        return None
+    parts = [f"{label}={method} (Sampson: {method.replace('_fast', '')})" for label, method in selected]
+    return (
+        "[NOTE] "
+        + ", ".join(parts)
+        + " uses the symmetric epipolar distance, measured +3.7% worse than Sampson on real data."
+    )
+
+
+def normalize_ekf2d_update_method(update_method: str | None) -> str:
+    """Validate the EKF2D measurement-update solver name (``None`` -> default)."""
+
+    method = DEFAULT_EKF2D_UPDATE_METHOD if update_method is None else str(update_method).strip().lower()
+    if method not in SUPPORTED_EKF2D_UPDATE_METHODS:
+        raise ValueError(f"Unsupported EKF2D update method: {update_method}")
+    return method
+
+
+def normalize_flight_detection(flight_detection: str | None) -> str:
+    """Validate the flight criterion used by the ``dyn`` predictor (``None`` -> default)."""
+
+    method = DEFAULT_FLIGHT_DETECTION if flight_detection is None else str(flight_detection).strip().lower()
+    if method not in SUPPORTED_FLIGHT_DETECTIONS:
+        raise ValueError(f"Unsupported flight detection: {flight_detection}")
+    return method
+
+
+def normalize_process_noise_model(process_noise_model: str | None) -> str:
+    """Validate the EKF2D process-noise model name (``None`` -> default)."""
+
+    model = DEFAULT_PROCESS_NOISE_MODEL if process_noise_model is None else str(process_noise_model).strip().lower()
+    if model not in SUPPORTED_PROCESS_NOISE_MODELS:
+        raise ValueError(f"Unsupported process noise model: {process_noise_model}")
+    return model
+
+
+def wrap_to_pi(values):
+    """Wrap angles (rad) into ``[-pi, pi)``."""
+
+    return (np.asarray(values, dtype=float) + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def joint_mirror_pair_indices(q_names: Iterable[str]) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(axial_idx, flexion_idx, sign)`` for the elbow and knee mirror symmetries.
+
+    ``sign * q[flexion_idx] > 0`` is the canonical (anatomical) branch: ``sign=-1``
+    for the elbow (``FOREARM:RotZ`` / ``FOREARM:RotY``) and ``sign=+1`` for the knee
+    (``THIGH:RotZ`` / ``SHANK:RotY``). ``(RotZ + pi, -RotY)`` leaves the distal
+    marker unchanged, which is why the image measurements cannot tell the branches apart.
+    """
+
+    index = {str(name): idx for idx, name in enumerate(q_names)}
+    pairs: list[tuple[int, int, int]] = []
+    for side in ("LEFT", "RIGHT"):
+        for axial_name, flexion_name, sign in (
+            (f"{side}_FOREARM:RotZ", f"{side}_FOREARM:RotY", -1),
+            (f"{side}_THIGH:RotZ", f"{side}_SHANK:RotY", 1),
+        ):
+            if axial_name in index and flexion_name in index:
+                pairs.append((index[axial_name], index[flexion_name], sign))
+    return tuple(pairs)
+
+
+def canonicalize_joint_mirror_branches(
+    q_names: Iterable[str],
+    q: np.ndarray,
+    qdot: np.ndarray | None = None,
+    qddot: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Move elbow/knee angles into the canonical branch (export-time helper).
+
+    Frames where ``sign * RotY < 0`` are mapped with the exact symmetry
+    ``(RotZ + pi, -RotY)`` (``qdot``/``qddot`` of ``RotY`` are negated
+    consistently), then the axial angle is wrapped into ``[-pi, pi)``. Shapes are
+    preserved (``(n_frames, nq)``); NaN values stay NaN.
+    """
+
+    names = list(q_names)
+    q = np.array(q, dtype=float, copy=True)
+    qdot = None if qdot is None else np.array(qdot, dtype=float, copy=True)
+    qddot = None if qddot is None else np.array(qddot, dtype=float, copy=True)
+    for axial_idx, flex_idx, sign in joint_mirror_pair_indices(names):
+        mirrored = sign * q[:, flex_idx] < 0.0
+        q[mirrored, axial_idx] += np.pi
+        q[mirrored, flex_idx] *= -1.0
+        for derivative in (qdot, qddot):
+            if derivative is not None:
+                derivative[mirrored, flex_idx] *= -1.0
+        finite = np.isfinite(q[:, axial_idx])
+        q[finite, axial_idx] = wrap_to_pi(q[finite, axial_idx])
+    return q, qdot, qddot
+
+
+def robust_mixture_measurement_variances(
+    innovations: np.ndarray,
+    H_blocks: np.ndarray,
+    predicted_q_covariance: np.ndarray,
+    variances: np.ndarray,
+    outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    image_area_px2: float = 1920.0 * 1080.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Inflate 2D keypoint variances with an inlier (Gaussian) / outlier (uniform) mixture.
+
+    For each keypoint ``k`` with innovation ``y_k`` (px), Jacobian ``H_k``
+    (``2 x nq``) and isotropic variance ``r_k`` (px^2):
+    ``S_k = H_k P_qq H_k^T + r_k I``,
+    ``w_k = pi_in N(y_k; 0, S_k) / (pi_in N(y_k; 0, S_k) + pi_out / A_img)``
+    and the effective variance is the diagonal of ``S_k / w_k - H_k P_qq H_k^T``,
+    i.e. ``r_k / w_k + diag(H_k P_qq H_k^T) (1 / w_k - 1)``: diagonal (as
+    required by the solvers), SPD and ``>= r_k``. ``w_k`` is floored at
+    ``ROBUST_MIXTURE_MIN_WEIGHT``. Everything is computed from the predicted
+    state, so the result does not depend on the camera order or on the solver.
+
+    Returns:
+        ``(variances_xy (m, 2), weights (m,))``.
+    """
+
+    innovations = np.asarray(innovations, dtype=float).reshape(-1, 2)
+    H_blocks = np.asarray(H_blocks, dtype=float)
+    variances = np.asarray(variances, dtype=float).reshape(-1)
+    hph = np.einsum("mai,ij,mbj->mab", H_blocks, np.asarray(predicted_q_covariance, dtype=float), H_blocks)
+    hph = 0.5 * (hph + np.transpose(hph, (0, 2, 1)))
+    S = hph + variances[:, np.newaxis, np.newaxis] * np.eye(2)[np.newaxis]
+    det = S[:, 0, 0] * S[:, 1, 1] - S[:, 0, 1] * S[:, 1, 0]
+    det = np.maximum(det, 1e-300)
+    inv_S = (
+        np.stack((np.stack((S[:, 1, 1], -S[:, 0, 1]), axis=-1), np.stack((-S[:, 1, 0], S[:, 0, 0]), axis=-1)), axis=-2)
+        / det[:, np.newaxis, np.newaxis]
+    )
+    mahalanobis = np.einsum("ma,mab,mb->m", innovations, inv_S, innovations)
+    outlier_prob = float(np.clip(outlier_prob, 0.0, 1.0))
+    log_inlier = np.log(max(1.0 - outlier_prob, 1e-300)) - 0.5 * mahalanobis - np.log(2.0 * np.pi) - 0.5 * np.log(det)
+    log_outlier = np.log(max(outlier_prob, 1e-300)) - np.log(float(image_area_px2))
+    weights = 1.0 / (1.0 + np.exp(np.clip(log_outlier - log_inlier, -700.0, 700.0)))
+    weights = np.where(np.isfinite(weights), weights, ROBUST_MIXTURE_MIN_WEIGHT)
+    weights = np.clip(weights, ROBUST_MIXTURE_MIN_WEIGHT, 1.0)
+    diag_hph = np.stack((hph[:, 0, 0], hph[:, 1, 1]), axis=-1)
+    inflated = variances[:, np.newaxis] / weights[:, np.newaxis] + np.maximum(diag_hph, 0.0) * (
+        1.0 / weights[:, np.newaxis] - 1.0
+    )
+    inflated = np.maximum(inflated, variances[:, np.newaxis])
+    return inflated, weights
+
+
+def validate_robust_mixture_lock_fractions(lock_fraction: float, resume_fraction: float) -> tuple[float, float]:
+    """Check ``0 <= resume_fraction <= lock_fraction <= 1`` (``lock_fraction = 1`` disables the guard)."""
+
+    lock_fraction = float(lock_fraction)
+    resume_fraction = float(resume_fraction)
+    if not 0.0 < lock_fraction <= 1.0:
+        raise ValueError("robust_mixture_lock_fraction must be in (0, 1].")
+    if not 0.0 <= resume_fraction <= lock_fraction:
+        raise ValueError("robust_mixture_resume_fraction must be in [0, robust_mixture_lock_fraction].")
+    return lock_fraction, resume_fraction
+
+
+def robust_mixture_lock_decision(
+    weights: np.ndarray,
+    suspended: bool,
+    lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
+) -> tuple[bool, float]:
+    """Hysteresis deciding whether the mixture is suspended for one frame.
+
+    ``fraction`` is the share of the frame's keypoints whose mixture weight is
+    ``< 0.5``. With ``pi_out`` of a few percent, a majority of "outliers" means
+    that the prediction is wrong (bad initial state, lost track), not the
+    detections: a mixture applied there rejects the very measurements that
+    would correct the state and the filter locks onto a wrong pose. Active
+    mixture is suspended when ``fraction > lock_fraction``; a suspended mixture
+    resumes when ``fraction <= resume_fraction``. Frames without weights keep
+    the current mode. ``lock_fraction = 1`` never suspends an active mixture
+    and ``lock_fraction = resume_fraction = 1`` disables the guard.
+
+    Returns:
+        ``(suspended, fraction)``.
+    """
+
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if weights.size == 0:
+        return bool(suspended), float("nan")
+    fraction = float(np.count_nonzero(weights < 0.5)) / float(weights.size)
+    if suspended:
+        return bool(fraction > resume_fraction), fraction
+    return bool(fraction > lock_fraction), fraction
+
+
+def robust_mixture_keypoint_guard(
+    weights: np.ndarray,
+    keypoint_indices: np.ndarray,
+    lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+) -> np.ndarray:
+    """Rows whose mixture weight must be dropped because the keypoint is rejected in most views.
+
+    A detector error is mostly view-specific, whereas a keypoint rejected in
+    more than ``lock_fraction`` of the (at least two) views that see it points
+    to a wrong predicted 3D point (e.g. a limb locked in a wrong pose): those
+    detections get back their nominal variance. Independent of the camera
+    order; ``lock_fraction = 1`` never restores.
+
+    Args:
+        weights: Mixture weights ``(m,)`` of the frame (all cameras).
+        keypoint_indices: COCO17 index ``(m,)`` of each weight.
+
+    Returns:
+        Boolean mask ``(m,)`` of the rows to restore.
+    """
+
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    keypoint_indices = np.asarray(keypoint_indices, dtype=int).reshape(-1)
+    if weights.shape != keypoint_indices.shape:
+        raise ValueError("weights and keypoint_indices must have the same length.")
+    restore = np.zeros(weights.size, dtype=bool)
+    if weights.size == 0:
+        return restore
+    low = weights < 0.5
+    unique, inverse = np.unique(keypoint_indices, return_inverse=True)
+    n_views = np.bincount(inverse, minlength=unique.size)
+    n_low = np.bincount(inverse, weights=low.astype(float), minlength=unique.size)
+    rejected = (n_views >= 2) & (n_low > float(lock_fraction) * n_views)
+    restore[:] = rejected[inverse]
+    return restore
+
+
+def legacy_process_noise(nq: int, process_noise_scale: float = 1.0) -> np.ndarray:
+    """Historical diagonal EKF2D process noise (independent of ``dt``)."""
+
+    base_process_noise = np.concatenate((1e-4 * np.ones(nq), 5e-3 * np.ones(nq), 5e-2 * np.ones(nq)))
+    return np.diag(base_process_noise * process_noise_scale)
+
+
+def white_jerk_noise_block(dt: float) -> np.ndarray:
+    """Return ``M(dt)`` such that ``Q = q_c M(dt)`` for one ``(q, qdot, qddot)`` triplet.
+
+    It is the exact discretization ``int_0^dt Phi(s) b b^T Phi(s)^T ds`` of a
+    constant-acceleration model driven by continuous white jerk of spectral
+    density ``q_c`` (``b = [0, 0, 1]``), consistent with the transition matrix
+    used by :class:`MultiViewKinematicEKF`.
+    """
+
+    dt = float(dt)
+    if not np.isfinite(dt) or dt <= 0.0:
+        raise ValueError("dt must be a positive finite time step.")
+    return np.array(
+        [
+            [dt**5 / 20.0, dt**4 / 8.0, dt**3 / 6.0],
+            [dt**4 / 8.0, dt**3 / 3.0, dt**2 / 2.0],
+            [dt**3 / 6.0, dt**2 / 2.0, dt],
+        ],
+        dtype=float,
+    )
+
+
+def white_jerk_process_noise(
+    dt: float,
+    q_names: Iterable[str],
+    n_root: int,
+    jerk_psd: Iterable[float] = DEFAULT_PROCESS_NOISE_JERK_PSD,
+    process_noise_scale: float = 1.0,
+) -> np.ndarray:
+    """Build the white-jerk process noise ``Q(dt) = M(dt) kron diag(q_c)`` for ``[q, qdot, qddot]``.
+
+    Args:
+        dt: Time step (s), i.e. ``1 / effective FPS``.
+        q_names: Generalized-coordinate names (``SEGMENT:DoF``) in state order.
+        n_root: Number of root DoFs; root DoFs whose name contains ``Trans`` use
+            the translation density, the other root DoFs the rotation density.
+        jerk_psd: ``(q_c_root_translation, q_c_root_rotation, q_c_joints)``.
+        process_noise_scale: Global multiplier, as for the legacy model.
+    """
+
+    names = [str(name) for name in q_names]
+    psd = np.asarray(list(jerk_psd), dtype=float).reshape(-1)
+    if psd.size != 3 or np.any(~np.isfinite(psd)) or np.any(psd <= 0.0):
+        raise ValueError("jerk_psd must contain three positive values (root translation, root rotation, joints).")
+    per_dof = np.full(len(names), psd[2], dtype=float)
+    for dof_idx in range(min(int(n_root), len(names))):
+        per_dof[dof_idx] = psd[0] if "trans" in names[dof_idx].lower() else psd[1]
+    return float(process_noise_scale) * np.kron(white_jerk_noise_block(dt), np.diag(per_dof))
+
+
+def apply_measurement_update_woodbury(
+    predicted_state: np.ndarray,
+    predicted_covariance: np.ndarray,
+    z: np.ndarray,
+    h: np.ndarray,
+    H_q: np.ndarray,
+    R_diag_array: np.ndarray,
+    nq: int,
+    identity_x: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Apply the batch Kalman correction in information (Woodbury) form.
+
+    The measurement Jacobian is ``H = [H_q, 0, 0]`` (image measurements only
+    depend on ``q``) and ``R`` is diagonal. With ``P_q = P[:, :nq]``,
+    ``P_qq = P[:nq, :nq]``, ``G = H_q^T R^-1 H_q`` and ``g = H_q^T R^-1 y``,
+    the push-through identity ``H_q^T S^-1 = (I + G P_qq)^-1 H_q^T R^-1``
+    (``S = H_q P_qq H_q^T + R``) gives, with ``C = (I + G P_qq)^-1``:
+
+    - ``x+ = x + P_q C g``;
+    - ``K H = [P_q C G, 0]`` and ``K R K^T = P_q (C G) C^T P_q^T``;
+    - Joseph form ``P+ = (I - K H) P (I - K H)^T + K R K^T``.
+
+    Only ``nq x nq`` systems are solved instead of the ``m x m`` innovation
+    covariance, and ``P_qq`` is never inverted, so locked DoFs (tiny variance)
+    and a singular ``P_qq`` are handled. Rows with non-finite values or an
+    infinite variance carry no information and are dropped; a non-positive
+    variance makes the update undefined and returns ``None`` so the caller can
+    fall back to the innovation-space solver. The result equals
+    :func:`apply_measurement_update_batch` (and the sequential update, which is
+    the same linear update) up to round-off.
+    """
+
+    del identity_x  # kept for signature compatibility with the other solvers
+    z_array = np.asarray(z, dtype=float).reshape(-1)
+    h_array = np.asarray(h, dtype=float).reshape(-1)
+    r_array = np.asarray(R_diag_array, dtype=float).reshape(-1)
+    if z_array.size == 0 or np.asarray(H_q).size == 0:
+        return None
+    hq_array = np.asarray(H_q, dtype=float).reshape((-1, nq))
+    if not (z_array.shape[0] == h_array.shape[0] == hq_array.shape[0] == r_array.shape[0]):
+        return None
+    if np.any(r_array <= 0.0) or np.any(np.isnan(r_array)):
+        return None
+    valid_rows = np.isfinite(z_array) & np.isfinite(h_array) & np.all(np.isfinite(hq_array), axis=1)
+    valid_rows &= np.isfinite(r_array)
+    if not np.any(valid_rows):
+        return None
+    innovation = z_array[valid_rows] - h_array[valid_rows]
+    hq_valid = hq_array[valid_rows]
+    weighted_hq = hq_valid / r_array[valid_rows, np.newaxis]
+    information = hq_valid.T @ weighted_hq
+    information = 0.5 * (information + information.T)
+    information_vector = weighted_hq.T @ innovation
+
+    predicted_covariance = np.asarray(predicted_covariance, dtype=float)
+    P_q = predicted_covariance[:, :nq]
+    P_qq = predicted_covariance[:nq, :nq]
+    system = np.eye(nq, dtype=float) + information @ P_qq
+    rhs = np.concatenate((np.eye(nq, dtype=float), information, information_vector[:, np.newaxis]), axis=1)
+    try:
+        solution = np.linalg.solve(system, rhs)
+    except np.linalg.LinAlgError:
+        return None
+    if not np.all(np.isfinite(solution)):
+        return None
+    C = solution[:, :nq]
+    CG = solution[:, nq : 2 * nq]
+    Cg = solution[:, 2 * nq]
+
+    updated_state = np.asarray(predicted_state, dtype=float) + P_q @ Cg
+    KH_q = P_q @ CG
+    # (I - K H) P (I - K H)^T with K H nonzero only on the first nq columns.
+    left = predicted_covariance - KH_q @ predicted_covariance[:nq, :]
+    updated_covariance = left - left[:, :nq] @ KH_q.T
+    updated_covariance += KH_q @ C.T @ P_q.T
+    updated_covariance = 0.5 * (updated_covariance + updated_covariance.T)
+    if not (np.all(np.isfinite(updated_state)) and np.all(np.isfinite(updated_covariance))):
+        return None
+    return updated_state, updated_covariance
 
 
 def stack_measurement_blocks(
@@ -3609,8 +4207,64 @@ class MultiViewKinematicEKF:
         upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
         ankle_bed_pseudo_obs: bool = False,
         ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+        update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+        flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+        flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+        flight_com_accel_tolerance: float | None = None,
+        process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+        process_noise_jerk_psd: Iterable[float] | None = None,
+        joint_prior: bool = False,
+        joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+        robust_mixture: bool = False,
+        robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+        robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+        robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
     ):
         self.model = model
+        self.robust_mixture = bool(robust_mixture)
+        self.robust_mixture_outlier_prob = float(robust_mixture_outlier_prob)
+        if not 0.0 < self.robust_mixture_outlier_prob < 1.0:
+            raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
+        self.robust_mixture_lock_fraction, self.robust_mixture_resume_fraction = validate_robust_mixture_lock_fractions(
+            robust_mixture_lock_fraction, robust_mixture_resume_fraction
+        )
+        # Warm-up: the first frames are updated with the nominal variances until the mixture agrees
+        # with the prediction (fraction of weights < 0.5 at most ``resume_fraction``).
+        self.robust_mixture_suspended = True
+        self.robust_mixture_stats = {
+            "keypoints": 0,
+            "weight_sum": 0.0,
+            "downweighted_below_0_5": 0,
+            "applied_downweighted_below_0_5": 0,
+            "frames": 0,
+            "suspended_frames": 0,
+            "suspended_keypoints": 0,
+            "lock_events": 0,
+            "keypoint_guard_restored": 0,
+        }
+        self.joint_prior = bool(joint_prior)
+        if float(joint_prior_axial_std_deg) <= 0.0:
+            raise ValueError("joint_prior_axial_std_deg must be > 0.")
+        self.joint_prior_axial_std_rad = float(np.deg2rad(float(joint_prior_axial_std_deg)))
+        self.joint_limit_rad = float(np.deg2rad(DEFAULT_JOINT_LIMIT_DEG))
+        self.joint_limit_std_rad = float(np.deg2rad(DEFAULT_JOINT_LIMIT_STD_DEG))
+        self.joint_reflect_rad = float(np.deg2rad(DEFAULT_JOINT_REFLECT_MARGIN_DEG))
+        self.joint_prior_counts = {"axial_prior_blocks": 0, "mirror_reflections": 0, "limit_projections": 0}
+        self.process_noise_model = normalize_process_noise_model(process_noise_model)
+        self.process_noise_jerk_psd = tuple(
+            float(value)
+            for value in (DEFAULT_PROCESS_NOISE_JERK_PSD if process_noise_jerk_psd is None else process_noise_jerk_psd)
+        )
+        self.update_method = normalize_ekf2d_update_method(update_method)
+        self.solver_counts = {"woodbury": 0, "woodbury_fallback_legacy": 0}
+        self.flight_detection = normalize_flight_detection(flight_detection)
+        self.flight_hysteresis_m = max(0.0, float(flight_hysteresis_m))
+        self.flight_com_accel_tolerance = (
+            None if flight_com_accel_tolerance is None else abs(float(flight_com_accel_tolerance))
+        )
+        self._state_flight_active = False
+        self._state_flight_candidate_frames = 0
+        self.flight_active_history: list[bool] = []
         self.calibrations = calibrations
         self.pose_data = pose_data
         self.reconstruction = reconstruction
@@ -3687,8 +4341,18 @@ class MultiViewKinematicEKF:
             if idx is not None
         )
         self.locked_q_indices: set[int] = set()
-        base_process_noise = np.concatenate((1e-4 * np.ones(self.nq), 5e-3 * np.ones(self.nq), 5e-2 * np.ones(self.nq)))
-        self.process_noise = np.diag(base_process_noise * self.process_noise_scale)
+        self.joint_mirror_pairs = joint_mirror_pair_indices(self.q_names)
+        self.joint_axial_indices = tuple(axial_idx for axial_idx, _flex_idx, _sign in self.joint_mirror_pairs)
+        if self.process_noise_model == "white_jerk":
+            self.process_noise = white_jerk_process_noise(
+                self.dt,
+                self.q_names,
+                self.n_root,
+                jerk_psd=self.process_noise_jerk_psd,
+                process_noise_scale=self.process_noise_scale,
+            )
+        else:
+            self.process_noise = legacy_process_noise(self.nq, self.process_noise_scale)
         self.multiview_coherence: np.ndarray | None = (
             None if self.use_framewise_coherence else reconstruction.multiview_coherence
         )
@@ -3836,6 +4500,82 @@ class MultiViewKinematicEKF:
                 )
             )
         return blocks
+
+    def _joint_axial_prior_blocks(
+        self,
+        reference_q: np.ndarray,
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Linear pseudo-observations ``FOREARM:RotZ ~ N(0, s^2)`` and ``THIGH:RotZ ~ N(0, s^2)``."""
+
+        blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for q_idx in self.joint_axial_indices:
+            if q_idx in self.locked_q_indices:
+                continue
+            current_value = float(reference_q[int(q_idx)])
+            if not np.isfinite(current_value):
+                continue
+            h_q = np.zeros((1, self.nq), dtype=float)
+            h_q[0, int(q_idx)] = 1.0
+            blocks.append(
+                (
+                    np.array([0.0], dtype=float),
+                    np.array([current_value], dtype=float),
+                    h_q,
+                    np.array([self.joint_prior_axial_std_rad**2], dtype=float),
+                )
+            )
+        self.joint_prior_counts["axial_prior_blocks"] += len(blocks)
+        return blocks
+
+    def _apply_joint_limit_constraints(
+        self, state: np.ndarray, covariance: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Enforce the elbow/knee flexion sign after the measurement update.
+
+        1. A flexion on the wrong side by more than the reflection margin is
+           moved to the mirror branch ``(RotZ + pi, -RotY)``, an exact symmetry of
+           the marker model (the distal marker lies on the rotation axis); the
+           state and covariance are transformed with the same linear map
+           ``T`` (``P <- T P T^T``), so ``P`` stays SPD.
+        2. A remaining violation of the bound (elbow ``<= -1 deg``, knee
+           ``>= +1 deg``) triggers an inequality pseudo-observation
+           ``RotY = bound`` (std ``DEFAULT_JOINT_LIMIT_STD_DEG``), active only
+           when violated and applied with the same exact Kalman update.
+        """
+
+        state = np.array(state, dtype=float, copy=True)
+        covariance = np.array(covariance, dtype=float, copy=True)
+        nq = self.nq
+        for axial_idx, flex_idx, sign in self.joint_mirror_pairs:
+            if flex_idx in self.locked_q_indices or axial_idx in self.locked_q_indices:
+                continue
+            if sign * state[flex_idx] < -self.joint_reflect_rad:
+                state[axial_idx] = float(wrap_to_pi(state[axial_idx] + np.pi))
+                flip = [flex_idx, nq + flex_idx, 2 * nq + flex_idx]
+                state[flip] *= -1.0
+                covariance[flip, :] *= -1.0
+                covariance[:, flip] *= -1.0
+                self.joint_prior_counts["mirror_reflections"] += 1
+        violated = [
+            (flex_idx, sign)
+            for _axial_idx, flex_idx, sign in self.joint_mirror_pairs
+            if flex_idx not in self.locked_q_indices and sign * state[flex_idx] < self.joint_limit_rad
+        ]
+        if not violated:
+            return state, covariance
+        H_q = np.zeros((len(violated), nq), dtype=float)
+        for row, (flex_idx, _sign) in enumerate(violated):
+            H_q[row, flex_idx] = 1.0
+        z = np.array([sign * self.joint_limit_rad for _flex_idx, sign in violated], dtype=float)
+        h = np.array([state[flex_idx] for flex_idx, _sign in violated], dtype=float)
+        R_diag = np.full(len(violated), self.joint_limit_std_rad**2, dtype=float)
+        result = apply_measurement_update_woodbury(state, covariance, z, h, H_q, R_diag, nq)
+        if result is None:
+            result = apply_measurement_update_batch(state, covariance, z, h, H_q, R_diag, nq, self.identity_x)
+        if result is None:
+            return state, covariance
+        self.joint_prior_counts["limit_projections"] += len(violated)
+        return result
 
     def _is_airborne_frame(self, frame_idx: int) -> bool:
         """Return whether one frame belongs to the airborne phase.
@@ -4053,6 +4793,71 @@ class MultiViewKinematicEKF:
                 return False
         return (frame_idx - start_idx) >= self.flight_min_consecutive_frames
 
+    def _lowest_model_marker_height(self, q: np.ndarray) -> float:
+        """Return the minimum world ``z`` (m) of the COCO model markers for one ``q``."""
+
+        marker_positions = self.model.markers(np.asarray(q, dtype=float))
+        heights = [float(marker_positions[marker_idx].to_array()[2]) for marker_idx, _kp_idx in self.marker_pairs]
+        heights = np.asarray(heights, dtype=float)
+        heights = heights[np.isfinite(heights)]
+        return float(np.min(heights)) if heights.size else float("nan")
+
+    def _com_vertical_acceleration(self, state: np.ndarray) -> float:
+        """Return the model centre-of-mass vertical acceleration (m/s^2) for one state."""
+
+        q = self._build_biorbd_state_vector("GeneralizedCoordinates", state[: self.nq])
+        qdot = self._build_biorbd_state_vector("GeneralizedVelocity", state[self.nq : 2 * self.nq])
+        qddot = self._build_biorbd_state_vector("GeneralizedAcceleration", state[2 * self.nq : 3 * self.nq])
+        return float(self._biorbd_to_numpy(self.model.CoMddot(q, qdot, qddot))[2])
+
+    def _is_airborne_from_previous_state(self, state: np.ndarray, frame_idx: int) -> bool:
+        """Flight criterion based on the previous corrected EKF state (``flight_detection='ekf_state'``).
+
+        Unlike :meth:`_is_airborne_from_previous_frame`, it does not need
+        triangulated 3D points, so it also works with
+        ``ekf2d_3d_source='first_frame_only'``. The lowest model marker height
+        of ``state`` (corrected estimate at ``frame_idx - 1``) must exceed
+        ``flight_height_threshold_m`` for ``flight_min_consecutive_frames``
+        consecutive frames to enter the flight phase; the phase is left when
+        it drops below ``flight_height_threshold_m - flight_hysteresis_m``.
+        When ``flight_com_accel_tolerance`` is set, entering the phase also
+        requires a ballistic centre-of-mass acceleration
+        ``|CoMddot_z - g_z| <= tolerance``.
+        """
+
+        if frame_idx <= 0:
+            self._state_flight_active = False
+            self._state_flight_candidate_frames = 0
+            return False
+        height = self._lowest_model_marker_height(state[: self.nq])
+        if not np.isfinite(height):
+            self._state_flight_active = False
+            self._state_flight_candidate_frames = 0
+            return False
+        if self._state_flight_active:
+            if height < self.flight_height_threshold_m - self.flight_hysteresis_m:
+                self._state_flight_active = False
+                self._state_flight_candidate_frames = 0
+            return self._state_flight_active
+        entering = height > self.flight_height_threshold_m
+        if entering and self.flight_com_accel_tolerance is not None:
+            gravity_z = float(self._biorbd_to_numpy(self.model.getGravity())[2])
+            com_accel_z = self._com_vertical_acceleration(state)
+            entering = bool(
+                np.isfinite(com_accel_z) and abs(com_accel_z - gravity_z) <= self.flight_com_accel_tolerance
+            )
+        self._state_flight_candidate_frames = self._state_flight_candidate_frames + 1 if entering else 0
+        if self._state_flight_candidate_frames >= self.flight_min_consecutive_frames:
+            self._state_flight_active = True
+        return self._state_flight_active
+
+    def _flight_dynamics_active(self, state: np.ndarray, frame_idx: int) -> bool:
+        """Return whether the ``dyn`` root predictor is active for the prediction of ``frame_idx``."""
+
+        if self.flight_detection == "ekf_state":
+            return self._is_airborne_from_previous_state(state, frame_idx)
+        return self._is_airborne_from_previous_frame(frame_idx)
+
     def _build_biorbd_state_vector(self, vector_type: str, values: np.ndarray):
         """Construit un vecteur d'etat `biorbd` a partir d'un tableau numpy.
 
@@ -4129,7 +4934,13 @@ class MultiViewKinematicEKF:
         F = self.transition_matrix()
         predicted_state = F @ state
         predicted_covariance = F @ covariance @ F.T + self.process_noise
-        if self.root_flight_dynamics and self._is_airborne_from_previous_frame(frame_idx):
+        # NOTE (known limitation, not corrected): in ``dyn``/``history3`` modes the state mean is
+        # re-predicted below, but the covariance is still propagated with the constant-acceleration
+        # ``F`` above, so ``P`` is not consistent with the non-linear mean prediction.
+        flight_active = bool(self.root_flight_dynamics and self._flight_dynamics_active(state, frame_idx))
+        if self.root_flight_dynamics:
+            self.flight_active_history.append(flight_active)
+        if flight_active:
             q_prev = state[: self.nq]
             qdot_prev = state[self.nq : 2 * self.nq]
             qddot_joint = predicted_state[2 * self.nq + self.n_root : 3 * self.nq]
@@ -4177,6 +4988,60 @@ class MultiViewKinematicEKF:
                 covariance[full_idx, :] = 0.0
                 covariance[:, full_idx] = 0.0
                 covariance[full_idx, full_idx] = 1e-9
+
+    def _apply_robust_mixture_lock_guard(
+        self,
+        measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+        mixture_blocks: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+    ) -> None:
+        """Restore nominal variances where the mixture contradicts the multi-view evidence.
+
+        Frame level (hysteresis, :func:`robust_mixture_lock_decision`): all keypoints of the frame.
+        Keypoint level (:func:`robust_mixture_keypoint_guard`): a keypoint rejected in more than
+        ``lock_fraction`` of the views that see it. ``mixture_blocks`` holds, per camera block,
+        ``(index in measurement_blocks, nominal variances, weights, keypoint indices)``.
+        """
+
+        weights = np.concatenate([block[2] for block in mixture_blocks])
+        keypoints = np.concatenate([block[3] for block in mixture_blocks])
+        was_suspended = self.robust_mixture_suspended
+        suspended, _fraction = robust_mixture_lock_decision(
+            weights,
+            was_suspended,
+            lock_fraction=self.robust_mixture_lock_fraction,
+            resume_fraction=self.robust_mixture_resume_fraction,
+        )
+        self.robust_mixture_suspended = suspended
+        if suspended:
+            restore = np.ones(weights.size, dtype=bool)
+        else:
+            restore = robust_mixture_keypoint_guard(weights, keypoints, self.robust_mixture_lock_fraction)
+        down = weights < 0.5
+        stats = self.robust_mixture_stats
+        stats["keypoints"] += int(weights.size)
+        stats["weight_sum"] += float(np.sum(weights))
+        stats["downweighted_below_0_5"] += int(np.count_nonzero(down))
+        stats["applied_downweighted_below_0_5"] += int(np.count_nonzero(down & ~restore))
+        stats["frames"] += 1
+        if suspended:
+            stats["suspended_frames"] += 1
+            stats["suspended_keypoints"] += int(weights.size)
+            if not was_suspended:
+                stats["lock_events"] += 1
+        else:
+            stats["keypoint_guard_restored"] += int(np.count_nonzero(down & restore))
+        if not np.any(restore):
+            return
+        start = 0
+        for block_idx, nominal_variances, block_weights, _block_keypoints in mixture_blocks:
+            rows = restore[start : start + block_weights.size]
+            start += block_weights.size
+            if not np.any(rows):
+                continue
+            z_block, h_block, H_block, inflated = measurement_blocks[block_idx]
+            variances = np.array(inflated, dtype=float, copy=True).reshape(-1, 2)
+            variances[rows] = np.asarray(nominal_variances, dtype=float).reshape(-1, 2)[rows]
+            measurement_blocks[block_idx] = (z_block, h_block, H_block, variances.reshape(-1))
 
     def update(
         self, predicted_state: np.ndarray, predicted_covariance: np.ndarray, frame_idx: int
@@ -4229,6 +5094,8 @@ class MultiViewKinematicEKF:
         finite_marker_points = np.all(np.isfinite(marker_points_array), axis=1)
 
         measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        # (index in measurement_blocks, nominal variances, mixture weights) of each mixture-weighted block.
+        mixture_blocks: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
         locked_indices = tuple(self.locked_q_indices)
         locked_q_columns = np.asarray(locked_indices, dtype=int) if locked_indices else np.empty(0, dtype=int)
         t_assembly = time.perf_counter()
@@ -4306,14 +5173,31 @@ class MultiViewKinematicEKF:
                 selected_variances = frame_variances[keypoint_indices]
             if not np.any(selected_mask):
                 continue
+            block_variances = np.repeat(selected_variances[selected_mask], 2).astype(float, copy=False)
+            if self.robust_mixture:
+                image_width, image_height = (float(value) for value in calibration.image_size)
+                inflated, weights = robust_mixture_measurement_variances(
+                    selected_points[selected_mask] - projected_uv[selected_mask],
+                    H_q_blocks[selected_mask],
+                    predicted_covariance[: self.nq, : self.nq],
+                    selected_variances[selected_mask],
+                    outlier_prob=self.robust_mixture_outlier_prob,
+                    image_area_px2=image_width * image_height,
+                )
+                mixture_blocks.append(
+                    (len(measurement_blocks), block_variances, weights, keypoint_indices[selected_mask])
+                )
+                block_variances = inflated.reshape(-1)
             measurement_blocks.append(
                 (
                     selected_points[selected_mask].reshape(-1),
                     projected_uv[selected_mask].reshape(-1),
                     H_q_blocks[selected_mask].reshape(-1, self.nq),
-                    np.repeat(selected_variances[selected_mask], 2).astype(float, copy=False),
+                    block_variances,
                 )
             )
+        if mixture_blocks:
+            self._apply_robust_mixture_lock_guard(measurement_blocks, mixture_blocks)
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
         pseudo_block = self._upper_back_pseudo_measurement_block(q)
@@ -4323,7 +5207,11 @@ class MultiViewKinematicEKF:
             marker_points_array=marker_points_array,
             marker_jacobians_array=marker_jacobians_array,
         )
-        has_pseudo_priors = pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks)
+        axial_prior_blocks = self._joint_axial_prior_blocks(q) if self.joint_prior else []
+        has_pseudo_priors = (
+            pseudo_block is not None or bool(zero_prior_blocks) or bool(ankle_bed_blocks) or bool(axial_prior_blocks)
+        )
+        measurement_blocks.extend(axial_prior_blocks)
         if pseudo_block is not None:
             measurement_blocks.append(pseudo_block)
         measurement_blocks.extend(zero_prior_blocks)
@@ -4335,8 +5223,29 @@ class MultiViewKinematicEKF:
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
 
         t_solve = time.perf_counter()
-        stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq) if has_pseudo_priors else None
         update_result = None
+        if self.update_method == "woodbury":
+            stacked_measurements = stack_measurement_blocks(measurement_blocks, self.nq)
+            if stacked_measurements is not None:
+                z_batch, h_batch, hq_batch, r_batch = stacked_measurements
+                update_result = apply_measurement_update_woodbury(
+                    predicted_state=predicted_state,
+                    predicted_covariance=predicted_covariance,
+                    z=z_batch,
+                    h=h_batch,
+                    H_q=hq_batch,
+                    R_diag_array=r_batch,
+                    nq=self.nq,
+                )
+            if update_result is not None:
+                self.solver_counts["woodbury"] += 1
+            else:
+                self.solver_counts["woodbury_fallback_legacy"] += 1
+        stacked_measurements = (
+            stack_measurement_blocks(measurement_blocks, self.nq)
+            if (update_result is None and has_pseudo_priors)
+            else None
+        )
         if stacked_measurements is not None:
             z_batch, h_batch, hq_batch, r_batch = stacked_measurements
             update_result = apply_measurement_update_batch(
@@ -4363,6 +5272,8 @@ class MultiViewKinematicEKF:
             self.profiling["update_s"] += time.perf_counter() - t_update
             return predicted_state, predicted_covariance, "pred_only_no_measurement"
         updated_state, updated_covariance = update_result
+        if self.joint_prior:
+            updated_state, updated_covariance = self._apply_joint_limit_constraints(updated_state, updated_covariance)
         self.profiling["solve_s"] += time.perf_counter() - t_solve
         self._apply_lock_constraints(updated_state, updated_covariance)
         self.update_status["corrected"] += 1
@@ -4731,6 +5642,15 @@ def initial_state_from_ekf_bootstrap(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -4786,6 +5706,15 @@ def initial_state_from_ekf_bootstrap(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -4819,6 +5748,8 @@ def initial_state_from_ekf_bootstrap(
             break
 
     diagnostics["final_q_norm"] = float(np.linalg.norm(state[: ekf.nq]))
+    if getattr(ekf, "robust_mixture", False):
+        diagnostics["robust_mixture_stats"] = dict(ekf.robust_mixture_stats)
     return state, diagnostics
 
 
@@ -4845,6 +5776,15 @@ def initial_state_from_root_pose_bootstrap(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -4884,6 +5824,15 @@ def initial_state_from_root_pose_bootstrap(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -4911,6 +5860,15 @@ def initial_state_from_root_pose_bootstrap(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -4944,6 +5902,15 @@ def compute_ekf2d_initial_state(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -4983,6 +5950,15 @@ def compute_ekf2d_initial_state(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5008,6 +5984,15 @@ def compute_ekf2d_initial_state(
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+            update_method=update_method,
+            process_noise_model=process_noise_model,
+            process_noise_jerk_psd=process_noise_jerk_psd,
+            joint_prior=joint_prior,
+            joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+            robust_mixture=robust_mixture,
+            robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5044,6 +6029,18 @@ def run_ekf(
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+    flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+    flight_com_accel_tolerance: float | None = None,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: Iterable[float] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5084,6 +6081,18 @@ def run_ekf(
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
+        flight_detection=flight_detection,
+        flight_hysteresis_m=flight_hysteresis_m,
+        flight_com_accel_tolerance=flight_com_accel_tolerance,
     )
     state = (
         np.array(initial_state, copy=True)
@@ -5123,6 +6132,15 @@ def run_ekf(
         update_status_per_frame.append(update_status)
     timings["loop_s"] = time.perf_counter() - t_loop
     timings.update({key: float(value) for key, value in ekf.profiling.items()})
+    if ekf.joint_prior:
+        # Export in the canonical elbow/knee branch (exact marker symmetry, root untouched).
+        q_canonical, qdot_canonical, qddot_canonical = canonicalize_joint_mirror_branches(
+            ekf.q_names,
+            states[:, : ekf.nq],
+            states[:, ekf.nq : 2 * ekf.nq],
+            states[:, 2 * ekf.nq :],
+        )
+        states = np.concatenate((q_canonical, qdot_canonical, qddot_canonical), axis=1)
     effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q = (
         unwrap_root_rotations(states[:, : ekf.nq], ekf.q_names, mode=effective_root_unwrap_mode)
@@ -5137,6 +6155,14 @@ def run_ekf(
             "q_names": np.asarray(ekf.q_names, dtype=object),
             "update_status_per_frame": np.asarray(update_status_per_frame, dtype=object),
             "update_status_counts": dict(ekf.update_status),
+            "update_method": str(ekf.update_method),
+            "update_solver_counts": dict(ekf.solver_counts),
+            "flight_detection": str(ekf.flight_detection),
+            "joint_prior_counts": dict(ekf.joint_prior_counts) if ekf.joint_prior else None,
+            "robust_mixture_stats": dict(ekf.robust_mixture_stats) if ekf.robust_mixture else None,
+            "dyn_active_per_frame": (
+                np.asarray(ekf.flight_active_history, dtype=bool) if root_flight_dynamics else None
+            ),
             "flip_diagnostics": (
                 {
                     "method": str(flip_method),
@@ -6285,6 +7311,11 @@ def parse_args() -> argparse.Namespace:
         "--compare-biorbd-kalman", action="store_true", help="Lance aussi le Kalman marqueurs classique de biorbd."
     )
     parser.add_argument("--animate", action="store_true", help="Exporte/lance une animation pyorerun si disponible.")
+    parser.add_argument(
+        "--undistort-keypoints",
+        action="store_true",
+        help="Dedistord les keypoints 2D au chargement avec les coefficients de Calib.toml (defaut: desactive).",
+    )
     return parser.parse_args()
 
 
@@ -6299,6 +7330,8 @@ def main() -> None:
     selected_camera_names = parse_camera_names(args.camera_names)
     if selected_camera_names:
         calibrations = subset_calibrations(calibrations, selected_camera_names)
+    if args.undistort_keypoints:
+        calibrations = calibrations_with_undistorted_keypoints(calibrations)
     pose_data = load_pose_data(
         args.keypoints,
         calibrations,
@@ -6310,6 +7343,7 @@ def main() -> None:
         outlier_threshold_ratio=args.pose_outlier_threshold_ratio,
         lower_percentile=args.pose_amplitude_lower_percentile,
         upper_percentile=args.pose_amplitude_upper_percentile,
+        undistort_keypoints=args.undistort_keypoints,
     )
     if args.pose_correction_mode != "none":
         if args.pose_correction_mode == "flip_epipolar":
