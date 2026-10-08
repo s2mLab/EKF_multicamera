@@ -11,10 +11,15 @@ import pipeline_gui
 class _FakeAxis:
     def __init__(self):
         self.plots = []
+        self.scatters = []
         self.ylabel = None
 
     def plot(self, *args, **kwargs):
         self.plots.append({"args": args, "kwargs": kwargs})
+        return None
+
+    def scatter(self, *args, **kwargs):
+        self.scatters.append({"args": args, "kwargs": kwargs})
         return None
 
     def set_title(self, *_args, **_kwargs):
@@ -236,3 +241,131 @@ def test_joint_kinematics_rotation_unit_popup_converts_rotational_dofs(monkeypat
     np.testing.assert_allclose(axis.plots[0]["args"][1], expected_left)
     np.testing.assert_allclose(axis.plots[1]["args"][1], expected_right)
     assert axis.ylabel == "deg"
+
+
+def test_pair_dof_names_includes_upper_back_singletons():
+    q_names = np.asarray(
+        [
+            "LEFT_KNEE:RotY",
+            "RIGHT_KNEE:RotY",
+            "UPPER_BACK:RotX",
+            "UPPER_BACK:RotY",
+            "UPPER_BACK:RotZ",
+            "LOWER_TRUNK:RotY",
+        ],
+        dtype=object,
+    )
+
+    pairs = pipeline_gui.pair_dof_names(q_names)
+
+    assert ("KNEE:RotY", "LEFT_KNEE:RotY", "RIGHT_KNEE:RotY") in pairs
+    assert ("UPPER_BACK:RotX", "UPPER_BACK:RotX", None) in pairs
+    assert ("UPPER_BACK:RotY", "UPPER_BACK:RotY", None) in pairs
+    assert ("UPPER_BACK:RotZ", "UPPER_BACK:RotZ", None) in pairs
+    assert ("LOWER_TRUNK:RotY", "LOWER_TRUNK:RotY", None) in pairs
+
+
+def test_upper_back_target_series_uses_hips_for_roty_and_zero_for_other_axes():
+    series = np.array(
+        [
+            [0.0, 1.0, 0.5, -0.2, 0.3],
+            [0.0, 0.5, 1.5, 0.1, -0.1],
+        ],
+        dtype=float,
+    )
+    name_to_index = {
+        "UPPER_BACK:RotY": 0,
+        "LEFT_THIGH:RotY": 1,
+        "RIGHT_THIGH:RotY": 2,
+        "UPPER_BACK:RotX": 3,
+        "UPPER_BACK:RotZ": 4,
+    }
+    roty_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotY")
+    rotx_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotX")
+    rotz_target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "UPPER_BACK:RotZ")
+
+    np.testing.assert_allclose(roty_target, np.array([0.15, 0.2], dtype=float))
+    np.testing.assert_allclose(rotx_target, np.zeros(2))
+    np.testing.assert_allclose(rotz_target, np.zeros(2))
+
+
+def test_upper_back_target_series_supports_lower_trunk_variant():
+    series = np.array([[1.0, 0.5], [0.2, 0.4]], dtype=float)
+    name_to_index = {
+        "LEFT_THIGH:RotY": 0,
+        "RIGHT_THIGH:RotY": 1,
+    }
+    target = pipeline_gui.JointKinematicsTab._upper_back_target_series(series, name_to_index, "LOWER_TRUNK:RotY")
+
+    np.testing.assert_allclose(target, np.array([0.15, 0.06], dtype=float))
+
+
+def test_draw_upper_back_preview_draws_back_triangles():
+    axis = _FakeAxis()
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 0.3, 1.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -0.3, 1.0])
+    segment_frames = [
+        ("TRUNK", np.array([0.0, 0.0, 0.0]), np.eye(3)),
+        ("UPPER_BACK", np.array([0.0, 0.0, 0.5]), np.eye(3)),
+    ]
+
+    pipeline_gui.draw_upper_back_preview(axis, frame_points, segment_frames)
+
+    assert len(axis.plots) >= 2
+    assert len(axis.scatters) == 1
+
+
+def test_draw_upper_back_preview_without_segment_frames_uses_mid_back_point():
+    axis = _FakeAxis()
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -0.2, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 0.3, 1.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -0.3, 1.0])
+
+    pipeline_gui.draw_upper_back_preview(axis, frame_points)
+
+    assert len(axis.plots) >= 2
+    assert len(axis.scatters) == 1
+
+
+def test_segmented_back_frame_geometry_returns_mid_back_and_triangles():
+    frame_points = np.full((len(pipeline_gui.COCO17), 3), np.nan, dtype=float)
+    frame_points[pipeline_gui.KP_INDEX["left_hip"]] = np.array([0.0, 1.0, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["right_hip"]] = np.array([0.0, -1.0, 0.0])
+    frame_points[pipeline_gui.KP_INDEX["left_shoulder"]] = np.array([0.0, 1.5, 2.0])
+    frame_points[pipeline_gui.KP_INDEX["right_shoulder"]] = np.array([0.0, -1.5, 2.0])
+    segment_frames = [("UPPER_BACK", np.array([0.3, 0.0, 1.0]), np.eye(3))]
+
+    geometry = pipeline_gui.segmented_back_frame_geometry(frame_points, segment_frames)
+
+    assert geometry is not None
+    mid_back, hip_triangle, shoulder_triangle = geometry
+    np.testing.assert_allclose(mid_back, np.array([0.3, 0.0, 1.0]))
+    np.testing.assert_allclose(hip_triangle[2], mid_back)
+    np.testing.assert_allclose(shoulder_triangle[2], mid_back)
+
+
+def test_draw_upper_back_overlay_2d_draws_two_triangles_and_mid_back():
+    axis = _FakeAxis()
+
+    pipeline_gui.draw_upper_back_overlay_2d(
+        axis,
+        hip_triangle_2d=np.array([[10.0, 20.0], [20.0, 20.0], [15.0, 15.0], [10.0, 20.0]], dtype=float),
+        shoulder_triangle_2d=np.array([[11.0, 10.0], [19.0, 10.0], [15.0, 15.0], [11.0, 10.0]], dtype=float),
+        mid_back_2d=np.array([15.0, 15.0], dtype=float),
+        color="#123456",
+    )
+
+    assert len(axis.plots) == 2
+    assert len(axis.scatters) == 1
+
+
+def test_has_segmented_back_visualization_detects_segment_frames_and_q_names():
+    assert pipeline_gui.has_segmented_back_visualization(segment_frames=[("UPPER_BACK", np.zeros(3), np.eye(3))])
+    assert pipeline_gui.has_segmented_back_visualization(q_names=["UPPER_BACK:RotY"])
+    assert pipeline_gui.has_segmented_back_visualization(summary={"model_variant": "upper_root_back_3dof"})
+    assert not pipeline_gui.has_segmented_back_visualization(q_names=["TRUNK:RotY"])

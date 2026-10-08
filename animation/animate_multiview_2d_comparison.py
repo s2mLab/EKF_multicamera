@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
-import math
 import os
 import sys
 import tempfile
@@ -26,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
@@ -50,7 +49,15 @@ from animation.animate_dual_stick_comparison import (
     resample_points,
 )
 from camera_tools.camera_selection import parse_camera_names, subset_calibrations, subset_pose_data
-from judging.execution import infer_execution_images_root, resolve_execution_image_path
+from judging.execution import infer_execution_images_root
+from preview.two_d_view import (
+    apply_2d_axis_limits,
+    camera_layout,
+    compute_pose_crop_limits_2d,
+    draw_2d_background_image,
+    hide_2d_axes,
+    load_camera_background_image,
+)
 from reconstruction.reconstruction_dataset import (
     dataset_source_paths,
     reconstruction_color,
@@ -75,6 +82,8 @@ LEFT_RIGHT_SWAP_PAIRS = [
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the multi-view 2D comparison animation."""
+
     parser = argparse.ArgumentParser(description="Animation 2D multi-vues des donnees brutes et des reprojections 3D.")
     parser.add_argument(
         "--dataset-dir", type=Path, default=None, help="Dossier dataset contenant les bundles de reconstruction."
@@ -122,6 +131,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_triangulation(npz_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load triangulated 3D points and their frame indices from one NPZ file."""
+
     data = np.load(npz_path, allow_pickle=True)
     points = np.asarray(data["points_3d"], dtype=float)
     frames = np.asarray(data["frames"], dtype=int) if "frames" in data else np.arange(points.shape[0], dtype=int)
@@ -154,6 +165,8 @@ def compute_airborne_mask(points_3d: np.ndarray, threshold_m: float, min_consecu
 def load_q_reconstructions(
     ekf_states_path: Path, kalman_comparison_path: Path
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Load the q-trajectories used as animation layers in the 2D export."""
+
     ekf = np.load(ekf_states_path, allow_pickle=True)
     comparison = np.load(kalman_comparison_path, allow_pickle=True)
     q_ekf_3d = comparison["q_ekf_3d"] if "q_ekf_3d" in comparison else comparison["q_biorbd_kalman"]
@@ -183,6 +196,8 @@ def project_points(points_3d: np.ndarray, calibrations: dict, camera_names: list
 def subsample_all(
     arrays: list[np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
 ) -> list[np.ndarray]:
+    """Apply the same temporal subsampling to a list of frame-indexed arrays."""
+
     out = []
     for array in arrays:
         if array is None:
@@ -203,19 +218,17 @@ def subsample_all(
 def subsample_layer_dict(
     layers: dict[str, np.ndarray], stride: int, max_frames: int | None, frame_axis: int = 1
 ) -> dict[str, np.ndarray]:
+    """Subsample one reconstruction-layer mapping along its frame axis."""
+
     keys = list(layers.keys())
     values = [layers[key] for key in keys]
     subsampled = subsample_all(values, stride=stride, max_frames=max_frames, frame_axis=frame_axis)
     return {key: value for key, value in zip(keys, subsampled)}
 
 
-def camera_layout(n_cameras: int) -> tuple[int, int]:
-    ncols = math.ceil(math.sqrt(n_cameras))
-    nrows = math.ceil(n_cameras / ncols)
-    return nrows, ncols
-
-
 def layer_style(name: str, marker_size: float) -> dict[str, object]:
+    """Return the display style associated with one animation layer."""
+
     if name == "raw":
         return {
             "color": "black",
@@ -235,7 +248,18 @@ def layer_style(name: str, marker_size: float) -> dict[str, object]:
     }
 
 
+def adapt_raw_style_for_background(style: dict[str, object], has_image_background: bool) -> dict[str, object]:
+    """Switch raw 2D to white when an image is visible underneath."""
+
+    adapted = dict(style)
+    if has_image_background and adapted.get("label") == "Raw 2D":
+        adapted["color"] = "white"
+    return adapted
+
+
 def grouped_points_2d(points: np.ndarray) -> dict[str, np.ndarray]:
+    """Split one COCO17 point cloud into left, right, and center subsets."""
+
     groups = {
         "left": [KP_INDEX[name] for name in COCO17 if name in LEFT_KEYPOINTS],
         "right": [KP_INDEX[name] for name in COCO17 if name in RIGHT_KEYPOINTS],
@@ -250,57 +274,16 @@ def grouped_points_2d(points: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def edge_linewidth(name_a: str, name_b: str, base: float) -> float:
+    """Return a thicker linewidth for lower-limb edges in 2D overlays."""
+
     return base * 3.0 if (name_a, name_b) in LOWER_LIMB_EDGES else base
 
 
 def scatter_markers(name: str) -> dict[str, str]:
+    """Return the marker shapes used for each body side for one layer."""
+
     center = "x" if name == "raw" else "o"
     return {"center": center, "left": "^", "right": "s"}
-
-
-def compute_pose_crop_limits(
-    raw_2d: np.ndarray, calibrations: dict, camera_names: list[str], margin: float
-) -> dict[str, np.ndarray]:
-    """Calcule des bornes de crop par frame et par camera a partir des keypoints 2D."""
-    limits: dict[str, np.ndarray] = {}
-    for cam_idx, cam_name in enumerate(camera_names):
-        width, height = calibrations[cam_name].image_size
-        n_frames = raw_2d.shape[1]
-        camera_limits = np.full((n_frames, 4), np.nan, dtype=float)
-        for frame_idx in range(n_frames):
-            points = raw_2d[cam_idx, frame_idx]
-            valid = np.all(np.isfinite(points), axis=1)
-            if not np.any(valid):
-                continue
-            xy = points[valid]
-            xmin, ymin = np.min(xy, axis=0)
-            xmax, ymax = np.max(xy, axis=0)
-            dx = max(10.0, float(xmax - xmin) * margin)
-            dy = max(10.0, float(ymax - ymin) * margin)
-            camera_limits[frame_idx] = np.array(
-                [
-                    max(0.0, float(xmin - dx)),
-                    min(float(width), float(xmax + dx)),
-                    min(float(height), float(ymax + dy)),
-                    max(0.0, float(ymin - dy)),
-                ],
-                dtype=float,
-            )
-        valid_frames = np.flatnonzero(np.all(np.isfinite(camera_limits), axis=1))
-        if valid_frames.size == 0:
-            camera_limits[:] = np.array([0.0, float(width), float(height), 0.0], dtype=float)
-        else:
-            first_valid = int(valid_frames[0])
-            last_valid = int(valid_frames[-1])
-            for frame_idx in range(0, first_valid):
-                camera_limits[frame_idx] = camera_limits[first_valid]
-            for frame_idx in range(first_valid + 1, n_frames):
-                if not np.all(np.isfinite(camera_limits[frame_idx])):
-                    camera_limits[frame_idx] = camera_limits[frame_idx - 1]
-            for frame_idx in range(last_valid + 1, n_frames):
-                camera_limits[frame_idx] = camera_limits[last_valid]
-        limits[cam_name] = camera_limits
-    return limits
 
 
 def compose_crop_reference_points(
@@ -321,27 +304,6 @@ def compose_crop_reference_points(
     if len(stacked) == 1:
         return stacked[0]
     return np.concatenate(stacked, axis=2)
-
-
-def apply_2d_axis_limits(
-    ax,
-    *,
-    crop_mode: str,
-    crop_limits: dict[str, np.ndarray],
-    cam_name: str,
-    frame_idx: int,
-    width: float,
-    height: float,
-) -> None:
-    """Applique un cadrage 2D fixe et empeche l'autoscale de l'annuler."""
-    if crop_mode == "pose":
-        x0, x1, y1, y0 = crop_limits[cam_name][frame_idx]
-        ax.set_xlim(x0, x1)
-        ax.set_ylim(y1, y0)
-    else:
-        ax.set_xlim(0, width)
-        ax.set_ylim(height, 0)
-    ax.set_autoscale_on(False)
 
 
 def swap_left_right_keypoints(points_2d: np.ndarray) -> np.ndarray:
@@ -457,7 +419,7 @@ def create_animation(
     n_cameras = len(camera_names)
     n_frames = raw_2d.shape[1]
     nrows, ncols = camera_layout(n_cameras)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.9 * ncols, 4.8 * nrows))
     axes = np.atleast_1d(axes).ravel()
 
     display_names = ([] if "raw" not in show else ["raw"]) + [
@@ -471,7 +433,7 @@ def create_animation(
     line_artists: dict[str, list[list]] = {key: [] for key in display_names}
     title = fig.suptitle("", fontsize=14)
     crop_limits = (
-        compute_pose_crop_limits(crop_reference_points, calibrations, camera_names, crop_margin)
+        compute_pose_crop_limits_2d(crop_reference_points, calibrations, camera_names, crop_margin)
         if crop_mode == "pose"
         else {}
     )
@@ -491,9 +453,10 @@ def create_animation(
             width=width,
             height=height,
         )
-        ax.set_aspect("equal")
+        ax.set_aspect("equal", adjustable="box")
         ax.set_title(cam_name)
         ax.grid(alpha=0.15)
+        ax.tick_params(labelsize=8)
         image_artists.append(ax.imshow(np.zeros((2, 2, 3), dtype=np.uint8), visible=False, zorder=0))
         for key in display_names:
             style = styles[key]
@@ -535,8 +498,8 @@ def create_animation(
     fig.legend(
         legend_handles,
         [styles[key]["label"] for key in display_names if artists[key] and artists[key][0] is not None],
-        loc="lower right",
-        bbox_to_anchor=(0.995, 0.02),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
         ncol=1,
         frameon=True,
     )
@@ -559,11 +522,18 @@ def create_animation(
         suspect_labels = []
         for cam_idx in range(n_cameras):
             label = camera_names[cam_idx]
+            has_image_background = False
             if show_images:
-                image_path = resolve_execution_image_path(images_root, label, int(frame_numbers[frame_idx]))
-                if image_path is not None and image_path.exists():
-                    image_artists[cam_idx].set_data(plt.imread(str(image_path)))
+                background_image = load_camera_background_image(
+                    images_root,
+                    label,
+                    int(frame_numbers[frame_idx]),
+                    image_reader=plt.imread,
+                )
+                if background_image is not None:
+                    image_artists[cam_idx].set_data(background_image)
                     image_artists[cam_idx].set_visible(True)
+                    has_image_background = True
                 else:
                     image_artists[cam_idx].set_visible(False)
             else:
@@ -584,6 +554,11 @@ def create_animation(
                 height=height,
             )
             if "raw" in artists:
+                raw_color = "white" if has_image_background else "black"
+                for scatter in artists["raw"][cam_idx].values():
+                    scatter.set_color(raw_color)
+                for line in line_artists["raw"][cam_idx]:
+                    line.set_color(raw_color)
                 set_offsets(artists["raw"][cam_idx], raw_2d[cam_idx, frame_idx])
                 set_lines(line_artists["raw"][cam_idx], raw_2d[cam_idx, frame_idx])
             for name in display_names:
@@ -677,10 +652,10 @@ def render_frame(
     """Rend une frame PNG de l'animation 2D."""
     n_cameras = len(camera_names)
     nrows, ncols = camera_layout(n_cameras)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5.2 * ncols, 4.0 * nrows))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5.9 * ncols, 4.8 * nrows))
     axes = np.atleast_1d(axes).ravel()
     crop_limits = (
-        compute_pose_crop_limits(
+        compute_pose_crop_limits_2d(
             compose_crop_reference_points(raw_2d, layer_2d, show), calibrations, camera_names, crop_margin
         )
         if crop_mode == "pose"
@@ -689,18 +664,23 @@ def render_frame(
     display_names = ([] if "raw" not in show else ["raw"]) + [
         name for name in show if name != "raw" and name in layer_2d
     ]
-    styles = {name: layer_style(name, marker_size) for name in display_names}
-
     for ax_idx, ax in enumerate(axes):
         if ax_idx >= n_cameras:
             ax.axis("off")
             continue
         cam_name = camera_names[ax_idx]
         width, height = calibrations[cam_name].image_size
+        has_image_background = False
         if show_images:
-            image_path = resolve_execution_image_path(images_root, cam_name, int(frame_numbers[frame_idx]))
-            if image_path is not None and image_path.exists():
-                ax.imshow(plt.imread(str(image_path)))
+            background_image = load_camera_background_image(
+                images_root,
+                cam_name,
+                int(frame_numbers[frame_idx]),
+                image_reader=plt.imread,
+            )
+            if background_image is not None:
+                draw_2d_background_image(ax, background_image, width, height)
+                has_image_background = True
         apply_2d_axis_limits(
             ax,
             crop_mode=crop_mode,
@@ -710,38 +690,43 @@ def render_frame(
             width=width,
             height=height,
         )
-        ax.set_aspect("equal")
+        ax.set_aspect("equal", adjustable="box")
         if confusion_mask is not None and confusion_mask[ax_idx, frame_idx]:
             ax.set_title(f"{cam_name} | face/dos ?", color="#c44e52")
         else:
             ax.set_title(cam_name)
-        ax.grid(alpha=0.15)
+        hide_2d_axes(ax)
+        ax.tick_params(labelsize=8, length=0)
 
-        if "raw" in styles:
-            draw_points_and_lines(ax, raw_2d[ax_idx, frame_idx], styles["raw"])
+        if "raw" in display_names:
+            draw_points_and_lines(
+                ax,
+                raw_2d[ax_idx, frame_idx],
+                adapt_raw_style_for_background(layer_style("raw", marker_size), has_image_background),
+            )
         for name in display_names:
             if name == "raw":
                 continue
-            draw_points_and_lines(ax, layer_2d[name][ax_idx, frame_idx], styles[name])
+            draw_points_and_lines(ax, layer_2d[name][ax_idx, frame_idx], layer_style(name, marker_size))
 
     handles = [
         plt.Line2D(
             [],
             [],
-            color=styles[key]["color"],
+            color=adapt_raw_style_for_background(layer_style(key, marker_size), False)["color"],
             marker=scatter_markers(key)["center"],
-            linestyle=styles[key]["linestyle"],
-            linewidth=styles[key]["linewidth"],
-            alpha=styles[key]["alpha"],
-            label=styles[key]["label"],
+            linestyle=layer_style(key, marker_size)["linestyle"],
+            linewidth=layer_style(key, marker_size)["linewidth"],
+            alpha=layer_style(key, marker_size)["alpha"],
+            label=layer_style(key, marker_size)["label"],
         )
         for key in display_names
     ]
     fig.legend(
         handles,
-        [styles[key]["label"] for key in display_names],
-        loc="lower right",
-        bbox_to_anchor=(0.995, 0.02),
+        [layer_style(key, marker_size)["label"] for key in display_names],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.985),
         ncol=1,
         frameon=True,
     )
@@ -751,7 +736,7 @@ def render_frame(
     ]
     warning = "" if not suspect_labels else f" | swap suspect: {', '.join(suspect_labels)}"
     fig.suptitle(f"Frame {int(frame_numbers[frame_idx])} | {phase}{warning}", fontsize=14)
-    fig.tight_layout()
+    fig.subplots_adjust(left=0.035, right=0.995, bottom=0.035, top=0.92, wspace=0.08, hspace=0.18)
     fig.savefig(output_path, dpi=140, bbox_inches="tight")
     plt.close(fig)
     return output_path
@@ -840,6 +825,8 @@ def create_animation_parallel(
 
 
 def main() -> None:
+    """Render and export the multi-view 2D comparison animation."""
+
     args = parse_args()
     if args.dataset_dir is not None:
         sources = dataset_source_paths(

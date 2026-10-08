@@ -3,6 +3,7 @@ import numpy as np
 from judging.dd_analysis import DDSessionAnalysis, JumpSegment
 from judging.execution import (
     analyze_execution_session,
+    available_execution_image_frames,
     build_execution_overlay_frame,
     compute_time_of_flight_robust,
     detect_contacts_velocity,
@@ -162,12 +163,38 @@ def test_resolve_execution_image_path_matches_camera_folder_and_frame(tmp_path):
     images_root = tmp_path / "images"
     camera_dir = images_root / "camA"
     camera_dir.mkdir(parents=True)
-    image_path = camera_dir / "frame_000123.png"
+    image_path = camera_dir / "frame_000123.jpeg"
     image_path.write_bytes(b"fake")
 
     resolved = resolve_execution_image_path(images_root, "camA", 123)
 
     assert resolved == image_path
+
+
+def test_resolve_execution_image_path_matches_flat_camera_prefixed_frame_pattern(tmp_path):
+    images_root = tmp_path / "images"
+    images_root.mkdir(parents=True)
+    wrong_image = images_root / "Camera1_M11139_frame_001623.png"
+    wrong_image.write_bytes(b"fake")
+    image_path = images_root / "Camera1_M11139_frame_000123.JPG"
+    image_path.write_bytes(b"fake")
+
+    resolved = resolve_execution_image_path(images_root, "M11139", 123)
+
+    assert resolved == image_path
+
+
+def test_available_execution_image_frames_indexes_folder_and_flat_layouts(tmp_path):
+    images_root = tmp_path / "images"
+    (images_root / "camA").mkdir(parents=True)
+    (images_root / "camA" / "frame_000123.jpeg").write_bytes(b"fake")
+    (images_root / "Camera1_M11139_frame_000124.JPG").write_bytes(b"fake")
+
+    available = available_execution_image_frames(images_root, ["camA", "M11139", "camB"])
+
+    assert available["camA"] == {123}
+    assert available["M11139"] == {124}
+    assert available["camB"] == set()
 
 
 def test_build_execution_overlay_frame_collects_raw_projected_points_and_image(tmp_path):

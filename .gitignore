@@ -4,9 +4,11 @@
 _cache/
 __pycache__/
 *.pyc
+*.egg-info/
 
 outputs/
 output/
+inputs/images/
 
 Archive.zip
 *.mat

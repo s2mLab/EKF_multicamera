@@ -1,8 +1,9 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
-from reconstruction.reconstruction_bundle import parse_trc_points, root_kinematics_from_trc
+from reconstruction.reconstruction_bundle import build_pose2sim_bundle, parse_trc_points, root_kinematics_from_trc
 from reconstruction.reconstruction_dataset import write_trc_root_kinematics_sidecar
 
 
@@ -80,3 +81,68 @@ def test_root_kinematics_from_trc_prefers_exported_sidecar(tmp_path: Path):
     np.testing.assert_allclose(resolved_qdot_root, qdot_root)
     assert correction_applied is True
     assert source == "trc_root_kinematics_sidecar"
+
+
+def test_build_pose2sim_bundle_initializes_excluded_views_without_reconstruction_object(tmp_path, monkeypatch):
+    trc_path = tmp_path / "demo.trc"
+    trc_path.write_text("demo", encoding="utf-8")
+    captured = {}
+
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.parse_trc_points",
+        lambda _path: (
+            np.array([0, 1], dtype=int),
+            np.array([0.0, 1.0 / 120.0], dtype=float),
+            np.zeros((2, 17, 3), dtype=float),
+            120.0,
+        ),
+    )
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.root_kinematics_from_trc",
+        lambda *_args, **_kwargs: (
+            np.zeros((2, 6), dtype=float),
+            np.zeros((2, 6), dtype=float),
+            False,
+            "trc_points",
+        ),
+    )
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.compute_points_reprojection_error_per_view",
+        lambda *_args, **_kwargs: np.zeros((2, 17, 2), dtype=float),
+    )
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.summarize_reprojection_errors",
+        lambda _errors, camera_names: {
+            "mean_px": 0.0,
+            "std_px": 0.0,
+            "per_keypoint": {},
+            "per_camera": {str(name): {"mean_px": 0.0, "std_px": 0.0} for name in camera_names},
+        },
+    )
+    monkeypatch.setattr(
+        "reconstruction.reconstruction_bundle.root_z_correction_angle_from_points",
+        lambda *_args, **_kwargs: 0.0,
+    )
+
+    def fake_build_bundle_payload(**kwargs):
+        captured.update(kwargs)
+        return {"excluded_views": kwargs["excluded_views"]}
+
+    monkeypatch.setattr("reconstruction.reconstruction_bundle.build_bundle_payload", fake_build_bundle_payload)
+    monkeypatch.setattr("reconstruction.reconstruction_bundle.write_bundle", lambda *_args, **_kwargs: None)
+
+    pose_data = SimpleNamespace(camera_names=["cam0", "cam1"])
+
+    result = build_pose2sim_bundle(
+        name="pose2sim_demo",
+        output_dir=tmp_path / "output",
+        pose2sim_trc=trc_path,
+        calibrations={"cam0": object(), "cam1": object()},
+        pose_data=pose_data,
+        fps=120.0,
+        initial_rotation_correction=False,
+        unwrap_root=False,
+    )
+
+    np.testing.assert_array_equal(result.payload["excluded_views"], np.zeros((2, 17, 2), dtype=bool))
+    np.testing.assert_array_equal(captured["excluded_views"], np.zeros((2, 17, 2), dtype=bool))

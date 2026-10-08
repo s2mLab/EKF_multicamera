@@ -2,6 +2,7 @@ import numpy as np
 
 from judging.dd_analysis import DDSessionAnalysis, JumpSegment
 from judging.trampoline_displacement import (
+    TRAMPOLINE_BED_HEIGHT_M,
     TRAMPOLINE_GEOMETRY,
     X_INNER,
     X_MAX,
@@ -66,6 +67,7 @@ def test_trampoline_geometry_is_centered_and_contains_expected_markers():
     assert X_INNER < X_MAX
     assert Y_INNER < Y_MAX
     np.testing.assert_allclose(geometry.cross["left"], TRAMPOLINE_GEOMETRY.cross["left"])
+    assert abs(TRAMPOLINE_BED_HEIGHT_M - 1.2441549663601654) < 1e-12
 
 
 def test_analyze_trampoline_contacts_uses_contact_medians_and_sums_penalties():

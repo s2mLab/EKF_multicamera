@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
@@ -143,6 +143,8 @@ LOWER_LIMB_EDGES = {
 
 
 def normalize(vector: np.ndarray) -> np.ndarray:
+    """Return the normalized 3D vector, or NaNs when the norm is invalid."""
+
     norm = np.linalg.norm(vector)
     if not np.isfinite(norm) or norm < 1e-12:
         return np.full(3, np.nan)
@@ -543,6 +545,8 @@ def draw_trampoline_contact_zone(ax, polygon_xy: np.ndarray | None, z_level: flo
 
 
 def grouped_marker_points(frame_points: np.ndarray) -> dict[str, np.ndarray]:
+    """Split one COCO17 3D pose into left, right, and center point groups."""
+
     groups = {
         "left": [KP_INDEX[name] for name in COCO17 if name in LEFT_KEYPOINTS],
         "right": [KP_INDEX[name] for name in COCO17 if name in RIGHT_KEYPOINTS],
@@ -557,6 +561,8 @@ def grouped_marker_points(frame_points: np.ndarray) -> dict[str, np.ndarray]:
 
 
 def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Estimate a local trunk/root frame from hips and shoulders."""
+
     left_hip = frame_points[KP_INDEX["left_hip"]]
     right_hip = frame_points[KP_INDEX["right_hip"]]
     left_shoulder = frame_points[KP_INDEX["left_shoulder"]]
@@ -585,6 +591,8 @@ def compute_root_frame_from_points(frame_points: np.ndarray) -> tuple[np.ndarray
 def draw_coordinate_system(
     ax, origin: np.ndarray, rotation: np.ndarray, scale: float = 0.18, alpha: float = 1.0, line_width: float = 2.0
 ):
+    """Draw one local 3-axis frame inside the 3D comparison animation."""
+
     colors = ["#d62728", "#2ca02c", "#1f77b4"]
     artists = []
     for axis_idx in range(3):
@@ -603,6 +611,8 @@ def draw_coordinate_system(
 
 
 def edge_linewidth(name_a: str, name_b: str, base: float = 2.0) -> float:
+    """Return a thicker linewidth for lower-limb segments."""
+
     return base * 3.0 if (name_a, name_b) in LOWER_LIMB_EDGES else base
 
 

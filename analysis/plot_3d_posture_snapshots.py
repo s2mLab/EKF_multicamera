@@ -13,22 +13,22 @@ from __future__ import annotations
 
 import argparse
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-LOCAL_MPLCONFIG = Path("/Users/mickaelbegon/Documents/Playground/.cache/matplotlib")
+LOCAL_MPLCONFIG = ROOT / ".cache" / "matplotlib"
 LOCAL_MPLCONFIG.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(LOCAL_MPLCONFIG))
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from analysis.plot_kinematic_comparison import compute_trunk_dofs_from_triangulation
+from animation.animate_dual_stick_comparison import KP_INDEX, SKELETON_EDGES
 from vitpose_ekf_pipeline import load_calibrations
 
 DEFAULT_TRIANGULATION = Path("output/vitpose_full/triangulation_pose2sim_like.npz")
@@ -39,6 +39,8 @@ DEFAULT_FPS = 120.0
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments for the 3D posture snapshot figure generator."""
+
     parser = argparse.ArgumentParser(description="Affiche quelques postures 3D representatives avec les cameras.")
     parser.add_argument("--triangulation", type=Path, default=DEFAULT_TRIANGULATION, help="NPZ de triangulation.")
     parser.add_argument("--calib", type=Path, default=DEFAULT_CALIB, help="Calibration des cameras.")
@@ -56,6 +58,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def pelvis_center(points_3d: np.ndarray) -> np.ndarray:
+    """Return the pelvis center estimated as the midpoint between both hips."""
+
     left_hip = points_3d[:, KP_INDEX["left_hip"], :]
     right_hip = points_3d[:, KP_INDEX["right_hip"], :]
     return 0.5 * (left_hip + right_hip)
@@ -79,6 +83,8 @@ def posture_descriptor(points_frame: np.ndarray) -> np.ndarray | None:
 
 
 def descriptor_distance(desc_a: np.ndarray | None, desc_b: np.ndarray | None) -> float:
+    """Return a finite-only distance between two posture descriptors."""
+
     if desc_a is None or desc_b is None:
         return -np.inf
     valid = np.isfinite(desc_a) & np.isfinite(desc_b)
@@ -159,6 +165,8 @@ def camera_center_and_direction(calibration) -> tuple[np.ndarray, np.ndarray]:
 
 
 def finite_bounds(points_3d: np.ndarray, camera_centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return finite lower and upper bounds covering poses and camera centers."""
+
     xyz = points_3d[np.all(np.isfinite(points_3d), axis=2)]
     if camera_centers.size:
         xyz = np.vstack((xyz, camera_centers))
@@ -169,6 +177,8 @@ def finite_bounds(points_3d: np.ndarray, camera_centers: np.ndarray) -> tuple[np
 
 
 def set_equal_3d_axes(ax, mins: np.ndarray, maxs: np.ndarray) -> None:
+    """Apply equal-aspect limits to one 3D Matplotlib axis."""
+
     center = 0.5 * (mins + maxs)
     radius = 0.5 * np.max(maxs - mins)
     ax.set_xlim(center[0] - radius, center[0] + radius)
@@ -327,6 +337,8 @@ def export_first_frame_with_root_coordinate_system(
 
 
 def main() -> None:
+    """Build the 3D posture snapshot figure from one reconstruction bundle."""
+
     args = parse_args()
     data = np.load(args.triangulation, allow_pickle=True)
     points_3d = np.asarray(data["points_3d"], dtype=float)

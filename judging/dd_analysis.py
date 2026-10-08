@@ -9,6 +9,7 @@ from datetime import datetime
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from judging.body_geometry import hip_angle_series, knee_angle_series
 from kinematics.root_kinematics import (
     ROOT_ROTATION_SLICE,
     TRUNK_ROOT_ROTATION_SEQUENCE,
@@ -18,6 +19,11 @@ from kinematics.root_kinematics import (
 
 DEFAULT_HIP_DOFS = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
 DEFAULT_KNEE_DOFS = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
+BODY_SHAPE_DISPLAY = {
+    "grouped": "groupé",
+    "piked": "carpé",
+    "straight": "tendu",
+}
 
 
 def dd_debug(message: str) -> None:
@@ -400,6 +406,25 @@ def detect_body_shape(
     return "straight"
 
 
+def detect_body_shape_from_curves(
+    hip_curve_rad: np.ndarray,
+    knee_curve_rad: np.ndarray,
+    *,
+    hip_threshold_deg: float = 70.0,
+    knee_tuck_threshold_deg: float = 70.0,
+    knee_pike_threshold_deg: float = 20.0,
+) -> str:
+    """Infer one coarse body shape directly from geometric flexion curves."""
+
+    hip_value = float(np.rad2deg(np.nanmax(hip_curve_rad))) if np.any(np.isfinite(hip_curve_rad)) else float("nan")
+    knee_value = float(np.rad2deg(np.nanmax(knee_curve_rad))) if np.any(np.isfinite(knee_curve_rad)) else float("nan")
+    if hip_value >= hip_threshold_deg and knee_value >= knee_tuck_threshold_deg:
+        return "grouped"
+    if hip_value >= hip_threshold_deg and knee_value <= knee_pike_threshold_deg:
+        return "piked"
+    return "straight"
+
+
 def normalize_flexion_curve_rad(curve_rad: np.ndarray) -> np.ndarray:
     """Fold wrapped joint angles back to a physiological flexion range.
 
@@ -414,6 +439,15 @@ def normalize_flexion_curve_rad(curve_rad: np.ndarray) -> np.ndarray:
     normalized = np.where(wrapped > np.pi, 2.0 * np.pi - wrapped, wrapped)
     normalized[~np.isfinite(curve)] = np.nan
     return normalized
+
+
+def flexion_curve_from_internal_angle(angle_curve_rad: np.ndarray) -> np.ndarray:
+    """Convert one internal joint-angle curve into a flexion magnitude."""
+
+    angle_curve = np.asarray(angle_curve_rad, dtype=float)
+    flexion = np.abs(np.pi - angle_curve)
+    flexion[~np.isfinite(angle_curve)] = np.nan
+    return flexion
 
 
 def flexion_curves_from_segment(
@@ -450,7 +484,23 @@ def body_shape_phase_masks(
 def body_shape_suffix(body_shape: str) -> str:
     """Map a body-shape label to the suffix used in DD codes."""
 
-    return {"grouped": "o", "piked": "<", "straight": "/"}.get(body_shape, "?")
+    normalized = str(body_shape).strip().lower()
+    return {
+        "grouped": "o",
+        "groupé": "o",
+        "piked": "<",
+        "carpé": "<",
+        "straight": "/",
+        "tendu": "/",
+    }.get(normalized, "?")
+
+
+def body_shape_display_label(body_shape: str | None) -> str | None:
+    """Return the French display label used in the GUI summaries."""
+
+    if body_shape is None:
+        return None
+    return BODY_SHAPE_DISPLAY.get(str(body_shape), str(body_shape))
 
 
 def quarter_salto_count_token(total_saltos: float) -> str:
@@ -493,6 +543,7 @@ def analyze_single_jump(
     segment: JumpSegment,
     full_q: np.ndarray | None = None,
     q_names: list[str] | None = None,
+    points_3d: np.ndarray | None = None,
     angle_mode: str = "euler",
 ) -> DDJumpAnalysis:
     """Analyze one jump segment and derive its DD-oriented summary metrics."""
@@ -529,7 +580,15 @@ def analyze_single_jump(
     knee_flex_curve = np.full_like(som, np.nan)
     grouped_mask = np.zeros_like(som, dtype=bool)
     piked_mask = np.zeros_like(som, dtype=bool)
-    if full_q is not None and q_names is not None:
+    if points_3d is not None:
+        points_segment = np.asarray(points_3d[segment.start : segment.end + 1], dtype=float)
+        if points_segment.ndim == 3 and points_segment.shape[0] == som.shape[0]:
+            hip_flex_curve = flexion_curve_from_internal_angle(hip_angle_series(points_segment))
+            knee_flex_curve = flexion_curve_from_internal_angle(knee_angle_series(points_segment))
+            if np.any(np.isfinite(hip_flex_curve)) and np.any(np.isfinite(knee_flex_curve)):
+                grouped_mask, piked_mask = body_shape_phase_masks(hip_flex_curve, knee_flex_curve)
+                body_shape = detect_body_shape_from_curves(hip_flex_curve, knee_flex_curve)
+    if body_shape is None and full_q is not None and q_names is not None:
         body_indices = default_body_shape_indices(q_names)
         if body_indices is not None:
             hip_indices, knee_indices = body_indices
@@ -581,6 +640,7 @@ def analyze_dd_session(
     contact_window_s: float = 0.35,
     full_q: np.ndarray | None = None,
     q_names: list[str] | None = None,
+    points_3d: np.ndarray | None = None,
     angle_mode: str = "euler",
     analysis_start_frame: int = 0,
     require_complete_jumps: bool = True,
@@ -598,10 +658,15 @@ def analyze_dd_session(
     analysis_start_frame = max(0, int(analysis_start_frame))
     window_frames = max(1, int(round(float(smoothing_window_s) * float(fps))))
     smoothed_height = smooth_signal(height, window_frames=window_frames)
+    threshold_reference = (
+        smoothed_height[analysis_start_frame:] if analysis_start_frame < smoothed_height.shape[0] else smoothed_height
+    )
+    if threshold_reference.size == 0:
+        threshold_reference = smoothed_height
     effective_threshold = (
         float(height_threshold)
         if height_threshold is not None
-        else relative_height_threshold(smoothed_height, ratio=height_threshold_range_ratio)
+        else relative_height_threshold(threshold_reference, ratio=height_threshold_range_ratio)
     )
     airborne_mask = smoothed_height > effective_threshold
     airborne_mask[:analysis_start_frame] = False
@@ -634,7 +699,14 @@ def analyze_dd_session(
     )
     q_name_list = list(q_names) if q_names is not None else None
     jumps = [
-        analyze_single_jump(root_q, segment, full_q=full_q, q_names=q_name_list, angle_mode=angle_mode)
+        analyze_single_jump(
+            root_q,
+            segment,
+            full_q=full_q,
+            q_names=q_name_list,
+            points_3d=points_3d,
+            angle_mode=angle_mode,
+        )
         for segment in segments
     ]
     dd_debug(f"analyze_dd_session done jumps={len(jumps)}")
