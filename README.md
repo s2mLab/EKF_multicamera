@@ -394,7 +394,16 @@ Robust measurements (`--ekf2d-robust-mixture`, opt-in, profile field
 `robust_mixture`): each 2D keypoint gets an inlier/outlier weight from a
 Gaussian-plus-uniform mixture (`--ekf2d-robust-outlier-prob`, default 0.03,
 uniform over the image area) and its variance is inflated accordingly, so gross
-detection errors are neutralized.
+detection errors are neutralized. A lock guard keeps the mixture from rejecting
+the very detections that would correct a wrong prediction: a frame with more than
+`--ekf2d-robust-lock-fraction` (default 0.5) of its keypoints at `w < 0.5` is
+updated with the nominal variances until the fraction falls to
+`--ekf2d-robust-resume-fraction` (default 0.25), every EKF (bootstrap included)
+starts in that suspended mode, and a keypoint rejected in more than half of its
+views gets back its nominal variance. `1 1` disables the guard (the unguarded
+mixture diverged with `white_jerk` on a real sequence). Counters are in
+`robust_mixture_stats` (`suspended_frames`, `lock_events`,
+`keypoint_guard_restored`, `applied_downweighted_below_0_5`).
 
 Known limitation: in `dyn`/`history3` modes the covariance is still propagated
 with the constant-acceleration transition matrix.

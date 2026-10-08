@@ -170,6 +170,29 @@ des cameras et identique pour `woodbury` et `legacy`. Statistiques dans
 `w < 0,5`, reprojection mediane 11,86 -> 11,66 px (moyenne 20,43 -> 22,36 px :
 les outliers ne sont plus suivis).
 
+Garde-fou anti-verrouillage du melange (actif des que `robust_mixture`) : le
+melange juge chaque mesure contre la prediction ; si la prediction est fausse
+(graine IK du bootstrap a ~240 px, membre parti dans une mauvaise pose), il
+rejette precisement les detections qui la corrigeraient et le filtre
+s'auto-confirme. Sur `1_partie_0429_001` (detecteur `best`, 120 Hz), le bootstrap
+avec melange restait sur la graine (2/3 des keypoints a `w < 0,5`, etat faux de
+~1,7 m) ; avec `white_jerk`, `P_qq` se contracte plus vite et le filtre ne se
+recalait jamais (96 % de `w < 0,5`, 2238 px / 56 m aux frames annotees) ; un `R`
+plus petit (scores eleves) aggrave le risque (`R x 4` : recalage ; `ECCV`/`base`
+avec `R / 4` : divergence). Deux regles, independantes de l'ordre des cameras et
+du solveur : (1) frame : si la fraction de `w < 0,5` depasse
+`robust_mixture_lock_fraction` (0,5, `--ekf2d-robust-lock-fraction`), la frame
+est corrigee avec les variances nominales jusqu'a ce que la fraction redescende
+a `robust_mixture_resume_fraction` (0,25) ; chaque EKF, bootstrap compris,
+demarre suspendu ; (2) keypoint : un keypoint rejete dans plus de
+`lock_fraction` de ses vues (au moins 2) reprend sa variance nominale (une erreur
+de detecteur est propre a une vue ; un rejet majoritaire signale un point 3D
+predit faux). `1 1` restaure le melange non garde. Compteurs :
+`suspended_frames`, `lock_events`, `keypoint_guard_restored`,
+`applied_downweighted_below_0_5` dans `robust_mixture_stats` (et dans les
+diagnostics du bootstrap). `white_jerk` + melange donne alors 8,61 px / 38,2 mm
+(`white_jerk` seul : 8,59 px / 38,4 mm).
+
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc

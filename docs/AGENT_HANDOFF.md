@@ -130,7 +130,13 @@ Test cible : `pytest -q tests/test_ekf2d_process_noise.py`.
 activent limites coude/genou, a priori axial et export canonique. Test cible :
 `pytest -q tests/test_ekf2d_joint_prior.py`.
 `--ekf2d-robust-mixture` (opt-in) et `--ekf2d-robust-outlier-prob` (defaut 0.03)
-activent la ponderation inlier/outlier. Test cible :
+activent la ponderation inlier/outlier. Un garde-fou anti-verrouillage
+(`--ekf2d-robust-lock-fraction`, defaut 0.5 ; `--ekf2d-robust-resume-fraction`,
+defaut 0.25) remet les variances nominales sur une frame dont plus de la moitie
+des keypoints ont `w < 0.5` (avec hysteresis ; chaque EKF, bootstrap compris,
+demarre suspendu) et sur un keypoint rejete dans plus de la moitie de ses vues.
+`1 1` restaure l'ancien comportement, qui peut se verrouiller sur un etat faux
+(divergence reelle `white_jerk` + melange sur `1_partie_0429_001`). Test cible :
 `pytest -q tests/test_ekf2d_robust_mixture.py`.
 Les modes `*_fast*` (coherence et flip) utilisent la distance epipolaire
 symetrique (+3,7 % d'erreur vs Sampson mesuree en reel) ; l'equivalent Sampson
