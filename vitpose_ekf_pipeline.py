@@ -138,6 +138,13 @@ DEFAULT_JOINT_REFLECT_MARGIN_DEG = 5.0
 # Opt-in robust inlier/outlier mixture on 2D keypoints (``robust_mixture``).
 DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB = 0.03
 ROBUST_MIXTURE_MIN_WEIGHT = 1e-6
+# Lock guard of the mixture: when more than ``lock_fraction`` of the 2D keypoints of a frame get a
+# weight < 0.5, the prediction (not the detections) is the likely outlier, so the frame is updated
+# with the nominal Gaussian variances; the mixture resumes once the fraction is <= ``resume_fraction``
+# (each EKF, bootstrap included, starts suspended). Likewise, a keypoint rejected in more than
+# ``lock_fraction`` of its views gets back its nominal variances. ``1, 1`` disables the guard.
+DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION = 0.5
+DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION = 0.25
 DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
@@ -1403,6 +1410,86 @@ def robust_mixture_measurement_variances(
     )
     inflated = np.maximum(inflated, variances[:, np.newaxis])
     return inflated, weights
+
+
+def validate_robust_mixture_lock_fractions(lock_fraction: float, resume_fraction: float) -> tuple[float, float]:
+    """Check ``0 <= resume_fraction <= lock_fraction <= 1`` (``lock_fraction = 1`` disables the guard)."""
+
+    lock_fraction = float(lock_fraction)
+    resume_fraction = float(resume_fraction)
+    if not 0.0 < lock_fraction <= 1.0:
+        raise ValueError("robust_mixture_lock_fraction must be in (0, 1].")
+    if not 0.0 <= resume_fraction <= lock_fraction:
+        raise ValueError("robust_mixture_resume_fraction must be in [0, robust_mixture_lock_fraction].")
+    return lock_fraction, resume_fraction
+
+
+def robust_mixture_lock_decision(
+    weights: np.ndarray,
+    suspended: bool,
+    lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
+) -> tuple[bool, float]:
+    """Hysteresis deciding whether the mixture is suspended for one frame.
+
+    ``fraction`` is the share of the frame's keypoints whose mixture weight is
+    ``< 0.5``. With ``pi_out`` of a few percent, a majority of "outliers" means
+    that the prediction is wrong (bad initial state, lost track), not the
+    detections: a mixture applied there rejects the very measurements that
+    would correct the state and the filter locks onto a wrong pose. Active
+    mixture is suspended when ``fraction > lock_fraction``; a suspended mixture
+    resumes when ``fraction <= resume_fraction``. Frames without weights keep
+    the current mode. ``lock_fraction = 1`` never suspends an active mixture
+    and ``lock_fraction = resume_fraction = 1`` disables the guard.
+
+    Returns:
+        ``(suspended, fraction)``.
+    """
+
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if weights.size == 0:
+        return bool(suspended), float("nan")
+    fraction = float(np.count_nonzero(weights < 0.5)) / float(weights.size)
+    if suspended:
+        return bool(fraction > resume_fraction), fraction
+    return bool(fraction > lock_fraction), fraction
+
+
+def robust_mixture_keypoint_guard(
+    weights: np.ndarray,
+    keypoint_indices: np.ndarray,
+    lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+) -> np.ndarray:
+    """Rows whose mixture weight must be dropped because the keypoint is rejected in most views.
+
+    A detector error is mostly view-specific, whereas a keypoint rejected in
+    more than ``lock_fraction`` of the (at least two) views that see it points
+    to a wrong predicted 3D point (e.g. a limb locked in a wrong pose): those
+    detections get back their nominal variance. Independent of the camera
+    order; ``lock_fraction = 1`` never restores.
+
+    Args:
+        weights: Mixture weights ``(m,)`` of the frame (all cameras).
+        keypoint_indices: COCO17 index ``(m,)`` of each weight.
+
+    Returns:
+        Boolean mask ``(m,)`` of the rows to restore.
+    """
+
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    keypoint_indices = np.asarray(keypoint_indices, dtype=int).reshape(-1)
+    if weights.shape != keypoint_indices.shape:
+        raise ValueError("weights and keypoint_indices must have the same length.")
+    restore = np.zeros(weights.size, dtype=bool)
+    if weights.size == 0:
+        return restore
+    low = weights < 0.5
+    unique, inverse = np.unique(keypoint_indices, return_inverse=True)
+    n_views = np.bincount(inverse, minlength=unique.size)
+    n_low = np.bincount(inverse, weights=low.astype(float), minlength=unique.size)
+    rejected = (n_views >= 2) & (n_low > float(lock_fraction) * n_views)
+    restore[:] = rejected[inverse]
+    return restore
 
 
 def legacy_process_noise(nq: int, process_noise_scale: float = 1.0) -> np.ndarray:
@@ -4130,13 +4217,31 @@ class MultiViewKinematicEKF:
         joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
         robust_mixture: bool = False,
         robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+        robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+        robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
     ):
         self.model = model
         self.robust_mixture = bool(robust_mixture)
         self.robust_mixture_outlier_prob = float(robust_mixture_outlier_prob)
         if not 0.0 < self.robust_mixture_outlier_prob < 1.0:
             raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
-        self.robust_mixture_stats = {"keypoints": 0, "weight_sum": 0.0, "downweighted_below_0_5": 0}
+        self.robust_mixture_lock_fraction, self.robust_mixture_resume_fraction = validate_robust_mixture_lock_fractions(
+            robust_mixture_lock_fraction, robust_mixture_resume_fraction
+        )
+        # Warm-up: the first frames are updated with the nominal variances until the mixture agrees
+        # with the prediction (fraction of weights < 0.5 at most ``resume_fraction``).
+        self.robust_mixture_suspended = True
+        self.robust_mixture_stats = {
+            "keypoints": 0,
+            "weight_sum": 0.0,
+            "downweighted_below_0_5": 0,
+            "applied_downweighted_below_0_5": 0,
+            "frames": 0,
+            "suspended_frames": 0,
+            "suspended_keypoints": 0,
+            "lock_events": 0,
+            "keypoint_guard_restored": 0,
+        }
         self.joint_prior = bool(joint_prior)
         if float(joint_prior_axial_std_deg) <= 0.0:
             raise ValueError("joint_prior_axial_std_deg must be > 0.")
@@ -4884,6 +4989,60 @@ class MultiViewKinematicEKF:
                 covariance[:, full_idx] = 0.0
                 covariance[full_idx, full_idx] = 1e-9
 
+    def _apply_robust_mixture_lock_guard(
+        self,
+        measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+        mixture_blocks: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+    ) -> None:
+        """Restore nominal variances where the mixture contradicts the multi-view evidence.
+
+        Frame level (hysteresis, :func:`robust_mixture_lock_decision`): all keypoints of the frame.
+        Keypoint level (:func:`robust_mixture_keypoint_guard`): a keypoint rejected in more than
+        ``lock_fraction`` of the views that see it. ``mixture_blocks`` holds, per camera block,
+        ``(index in measurement_blocks, nominal variances, weights, keypoint indices)``.
+        """
+
+        weights = np.concatenate([block[2] for block in mixture_blocks])
+        keypoints = np.concatenate([block[3] for block in mixture_blocks])
+        was_suspended = self.robust_mixture_suspended
+        suspended, _fraction = robust_mixture_lock_decision(
+            weights,
+            was_suspended,
+            lock_fraction=self.robust_mixture_lock_fraction,
+            resume_fraction=self.robust_mixture_resume_fraction,
+        )
+        self.robust_mixture_suspended = suspended
+        if suspended:
+            restore = np.ones(weights.size, dtype=bool)
+        else:
+            restore = robust_mixture_keypoint_guard(weights, keypoints, self.robust_mixture_lock_fraction)
+        down = weights < 0.5
+        stats = self.robust_mixture_stats
+        stats["keypoints"] += int(weights.size)
+        stats["weight_sum"] += float(np.sum(weights))
+        stats["downweighted_below_0_5"] += int(np.count_nonzero(down))
+        stats["applied_downweighted_below_0_5"] += int(np.count_nonzero(down & ~restore))
+        stats["frames"] += 1
+        if suspended:
+            stats["suspended_frames"] += 1
+            stats["suspended_keypoints"] += int(weights.size)
+            if not was_suspended:
+                stats["lock_events"] += 1
+        else:
+            stats["keypoint_guard_restored"] += int(np.count_nonzero(down & restore))
+        if not np.any(restore):
+            return
+        start = 0
+        for block_idx, nominal_variances, block_weights, _block_keypoints in mixture_blocks:
+            rows = restore[start : start + block_weights.size]
+            start += block_weights.size
+            if not np.any(rows):
+                continue
+            z_block, h_block, H_block, inflated = measurement_blocks[block_idx]
+            variances = np.array(inflated, dtype=float, copy=True).reshape(-1, 2)
+            variances[rows] = np.asarray(nominal_variances, dtype=float).reshape(-1, 2)[rows]
+            measurement_blocks[block_idx] = (z_block, h_block, H_block, variances.reshape(-1))
+
     def update(
         self, predicted_state: np.ndarray, predicted_covariance: np.ndarray, frame_idx: int
     ) -> tuple[np.ndarray, np.ndarray, str]:
@@ -4935,6 +5094,8 @@ class MultiViewKinematicEKF:
         finite_marker_points = np.all(np.isfinite(marker_points_array), axis=1)
 
         measurement_blocks: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        # (index in measurement_blocks, nominal variances, mixture weights) of each mixture-weighted block.
+        mixture_blocks: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]] = []
         locked_indices = tuple(self.locked_q_indices)
         locked_q_columns = np.asarray(locked_indices, dtype=int) if locked_indices else np.empty(0, dtype=int)
         t_assembly = time.perf_counter()
@@ -5023,10 +5184,10 @@ class MultiViewKinematicEKF:
                     outlier_prob=self.robust_mixture_outlier_prob,
                     image_area_px2=image_width * image_height,
                 )
+                mixture_blocks.append(
+                    (len(measurement_blocks), block_variances, weights, keypoint_indices[selected_mask])
+                )
                 block_variances = inflated.reshape(-1)
-                self.robust_mixture_stats["keypoints"] += int(weights.size)
-                self.robust_mixture_stats["weight_sum"] += float(np.sum(weights))
-                self.robust_mixture_stats["downweighted_below_0_5"] += int(np.count_nonzero(weights < 0.5))
             measurement_blocks.append(
                 (
                     selected_points[selected_mask].reshape(-1),
@@ -5035,6 +5196,8 @@ class MultiViewKinematicEKF:
                     block_variances,
                 )
             )
+        if mixture_blocks:
+            self._apply_robust_mixture_lock_guard(measurement_blocks, mixture_blocks)
         self.profiling["assembly_s"] += time.perf_counter() - t_assembly
 
         pseudo_block = self._upper_back_pseudo_measurement_block(q)
@@ -5486,6 +5649,8 @@ def initial_state_from_ekf_bootstrap(
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     robust_mixture: bool = False,
     robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Affine `q0` par corrections EKF repetees sur une seule frame.
 
@@ -5548,6 +5713,8 @@ def initial_state_from_ekf_bootstrap(
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         robust_mixture=robust_mixture,
         robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
     )
     state = np.array(ik_state, copy=True)
     base_covariance = np.eye(ekf.nx) * 1e-2
@@ -5581,6 +5748,8 @@ def initial_state_from_ekf_bootstrap(
             break
 
     diagnostics["final_q_norm"] = float(np.linalg.norm(state[: ekf.nq]))
+    if getattr(ekf, "robust_mixture", False):
+        diagnostics["robust_mixture_stats"] = dict(ekf.robust_mixture_stats)
     return state, diagnostics
 
 
@@ -5614,6 +5783,8 @@ def initial_state_from_root_pose_bootstrap(
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     robust_mixture: bool = False,
     robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Initialise l'EKF 2D depuis une pose racine geometrique, puis bootstrappe."""
     zero_state = np.zeros(3 * model.nbQ(), dtype=float)
@@ -5660,6 +5831,8 @@ def initial_state_from_root_pose_bootstrap(
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
             robust_mixture=robust_mixture,
             robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
 
     root_seed_state = apply_root_pose_guess_to_state(model, zero_state, root_pose)
@@ -5694,6 +5867,8 @@ def initial_state_from_root_pose_bootstrap(
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         robust_mixture=robust_mixture,
         robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
     )
     diagnostics = dict(diagnostics)
     diagnostics["method"] = "root_pose_bootstrap"
@@ -5734,6 +5909,8 @@ def compute_ekf2d_initial_state(
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     robust_mixture: bool = False,
     robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Selectionne et calcule l'etat initial des EKF 2D."""
     if method == "triangulation_ik":
@@ -5780,6 +5957,8 @@ def compute_ekf2d_initial_state(
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
             robust_mixture=robust_mixture,
             robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
     if method == "root_pose_bootstrap":
         return initial_state_from_root_pose_bootstrap(
@@ -5812,6 +5991,8 @@ def compute_ekf2d_initial_state(
             joint_prior_axial_std_deg=joint_prior_axial_std_deg,
             robust_mixture=robust_mixture,
             robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+            robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+            robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         )
     raise ValueError(f"Unsupported ekf2d initial state method: {method}")
 
@@ -5858,6 +6039,8 @@ def run_ekf(
     joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     robust_mixture: bool = False,
     robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
 ) -> tuple[dict[str, np.ndarray], dict[str, float]]:
     """Execute l'EKF multi-vues sur toute la sequence.
 
@@ -5905,6 +6088,8 @@ def run_ekf(
         joint_prior_axial_std_deg=joint_prior_axial_std_deg,
         robust_mixture=robust_mixture,
         robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
         flight_detection=flight_detection,
         flight_hysteresis_m=flight_hysteresis_m,
         flight_com_accel_tolerance=flight_com_accel_tolerance,

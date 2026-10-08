@@ -51,7 +51,9 @@ from vitpose_ekf_pipeline import (
     DEFAULT_PROCESS_NOISE_JERK_PSD,
     DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
+    DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
     DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
@@ -222,6 +224,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--ekf2d-robust-outlier-prob", type=float, default=DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB, help="pi_out."
+    )
+    parser.add_argument(
+        "--ekf2d-robust-lock-fraction",
+        type=float,
+        default=DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+        help=(
+            "Garde-fou du melange : au-dela de cette fraction de keypoints d'une frame avec w < 0.5, la frame "
+            "est corrigee avec les variances nominales (melange suspendu) ; idem pour un keypoint rejete dans "
+            "plus de cette fraction de ses vues. 1 (avec --ekf2d-robust-resume-fraction 1) desactive le garde-fou."
+        ),
+    )
+    parser.add_argument(
+        "--ekf2d-robust-resume-fraction",
+        type=float,
+        default=DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
+        help="Le melange suspendu (et au demarrage) reprend quand la fraction de w < 0.5 est <= ce seuil.",
     )
     parser.add_argument("--coherence-confidence-floor", type=float, default=DEFAULT_COHERENCE_CONFIDENCE_FLOOR)
     parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
@@ -438,6 +456,8 @@ def main() -> None:
             joint_prior_axial_std_deg=args.ekf2d_joint_prior_axial_std_deg,
             robust_mixture=args.ekf2d_robust_mixture,
             robust_mixture_outlier_prob=args.ekf2d_robust_outlier_prob,
+            robust_mixture_lock_fraction=args.ekf2d_robust_lock_fraction,
+            robust_mixture_resume_fraction=args.ekf2d_robust_resume_fraction,
             flight_detection=args.flight_detection,
             flight_hysteresis_m=args.flight_hysteresis_m,
             flight_com_accel_tolerance=args.flight_com_accel_tolerance,

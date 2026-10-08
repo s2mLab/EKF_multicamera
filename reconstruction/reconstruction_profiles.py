@@ -124,6 +124,8 @@ class ReconstructionProfile:
     joint_prior_axial_std_deg: float = 30.0
     robust_mixture: bool = False
     robust_mixture_outlier_prob: float = 0.03
+    robust_mixture_lock_fraction: float = 0.5
+    robust_mixture_resume_fraction: float = 0.25
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
@@ -179,6 +181,12 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             outlier_prob = float(getattr(profile, "robust_mixture_outlier_prob", 0.03))
             if not math.isclose(outlier_prob, 0.03, rel_tol=0.0, abs_tol=1e-12):
                 parts.append(f"po{slugify(f'{outlier_prob:g}')}")
+            lock_fraction = float(getattr(profile, "robust_mixture_lock_fraction", 0.5))
+            resume_fraction = float(getattr(profile, "robust_mixture_resume_fraction", 0.25))
+            if not math.isclose(lock_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"lk{slugify(f'{lock_fraction:g}')}")
+            if not math.isclose(resume_fraction, 0.25, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"rs{slugify(f'{resume_fraction:g}')}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -355,6 +363,12 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.robust_mixture = bool(profile.robust_mixture)
         if not 0.0 < float(profile.robust_mixture_outlier_prob) < 1.0:
             raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
+        profile.robust_mixture_lock_fraction = float(profile.robust_mixture_lock_fraction)
+        profile.robust_mixture_resume_fraction = float(profile.robust_mixture_resume_fraction)
+        if not 0.0 < profile.robust_mixture_lock_fraction <= 1.0:
+            raise ValueError("robust_mixture_lock_fraction must be in (0, 1].")
+        if not 0.0 <= profile.robust_mixture_resume_fraction <= profile.robust_mixture_lock_fraction:
+            raise ValueError("robust_mixture_resume_fraction must be in [0, robust_mixture_lock_fraction].")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -377,6 +391,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.joint_prior_axial_std_deg = 30.0
         profile.robust_mixture = False
         profile.robust_mixture_outlier_prob = 0.03
+        profile.robust_mixture_lock_fraction = 0.5
+        profile.robust_mixture_resume_fraction = 0.25
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -713,6 +729,8 @@ def build_pipeline_command(
         if profile.robust_mixture:
             cmd.append("--ekf2d-robust-mixture")
             cmd.extend(["--ekf2d-robust-outlier-prob", str(float(profile.robust_mixture_outlier_prob))])
+            cmd.extend(["--ekf2d-robust-lock-fraction", str(float(profile.robust_mixture_lock_fraction))])
+            cmd.extend(["--ekf2d-robust-resume-fraction", str(float(profile.robust_mixture_resume_fraction))])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])
