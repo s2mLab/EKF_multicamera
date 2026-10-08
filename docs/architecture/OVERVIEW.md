@@ -191,7 +191,10 @@ predit faux). `1 1` restaure le melange non garde. Compteurs :
 `suspended_frames`, `lock_events`, `keypoint_guard_restored`,
 `applied_downweighted_below_0_5` dans `robust_mixture_stats` (et dans les
 diagnostics du bootstrap). `white_jerk` + melange donne alors 8,61 px / 38,2 mm
-(`white_jerk` seul : 8,59 px / 38,4 mm).
+(`white_jerk` seul : 8,59 px / 38,4 mm) ; la combinaison `white_jerk` +
+`undistort` + `joint_prior` + melange, 8,41 px / 42,5 mm, et aucune
+divergence avec les detecteurs `best`, `ECCV` et `base` (sans melange :
+resultats identiques au bit pres).
 
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
