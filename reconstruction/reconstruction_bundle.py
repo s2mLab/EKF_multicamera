@@ -57,6 +57,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    DEFAULT_HEAD_MARKER_MODEL,
     DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     DEFAULT_KEYPOINTS,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
@@ -98,6 +99,7 @@ from vitpose_ekf_pipeline import (
     metadata_cache_matches,
     model_stage_cache_matches,
     model_stage_metadata,
+    normalize_head_marker_model,
     pose_data_signature,
     reconstruction_cache_metadata,
     run_biorbd_marker_kalman_with_parameters,
@@ -845,6 +847,7 @@ def load_or_build_model_cache(
     lengths_mode: str,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> tuple[SegmentLengths, Path, Path, int, float, str]:
     """Reuse or build the biomechanical model stage associated with one run."""
 
@@ -863,6 +866,7 @@ def load_or_build_model_cache(
         initial_rotation_correction,
         model_variant=model_variant,
         symmetrize_limbs=symmetrize_limbs,
+        head_marker_model=head_marker_model,
     )
     metadata["lengths_mode"] = lengths_mode
     metadata["bootstrap_frame_idx"] = int(bootstrap_frame_idx)
@@ -881,6 +885,7 @@ def load_or_build_model_cache(
         apply_initial_root_rotation_correction=initial_rotation_correction,
         model_variant=model_variant,
         symmetrize_limbs=symmetrize_limbs,
+        head_marker_model=head_marker_model,
     )
     compute_time_s = time.perf_counter() - build_start
     save_model_stage(cache_path, lengths, biomod_cache_path, metadata, compute_time_s=compute_time_s)
@@ -1997,8 +2002,11 @@ def build_ekf_3d_bundle(
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> BundleBuildResult:
     """Build and export the standardized EKF3D reconstruction bundle."""
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
 
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2092,6 +2100,7 @@ def build_ekf_3d_bundle(
                 lengths_mode="full_triangulation",
                 model_variant=model_variant,
                 symmetrize_limbs=symmetrize_limbs,
+                head_marker_model=head_marker_model,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -2226,6 +2235,7 @@ def build_ekf_3d_bundle(
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
         "symmetrize_limbs": bool(symmetrize_limbs),
+        "head_marker_model": None if selected_biomod_path is not None else head_marker_model,
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
             "error_factor": float(biorbd_kalman_error_factor),
@@ -2349,8 +2359,11 @@ def build_ekf_2d_bundle(
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
     symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> BundleBuildResult:
     """Build and export the standardized EKF2D reconstruction bundle."""
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
 
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2503,6 +2516,7 @@ def build_ekf_2d_bundle(
                 lengths_mode=ekf2d_3d_source,
                 model_variant=model_variant,
                 symmetrize_limbs=symmetrize_limbs,
+                head_marker_model=head_marker_model,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -2807,6 +2821,7 @@ def build_ekf_2d_bundle(
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
         "symmetrize_limbs": bool(symmetrize_limbs),
+        "head_marker_model": None if selected_biomod_path is not None else head_marker_model,
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),

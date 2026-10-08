@@ -85,6 +85,26 @@ SUPPORTED_MODEL_VARIANTS = (
     "upper_root_back_flexion_1d",
     "upper_root_back_3dof",
 )
+# Geometrie des marqueurs de tete (nez, yeux, oreilles) dans le repere du segment HEAD.
+# - legacy (defaut) : geometrie historique, nez en (h, 0, h), soit a sqrt(2) h du pivot,
+#   oreilles a la verticale du pivot (x = 0).
+# - anthropometric : positions locales fixes en proportion de h = head_length (mediane de
+#   |nez - centre des epaules|), repere HEAD a q = 0 : x avant, y gauche, z haut, origine au
+#   pivot (centre des epaules). Valeurs = forme moyenne d'une analyse procrustes en rotation
+#   autour du pivot sur les TRC pose2sim continus de 3 sequences x 3 detecteurs ViTPose
+#   (1_partie_0429_001, 3_partie_0429_001, 3_partie_0429_004 ; best, ECCV, base), symetrisee
+#   gauche/droite. Jauge : direction pivot -> nez a 45 deg dans le plan sagittal (comme legacy,
+#   donc q tete comparable), axe oreille droite -> oreille gauche selon +y. Detail et
+#   validation croisee : docs/architecture/OVERVIEW.md, section "Marqueurs de tete".
+DEFAULT_HEAD_MARKER_MODEL = "legacy"
+SUPPORTED_HEAD_MARKER_MODELS = ("legacy", "anthropometric")
+ANTHROPOMETRIC_HEAD_MARKER_RATIOS = {
+    "nose": (0.706, 0.0, 0.706),
+    "left_eye": (0.613, 0.113, 0.842),
+    "right_eye": (0.613, -0.113, 0.842),
+    "left_ear": (0.190, 0.339, 0.762),
+    "right_ear": (0.190, -0.339, 0.762),
+}
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -223,6 +243,60 @@ def model_variant_has_back_dofs(model_variant: str) -> bool:
         "back_3dof",
         "upper_root_back_flexion_1d",
         "upper_root_back_3dof",
+    }
+
+
+def normalize_head_marker_model(head_marker_model: str | None) -> str:
+    """Return the canonical head marker model name, raising on unsupported values."""
+
+    name = str(head_marker_model or DEFAULT_HEAD_MARKER_MODEL).strip().lower()
+    if name not in SUPPORTED_HEAD_MARKER_MODELS:
+        raise ValueError(f"Unsupported head_marker_model: {head_marker_model}")
+    return name
+
+
+def head_marker_local_positions(
+    lengths: SegmentLengths, head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL
+) -> dict[str, list[float]]:
+    """Local positions (m) of the COCO17 head markers in the HEAD segment frame.
+
+    The HEAD origin is the shoulder centre (pivot); at ``q = 0`` its axes are
+    x forward, y left, z up. ``legacy`` reproduces the historical expressions
+    exactly; ``anthropometric`` scales ``ANTHROPOMETRIC_HEAD_MARKER_RATIOS`` by
+    ``lengths.head_length``.
+    """
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
+    h = lengths.head_length
+    if head_marker_model == "legacy":
+        return {
+            "nose": [h, 0, h],
+            "left_eye": [h - lengths.eye_offset_x, lengths.eye_offset_y, h],
+            "right_eye": [h - lengths.eye_offset_x, -lengths.eye_offset_y, h],
+            "left_ear": [0, lengths.ear_offset_y, 0.7 * h],
+            "right_ear": [0, -lengths.ear_offset_y, 0.7 * h],
+        }
+    return {
+        name: [float(ratio) * float(h) for ratio in ratios]
+        for name, ratios in ANTHROPOMETRIC_HEAD_MARKER_RATIOS.items()
+    }
+
+
+def head_marker_model_metadata(head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL) -> dict[str, object]:
+    """Cache metadata describing the head marker geometry.
+
+    Empty for ``legacy`` so that existing model-stage metadata, cache keys and
+    directories stay unchanged; otherwise the model name and a signature of the
+    ratios, so that a change of geometry invalidates the model stage.
+    """
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
+    if head_marker_model == "legacy":
+        return {}
+    payload = json.dumps(ANTHROPOMETRIC_HEAD_MARKER_RATIOS, sort_keys=True).encode("utf-8")
+    return {
+        "head_marker_model": head_marker_model,
+        "head_marker_geometry_signature": hashlib.sha1(payload).hexdigest()[:16],
     }
 
 
@@ -3591,12 +3665,16 @@ def build_biomod(
     apply_initial_root_rotation_correction: bool = True,
     model_variant: str = DEFAULT_MODEL_VARIANT,
     symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> Path:
     """Construit un modele `.bioMod` minimal compatible avec les keypoints COCO17.
 
     Des parametres inertiels sont ajoutes a partir du modele proportionnel de
     de Leva pour une femme. Comme le modele courant ne comporte pas de segments
     main/pied, leurs inerties sont agrégées aux segments avant-bras/jambe.
+    ``head_marker_model`` choisit la geometrie des marqueurs de tete (voir
+    ``head_marker_local_positions``) ; ``legacy`` reproduit le fichier historique
+    octet pour octet.
     """
     ensure_local_imports()
     from biobuddy import (
@@ -3612,6 +3690,8 @@ def build_biomod(
 
     if model_variant not in SUPPORTED_MODEL_VARIANTS:
         raise ValueError(f"Unsupported model_variant: {model_variant}")
+    head_marker_model = normalize_head_marker_model(head_marker_model)
+    head_markers = head_marker_local_positions(lengths, head_marker_model)
 
     inertia = female_deleva_inertia_parameters(lengths, total_mass_kg=subject_mass_kg)
     model = BiomechanicalModelReal()
@@ -3829,33 +3909,14 @@ def build_biomod(
             rotations=Rotations.XYZ,
             inertia_parameters=inertia["HEAD"],
             mesh=mesh_with_axes(
-                [(0.0, 0.0, 0.0), (lengths.head_length, 0.0, lengths.head_length)],
+                [(0.0, 0.0, 0.0), tuple(float(value) for value in head_markers["nose"])],
                 axis_scale=0.35 * lengths.head_length,
             ),
         )
     )
     head = model.segments["HEAD"]
-    head.add_marker(MarkerReal(name="nose", parent_name="HEAD", position=[lengths.head_length, 0, lengths.head_length]))
-    head.add_marker(
-        MarkerReal(
-            name="left_eye",
-            parent_name="HEAD",
-            position=[lengths.head_length - lengths.eye_offset_x, lengths.eye_offset_y, lengths.head_length],
-        )
-    )
-    head.add_marker(
-        MarkerReal(
-            name="right_eye",
-            parent_name="HEAD",
-            position=[lengths.head_length - lengths.eye_offset_x, -lengths.eye_offset_y, lengths.head_length],
-        )
-    )
-    head.add_marker(
-        MarkerReal(name="left_ear", parent_name="HEAD", position=[0, lengths.ear_offset_y, 0.7 * lengths.head_length])
-    )
-    head.add_marker(
-        MarkerReal(name="right_ear", parent_name="HEAD", position=[0, -lengths.ear_offset_y, 0.7 * lengths.head_length])
-    )
+    for marker_name in ("nose", "left_eye", "right_eye", "left_ear", "right_ear"):
+        head.add_marker(MarkerReal(name=marker_name, parent_name="HEAD", position=head_markers[marker_name]))
 
     for side, sign in (("left", 1.0), ("right", -1.0)):
         upper_arm_length = segment_length_for_side(
@@ -6436,8 +6497,14 @@ def model_stage_metadata(
     initial_rotation_correction: bool,
     model_variant: str = DEFAULT_MODEL_VARIANT,
     symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> dict[str, object]:
-    """Metadonnees de validite du stage modele."""
+    """Metadonnees de validite du stage modele.
+
+    La geometrie des marqueurs de tete n'ajoute des cles que hors ``legacy``
+    (``head_marker_model_metadata``) : les metadonnees, cles et caches existants
+    restent valides.
+    """
     return {
         "model_stage_version": int(MODEL_STAGE_VERSION),
         "reconstruction_cache_path": str(reconstruction_cache_path),
@@ -6449,6 +6516,7 @@ def model_stage_metadata(
         "initial_rotation_correction": bool(initial_rotation_correction),
         "model_variant": str(model_variant),
         "symmetrize_limbs": bool(symmetrize_limbs),
+        **head_marker_model_metadata(head_marker_model),
     }
 
 
@@ -7063,6 +7131,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
     )
+    parser.add_argument(
+        "--head-marker-model",
+        choices=SUPPORTED_HEAD_MARKER_MODELS,
+        default=DEFAULT_HEAD_MARKER_MODEL,
+        help="Geometrie des marqueurs de tete du bioMod: 'legacy' (historique) ou 'anthropometric' "
+        "(proportions fixes de la longueur de tete calibrees sur triangulations reelles).",
+    )
     parser.add_argument("--model-cache", type=Path, default=None, help="Cache NPZ du stage modele.")
     parser.add_argument("--biorbd-kalman-cache", type=Path, default=None, help="Cache NPZ du Kalman marqueurs biorbd.")
     parser.add_argument(
@@ -7541,6 +7616,7 @@ def main() -> None:
         args.initial_rotation_correction,
         model_variant=args.model_variant,
         symmetrize_limbs=not args.no_symmetrize_limbs,
+        head_marker_model=args.head_marker_model,
     )
     if model_stage_cache_matches(model_cache_path, model_metadata, args.biomod):
         t0 = time.perf_counter()
@@ -7558,6 +7634,7 @@ def main() -> None:
             apply_initial_root_rotation_correction=args.initial_rotation_correction,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,
+            head_marker_model=args.head_marker_model,
         )
         model_compute_time_s = time.perf_counter() - t0
         save_model_stage(model_cache_path, lengths, biomod_path, model_metadata, compute_time_s=model_compute_time_s)

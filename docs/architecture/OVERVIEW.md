@@ -201,6 +201,69 @@ predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc
 pas coherente avec la prediction de la moyenne.
 
+## Marqueurs de tete du modele
+
+`build_biomod` place nez, yeux et oreilles dans le segment `HEAD`, dont
+l'origine (pivot, 3 rotations `XYZ`) est le centre des epaules pour toutes les
+variantes (`single_trunk`, `back_*`, `upper_root_*`) ; a `q = 0` ses axes sont x
+avant, y gauche, z haut. `h = head_length` est la mediane de
+`|nez - centre des epaules|` (`estimate_segment_lengths`, 2 premieres secondes).
+Option `head_marker_model` (`--head-marker-model`, champ de profil, familles
+`ekf_2d`/`ekf_3d`, sans effet avec `--biomod`) :
+
+- `legacy` (defaut) : nez en `(h, 0, h)`, donc a `sqrt(2) h` du pivot (258 mm au
+  lieu de 182 mm sur `1_partie_0429_001`), yeux `(h - eye_offset_x,
+  +-eye_offset_y, h)`, oreilles `(0, +-ear_offset_y, 0.7 h)` a la verticale du
+  pivot (nez-oreilles 191 mm contre ~110 mm en GT). Fichier octet pour octet
+  identique a l'historique.
+- `anthropometric` : positions fixes `ANTHROPOMETRIC_HEAD_MARKER_RATIOS * h` :
+  nez `(0.706, 0, 0.706)`, yeux `(0.613, +-0.113, 0.842)`, oreilles
+  `(0.190, +-0.339, 0.762)` (nez-pivot 0.998 h, nez-milieu des oreilles 0.519 h).
+  Provenance : analyse procrustes en rotation autour du pivot (sans translation
+  ni echelle, forme = mediane, 2e passe sans les frames > p90 du residu) des TRC
+  pose2sim continus de 3 sequences x 3 detecteurs ViTPose (`1_partie_0429_001`,
+  `3_partie_0429_001`, `3_partie_0429_004` ; `best`, `ECCV`, `base`), normalisee
+  par `h` de chaque TRC, symetrisee G/D, moyenne des detecteurs puis des
+  sequences. Jauge (rotation globale inobservable) : direction pivot -> nez a
+  45 deg dans le plan sagittal comme `legacy` (angles de tete comparables),
+  axe oreille droite -> gauche selon +y. Validation croisee en laissant une
+  sequence de cote (residu 3D median de l'ajustement de la tete par frame,
+  frames >= 4 s, moyenne des 9 couples) : `legacy` 57,7 mm, population des 2
+  autres sequences 25,0 mm, forme propre de la sequence (oracle) 22,2 mm ; les
+  ratios des trois plis different de moins de 0,025 h.
+
+Les metadonnees du stage modele n'incluent `head_marker_model` et
+`head_marker_geometry_signature` (SHA-1 des ratios) que hors `legacy` : cle,
+repertoire et caches existants inchanges ; `biomod_signature` (contenu du
+fichier) et le cache Kalman `biorbd` suivent automatiquement le bioMod ;
+`reconstruction_signature` (points triangules) n'est pas concernee. Le resume des
+bundles porte `head_marker_model` (`None` avec un bioMod fourni). Les noms, ordre
+et parents des marqueurs COCO17, les formes `PoseData` et les autres segments
+sont inchanges. Le GUI n'expose pas l'option. Test cible :
+`pytest -q tests/test_head_marker_model.py`.
+
+Verite terrain (EKF 2D, configs c = defauts, d = `white_jerk`, x =
+`white_jerk` + `undistort` + `joint_prior` + sigma(score) calibre, sans melange ;
+IC95 bootstrap par frame annotee, `anthropometric - legacy`) :
+
+- `1_partie_0429_001` (21 frames) : `best` c 9,21 -> 7,90 px (-1,31
+  [-1,67 ; -0,97]) et 42,3 -> 33,7 mm ; d 8,59 -> 7,32 px, 38,4 -> 29,8 mm ;
+  x 7,68 -> 6,54 px, 40,2 -> 30,8 mm. Visage -4,2 a -4,8 px, reste du corps non
+  significatif. `ECCV` -1,34 a -1,78 px, -13 mm ; `base` c -1,57 px, d et x
+  -0,3 px (non significatif, visage -3,2 a -3,8 px significatif).
+- `3_partie_0429_001` (17 frames, GT 2D + 3D) : -1,35 a -2,90 px (7 sur 9
+  significatifs) ; `ECCV`/x -1,41 [-2,33 ; +0,56] et `base`/d +0,92
+  [-0,18 ; +3,47] non significatifs ; 3D -30 a +6 mm, IC larges.
+- `3_partie_0429_004` (33 frames, GT 2D seule, vue a l'entrainement probable) :
+  -0,42 a -1,12 px, toutes significatives.
+
+Une calibration par sequence (`fitted`, 4 premieres secondes de triangulation)
+n'a pas ete retenue : sur `1_partie_0429_001` (3 detecteurs x 3 configs) elle
+ne fait jamais significativement mieux que `anthropometric` sur le visage
+(ecarts -0,35 a +0,24 px) ; elle est moins bonne avec `best` (+0,09 a
++0,20 px) et les seuls gains globaux (`base` d et x, -0,67 et -0,82 px) portent
+sur le reste du corps, pas sur la tete.
+
 ## Caches et effets de bord
 
 Les caches de pose corrigee, flip, coherence epipolaire, triangulation, modele
