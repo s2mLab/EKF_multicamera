@@ -33,6 +33,7 @@ SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
 DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
 SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
+SUPPORTED_HEAD_MARKER_MODELS = ("legacy", "anthropometric")
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",
     "back_flexion_1d",
@@ -85,6 +86,7 @@ class ReconstructionProfile:
     ekf_model_path: str | None = None
     model_variant: str = "single_trunk"
     symmetrize_limbs: bool = True
+    head_marker_model: str = "legacy"
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
@@ -148,6 +150,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
         parts.append(profile.model_variant)
     if not bool(profile.symmetrize_limbs):
         parts.append("asym")
+    if str(getattr(profile, "head_marker_model", "legacy")) == "anthropometric":
+        parts.append("headanthro")
     if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
         parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
@@ -283,6 +287,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         raise ValueError(f"Unsupported flip_method: {profile.flip_method}")
     if profile.model_variant not in SUPPORTED_MODEL_VARIANTS:
         raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
+    profile.head_marker_model = str(getattr(profile, "head_marker_model", None) or "legacy").strip().lower()
+    if profile.head_marker_model not in SUPPORTED_HEAD_MARKER_MODELS:
+        raise ValueError(f"Unsupported head_marker_model: {profile.head_marker_model}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
     profile.root_unwrap_mode = normalize_root_unwrap_mode(
@@ -401,6 +408,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf_model_path = None
         profile.model_variant = "single_trunk"
         profile.symmetrize_limbs = True
+        profile.head_marker_model = "legacy"
         profile.upper_back_sagittal_gain = 0.2
         profile.upper_back_pseudo_std_deg = 10.0
         profile.ankle_bed_pseudo_obs = False
@@ -705,6 +713,8 @@ def build_pipeline_command(
         cmd.extend(["--model-variant", profile.model_variant])
         if not profile.symmetrize_limbs:
             cmd.append("--no-symmetrize-limbs")
+        if profile.head_marker_model != "legacy":
+            cmd.extend(["--head-marker-model", profile.head_marker_model])
         cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
         cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
         if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
@@ -746,6 +756,8 @@ def build_pipeline_command(
         cmd.extend(["--model-variant", profile.model_variant])
         if not profile.symmetrize_limbs:
             cmd.append("--no-symmetrize-limbs")
+        if profile.head_marker_model != "legacy":
+            cmd.extend(["--head-marker-model", profile.head_marker_model])
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")

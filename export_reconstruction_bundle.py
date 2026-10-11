@@ -42,6 +42,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    DEFAULT_HEAD_MARKER_MODEL,
     DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     DEFAULT_KEYPOINTS,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
@@ -62,6 +63,7 @@ from vitpose_ekf_pipeline import (
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_EKF2D_UPDATE_METHODS,
     SUPPORTED_FLIGHT_DETECTIONS,
+    SUPPORTED_HEAD_MARKER_MODELS,
     SUPPORTED_MODEL_VARIANTS,
     SUPPORTED_PROCESS_NOISE_MODELS,
     SUPPORTED_ROOT_UNWRAP_MODES,
@@ -95,6 +97,13 @@ def parse_args() -> argparse.Namespace:
         "--no-symmetrize-limbs",
         action="store_true",
         help="Conserve des longueurs gauche/droite distinctes au lieu de symétriser les membres.",
+    )
+    parser.add_argument(
+        "--head-marker-model",
+        choices=SUPPORTED_HEAD_MARKER_MODELS,
+        default=DEFAULT_HEAD_MARKER_MODEL,
+        help="Geometrie des marqueurs de tete du bioMod genere (ekf_3d/ekf_2d, ignore avec --biomod): "
+        "'legacy' (historique) ou 'anthropometric' (proportions fixes de la longueur de tete).",
     )
     parser.add_argument("--fps", type=float, default=DEFAULT_CAMERA_FPS)
     parser.add_argument(
@@ -398,6 +407,7 @@ def main() -> None:
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,
+            head_marker_model=args.head_marker_model,
         )
     else:
         build_ekf_2d_bundle(
@@ -464,6 +474,7 @@ def main() -> None:
             biomod_path=args.biomod,
             model_variant=args.model_variant,
             symmetrize_limbs=not args.no_symmetrize_limbs,
+            head_marker_model=args.head_marker_model,
         )
 
     print(f"Bundle ecrit dans {args.output_dir}", flush=True)
