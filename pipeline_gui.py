@@ -200,9 +200,7 @@ from reconstruction.reconstruction_bundle import (
     load_or_compute_triangulation_cache,
 )
 from reconstruction.reconstruction_bundle import parse_trc_points as parse_reconstruction_trc_points
-from reconstruction.reconstruction_bundle import (
-    slice_pose_data,
-)
+from reconstruction.reconstruction_bundle import slice_pose_data
 from reconstruction.reconstruction_dataset import (
     dataset_source_paths,
     reconstruction_color,
