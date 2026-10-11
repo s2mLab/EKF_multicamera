@@ -8,21 +8,38 @@ jobs:
   lint-and-tests:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        shell: bash -el {0}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Python and conda
+        uses: conda-incubator/setup-miniconda@v3
         with:
           python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: pyproject.toml
+          miniforge-version: latest
+          channels: conda-forge
+          channel-priority: strict
+          activate-environment: ekf-ci
+
+      - name: Install biorbd
+        run: conda install -y biorbd=1.11.2
 
       - name: Install project and test dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .[test]
+
+      - name: Install biobuddy
+        # Pinned to the commit used by environment.vitpose-ekf.yml. biorbd comes
+        # from conda, so biobuddy is installed without its own dependencies; plotly
+        # (needed at import time) is installed with its dependencies.
+        run: |
+          pip install plotly
+          pip install --no-deps "git+https://github.com/pyomeca/biobuddy.git@85ec552f4c73152590336ca571c1a32ed911c75a"
 
       - name: Run isort --check-only
         id: isort

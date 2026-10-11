@@ -1,5 +1,6 @@
 """The ``*_fast*`` epipolar modes are flagged as using the symmetric distance."""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -42,7 +43,8 @@ def test_export_cli_help_documents_symmetric_fast_modes():
         [sys.executable, "export_reconstruction_bundle.py", "--help"],
         cwd=ROOT,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=True,
     ).stdout
     assert "symetrique" in output and "Sampson" in output

@@ -1,5 +1,6 @@
-import numpy as np
 import warnings
+
+import numpy as np
 
 import calibration_qc
 from vitpose_ekf_pipeline import CameraCalibration, PoseData
