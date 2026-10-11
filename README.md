@@ -214,6 +214,15 @@ Supported families:
 
 The CLI and GUI both support `raw`, `cleaned`, and, when available, `annotated` 2D inputs.
 
+`--undistort-keypoints` (opt-in, profile field `undistort_keypoints`, not for
+`pose2sim`) undistorts the 2D keypoints once at load time with the
+`distortions` coefficients of `Calib.toml`, so that coherence, triangulation
+and EKF use an exact pinhole model. By default the keypoints are used as
+detected (historical behavior). Toggling the option invalidates the geometric
+caches. On the first 300 frames of `1_partie_0429` the keypoints move by 2.5 px
+on average and the exhaustive triangulation reprojection error drops from
+9.55 to 9.38 px (mean).
+
 ### Run a list of named profiles
 
 Example:
@@ -338,6 +347,67 @@ Important improvements already integrated in the codebase:
 - lower confidence on views detected as left/right-flipped so they still help
   the filter without dominating it
 
+Measurement update solver (`--ekf2d-update-method`, profile field
+`ekf2d_update_method`):
+
+- `woodbury` (default): information-form batch update that only solves
+  `Q x Q` systems (`G = H_q^T R^-1 H_q`) and keeps the Joseph covariance form.
+  It is algebraically identical to the historical solver (relative differences
+  around `1e-14` on a real 240-frame sequence) and about 4x faster on the whole
+  EKF2D loop. It falls back to `legacy` automatically if the reduced system is
+  not solvable.
+- `legacy`: innovation-space update (sequential per camera, batch when
+  pseudo-observations are active).
+
+Flight criterion of the `dyn` / `dyn_history3` predictors
+(`--flight-detection`, profile field `flight_detection`):
+
+- `triangulation` (default): every triangulated point of the previous frames
+  above `--flight-height-threshold-m`. With `--ekf2d-3d-source first_frame_only`
+  there is no 3D support after frame 0, so `dyn` never activates.
+- `ekf_state`: the lowest model marker of the previous corrected EKF state is
+  above the threshold (with `--flight-hysteresis-m`, default 0.05 m, and an
+  optional ballistic gate `--flight-com-accel-tolerance`). On the first 900
+  frames of `1_partie_0429` in `first_frame_only`-like mode, `dyn` becomes active
+  on 740 frames instead of 0.
+
+Process noise (`--process-noise-model`, profile field `process_noise_model`):
+
+- `legacy` (default): diagonal `Q` independent of the time step.
+- `white_jerk`: exact discretization of continuous white jerk,
+  `Q(dt) = q_c * [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2], [dt^3/6, dt^2/2, dt]]`
+  per DoF, with one density per group given by
+  `--process-noise-jerk-psd ROOT_TRANS ROOT_ROT JOINTS` (default
+  `200 1000 10000`, in m^2/s^5 and rad^2/s^5, calibrated offline; on the first
+  240 frames of `1_partie_0429` the median reprojection error is 12.26 px versus
+  12.91 px with `legacy`).
+
+Joint prior (`--ekf2d-joint-prior`, opt-in, profile field `joint_prior`): the
+elbow and knee have an unobservable mirror branch (`RotZ + pi`, `-RotY`). The
+option reflects the state into the anatomical branch, enforces the flexion sign
+(elbow <= -1 deg, knee >= +1 deg), adds `FOREARM:RotZ` / `THIGH:RotZ ~ N(0, sigma)`
+pseudo-observations (`--ekf2d-joint-prior-axial-std-deg`, default 30) and
+exports q in the canonical branch. On 900 real frames, mirrored frames drop from
+about 48 % per limb to 0 % and the forearm axial range from 2115 to 251 deg.
+
+Robust measurements (`--ekf2d-robust-mixture`, opt-in, profile field
+`robust_mixture`): each 2D keypoint gets an inlier/outlier weight from a
+Gaussian-plus-uniform mixture (`--ekf2d-robust-outlier-prob`, default 0.03,
+uniform over the image area) and its variance is inflated accordingly, so gross
+detection errors are neutralized. A lock guard keeps the mixture from rejecting
+the very detections that would correct a wrong prediction: a frame with more than
+`--ekf2d-robust-lock-fraction` (default 0.5) of its keypoints at `w < 0.5` is
+updated with the nominal variances until the fraction falls to
+`--ekf2d-robust-resume-fraction` (default 0.25), every EKF (bootstrap included)
+starts in that suspended mode, and a keypoint rejected in more than half of its
+views gets back its nominal variance. `1 1` disables the guard (the unguarded
+mixture diverged with `white_jerk` on a real sequence). Counters are in
+`robust_mixture_stats` (`suspended_frames`, `lock_events`,
+`keypoint_guard_restored`, `applied_downweighted_below_0_5`).
+
+Known limitation: in `dyn`/`history3` modes the covariance is still propagated
+with the constant-acceleration transition matrix.
+
 ### 6.b Complexity overview
 
 The dominant asymptotic costs below use:
@@ -357,6 +427,9 @@ The dominant asymptotic costs below use:
 | EKF2D `dyn` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`, with a larger constant when root flight dynamics are active. |
 | EKF2D `history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `acc`; the higher-order predictor adds only `O(Q)` state-history work. |
 | EKF2D `dyn_history3` | `O(Q^3 + L^3 + L^2 * Q)` | `O(F * (Q^3 + L^3 + L^2 * Q))` | Same asymptotic order as `dyn`; root uses `dyn`, joints use the smoothed history-based predictor. |
+
+With the default `woodbury` update, the `L^3 + L^2 * Q` update terms become
+`O(L * Q^2 + Q^3)`; the table keeps the `legacy` costs.
 
 In practice:
 

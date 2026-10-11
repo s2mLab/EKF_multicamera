@@ -29,6 +29,10 @@ from reconstruction.reconstruction_registry import (
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
 SUPPORTED_PREDICTORS = ("acc", "dyn", "history3", "dyn_history3")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
+SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
+DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
+SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",
     "back_flexion_1d",
@@ -86,6 +90,8 @@ class ReconstructionProfile:
     ekf2d_3d_source: str = "full_triangulation"
     ekf2d_initial_state_method: str = "ekf_bootstrap"
     ekf2d_bootstrap_passes: int = 5
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD
+    flight_detection: str = "triangulation"
     flip: bool = False
     flip_method: str = "epipolar"
     flip_improvement_ratio: float = 0.7
@@ -112,6 +118,14 @@ class ReconstructionProfile:
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
+    process_noise_model: str = "legacy"
+    process_noise_jerk_psd: list[float] | None = None
+    joint_prior: bool = False
+    joint_prior_axial_std_deg: float = 30.0
+    robust_mixture: bool = False
+    robust_mixture_outlier_prob: float = 0.03
+    robust_mixture_lock_fraction: float = 0.5
+    robust_mixture_resume_fraction: float = 0.25
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
@@ -121,6 +135,7 @@ class ReconstructionProfile:
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
     pose_amplitude_upper_percentile: float = 95.0
+    undistort_keypoints: bool = False
     enabled: bool = True
     extra_args: list[str] | None = None
 
@@ -148,6 +163,30 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("rootq0")
         if int(profile.ekf2d_bootstrap_passes) != 5:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
+        if str(getattr(profile, "ekf2d_update_method", DEFAULT_EKF2D_UPDATE_METHOD)) != DEFAULT_EKF2D_UPDATE_METHOD:
+            parts.append(f"upd_{profile.ekf2d_update_method}")
+        if str(getattr(profile, "flight_detection", "triangulation")) == "ekf_state":
+            parts.append("flightekf")
+        if str(getattr(profile, "process_noise_model", "legacy")) == "white_jerk":
+            parts.append("qjerk")
+            if getattr(profile, "process_noise_jerk_psd", None):
+                parts.append("qc" + "_".join(slugify(f"{float(value):g}") for value in profile.process_noise_jerk_psd))
+        if bool(getattr(profile, "joint_prior", False)):
+            parts.append("jprior")
+            axial_std = float(getattr(profile, "joint_prior_axial_std_deg", 30.0))
+            if not math.isclose(axial_std, 30.0, rel_tol=0.0, abs_tol=1e-9):
+                parts.append(f"ax{slugify(f'{axial_std:g}')}")
+        if bool(getattr(profile, "robust_mixture", False)):
+            parts.append("robust")
+            outlier_prob = float(getattr(profile, "robust_mixture_outlier_prob", 0.03))
+            if not math.isclose(outlier_prob, 0.03, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"po{slugify(f'{outlier_prob:g}')}")
+            lock_fraction = float(getattr(profile, "robust_mixture_lock_fraction", 0.5))
+            resume_fraction = float(getattr(profile, "robust_mixture_resume_fraction", 0.25))
+            if not math.isclose(lock_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"lk{slugify(f'{lock_fraction:g}')}")
+            if not math.isclose(resume_fraction, 0.25, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"rs{slugify(f'{resume_fraction:g}')}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
@@ -213,6 +252,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if bool(getattr(profile, "undistort_keypoints", False)):
+        parts.append("undist")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
     if profile.use_all_cameras:
@@ -289,6 +330,8 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.triangulation_method = "exhaustive"
         profile.reprojection_threshold_px = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
         profile.frame_stride = 1
+        profile.undistort_keypoints = False
+    profile.undistort_keypoints = bool(profile.undistort_keypoints)
     if profile.family == "ekf_2d":
         profile.predictor = profile.predictor or "acc"
         if profile.predictor not in SUPPORTED_PREDICTORS:
@@ -298,6 +341,34 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"):
             raise ValueError(f"Unsupported ekf2d_initial_state_method: {profile.ekf2d_initial_state_method}")
         profile.ekf2d_bootstrap_passes = max(1, int(profile.ekf2d_bootstrap_passes))
+        profile.ekf2d_update_method = str(profile.ekf2d_update_method or DEFAULT_EKF2D_UPDATE_METHOD).strip().lower()
+        if profile.ekf2d_update_method not in SUPPORTED_EKF2D_UPDATE_METHODS:
+            raise ValueError(f"Unsupported ekf2d_update_method: {profile.ekf2d_update_method}")
+        profile.flight_detection = str(profile.flight_detection or "triangulation").strip().lower()
+        if profile.flight_detection not in SUPPORTED_FLIGHT_DETECTIONS:
+            raise ValueError(f"Unsupported flight_detection: {profile.flight_detection}")
+        profile.process_noise_model = str(profile.process_noise_model or "legacy").strip().lower()
+        if profile.process_noise_model not in SUPPORTED_PROCESS_NOISE_MODELS:
+            raise ValueError(f"Unsupported process_noise_model: {profile.process_noise_model}")
+        if profile.process_noise_jerk_psd is not None:
+            psd = [float(value) for value in profile.process_noise_jerk_psd]
+            if len(psd) != 3 or any((not math.isfinite(value)) or value <= 0.0 for value in psd):
+                raise ValueError("process_noise_jerk_psd must contain three positive values.")
+            profile.process_noise_jerk_psd = psd
+        if profile.process_noise_model != "white_jerk":
+            profile.process_noise_jerk_psd = None
+        profile.joint_prior = bool(profile.joint_prior)
+        if float(profile.joint_prior_axial_std_deg) <= 0.0:
+            raise ValueError("joint_prior_axial_std_deg must be > 0.")
+        profile.robust_mixture = bool(profile.robust_mixture)
+        if not 0.0 < float(profile.robust_mixture_outlier_prob) < 1.0:
+            raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
+        profile.robust_mixture_lock_fraction = float(profile.robust_mixture_lock_fraction)
+        profile.robust_mixture_resume_fraction = float(profile.robust_mixture_resume_fraction)
+        if not 0.0 < profile.robust_mixture_lock_fraction <= 1.0:
+            raise ValueError("robust_mixture_lock_fraction must be in (0, 1].")
+        if not 0.0 <= profile.robust_mixture_resume_fraction <= profile.robust_mixture_lock_fraction:
+            raise ValueError("robust_mixture_resume_fraction must be in [0, robust_mixture_lock_fraction].")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -312,6 +383,16 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_3d_source = "full_triangulation"
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
+        profile.ekf2d_update_method = DEFAULT_EKF2D_UPDATE_METHOD
+        profile.flight_detection = "triangulation"
+        profile.process_noise_model = "legacy"
+        profile.process_noise_jerk_psd = None
+        profile.joint_prior = False
+        profile.joint_prior_axial_std_deg = 30.0
+        profile.robust_mixture = False
+        profile.robust_mixture_outlier_prob = 0.03
+        profile.robust_mixture_lock_fraction = 0.5
+        profile.robust_mixture_resume_fraction = 0.25
         profile.dof_locking = False
         profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
@@ -615,6 +696,8 @@ def build_pipeline_command(
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
+    if profile.undistort_keypoints:
+        cmd.append("--undistort-keypoints")
     cmd.extend(["--root-unwrap-mode", "off"])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
@@ -631,6 +714,23 @@ def build_pipeline_command(
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
         cmd.extend(["--ekf2d-bootstrap-passes", str(profile.ekf2d_bootstrap_passes)])
+        if profile.ekf2d_update_method != DEFAULT_EKF2D_UPDATE_METHOD:
+            cmd.extend(["--ekf2d-update-method", profile.ekf2d_update_method])
+        if profile.flight_detection != "triangulation":
+            cmd.extend(["--flight-detection", profile.flight_detection])
+        if profile.process_noise_model != "legacy":
+            cmd.extend(["--process-noise-model", profile.process_noise_model])
+            if profile.process_noise_jerk_psd:
+                cmd.append("--process-noise-jerk-psd")
+                cmd.extend(str(float(value)) for value in profile.process_noise_jerk_psd)
+        if profile.joint_prior:
+            cmd.append("--ekf2d-joint-prior")
+            cmd.extend(["--ekf2d-joint-prior-axial-std-deg", str(float(profile.joint_prior_axial_std_deg))])
+        if profile.robust_mixture:
+            cmd.append("--ekf2d-robust-mixture")
+            cmd.extend(["--ekf2d-robust-outlier-prob", str(float(profile.robust_mixture_outlier_prob))])
+            cmd.extend(["--ekf2d-robust-lock-fraction", str(float(profile.robust_mixture_lock_fraction))])
+            cmd.extend(["--ekf2d-robust-resume-fraction", str(float(profile.robust_mixture_resume_fraction))])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])
