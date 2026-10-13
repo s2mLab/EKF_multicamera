@@ -144,6 +144,13 @@ demarre suspendu) et sur un keypoint rejete dans plus de la moitie de ses vues.
 `legacy` produit le fichier historique octet pour octet et laisse les
 metadonnees/caches du stage modele inchanges. Test cible :
 `pytest -q tests/test_head_marker_model.py`.
+`--ekf2d-back-prior-mode {legacy,consistent}` (defaut `legacy`, champ de profil
+`back_prior_mode`, variantes de modele avec dos) choisit la pseudo-observation
+de flexion du dos : `legacy` est l'historique (signe inverse pour `back_*`,
+RotX des cuisses melangees, `H` incomplet) ; `consistent` impose flexion du
+dos = gain x flexion de hanche moyenne avec le signe du DoF de dos et `H`
+complet. Detail et impact dans `OVERVIEW.md`. Test cible :
+`pytest -q tests/test_ekf2d_back_prior.py`.
 Les modes `*_fast*` (coherence et flip) utilisent la distance epipolaire
 symetrique (+3,7 % d'erreur vs Sampson mesuree en reel) ; l'equivalent Sampson
 est le meme nom sans `_fast`. Les profils existants restent inchanges ; la CLI
