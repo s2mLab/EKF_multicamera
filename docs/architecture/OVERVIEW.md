@@ -196,6 +196,69 @@ diagnostics du bootstrap). `white_jerk` + melange donne alors 8,61 px / 38,2 mm
 divergence avec les detecteurs `best`, `ECCV` et `base` (sans melange :
 resultats identiques au bit pres).
 
+Pseudo-observation du dos (variantes `back_flexion_1d`, `back_3dof` a racine
+basse = bassin, segment `UPPER_BACK` ; `upper_root_back_flexion_1d`,
+`upper_root_back_3dof` a racine haute, segment `LOWER_TRUNK` porteur des
+hanches ; sans effet sur `single_trunk`). Avec les marqueurs COCO17, le tangage
+du bassin et la flexion du dos sont inobservables au premier ordre (les deux
+hanches sont sur l'axe y du bassin) : la pseudo-observation fixe donc la
+posture du dos. Conventions verifiees avec biorbd sur les modeles de
+`build_biomod` : `THIGH:RotY > 0` = extension de hanche, `UPPER_BACK:RotY > 0`
+= flexion du dos, `LOWER_TRUNK:RotY > 0` = extension du dos. Option
+`back_prior_mode` (`--ekf2d-back-prior-mode`, champ de profil
+`back_prior_mode`, suffixe de nom `bp_consistent`, familles `ekf_2d`) ; gain `g`
+et ecart-type `s` restent `--upper-back-sagittal-gain` (0,2) et
+`--upper-back-pseudo-std-deg` (10 deg) :
+
+- `legacy` (defaut, resultats identiques au bit pres) : cible
+  `RotY_dos = g * moyenne(RotY et RotX des deux cuisses)`, `H = e_dos`. Trois
+  defauts : (1) les RotX G/D s'annulent en abduction symetrique, le gain
+  effectif sur la flexion est `g/2` et les asymetries fuient dans le dos ;
+  (2) la cible depend des hanches mais `H` ne contient que le DoF du dos ;
+  (3) signe : hanches flechies a 90 deg, la cible vaut -9 deg de flexion
+  geometrique (extension) pour `back_*` et +9 deg pour `upper_root_*`.
+- `consistent` : flexion anatomique du dos = `g` x flexion de hanche moyenne,
+  soit `RotY_dos - c * moyenne(a_G, a_D) ~ N(0, s^2)` avec `c = -g`
+  (`UPPER_BACK`) ou `+g` (`LOWER_TRUNK`) (`BACK_FLEXION_SIGN_BY_SEGMENT`,
+  `THIGH_ROTY_HIP_FLEXION_SIGN`), `a = atan2(sin RotY cos RotX, cos RotY cos RotX)`
+  (RotY de la cuisse independante de la branche d'Euler YXZ equivalente
+  `(RotY + pi, pi - RotX, RotZ + pi)`, observee en reel), residu replie dans
+  `[-pi, pi)`, `H` exact : 1 sur le DoF du dos, `-c/2` sur chaque `THIGH:RotY`.
+
+Les a priori nuls sur RotX/RotZ du dos (meme `s`) sont inchanges dans les deux
+modes. Il n'y a pas de cache EKF ; le stage modele n'est pas concerne ; le mode
+est trace dans `summary.filter_parameters.back_prior_mode` et
+`summary.back_prior` (DoF, hanches, coefficient, `full_jacobian`), et dans les
+sorties de `run_ekf`. Basculer le defaut = changer `DEFAULT_BACK_PRIOR_MODE`
+dans `vitpose_ekf_pipeline.py` et `reconstruction/reconstruction_profiles.py`
+(un test impose leur egalite) ; les profils prendraient alors le suffixe
+`bp_legacy` pour l'ancien mode. Test cible :
+`pytest -q tests/test_ekf2d_back_prior.py`.
+
+Impact mesure (verite terrain, `head_marker_model=anthropometric`, configs d et
+x, 4 variantes ; `1_partie_0429_001` best/ECCV/base et `3_partie_0429_001` best ;
+32 paires, IC95 bootstrap par frame annotee ; angles geometriques des reperes
+de segments, groupe = 10 % des frames de plus forte flexion de hanche) :
+
+- Erreurs : `1_partie_0429_001`/best, aucune difference significative de la
+  mediane (|d| <= 0,07 px, <= 0,9 mm). Sur les 32 paires, 3 differences
+  globales significatives de la mediane 2D : -0,53 px (`base`/d/
+  `back_flexion_1d`), -1,19 px (`3_partie_0429_001`/d/`back_flexion_1d`, dont le
+  run `legacy` diverge en extension a -80 deg) et +1,20 px
+  (`3_partie_0429_001`/x/`upper_root_back_3dof`, torsion instable dans les deux
+  modes).
+- Posture : flexion du dos en groupe `back_*` -10 a -35 deg (extension) ->
+  +16 a +26 deg ; `upper_root_*` +12 a +35 deg -> +12 a +32 deg ; p95 de la
+  flexion de hanche `back_*` 137-145 deg -> 119-127 deg (`upper_root_*`
+  114-127 -> 115-123 deg). Temps EKF sans ecart systematique (4 a 12 s par run).
+
+Limites : la flexion du dos reste determinee par l'a priori (evaluation
+precedente par borne de Cramer-Rao : 8 a 16 % de l'information vient des
+donnees ; posture a +-25-35 deg pres selon `g` et `s`) ; aucune borne ni a
+priori nouveau sur l'inclinaison et la torsion du dos : avec `back_3dof`/`upper_root_back_3dof` en config x, la
+torsion fait des tours complets sur `3_partie_0429_001` (environ 2 tours,
+sauts de ~350 deg) dans les deux modes ; non corrige ici.
+
 Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
 predite est recalculee (dynamique ou extrapolation d'historique) mais la
 covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc

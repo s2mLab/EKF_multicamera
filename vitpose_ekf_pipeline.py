@@ -169,6 +169,23 @@ DEFAULT_FLIGHT_DETECTION = "triangulation"
 DEFAULT_FLIGHT_HYSTERESIS_M = 0.05
 DEFAULT_UPPER_BACK_SAGITTAL_GAIN = 0.2
 DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
+# Back flexion pseudo-observation of the back model variants (``back_prior_mode``):
+# "legacy": historical target ``RotY_back = g * mean(THIGH:RotY, THIGH:RotX of both legs)`` with
+#   ``H = e_back`` only. Since ``THIGH:RotY > 0`` is a hip *extension* and ``UPPER_BACK:RotY > 0`` a back
+#   *flexion*, the low-root variants (``back_*``) are pulled into back extension when the hips flex; the
+#   symmetric RotX terms halve the effective flexion gain and leak hip asymmetries into the back.
+# "consistent": anatomical back flexion = g * mean hip flexion, with hip flexion = -THIGH:RotY and the
+#   back flexion sign of the back DoF (``BACK_FLEXION_SIGN_BY_SEGMENT``), i.e. the linear prior
+#   ``RotY_back - c * mean(THIGH:RotY) ~ N(0, s^2)`` with ``c = -g`` (UPPER_BACK) or ``+g`` (LOWER_TRUNK),
+#   linearised with the full ``H`` (``1`` on the back DoF, ``-c/2`` on each thigh RotY). The thigh RotY is
+#   read in a branch-independent way (equivalent YXZ Euler branch) and the residual is wrapped to [-pi, pi).
+SUPPORTED_BACK_PRIOR_MODES = ("legacy", "consistent")
+DEFAULT_BACK_PRIOR_MODE = "legacy"
+# Sign of the anatomical back flexion carried by ``<segment>:RotY`` (checked with biorbd on build_biomod models):
+# UPPER_BACK:RotY > 0 leans the shoulders forward (flexion); LOWER_TRUNK:RotY > 0 is an extension of the
+# lower trunk under the upper-trunk root. Hip flexion is ``-THIGH:RotY`` (``THIGH:RotY > 0`` moves the knee back).
+BACK_FLEXION_SIGN_BY_SEGMENT = {"UPPER_BACK": 1.0, "LOWER_TRUNK": -1.0}
+THIGH_ROTY_HIP_FLEXION_SIGN = -1.0
 DEFAULT_ANKLE_BED_PSEUDO_STD_M = 0.02
 DEFAULT_FLIP_IMPROVEMENT_RATIO = 0.7
 DEFAULT_FLIP_MIN_GAIN_PX = 3.0
@@ -244,6 +261,15 @@ def model_variant_has_back_dofs(model_variant: str) -> bool:
         "upper_root_back_flexion_1d",
         "upper_root_back_3dof",
     }
+
+
+def normalize_back_prior_mode(back_prior_mode: str | None) -> str:
+    """Return the canonical back pseudo-observation mode, raising on unsupported values."""
+
+    name = str(back_prior_mode or DEFAULT_BACK_PRIOR_MODE).strip().lower()
+    if name not in SUPPORTED_BACK_PRIOR_MODES:
+        raise ValueError(f"Unsupported back_prior_mode: {back_prior_mode}")
+    return name
 
 
 def normalize_head_marker_model(head_marker_model: str | None) -> str:
@@ -4240,6 +4266,11 @@ class MultiViewKinematicEKF:
     avec la jacobienne analytique de projection camera.
     """
 
+    # Class-level defaults of the back pseudo-observation (instances built with ``__new__`` in tests).
+    back_prior_mode = DEFAULT_BACK_PRIOR_MODE
+    back_prior_hip_coefficient = 0.0
+    back_prior_thigh_rotx_indices: tuple[int, ...] = ()
+
     def __init__(
         self,
         model,
@@ -4266,6 +4297,7 @@ class MultiViewKinematicEKF:
         flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
         upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
         upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+        back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
         ankle_bed_pseudo_obs: bool = False,
         ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
         update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -4349,6 +4381,7 @@ class MultiViewKinematicEKF:
         self.flip_error_delta_threshold_px = float(flip_error_delta_threshold_px)
         self.upper_back_sagittal_gain = float(upper_back_sagittal_gain)
         self.upper_back_pseudo_std_rad = float(upper_back_pseudo_std_rad)
+        self.back_prior_mode = normalize_back_prior_mode(back_prior_mode)
         self.ankle_bed_pseudo_obs = bool(ankle_bed_pseudo_obs)
         self.ankle_bed_pseudo_std_m = float(ankle_bed_pseudo_std_m)
         self.use_prediction_flip_gate = self.flip_method == "ekf_prediction_gate"
@@ -4495,6 +4528,24 @@ class MultiViewKinematicEKF:
         if not self.upper_back_segment_name:
             return None, ()
         upper_back_sagittal_idx = self.lock_map.get(f"{self.upper_back_segment_name}:RotY")
+        if self.back_prior_mode == "consistent":
+            # Sagittal hip angles only; both thighs are required (mean hip flexion).
+            hip_candidates = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
+            if upper_back_sagittal_idx is None or any(name not in self.lock_map for name in hip_candidates):
+                return None, tuple()
+            back_sign = BACK_FLEXION_SIGN_BY_SEGMENT[self.upper_back_segment_name]
+            # back_sign * RotY_back = g * mean(THIGH_ROTY_HIP_FLEXION_SIGN * RotY_thigh)
+            self.back_prior_hip_coefficient = float(
+                back_sign * THIGH_ROTY_HIP_FLEXION_SIGN * self.upper_back_sagittal_gain
+            )
+            # RotX selects the Euler branch of the YXZ thigh rotation (see _consistent_back_prior_block).
+            rotx_names = ("LEFT_THIGH:RotX", "RIGHT_THIGH:RotX")
+            self.back_prior_thigh_rotx_indices = (
+                tuple(self.lock_map[name] for name in rotx_names)
+                if all(name in self.lock_map for name in rotx_names)
+                else ()
+            )
+            return int(upper_back_sagittal_idx), tuple(self.lock_map[name] for name in hip_candidates)
         hip_candidates = (
             "LEFT_THIGH:RotY",
             "RIGHT_THIGH:RotY",
@@ -4505,6 +4556,26 @@ class MultiViewKinematicEKF:
         if upper_back_sagittal_idx is None or len(hip_indices) < 2:
             return None, tuple()
         return int(upper_back_sagittal_idx), hip_indices
+
+    def back_prior_description(self) -> dict[str, object] | None:
+        """Describe the active back flexion pseudo-observation (``None`` without back DoF)."""
+
+        if self.upper_back_sagittal_idx is None:
+            return None
+        return {
+            "mode": str(self.back_prior_mode),
+            "back_dof": str(self.q_names[self.upper_back_sagittal_idx]),
+            "hip_dofs": [str(self.q_names[idx]) for idx in self.hip_flexion_indices],
+            "gain": float(self.upper_back_sagittal_gain),
+            "std_deg": float(np.rad2deg(self.upper_back_pseudo_std_rad)),
+            # RotY_back target = coefficient * mean(hip_dofs); legacy: +gain on RotY and RotX of both thighs.
+            "target_coefficient": float(
+                self.back_prior_hip_coefficient
+                if self.back_prior_mode == "consistent"
+                else self.upper_back_sagittal_gain
+            ),
+            "full_jacobian": bool(self.back_prior_mode == "consistent"),
+        }
 
     def _resolve_ankle_bed_pair_indices(self) -> tuple[tuple[int, int], ...]:
         """Map ankle keypoints to the corresponding model-marker pair indices.
@@ -4531,11 +4602,48 @@ class MultiViewKinematicEKF:
         hip_flexion = np.asarray(reference_q[list(self.hip_flexion_indices)], dtype=float)
         if not np.all(np.isfinite(hip_flexion)):
             return None
+        if self.back_prior_mode == "consistent":
+            return self._consistent_back_prior_block(reference_q, hip_flexion)
         target_value = self.upper_back_sagittal_gain * float(np.mean(hip_flexion))
         H_q = np.zeros((1, self.nq), dtype=float)
         H_q[0, self.upper_back_sagittal_idx] = 1.0
         h = np.array([float(reference_q[self.upper_back_sagittal_idx])], dtype=float)
         z = np.array([target_value], dtype=float)
+        variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
+        return z, h, H_q, variance
+
+    def _consistent_back_prior_block(
+        self,
+        reference_q: np.ndarray,
+        hip_roty: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+        """Prior ``RotY_back - c * mean(thigh sagittal angle) ~ N(0, s^2)`` (``back_prior_mode="consistent"``).
+
+        The thigh sagittal angle ``atan2(sin(RotY) cos(RotX), cos(RotY) cos(RotX))`` is the thigh RotY made
+        independent of the YXZ Euler branch: it equals ``wrap(RotY)`` when ``cos(RotX) > 0`` and
+        ``wrap(RotY + pi)`` in the equivalent branch ``(RotY + pi, pi - RotX, RotZ + pi)`` (same thigh axis), so
+        ``-angle`` is the geometric hip flexion. Its derivative is ``1`` in RotY and ``0`` in RotX, hence the
+        exact ``H``: ``1`` on the back DoF and ``-c / n_hips`` on each thigh RotY (corrected jointly). ``z = 0``
+        and the residual is wrapped to ``[-pi, pi)`` (a ``2 pi`` turn of the back DoF is not an innovation).
+        """
+
+        back_value = float(reference_q[self.upper_back_sagittal_idx])
+        if not np.isfinite(back_value):
+            return None
+        if self.back_prior_thigh_rotx_indices:
+            cos_rotx = np.cos(np.asarray(reference_q[list(self.back_prior_thigh_rotx_indices)], dtype=float))
+        else:
+            cos_rotx = np.ones_like(hip_roty)
+        if not np.all(np.isfinite(cos_rotx)):
+            return None
+        thigh_sagittal = np.arctan2(np.sin(hip_roty) * cos_rotx, np.cos(hip_roty) * cos_rotx)
+        coefficient = float(self.back_prior_hip_coefficient)
+        H_q = np.zeros((1, self.nq), dtype=float)
+        H_q[0, self.upper_back_sagittal_idx] = 1.0
+        for hip_idx in self.hip_flexion_indices:
+            H_q[0, hip_idx] -= coefficient / len(self.hip_flexion_indices)
+        h = np.array([wrap_to_pi(back_value - coefficient * float(np.mean(thigh_sagittal)))], dtype=float)
+        z = np.zeros(1, dtype=float)
         variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
         return z, h, H_q, variance
 
@@ -5701,6 +5809,7 @@ def initial_state_from_ekf_bootstrap(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -5765,6 +5874,7 @@ def initial_state_from_ekf_bootstrap(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        back_prior_mode=back_prior_mode,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
@@ -5835,6 +5945,7 @@ def initial_state_from_root_pose_bootstrap(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -5883,6 +5994,7 @@ def initial_state_from_root_pose_bootstrap(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            back_prior_mode=back_prior_mode,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
@@ -5919,6 +6031,7 @@ def initial_state_from_root_pose_bootstrap(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        back_prior_mode=back_prior_mode,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
@@ -5961,6 +6074,7 @@ def compute_ekf2d_initial_state(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -6009,6 +6123,7 @@ def compute_ekf2d_initial_state(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            back_prior_mode=back_prior_mode,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
@@ -6043,6 +6158,7 @@ def compute_ekf2d_initial_state(
             flip_error_delta_threshold_px=flip_error_delta_threshold_px,
             upper_back_sagittal_gain=upper_back_sagittal_gain,
             upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+            back_prior_mode=back_prior_mode,
             ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
             update_method=update_method,
@@ -6088,6 +6204,7 @@ def run_ekf(
     flip_error_delta_threshold_px: float = DEFAULT_EKF_PREDICTION_GATE_ERROR_DELTA_THRESHOLD_PX,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_rad: float = DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -6140,6 +6257,7 @@ def run_ekf(
         flip_error_delta_threshold_px=flip_error_delta_threshold_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=upper_back_pseudo_std_rad,
+        back_prior_mode=back_prior_mode,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=update_method,
@@ -6220,6 +6338,8 @@ def run_ekf(
             "update_solver_counts": dict(ekf.solver_counts),
             "flight_detection": str(ekf.flight_detection),
             "joint_prior_counts": dict(ekf.joint_prior_counts) if ekf.joint_prior else None,
+            "back_prior_mode": str(ekf.back_prior_mode),
+            "back_prior": ekf.back_prior_description(),
             "robust_mixture_stats": dict(ekf.robust_mixture_stats) if ekf.robust_mixture else None,
             "dyn_active_per_frame": (
                 np.asarray(ekf.flight_active_history, dtype=bool) if root_flight_dynamics else None

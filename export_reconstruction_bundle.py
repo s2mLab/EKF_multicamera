@@ -26,6 +26,7 @@ from reconstruction.reconstruction_bundle import (
 )
 from vitpose_ekf_pipeline import (
     DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    DEFAULT_BACK_PRIOR_MODE,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
@@ -60,6 +61,7 @@ from vitpose_ekf_pipeline import (
     DEFAULT_TRIANGULATION_WORKERS,
     DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
     DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    SUPPORTED_BACK_PRIOR_MODES,
     SUPPORTED_COHERENCE_METHODS,
     SUPPORTED_EKF2D_UPDATE_METHODS,
     SUPPORTED_FLIGHT_DETECTIONS,
@@ -254,6 +256,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--upper-back-sagittal-gain", type=float, default=DEFAULT_UPPER_BACK_SAGITTAL_GAIN)
     parser.add_argument(
         "--upper-back-pseudo-std-deg", type=float, default=np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD)
+    )
+    parser.add_argument(
+        "--ekf2d-back-prior-mode",
+        choices=SUPPORTED_BACK_PRIOR_MODES,
+        default=DEFAULT_BACK_PRIOR_MODE,
+        help=(
+            "Pseudo-observation de flexion du dos (variantes back_*/upper_root_*): 'legacy' (historique, signe "
+            "inverse pour back_*, RotX des cuisses melangees) ou 'consistent' (flexion du dos = gain x flexion "
+            "de hanche moyenne, RotY des cuisses seulement, signe selon la racine, H complet)."
+        ),
     )
     parser.add_argument("--ankle-bed-pseudo-obs", action="store_true")
     parser.add_argument("--ankle-bed-pseudo-std-m", type=float, default=DEFAULT_ANKLE_BED_PSEUDO_STD_M)
@@ -457,6 +469,7 @@ def main() -> None:
             flight_min_consecutive_frames=args.flight_min_consecutive_frames,
             upper_back_sagittal_gain=args.upper_back_sagittal_gain,
             upper_back_pseudo_std_deg=args.upper_back_pseudo_std_deg,
+            back_prior_mode=args.ekf2d_back_prior_mode,
             ankle_bed_pseudo_obs=args.ankle_bed_pseudo_obs,
             ankle_bed_pseudo_std_m=args.ankle_bed_pseudo_std_m,
             ekf2d_update_method=args.ekf2d_update_method,

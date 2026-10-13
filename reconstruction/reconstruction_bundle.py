@@ -35,6 +35,7 @@ from reconstruction.reconstruction_timings import make_timing_stage
 from vitpose_ekf_pipeline import (
     COCO17,
     DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    DEFAULT_BACK_PRIOR_MODE,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
@@ -99,6 +100,7 @@ from vitpose_ekf_pipeline import (
     metadata_cache_matches,
     model_stage_cache_matches,
     model_stage_metadata,
+    normalize_back_prior_mode,
     normalize_head_marker_model,
     pose_data_signature,
     reconstruction_cache_metadata,
@@ -2342,6 +2344,7 @@ def build_ekf_2d_bundle(
     flight_min_consecutive_frames: int,
     upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
     ankle_bed_pseudo_obs: bool = False,
     ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
     ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
@@ -2364,6 +2367,7 @@ def build_ekf_2d_bundle(
     """Build and export the standardized EKF2D reconstruction bundle."""
 
     head_marker_model = normalize_head_marker_model(head_marker_model)
+    back_prior_mode = normalize_back_prior_mode(back_prior_mode)
 
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
@@ -2548,6 +2552,7 @@ def build_ekf_2d_bundle(
         flip_error_delta_threshold_px=flip_min_gain_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
+        back_prior_mode=back_prior_mode,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=ekf2d_update_method,
@@ -2591,6 +2596,7 @@ def build_ekf_2d_bundle(
         flip_error_delta_threshold_px=flip_min_gain_px,
         upper_back_sagittal_gain=upper_back_sagittal_gain,
         upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
+        back_prior_mode=back_prior_mode,
         ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
         ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
         update_method=ekf2d_update_method,
@@ -2828,6 +2834,7 @@ def build_ekf_2d_bundle(
             "coherence_confidence_floor": float(coherence_confidence_floor),
             "upper_back_sagittal_gain": float(upper_back_sagittal_gain),
             "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
+            "back_prior_mode": str(back_prior_mode),
             "ankle_bed_pseudo_obs": bool(ankle_bed_pseudo_obs),
             "ankle_bed_pseudo_std_m": float(ankle_bed_pseudo_std_m),
             "update_method": str(result.get("update_method", ekf2d_update_method)),
@@ -2853,6 +2860,7 @@ def build_ekf_2d_bundle(
             "flip_method": str(flip_method or "epipolar"),
         },
         "joint_prior_counts": result.get("joint_prior_counts"),
+        "back_prior": result.get("back_prior"),
         "robust_mixture_stats": result.get("robust_mixture_stats"),
         "bootstrap_frame_idx": int(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx

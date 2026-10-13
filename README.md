@@ -390,6 +390,20 @@ pseudo-observations (`--ekf2d-joint-prior-axial-std-deg`, default 30) and
 exports q in the canonical branch. On 900 real frames, mirrored frames drop from
 about 48 % per limb to 0 % and the forearm axial range from 2115 to 251 deg.
 
+Back flexion pseudo-observation of the back model variants
+(`--ekf2d-back-prior-mode {legacy,consistent}`, profile field `back_prior_mode`;
+gain and std via `--upper-back-sagittal-gain` / `--upper-back-pseudo-std-deg`):
+pelvis pitch and back flexion are not observable from COCO17 keypoints, so this
+prior sets the back posture. `legacy` (default, unchanged) targets
+`gain * mean(thigh RotY and RotX)` on the back RotY, which pulls the low-root
+`back_*` variants into back extension when the hips flex. `consistent` sets the
+anatomical back flexion to `gain` times the mean hip flexion (thigh RotY only,
+sign of the back DoF, full Jacobian). On real ground truth, marker errors are
+unchanged (no significant difference on `1_partie_0429_001`/best) while the
+tucked back flexion of `back_*` goes from -10..-35 deg to +16..+26 deg.
+Inclination and torsion of the back are not constrained beyond the historical
+zero priors.
+
 Robust measurements (`--ekf2d-robust-mixture`, opt-in, profile field
 `robust_mixture`): each 2D keypoint gets an inlier/outlier weight from a
 Gaussian-plus-uniform mixture (`--ekf2d-robust-outlier-prob`, default 0.03,
