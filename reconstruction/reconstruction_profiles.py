@@ -34,6 +34,9 @@ DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
 SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
 SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
 SUPPORTED_HEAD_MARKER_MODELS = ("legacy", "anthropometric")
+# Back flexion pseudo-observation of the back model variants (same values as vitpose_ekf_pipeline).
+SUPPORTED_BACK_PRIOR_MODES = ("legacy", "consistent")
+DEFAULT_BACK_PRIOR_MODE = "legacy"
 SUPPORTED_MODEL_VARIANTS = (
     "single_trunk",
     "back_flexion_1d",
@@ -131,6 +134,7 @@ class ReconstructionProfile:
     coherence_confidence_floor: float = 0.35
     upper_back_sagittal_gain: float = 0.2
     upper_back_pseudo_std_deg: float = 10.0
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE
     ankle_bed_pseudo_obs: bool = False
     ankle_bed_pseudo_std_m: float = 0.02
     pose_filter_window: int = 9
@@ -195,6 +199,8 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"coh_{profile.coherence_method}")
         if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
             parts.append(f"ubg{slugify(f'{profile.upper_back_sagittal_gain:.2f}')}")
+        if str(getattr(profile, "back_prior_mode", DEFAULT_BACK_PRIOR_MODE)) != DEFAULT_BACK_PRIOR_MODE:
+            parts.append(f"bp_{profile.back_prior_mode}")
         if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
             parts.append("ankbed")
             if not math.isclose(
@@ -351,6 +357,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_update_method = str(profile.ekf2d_update_method or DEFAULT_EKF2D_UPDATE_METHOD).strip().lower()
         if profile.ekf2d_update_method not in SUPPORTED_EKF2D_UPDATE_METHODS:
             raise ValueError(f"Unsupported ekf2d_update_method: {profile.ekf2d_update_method}")
+        profile.back_prior_mode = str(profile.back_prior_mode or DEFAULT_BACK_PRIOR_MODE).strip().lower()
+        if profile.back_prior_mode not in SUPPORTED_BACK_PRIOR_MODES:
+            raise ValueError(f"Unsupported back_prior_mode: {profile.back_prior_mode}")
         profile.flight_detection = str(profile.flight_detection or "triangulation").strip().lower()
         if profile.flight_detection not in SUPPORTED_FLIGHT_DETECTIONS:
             raise ValueError(f"Unsupported flight_detection: {profile.flight_detection}")
@@ -391,6 +400,7 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
         profile.ekf2d_update_method = DEFAULT_EKF2D_UPDATE_METHOD
+        profile.back_prior_mode = DEFAULT_BACK_PRIOR_MODE
         profile.flight_detection = "triangulation"
         profile.process_noise_model = "legacy"
         profile.process_noise_jerk_psd = None
@@ -717,6 +727,8 @@ def build_pipeline_command(
             cmd.extend(["--head-marker-model", profile.head_marker_model])
         cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
         cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
+        if profile.back_prior_mode != DEFAULT_BACK_PRIOR_MODE:
+            cmd.extend(["--ekf2d-back-prior-mode", profile.back_prior_mode])
         if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
             cmd.append("--ankle-bed-pseudo-obs")
         cmd.extend(["--ankle-bed-pseudo-std-m", str(float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)))])
