@@ -186,6 +186,36 @@ def test_consistent_block_ignores_thigh_abduction(tmp_path, model_variant):
             np.testing.assert_array_equal(got, ref)
 
 
+@pytest.mark.parametrize("model_variant", ("back_3dof", "upper_root_back_flexion_1d"))
+def test_consistent_block_is_independent_of_the_thigh_euler_branch(tmp_path, model_variant):
+    """(RotY + pi, pi - RotX, RotZ + pi) is the same YXZ thigh rotation; a 2 pi turn of the back is no innovation."""
+
+    ekf = _ekf(tmp_path, model_variant, back_prior_mode="consistent")
+    names = ekf.q_names
+    q = np.zeros(ekf.nq)
+    q[2] = 1.0
+    q[names.index("LEFT_THIGH:RotY")] = np.deg2rad(-100.0)
+    q[names.index("RIGHT_THIGH:RotY")] = np.deg2rad(-80.0)
+    q[names.index("LEFT_THIGH:RotX")] = np.deg2rad(10.0)
+    q[ekf.upper_back_sagittal_idx] = np.deg2rad(5.0)
+    other = np.array(q, copy=True)
+    for side in ("LEFT", "RIGHT"):
+        other[names.index(f"{side}_THIGH:RotY")] += np.pi
+        other[names.index(f"{side}_THIGH:RotX")] = np.pi - other[names.index(f"{side}_THIGH:RotX")]
+        other[names.index(f"{side}_THIGH:RotZ")] += np.pi
+    other[ekf.upper_back_sagittal_idx] += 2.0 * np.pi
+    np.testing.assert_allclose(
+        model_keypoints_3d(ekf.model, other[None]), model_keypoints_3d(ekf.model, q[None]), atol=1e-9
+    )
+    reference = ekf._upper_back_pseudo_measurement_block(q)
+    for got, ref in zip(ekf._upper_back_pseudo_measurement_block(other), reference):
+        np.testing.assert_allclose(got, ref, atol=1e-12)
+    # Mean hip flexion 90 deg -> target anatomical back flexion g x 90 deg.
+    back_sign = 1.0 if model_variant.startswith("back_") else -1.0
+    target = q[ekf.upper_back_sagittal_idx] - reference[1][0]
+    assert back_sign * target == pytest.approx(np.deg2rad(GAIN * 90.0), abs=1e-12)
+
+
 @pytest.mark.parametrize("model_variant", BACK_VARIANTS)
 def test_consistent_jacobian_matches_finite_differences(tmp_path, model_variant):
     ekf = _ekf(tmp_path, model_variant, back_prior_mode="consistent")

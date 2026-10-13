@@ -177,7 +177,8 @@ DEFAULT_UPPER_BACK_PSEUDO_STD_RAD = np.deg2rad(10.0)
 # "consistent": anatomical back flexion = g * mean hip flexion, with hip flexion = -THIGH:RotY and the
 #   back flexion sign of the back DoF (``BACK_FLEXION_SIGN_BY_SEGMENT``), i.e. the linear prior
 #   ``RotY_back - c * mean(THIGH:RotY) ~ N(0, s^2)`` with ``c = -g`` (UPPER_BACK) or ``+g`` (LOWER_TRUNK),
-#   linearised with the full ``H`` (``1`` on the back DoF, ``-c/2`` on each thigh RotY).
+#   linearised with the full ``H`` (``1`` on the back DoF, ``-c/2`` on each thigh RotY). The thigh RotY is
+#   read in a branch-independent way (equivalent YXZ Euler branch) and the residual is wrapped to [-pi, pi).
 SUPPORTED_BACK_PRIOR_MODES = ("legacy", "consistent")
 DEFAULT_BACK_PRIOR_MODE = "legacy"
 # Sign of the anatomical back flexion carried by ``<segment>:RotY`` (checked with biorbd on build_biomod models):
@@ -4268,6 +4269,7 @@ class MultiViewKinematicEKF:
     # Class-level defaults of the back pseudo-observation (instances built with ``__new__`` in tests).
     back_prior_mode = DEFAULT_BACK_PRIOR_MODE
     back_prior_hip_coefficient = 0.0
+    back_prior_thigh_rotx_indices: tuple[int, ...] = ()
 
     def __init__(
         self,
@@ -4536,6 +4538,13 @@ class MultiViewKinematicEKF:
             self.back_prior_hip_coefficient = float(
                 back_sign * THIGH_ROTY_HIP_FLEXION_SIGN * self.upper_back_sagittal_gain
             )
+            # RotX selects the Euler branch of the YXZ thigh rotation (see _consistent_back_prior_block).
+            rotx_names = ("LEFT_THIGH:RotX", "RIGHT_THIGH:RotX")
+            self.back_prior_thigh_rotx_indices = (
+                tuple(self.lock_map[name] for name in rotx_names)
+                if all(name in self.lock_map for name in rotx_names)
+                else ()
+            )
             return int(upper_back_sagittal_idx), tuple(self.lock_map[name] for name in hip_candidates)
         hip_candidates = (
             "LEFT_THIGH:RotY",
@@ -4608,21 +4617,32 @@ class MultiViewKinematicEKF:
         reference_q: np.ndarray,
         hip_roty: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-        """Linear prior ``RotY_back - c * mean(THIGH:RotY) ~ N(0, s^2)`` (``back_prior_mode="consistent"``).
+        """Prior ``RotY_back - c * mean(thigh sagittal angle) ~ N(0, s^2)`` (``back_prior_mode="consistent"``).
 
-        ``z = 0`` and ``h(q) = RotY_back - c * mean(RotY_left, RotY_right)`` is linear, so ``H`` is exact:
-        ``1`` on the back DoF and ``-c / n_hips`` on each thigh RotY (both corrected jointly).
+        The thigh sagittal angle ``atan2(sin(RotY) cos(RotX), cos(RotY) cos(RotX))`` is the thigh RotY made
+        independent of the YXZ Euler branch: it equals ``wrap(RotY)`` when ``cos(RotX) > 0`` and
+        ``wrap(RotY + pi)`` in the equivalent branch ``(RotY + pi, pi - RotX, RotZ + pi)`` (same thigh axis), so
+        ``-angle`` is the geometric hip flexion. Its derivative is ``1`` in RotY and ``0`` in RotX, hence the
+        exact ``H``: ``1`` on the back DoF and ``-c / n_hips`` on each thigh RotY (corrected jointly). ``z = 0``
+        and the residual is wrapped to ``[-pi, pi)`` (a ``2 pi`` turn of the back DoF is not an innovation).
         """
 
         back_value = float(reference_q[self.upper_back_sagittal_idx])
         if not np.isfinite(back_value):
             return None
+        if self.back_prior_thigh_rotx_indices:
+            cos_rotx = np.cos(np.asarray(reference_q[list(self.back_prior_thigh_rotx_indices)], dtype=float))
+        else:
+            cos_rotx = np.ones_like(hip_roty)
+        if not np.all(np.isfinite(cos_rotx)):
+            return None
+        thigh_sagittal = np.arctan2(np.sin(hip_roty) * cos_rotx, np.cos(hip_roty) * cos_rotx)
         coefficient = float(self.back_prior_hip_coefficient)
         H_q = np.zeros((1, self.nq), dtype=float)
         H_q[0, self.upper_back_sagittal_idx] = 1.0
         for hip_idx in self.hip_flexion_indices:
             H_q[0, hip_idx] -= coefficient / len(self.hip_flexion_indices)
-        h = np.array([back_value - coefficient * float(np.mean(hip_roty))], dtype=float)
+        h = np.array([wrap_to_pi(back_value - coefficient * float(np.mean(thigh_sagittal)))], dtype=float)
         z = np.zeros(1, dtype=float)
         variance = np.array([self.upper_back_pseudo_std_rad**2], dtype=float)
         return z, h, H_q, variance
