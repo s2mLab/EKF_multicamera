@@ -3098,6 +3098,7 @@ def test_flip_method_display_name_uses_user_friendly_labels():
     assert pipeline_gui.flip_method_display_name("none") == "None"
     assert pipeline_gui.flip_method_display_name("epipolar_fast_viterbi") == "Epipolar fast (Viterbi)"
     assert pipeline_gui.flip_method_display_name("triangulation_once") == "Triangulation once"
+    assert pipeline_gui.flip_method_display_name("epipolar_agr6") == "Epipolar A6 (alerts)"
 
 
 def test_coherence_method_display_name_uses_precomputed_labels():

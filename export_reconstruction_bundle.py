@@ -184,6 +184,7 @@ def parse_args() -> argparse.Namespace:
             "triangulation_once",
             "triangulation_greedy",
             "triangulation_exhaustive",
+            "epipolar_agr6",
         ),
         default="epipolar",
     )

@@ -65,6 +65,7 @@ SUPPORTED_FLIP_METHODS = (
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
+    "epipolar_agr6",
 )
 SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
     "none",
