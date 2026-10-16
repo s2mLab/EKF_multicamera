@@ -1192,7 +1192,7 @@ def root_kinematics_from_trc(
     q_root, correction_applied = extract_root_from_points(
         points_3d,
         initial_rotation_correction,
-        unwrap_root=(effective_root_unwrap_mode != "off"),
+        unwrap_rotations=(effective_root_unwrap_mode != "off"),
         unwrap_mode=effective_root_unwrap_mode,
     )
     qdot_root = centered_finite_difference(q_root, 1.0 / fps)
