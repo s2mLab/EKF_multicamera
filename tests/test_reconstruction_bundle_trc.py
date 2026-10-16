@@ -332,7 +332,9 @@ def test_build_pose2sim_bundle_imports_generic_trc_without_sidecar(tmp_path: Pat
 
     # Root orientation follows the imposed yaw: R_t = Rz(yaw_rate * t) @ R_0, whatever the Euler unwrap mode.
     root_matrices = Rotation.from_euler(TRUNK_ROOT_ROTATION_SCIPY_SEQUENCE, q_root[:, 3:6]).as_matrix()
-    expected_matrices = Rotation.from_euler("z", YAW_RATE_RAD_S * time_s).as_matrix() @ root_matrices[0]
+    # One angle per frame as a column: recent SciPy requires the last axis to match the single "z" axis.
+    yaw_angles = (YAW_RATE_RAD_S * time_s)[:, np.newaxis]
+    expected_matrices = Rotation.from_euler("z", yaw_angles).as_matrix() @ root_matrices[0]
     np.testing.assert_allclose(root_matrices, expected_matrices, atol=1e-9)
 
 
