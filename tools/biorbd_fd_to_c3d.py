@@ -13,18 +13,17 @@ python biorbd_fd_to_c3d.py \
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Iterable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np
-
 import biorbd
 import ezc3d
+import numpy as np
 
 
 def _try_loadmat(path: Path):
@@ -36,9 +35,7 @@ def _try_loadmat(path: Path):
         try:
             import h5py
         except Exception as exc:
-            raise RuntimeError(
-                "Could not read .mat file with scipy.io.loadmat and h5py is unavailable."
-            ) from exc
+            raise RuntimeError("Could not read .mat file with scipy.io.loadmat and h5py is unavailable.") from exc
 
         data = {}
         with h5py.File(path, "r") as f:
@@ -101,9 +98,7 @@ def _ensure_dof_by_frames(arr: np.ndarray, ndof: int, name: str) -> np.ndarray:
     if arr.shape[1] == ndof:
         return arr.T
 
-    raise ValueError(
-        f"{name} shape {arr.shape} does not match model DoF ({ndof}) in either axis."
-    )
+    raise ValueError(f"{name} shape {arr.shape} does not match model DoF ({ndof}) in either axis.")
 
 
 def _to_np(v) -> np.ndarray:
@@ -126,9 +121,7 @@ def _segment_origin(model: biorbd.Model, q: np.ndarray, iseg: int) -> np.ndarray
     raise ValueError(f"Unexpected RotoTrans shape for segment {iseg}: {rt_np.shape}")
 
 
-def _collect_points(
-    model: biorbd.Model, q_traj: np.ndarray
-) -> tuple[np.ndarray, list[str], int, int]:
+def _collect_points(model: biorbd.Model, q_traj: np.ndarray) -> tuple[np.ndarray, list[str], int, int]:
     marker_names = [_str_name(n) for n in model.markerNames()]
     seg_names = [_str_name(model.segment(i).name()) for i in range(model.nbSegment())]
     jc_names = [f"JC_{name}" for name in seg_names]

@@ -11,11 +11,13 @@ Ce module permet de:
 from __future__ import annotations
 
 import json
+import math
 import sys
 from dataclasses import asdict, dataclass
 from itertools import product
 from pathlib import Path
 
+from kinematics.root_kinematics import normalize_root_unwrap_mode
 from reconstruction.reconstruction_registry import (
     infer_dataset_name,
     reconstruction_output_dir,
@@ -25,10 +27,24 @@ from reconstruction.reconstruction_registry import (
 )
 
 SUPPORTED_FAMILIES = ("pose2sim", "triangulation", "ekf_3d", "ekf_2d")
-SUPPORTED_PREDICTORS = ("acc", "dyn")
+SUPPORTED_PREDICTORS = ("acc", "dyn", "history3", "dyn_history3")
 SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
-SUPPORTED_MODEL_VARIANTS = ("single_trunk", "back_flexion_1d", "back_3dof")
-SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned")
+SUPPORTED_EKF2D_UPDATE_METHODS = ("woodbury", "legacy")
+DEFAULT_EKF2D_UPDATE_METHOD = "woodbury"
+SUPPORTED_FLIGHT_DETECTIONS = ("triangulation", "ekf_state")
+SUPPORTED_PROCESS_NOISE_MODELS = ("legacy", "white_jerk")
+SUPPORTED_HEAD_MARKER_MODELS = ("legacy", "anthropometric")
+# Back flexion pseudo-observation of the back model variants (same values as vitpose_ekf_pipeline).
+SUPPORTED_BACK_PRIOR_MODES = ("legacy", "consistent")
+DEFAULT_BACK_PRIOR_MODE = "legacy"
+SUPPORTED_MODEL_VARIANTS = (
+    "single_trunk",
+    "back_flexion_1d",
+    "back_3dof",
+    "upper_root_back_flexion_1d",
+    "upper_root_back_3dof",
+)
+SUPPORTED_POSE_DATA_MODES = ("raw", "filtered", "cleaned", "annotated")
 SUPPORTED_TRIANGULATION_METHODS = ("once", "greedy", "exhaustive")
 SUPPORTED_COHERENCE_METHODS = (
     "epipolar",
@@ -49,6 +65,7 @@ SUPPORTED_FLIP_METHODS = (
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
+    "epipolar_agr6",
 )
 SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
     "none",
@@ -59,20 +76,28 @@ SUPPORTED_BIORBD_KALMAN_INIT_METHODS = (
 )
 SUPPORTED_FRAME_STRIDES = (1, 2, 3, 4)
 DEFAULT_POSE2SIM_TRC = Path("inputs/trc/1_partie_0429.trc")
+DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX = 15.0
 
 
 @dataclass
 class ReconstructionProfile:
+    """Serializable description of one reproducible reconstruction configuration."""
+
     name: str
     family: str
     camera_names: list[str] | None = None
+    use_all_cameras: bool = False
     ekf_model_path: str | None = None
     model_variant: str = "single_trunk"
+    symmetrize_limbs: bool = True
+    head_marker_model: str = "legacy"
     frame_stride: int = 1
     predictor: str | None = None
     ekf2d_3d_source: str = "full_triangulation"
     ekf2d_initial_state_method: str = "ekf_bootstrap"
     ekf2d_bootstrap_passes: int = 5
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD
+    flight_detection: str = "triangulation"
     flip: bool = False
     flip_method: str = "epipolar"
     flip_improvement_ratio: float = 0.7
@@ -88,28 +113,50 @@ class ReconstructionProfile:
     initial_rotation_correction: bool = False
     pose_data_mode: str = "cleaned"
     triangulation_method: str = "exhaustive"
+    reprojection_threshold_px: float | None = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
     coherence_method: str = "epipolar"
     compare_biorbd_kalman: bool = True
     reuse_triangulation: bool = False
-    no_root_unwrap: bool = False
+    no_root_unwrap: bool = True
+    root_unwrap_mode: str = "off"
     biorbd_kalman_noise_factor: float = 1e-8
     biorbd_kalman_error_factor: float = 1e-4
     biorbd_kalman_init_method: str = "triangulation_ik_root_translation"
     measurement_noise_scale: float = 1.5
     process_noise_scale: float = 1.0
+    process_noise_model: str = "legacy"
+    process_noise_jerk_psd: list[float] | None = None
+    joint_prior: bool = False
+    joint_prior_axial_std_deg: float = 30.0
+    robust_mixture: bool = False
+    robust_mixture_outlier_prob: float = 0.03
+    robust_mixture_lock_fraction: float = 0.5
+    robust_mixture_resume_fraction: float = 0.25
     coherence_confidence_floor: float = 0.35
+    upper_back_sagittal_gain: float = 0.2
+    upper_back_pseudo_std_deg: float = 10.0
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE
+    ankle_bed_pseudo_obs: bool = False
+    ankle_bed_pseudo_std_m: float = 0.02
     pose_filter_window: int = 9
     pose_outlier_threshold_ratio: float = 0.10
     pose_amplitude_lower_percentile: float = 5.0
     pose_amplitude_upper_percentile: float = 95.0
+    undistort_keypoints: bool = False
     enabled: bool = True
     extra_args: list[str] | None = None
 
 
 def canonical_profile_name(profile: ReconstructionProfile) -> str:
+    """Build the canonical slug used to name outputs for one profile."""
+
     parts = [profile.family]
     if profile.model_variant != "single_trunk":
         parts.append(profile.model_variant)
+    if not bool(profile.symmetrize_limbs):
+        parts.append("asym")
+    if str(getattr(profile, "head_marker_model", "legacy")) == "anthropometric":
+        parts.append("headanthro")
     if profile.family in ("ekf_2d", "ekf_3d") and profile.ekf_model_path:
         parts.append(f"mdl_{Path(profile.ekf_model_path).stem}")
     if profile.family == "pose2sim":
@@ -125,8 +172,43 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("rootq0")
         if int(profile.ekf2d_bootstrap_passes) != 5:
             parts.append(f"boot{int(profile.ekf2d_bootstrap_passes)}")
+        if str(getattr(profile, "ekf2d_update_method", DEFAULT_EKF2D_UPDATE_METHOD)) != DEFAULT_EKF2D_UPDATE_METHOD:
+            parts.append(f"upd_{profile.ekf2d_update_method}")
+        if str(getattr(profile, "flight_detection", "triangulation")) == "ekf_state":
+            parts.append("flightekf")
+        if str(getattr(profile, "process_noise_model", "legacy")) == "white_jerk":
+            parts.append("qjerk")
+            if getattr(profile, "process_noise_jerk_psd", None):
+                parts.append("qc" + "_".join(slugify(f"{float(value):g}") for value in profile.process_noise_jerk_psd))
+        if bool(getattr(profile, "joint_prior", False)):
+            parts.append("jprior")
+            axial_std = float(getattr(profile, "joint_prior_axial_std_deg", 30.0))
+            if not math.isclose(axial_std, 30.0, rel_tol=0.0, abs_tol=1e-9):
+                parts.append(f"ax{slugify(f'{axial_std:g}')}")
+        if bool(getattr(profile, "robust_mixture", False)):
+            parts.append("robust")
+            outlier_prob = float(getattr(profile, "robust_mixture_outlier_prob", 0.03))
+            if not math.isclose(outlier_prob, 0.03, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"po{slugify(f'{outlier_prob:g}')}")
+            lock_fraction = float(getattr(profile, "robust_mixture_lock_fraction", 0.5))
+            resume_fraction = float(getattr(profile, "robust_mixture_resume_fraction", 0.25))
+            if not math.isclose(lock_fraction, 0.5, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"lk{slugify(f'{lock_fraction:g}')}")
+            if not math.isclose(resume_fraction, 0.25, rel_tol=0.0, abs_tol=1e-12):
+                parts.append(f"rs{slugify(f'{resume_fraction:g}')}")
         if profile.coherence_method != "epipolar":
             parts.append(f"coh_{profile.coherence_method}")
+        if not math.isclose(float(profile.upper_back_sagittal_gain), 0.2, rel_tol=0.0, abs_tol=1e-9):
+            parts.append(f"ubg{slugify(f'{profile.upper_back_sagittal_gain:.2f}')}")
+        if str(getattr(profile, "back_prior_mode", DEFAULT_BACK_PRIOR_MODE)) != DEFAULT_BACK_PRIOR_MODE:
+            parts.append(f"bp_{profile.back_prior_mode}")
+        if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
+            parts.append("ankbed")
+            if not math.isclose(
+                float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)), 0.02, rel_tol=0.0, abs_tol=1e-9
+            ):
+                ankle_std_m = float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02))
+                parts.append(f"abm{slugify(f'{ankle_std_m:.3f}')}")
         if profile.flip:
             if profile.flip_method != "epipolar":
                 parts.append(f"flip_{profile.flip_method}")
@@ -156,6 +238,12 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append("flip")
         if profile.initial_rotation_correction:
             parts.append("rotfix")
+    if profile.family in ("triangulation", "ekf_2d", "ekf_3d"):
+        if profile.reprojection_threshold_px is None:
+            parts.append("taunone")
+        elif abs(float(profile.reprojection_threshold_px) - DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX) > 1e-9:
+            tau_value = float(profile.reprojection_threshold_px)
+            parts.append(f"tau{int(tau_value) if float(tau_value).is_integer() else slugify(f'{tau_value:g}')}")
     if profile.flip:
         if abs(float(profile.flip_improvement_ratio) - 0.7) > 1e-9:
             parts.append(f"fr{str(float(profile.flip_improvement_ratio)).replace('.', 'p')}")
@@ -175,29 +263,53 @@ def canonical_profile_name(profile: ReconstructionProfile) -> str:
             parts.append(f"ftt{str(float(profile.flip_temporal_tau_px)).replace('.', 'p')}")
     if profile.pose_data_mode != "cleaned":
         parts.append(profile.pose_data_mode)
+    if bool(getattr(profile, "undistort_keypoints", False)):
+        parts.append("undist")
     if int(profile.frame_stride) != 1:
         parts.append(f"stride{int(profile.frame_stride)}")
-    if profile.camera_names:
+    if profile.use_all_cameras:
+        parts.append("all_cameras")
+    elif profile.camera_names:
         parts.append("cams")
         parts.extend(str(name) for name in profile.camera_names)
     return slugify("_".join(parts))
 
 
 def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
+    """Normalize and validate one reconstruction profile in place."""
+
     if profile.family not in SUPPORTED_FAMILIES:
         raise ValueError(f"Unsupported family: {profile.family}")
     if profile.pose_data_mode not in SUPPORTED_POSE_DATA_MODES:
         raise ValueError(f"Unsupported pose_data_mode: {profile.pose_data_mode}")
     if profile.triangulation_method not in SUPPORTED_TRIANGULATION_METHODS:
         raise ValueError(f"Unsupported triangulation_method: {profile.triangulation_method}")
+    if profile.reprojection_threshold_px is not None and float(profile.reprojection_threshold_px) <= 0.0:
+        raise ValueError("reprojection_threshold_px must be > 0 when provided.")
+    if profile.reprojection_threshold_px is None and profile.triangulation_method != "once":
+        raise ValueError("reprojection_threshold_px=None is only supported when triangulation_method='once'.")
     if profile.coherence_method not in SUPPORTED_COHERENCE_METHODS:
         raise ValueError(f"Unsupported coherence_method: {profile.coherence_method}")
     if profile.flip_method not in SUPPORTED_FLIP_METHODS:
         raise ValueError(f"Unsupported flip_method: {profile.flip_method}")
     if profile.model_variant not in SUPPORTED_MODEL_VARIANTS:
         raise ValueError(f"Unsupported model_variant: {profile.model_variant}")
+    profile.head_marker_model = str(getattr(profile, "head_marker_model", None) or "legacy").strip().lower()
+    if profile.head_marker_model not in SUPPORTED_HEAD_MARKER_MODELS:
+        raise ValueError(f"Unsupported head_marker_model: {profile.head_marker_model}")
     if profile.biorbd_kalman_init_method not in SUPPORTED_BIORBD_KALMAN_INIT_METHODS:
         raise ValueError(f"Unsupported biorbd_kalman_init_method: {profile.biorbd_kalman_init_method}")
+    profile.root_unwrap_mode = normalize_root_unwrap_mode(
+        getattr(profile, "root_unwrap_mode", None),
+        legacy_unwrap=(not bool(getattr(profile, "no_root_unwrap", False))),
+    )
+    profile.no_root_unwrap = profile.root_unwrap_mode == "off"
+    if float(profile.upper_back_sagittal_gain) < 0.0:
+        raise ValueError("upper_back_sagittal_gain must be >= 0.")
+    if float(profile.upper_back_pseudo_std_deg) <= 0.0:
+        raise ValueError("upper_back_pseudo_std_deg must be > 0.")
+    if float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)) <= 0.0:
+        raise ValueError("ankle_bed_pseudo_std_m must be > 0.")
     profile.frame_stride = int(profile.frame_stride)
     if profile.frame_stride not in SUPPORTED_FRAME_STRIDES:
         raise ValueError(f"Unsupported frame_stride: {profile.frame_stride}")
@@ -211,6 +323,9 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
             seen_camera_names.add(name)
             normalized_camera_names.append(name)
         profile.camera_names = normalized_camera_names or None
+    profile.use_all_cameras = bool(profile.use_all_cameras)
+    if profile.use_all_cameras:
+        profile.camera_names = None
     if profile.ekf_model_path is not None:
         normalized_model_path = str(profile.ekf_model_path).strip()
         profile.ekf_model_path = normalized_model_path or None
@@ -227,7 +342,10 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
     if profile.family == "pose2sim":
         profile.pose_data_mode = "cleaned"
         profile.triangulation_method = "exhaustive"
+        profile.reprojection_threshold_px = DEFAULT_PROFILE_REPROJECTION_THRESHOLD_PX
         profile.frame_stride = 1
+        profile.undistort_keypoints = False
+    profile.undistort_keypoints = bool(profile.undistort_keypoints)
     if profile.family == "ekf_2d":
         profile.predictor = profile.predictor or "acc"
         if profile.predictor not in SUPPORTED_PREDICTORS:
@@ -237,6 +355,37 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         if profile.ekf2d_initial_state_method not in ("triangulation_ik", "ekf_bootstrap", "root_pose_bootstrap"):
             raise ValueError(f"Unsupported ekf2d_initial_state_method: {profile.ekf2d_initial_state_method}")
         profile.ekf2d_bootstrap_passes = max(1, int(profile.ekf2d_bootstrap_passes))
+        profile.ekf2d_update_method = str(profile.ekf2d_update_method or DEFAULT_EKF2D_UPDATE_METHOD).strip().lower()
+        if profile.ekf2d_update_method not in SUPPORTED_EKF2D_UPDATE_METHODS:
+            raise ValueError(f"Unsupported ekf2d_update_method: {profile.ekf2d_update_method}")
+        profile.back_prior_mode = str(profile.back_prior_mode or DEFAULT_BACK_PRIOR_MODE).strip().lower()
+        if profile.back_prior_mode not in SUPPORTED_BACK_PRIOR_MODES:
+            raise ValueError(f"Unsupported back_prior_mode: {profile.back_prior_mode}")
+        profile.flight_detection = str(profile.flight_detection or "triangulation").strip().lower()
+        if profile.flight_detection not in SUPPORTED_FLIGHT_DETECTIONS:
+            raise ValueError(f"Unsupported flight_detection: {profile.flight_detection}")
+        profile.process_noise_model = str(profile.process_noise_model or "legacy").strip().lower()
+        if profile.process_noise_model not in SUPPORTED_PROCESS_NOISE_MODELS:
+            raise ValueError(f"Unsupported process_noise_model: {profile.process_noise_model}")
+        if profile.process_noise_jerk_psd is not None:
+            psd = [float(value) for value in profile.process_noise_jerk_psd]
+            if len(psd) != 3 or any((not math.isfinite(value)) or value <= 0.0 for value in psd):
+                raise ValueError("process_noise_jerk_psd must contain three positive values.")
+            profile.process_noise_jerk_psd = psd
+        if profile.process_noise_model != "white_jerk":
+            profile.process_noise_jerk_psd = None
+        profile.joint_prior = bool(profile.joint_prior)
+        if float(profile.joint_prior_axial_std_deg) <= 0.0:
+            raise ValueError("joint_prior_axial_std_deg must be > 0.")
+        profile.robust_mixture = bool(profile.robust_mixture)
+        if not 0.0 < float(profile.robust_mixture_outlier_prob) < 1.0:
+            raise ValueError("robust_mixture_outlier_prob must be in (0, 1).")
+        profile.robust_mixture_lock_fraction = float(profile.robust_mixture_lock_fraction)
+        profile.robust_mixture_resume_fraction = float(profile.robust_mixture_resume_fraction)
+        if not 0.0 < profile.robust_mixture_lock_fraction <= 1.0:
+            raise ValueError("robust_mixture_lock_fraction must be in (0, 1].")
+        if not 0.0 <= profile.robust_mixture_resume_fraction <= profile.robust_mixture_lock_fraction:
+            raise ValueError("robust_mixture_resume_fraction must be in [0, robust_mixture_lock_fraction].")
         if profile.ekf2d_3d_source == "first_frame_only" and profile.coherence_method not in (
             "epipolar",
             "epipolar_fast",
@@ -251,12 +400,30 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
         profile.ekf2d_3d_source = "full_triangulation"
         profile.ekf2d_initial_state_method = "ekf_bootstrap"
         profile.ekf2d_bootstrap_passes = 5
+        profile.ekf2d_update_method = DEFAULT_EKF2D_UPDATE_METHOD
+        profile.back_prior_mode = DEFAULT_BACK_PRIOR_MODE
+        profile.flight_detection = "triangulation"
+        profile.process_noise_model = "legacy"
+        profile.process_noise_jerk_psd = None
+        profile.joint_prior = False
+        profile.joint_prior_axial_std_deg = 30.0
+        profile.robust_mixture = False
+        profile.robust_mixture_outlier_prob = 0.03
+        profile.robust_mixture_lock_fraction = 0.5
+        profile.robust_mixture_resume_fraction = 0.25
         profile.dof_locking = False
+        profile.ankle_bed_pseudo_obs = False
     if profile.family != "ekf_3d":
         profile.biorbd_kalman_init_method = "triangulation_ik_root_translation"
     if profile.family not in ("ekf_2d", "ekf_3d"):
         profile.ekf_model_path = None
         profile.model_variant = "single_trunk"
+        profile.symmetrize_limbs = True
+        profile.head_marker_model = "legacy"
+        profile.upper_back_sagittal_gain = 0.2
+        profile.upper_back_pseudo_std_deg = 10.0
+        profile.ankle_bed_pseudo_obs = False
+        profile.ankle_bed_pseudo_std_m = 0.02
     profile.flip_min_other_cameras = max(1, int(profile.flip_min_other_cameras))
     if not (0.0 < float(profile.flip_improvement_ratio) < 1.0):
         raise ValueError("flip_improvement_ratio must be in (0, 1).")
@@ -285,15 +452,24 @@ def validate_profile(profile: ReconstructionProfile) -> ReconstructionProfile:
 
 
 def profile_from_dict(data: dict[str, object]) -> ReconstructionProfile:
-    profile = ReconstructionProfile(**data)
+    """Deserialize one JSON mapping into a validated reconstruction profile."""
+
+    payload = dict(data)
+    if "root_unwrap_mode" not in payload and "no_root_unwrap" in payload:
+        payload["root_unwrap_mode"] = "off" if bool(payload.get("no_root_unwrap")) else "single"
+    profile = ReconstructionProfile(**payload)
     return validate_profile(profile)
 
 
 def profile_to_dict(profile: ReconstructionProfile) -> dict[str, object]:
+    """Serialize one reconstruction profile into JSON-compatible values."""
+
     return asdict(validate_profile(profile))
 
 
 def load_profiles_json(path: Path) -> list[ReconstructionProfile]:
+    """Load and validate all reconstruction profiles from one JSON file."""
+
     payload = json.loads(path.read_text())
     if isinstance(payload, dict):
         entries = payload.get("profiles", [])
@@ -303,12 +479,16 @@ def load_profiles_json(path: Path) -> list[ReconstructionProfile]:
 
 
 def save_profiles_json(path: Path, profiles: list[ReconstructionProfile]) -> None:
+    """Write one list of reconstruction profiles to disk as JSON."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"profiles": [profile_to_dict(profile) for profile in profiles]}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def example_profiles() -> list[ReconstructionProfile]:
+    """Return a compact set of example profiles used by the GUI and tests."""
+
     examples = [
         ReconstructionProfile(name="pose2sim", family="pose2sim", initial_rotation_correction=False),
         ReconstructionProfile(name="pose2sim_rotfix", family="pose2sim", initial_rotation_correction=True),
@@ -360,6 +540,8 @@ def generate_supported_profiles(
     enable_dof_locking: bool = True,
     enable_initial_rotation_correction: bool = True,
 ) -> list[ReconstructionProfile]:
+    """Generate the supported family/predictor/profile combinations."""
+
     profiles: list[ReconstructionProfile] = []
     for family in families:
         if family == "pose2sim":
@@ -454,6 +636,8 @@ def variant_output_dir(
     keypoints_path: Path | None = None,
     pose2sim_trc: Path | None = None,
 ) -> Path:
+    """Return the output directory corresponding to one profile execution."""
+
     profile = validate_profile(profile)
     dataset_name = infer_dataset_name(
         keypoints_path=keypoints_path, pose2sim_trc=pose2sim_trc, dataset_name=dataset_name
@@ -471,6 +655,8 @@ def build_pipeline_command(
     python_executable: str | None = None,
     camera_names_override: list[str] | None = None,
 ) -> list[str]:
+    """Build the CLI command that executes one reconstruction profile."""
+
     profile = validate_profile(profile)
     python_executable = python_executable or sys.executable
     out_dir = variant_output_dir(
@@ -499,6 +685,8 @@ def build_pipeline_command(
         str(profile.frame_stride),
         "--triangulation-method",
         profile.triangulation_method,
+        "--reprojection-threshold-px",
+        ("none" if profile.reprojection_threshold_px is None else str(profile.reprojection_threshold_px)),
         "--coherence-method",
         profile.coherence_method,
         "--pose-filter-window",
@@ -522,21 +710,50 @@ def build_pipeline_command(
     ]
     if pose2sim_trc is not None:
         cmd.extend(["--trc-file", str(pose2sim_trc)])
-    camera_names = profile.camera_names or camera_names_override
+    camera_names = None if profile.use_all_cameras else (profile.camera_names or camera_names_override)
     if camera_names:
         cmd.extend(["--camera-names", ",".join(str(name) for name in camera_names)])
     if profile.initial_rotation_correction:
         cmd.append("--initial-rotation-correction")
-    if profile.no_root_unwrap:
-        cmd.append("--no-root-unwrap")
+    if profile.undistort_keypoints:
+        cmd.append("--undistort-keypoints")
+    cmd.extend(["--root-unwrap-mode", "off"])
     if profile.family == "ekf_2d":
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
+        if profile.head_marker_model != "legacy":
+            cmd.extend(["--head-marker-model", profile.head_marker_model])
+        cmd.extend(["--upper-back-sagittal-gain", str(profile.upper_back_sagittal_gain)])
+        cmd.extend(["--upper-back-pseudo-std-deg", str(profile.upper_back_pseudo_std_deg)])
+        if profile.back_prior_mode != DEFAULT_BACK_PRIOR_MODE:
+            cmd.extend(["--ekf2d-back-prior-mode", profile.back_prior_mode])
+        if bool(getattr(profile, "ankle_bed_pseudo_obs", False)):
+            cmd.append("--ankle-bed-pseudo-obs")
+        cmd.extend(["--ankle-bed-pseudo-std-m", str(float(getattr(profile, "ankle_bed_pseudo_std_m", 0.02)))])
         cmd.extend(["--predictor", str(profile.predictor or "acc")])
         cmd.extend(["--ekf2d-3d-source", profile.ekf2d_3d_source])
         cmd.extend(["--ekf2d-initial-state-method", profile.ekf2d_initial_state_method])
         cmd.extend(["--ekf2d-bootstrap-passes", str(profile.ekf2d_bootstrap_passes)])
+        if profile.ekf2d_update_method != DEFAULT_EKF2D_UPDATE_METHOD:
+            cmd.extend(["--ekf2d-update-method", profile.ekf2d_update_method])
+        if profile.flight_detection != "triangulation":
+            cmd.extend(["--flight-detection", profile.flight_detection])
+        if profile.process_noise_model != "legacy":
+            cmd.extend(["--process-noise-model", profile.process_noise_model])
+            if profile.process_noise_jerk_psd:
+                cmd.append("--process-noise-jerk-psd")
+                cmd.extend(str(float(value)) for value in profile.process_noise_jerk_psd)
+        if profile.joint_prior:
+            cmd.append("--ekf2d-joint-prior")
+            cmd.extend(["--ekf2d-joint-prior-axial-std-deg", str(float(profile.joint_prior_axial_std_deg))])
+        if profile.robust_mixture:
+            cmd.append("--ekf2d-robust-mixture")
+            cmd.extend(["--ekf2d-robust-outlier-prob", str(float(profile.robust_mixture_outlier_prob))])
+            cmd.extend(["--ekf2d-robust-lock-fraction", str(float(profile.robust_mixture_lock_fraction))])
+            cmd.extend(["--ekf2d-robust-resume-fraction", str(float(profile.robust_mixture_resume_fraction))])
         if profile.flip:
             cmd.append("--flip-left-right")
             cmd.extend(["--flip-method", profile.flip_method])
@@ -550,6 +767,10 @@ def build_pipeline_command(
         if profile.ekf_model_path:
             cmd.extend(["--biomod", str(profile.ekf_model_path)])
         cmd.extend(["--model-variant", profile.model_variant])
+        if not profile.symmetrize_limbs:
+            cmd.append("--no-symmetrize-limbs")
+        if profile.head_marker_model != "legacy":
+            cmd.extend(["--head-marker-model", profile.head_marker_model])
         cmd.extend(["--biorbd-kalman-init-method", profile.biorbd_kalman_init_method])
         if profile.flip:
             cmd.append("--flip-left-right")
@@ -571,6 +792,8 @@ def build_pipeline_command(
 
 
 def scan_variant_output_dirs(output_root: Path) -> list[Path]:
+    """Scan all dataset directories for profile-generated reconstruction outputs."""
+
     candidates: list[Path] = []
     for dataset_dir in scan_dataset_dirs(output_root):
         candidates.extend(scan_reconstruction_dirs(dataset_dir))

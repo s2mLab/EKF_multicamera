@@ -43,6 +43,26 @@ def _reference_marker_xy() -> dict[str, np.ndarray]:
     }
 
 
+def _reference_marker_xyz() -> dict[str, np.ndarray]:
+    """Return the full reference trampoline markers extracted from the TRC example."""
+
+    return {
+        "Center": np.array([0.043268113558143854, -0.05300411860982727, 1.2440734991150493], dtype=float),
+        "Cross_1": np.array([-0.27952443398574717, -0.04696764728727904, 1.2391880887638858], dtype=float),
+        "Cross_2": np.array([0.37652836700158177, -0.04795804673711549, 1.2402354305239016], dtype=float),
+        "Cross_3": np.array([0.05005495872135084, -0.3823917151684797, 1.2399942447962533], dtype=float),
+        "Cross_4": np.array([0.04356532271660445, 0.27947414593708636, 1.245396056095114], dtype=float),
+        "SmallSquare_1": np.array([-0.45678352093271957, -0.558066501261472, 1.2396003056682545], dtype=float),
+        "SmallSquare_2": np.array([-0.46609020457361006, 0.46948830182957657, 1.2484197798034131], dtype=float),
+        "SmallSquare_3": np.array([0.564131366062569, -0.5636934229359234, 1.2398627229190031], dtype=float),
+        "SmallSquare_4": np.array([0.55429137445568, 0.4711246832757012, 1.2490164829519783], dtype=float),
+        "BigRect_1": np.array([-0.9598132124496965, -0.5786406873658397, 1.2396327440493142], dtype=float),
+        "BigRect_2": np.array([-0.9982785248343781, 0.47024547295091973, 1.2461274907323676], dtype=float),
+        "BigRect_3": np.array([1.0873758536665161, -0.5780009194576564, 1.2474209618855885], dtype=float),
+        "BigRect_4": np.array([1.08636698254981, 0.46828409287201767, 1.2550467553780242], dtype=float),
+    }
+
+
 def trampoline_geometry_from_reference() -> TrampolineGeometry:
     """Build a centered geometry model from the reference TRC marker set."""
 
@@ -82,6 +102,9 @@ def rectangle_half_extents(corners: dict[str, np.ndarray]) -> tuple[float, float
 TRAMPOLINE_GEOMETRY = trampoline_geometry_from_reference()
 X_INNER, Y_INNER = rectangle_half_extents(TRAMPOLINE_GEOMETRY.small_square)
 X_MAX, Y_MAX = rectangle_half_extents(TRAMPOLINE_GEOMETRY.big_rectangle)
+TRAMPOLINE_BED_HEIGHT_M = float(
+    np.mean(np.asarray([point[2] for point in _reference_marker_xyz().values()], dtype=float))
+)
 
 
 @dataclass

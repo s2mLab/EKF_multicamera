@@ -34,7 +34,9 @@ def format_camera_names(camera_names: list[str] | tuple[str, ...]) -> str:
     return ", ".join(str(name) for name in camera_names)
 
 
-def select_camera_names(available_camera_names: list[str], requested_camera_names: list[str] | tuple[str, ...] | None) -> list[str]:
+def select_camera_names(
+    available_camera_names: list[str], requested_camera_names: list[str] | tuple[str, ...] | None
+) -> list[str]:
     """Validate and resolve a requested camera subset against the available names."""
 
     requested = parse_camera_names(list(requested_camera_names) if requested_camera_names is not None else None)

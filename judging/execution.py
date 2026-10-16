@@ -14,12 +14,15 @@ to claim full FIG compliance yet.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 from scipy.signal import butter, filtfilt
 
+from judging.body_geometry import arm_raise_series, hip_angle_series, knee_angle_series
 from judging.dd_analysis import DDSessionAnalysis, JumpSegment
 from vitpose_ekf_pipeline import KP_INDEX
 
@@ -34,6 +37,8 @@ EXECUTION_HIP_DOF_NAMES = ("LEFT_THIGH:RotY", "RIGHT_THIGH:RotY")
 EXECUTION_KNEE_DOF_NAMES = ("LEFT_SHANK:RotY", "RIGHT_SHANK:RotY")
 ROOT_TILT_DOF_NAME = "TRUNK:RotX"
 ROOT_TRANSLATION_VELOCITY_NAMES = ("TRUNK:TransX", "TRUNK:TransY", "TRUNK:TransZ")
+SUPPORTED_OVERLAY_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+_EXECUTION_IMAGE_INDEX_CACHE: dict[str, tuple[float, dict[tuple[str, int], Path], dict[str, set[int]]]] = {}
 
 
 @dataclass
@@ -230,98 +235,6 @@ def _optional_dof_indices(q_names: list[str] | np.ndarray, names: tuple[str, ...
     return [name_to_index[name] for name in names if name in name_to_index]
 
 
-def _vector_angle(vectors_a: np.ndarray, vectors_b: np.ndarray) -> np.ndarray:
-    """Return the frame-wise angle between two vector series."""
-
-    vectors_a = np.asarray(vectors_a, dtype=float)
-    vectors_b = np.asarray(vectors_b, dtype=float)
-    if vectors_a.shape != vectors_b.shape:
-        raise ValueError("Both vector series must share the same shape.")
-    norms_a = np.linalg.norm(vectors_a, axis=-1)
-    norms_b = np.linalg.norm(vectors_b, axis=-1)
-    denom = norms_a * norms_b
-    cosine = np.full(vectors_a.shape[:-1], np.nan, dtype=float)
-    valid = (
-        np.all(np.isfinite(vectors_a), axis=-1)
-        & np.all(np.isfinite(vectors_b), axis=-1)
-        & np.isfinite(denom)
-        & (denom > 1e-12)
-    )
-    if np.any(valid):
-        cosine[valid] = np.sum(vectors_a[valid] * vectors_b[valid], axis=-1) / denom[valid]
-    return np.arccos(np.clip(cosine, -1.0, 1.0))
-
-
-def _midpoint(points_a: np.ndarray, points_b: np.ndarray) -> np.ndarray:
-    """Return the midpoint between two point trajectories."""
-
-    return 0.5 * (np.asarray(points_a, dtype=float) + np.asarray(points_b, dtype=float))
-
-
-def _joint_angle_series(
-    points_proximal: np.ndarray,
-    points_joint: np.ndarray,
-    points_distal: np.ndarray,
-) -> np.ndarray:
-    """Return the internal joint angle defined by three point series."""
-
-    return _vector_angle(
-        np.asarray(points_proximal, dtype=float) - np.asarray(points_joint, dtype=float),
-        np.asarray(points_distal, dtype=float) - np.asarray(points_joint, dtype=float),
-    )
-
-
-def knee_angle_series(points_3d: np.ndarray) -> np.ndarray:
-    """Estimate the average internal knee angle from left and right leg markers."""
-
-    points_3d = np.asarray(points_3d, dtype=float)
-    left = _joint_angle_series(
-        points_3d[:, KP_INDEX["left_hip"], :],
-        points_3d[:, KP_INDEX["left_knee"], :],
-        points_3d[:, KP_INDEX["left_ankle"], :],
-    )
-    right = _joint_angle_series(
-        points_3d[:, KP_INDEX["right_hip"], :],
-        points_3d[:, KP_INDEX["right_knee"], :],
-        points_3d[:, KP_INDEX["right_ankle"], :],
-    )
-    return np.nanmean(np.column_stack((left, right)), axis=1)
-
-
-def hip_angle_series(points_3d: np.ndarray) -> np.ndarray:
-    """Estimate the average internal hip angle from trunk and thigh directions."""
-
-    points_3d = np.asarray(points_3d, dtype=float)
-    shoulder_center = _midpoint(points_3d[:, KP_INDEX["left_shoulder"], :], points_3d[:, KP_INDEX["right_shoulder"], :])
-    left = _joint_angle_series(
-        shoulder_center,
-        points_3d[:, KP_INDEX["left_hip"], :],
-        points_3d[:, KP_INDEX["left_knee"], :],
-    )
-    right = _joint_angle_series(
-        shoulder_center,
-        points_3d[:, KP_INDEX["right_hip"], :],
-        points_3d[:, KP_INDEX["right_knee"], :],
-    )
-    return np.nanmean(np.column_stack((left, right)), axis=1)
-
-
-def arm_raise_series(points_3d: np.ndarray) -> np.ndarray:
-    """Estimate how far the upper arms move away from the trunk."""
-
-    points_3d = np.asarray(points_3d, dtype=float)
-    hip_center = _midpoint(points_3d[:, KP_INDEX["left_hip"], :], points_3d[:, KP_INDEX["right_hip"], :])
-    left = _vector_angle(
-        points_3d[:, KP_INDEX["left_elbow"], :] - points_3d[:, KP_INDEX["left_shoulder"], :],
-        hip_center - points_3d[:, KP_INDEX["left_shoulder"], :],
-    )
-    right = _vector_angle(
-        points_3d[:, KP_INDEX["right_elbow"], :] - points_3d[:, KP_INDEX["right_shoulder"], :],
-        hip_center - points_3d[:, KP_INDEX["right_shoulder"], :],
-    )
-    return np.nanmean(np.column_stack((left, right)), axis=1)
-
-
 def root_tilt_series(q_series: np.ndarray, q_names: list[str] | np.ndarray) -> np.ndarray:
     """Extract the root tilt DoF from the generalized coordinates."""
 
@@ -421,6 +334,103 @@ def _normalize_overlay_token(value: str) -> str:
     return "".join(ch for ch in str(value).lower() if ch.isalnum())
 
 
+def _extract_overlay_frame_number(path: Path) -> int | None:
+    """Extract one frame number from a pragmatic camera-image filename."""
+
+    stem = str(path.stem)
+    patterns = (
+        r"(?:^|[_-])frame[_-]?(\d+)(?:$|[_-])",
+        r"(?:^|[_-])(\d{4,})(?:$|[_-])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, stem, flags=re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _overlay_camera_tokens(path: Path, *, directory_token: str | None = None) -> set[str]:
+    tokens: set[str] = set()
+    if directory_token:
+        tokens.add(directory_token)
+    for match in re.findall(r"M\d{4,}", path.stem, flags=re.IGNORECASE):
+        tokens.add(_normalize_overlay_token(match))
+    return tokens
+
+
+def _execution_image_index(
+    images_root: Path | str | None,
+) -> tuple[dict[tuple[str, int], Path], dict[str, set[int]]]:
+    """Index execution images once per root to avoid repeated directory scans."""
+
+    if images_root is None:
+        return {}, {}
+    root = Path(images_root)
+    if not root.exists() or not root.is_dir():
+        return {}, {}
+
+    cache_key = str(root.resolve())
+    try:
+        root_mtime = float(root.stat().st_mtime_ns)
+    except OSError:
+        root_mtime = -1.0
+    cached = _EXECUTION_IMAGE_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] == root_mtime:
+        return cached[1], cached[2]
+
+    paths_by_camera_frame: dict[tuple[str, int], Path] = {}
+    frames_by_camera: dict[str, set[int]] = {}
+
+    candidate_directories: list[tuple[Path, str | None]] = [(root, None)]
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.is_dir():
+                    candidate_directories.append((Path(entry.path), _normalize_overlay_token(entry.name)))
+    except OSError:
+        pass
+
+    for directory, directory_token in candidate_directories:
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.is_file():
+                        continue
+                    path = Path(entry.path)
+                    if path.suffix.lower() not in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
+                        continue
+                    frame_number = _extract_overlay_frame_number(path)
+                    if frame_number is None:
+                        continue
+                    for token in _overlay_camera_tokens(path, directory_token=directory_token):
+                        frames_by_camera.setdefault(token, set()).add(frame_number)
+                        paths_by_camera_frame.setdefault((token, frame_number), path)
+        except OSError:
+            continue
+
+    _EXECUTION_IMAGE_INDEX_CACHE[cache_key] = (root_mtime, paths_by_camera_frame, frames_by_camera)
+    return paths_by_camera_frame, frames_by_camera
+
+
+def available_execution_image_frames(
+    images_root: Path | str | None,
+    camera_names: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, set[int]]:
+    """Return available frame ids per camera without rescanning the disk repeatedly."""
+
+    _paths_by_camera_frame, frames_by_camera = _execution_image_index(images_root)
+    if camera_names is None:
+        return {camera: set(frames) for camera, frames in frames_by_camera.items()}
+    available: dict[str, set[int]] = {}
+    for camera_name in camera_names:
+        token = _normalize_overlay_token(str(camera_name))
+        available[str(camera_name)] = set(frames_by_camera.get(token, set()))
+    return available
+
+
 def infer_execution_images_root(keypoints_path: Path | str | None) -> Path | None:
     """Infer the most likely image root for a keypoint file.
 
@@ -457,7 +467,12 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
 
     frame_number = int(frame_number)
     camera_name = str(camera_name)
-    extensions = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+    normalized_camera = _normalize_overlay_token(camera_name)
+    indexed_paths, _frames_by_camera = _execution_image_index(images_root)
+    indexed = indexed_paths.get((normalized_camera, frame_number))
+    if indexed is not None and indexed.exists():
+        return indexed
+
     frame_tokens = (
         f"{frame_number}",
         f"{frame_number:04d}",
@@ -468,7 +483,7 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
         f"frame_{frame_number:05d}",
         f"frame_{frame_number:06d}",
     )
-    camera_tokens = {camera_name, camera_name.lower(), _normalize_overlay_token(camera_name)}
+    camera_tokens = {camera_name, camera_name.lower(), normalized_camera}
 
     candidate_dirs = [images_root]
     for child in images_root.iterdir():
@@ -477,13 +492,23 @@ def resolve_execution_image_path(images_root: Path | str | None, camera_name: st
 
     for directory in candidate_dirs:
         for frame_token in frame_tokens:
-            for extension in extensions:
+            for extension in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
                 direct_path = directory / f"{frame_token}{extension}"
                 if direct_path.exists():
                     return direct_path
                 camera_prefixed = directory / f"{camera_name}_{frame_token}{extension}"
                 if camera_prefixed.exists():
                     return camera_prefixed
+        for candidate in directory.iterdir():
+            if not candidate.is_file() or candidate.suffix.lower() not in SUPPORTED_OVERLAY_IMAGE_EXTENSIONS:
+                continue
+            stem_normalized = _normalize_overlay_token(candidate.stem)
+            if normalized_camera not in stem_normalized:
+                continue
+            candidate_frame = _extract_overlay_frame_number(candidate)
+            if candidate_frame != frame_number:
+                continue
+            return candidate
     return None
 
 

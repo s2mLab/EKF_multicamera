@@ -12,6 +12,28 @@ from judging.dd_analysis import (
 )
 
 
+def _body_shape_points() -> np.ndarray:
+    points = np.full((3, 17, 3), np.nan, dtype=float)
+    for frame_idx in range(3):
+        points[frame_idx, 5] = np.array([0.0, 0.2, 1.0], dtype=float)
+        points[frame_idx, 6] = np.array([0.0, -0.2, 1.0], dtype=float)
+        points[frame_idx, 11] = np.array([0.0, 0.2, 0.0], dtype=float)
+        points[frame_idx, 12] = np.array([0.0, -0.2, 0.0], dtype=float)
+    points[0, 13] = np.array([0.0, 0.2, -1.0], dtype=float)
+    points[0, 14] = np.array([0.0, -0.2, -1.0], dtype=float)
+    points[0, 15] = np.array([0.0, 0.2, -2.0], dtype=float)
+    points[0, 16] = np.array([0.0, -0.2, -2.0], dtype=float)
+    points[1, 13] = np.array([1.0, 0.2, 0.0], dtype=float)
+    points[1, 14] = np.array([1.0, -0.2, 0.0], dtype=float)
+    points[1, 15] = np.array([1.0, 0.2, -1.0], dtype=float)
+    points[1, 16] = np.array([1.0, -0.2, -1.0], dtype=float)
+    points[2, 13] = np.array([1.0, 0.2, 0.0], dtype=float)
+    points[2, 14] = np.array([1.0, -0.2, 0.0], dtype=float)
+    points[2, 15] = np.array([2.0, 0.2, 0.0], dtype=float)
+    points[2, 16] = np.array([2.0, -0.2, 0.0], dtype=float)
+    return points
+
+
 def test_default_body_shape_indices_use_rot_y_flexion_axes():
     q_names = [
         "LEFT_THIGH:RotY",
@@ -64,6 +86,28 @@ def test_analyze_single_jump_infers_last_salto_twist_from_end_of_jump(monkeypatc
     assert jump.code == "821"
 
 
+def test_analyze_single_jump_uses_geometric_hip_and_knee_angles_when_points_are_available(monkeypatch):
+    som_curve = np.array([0.0, -0.25, -0.5], dtype=float) * (2.0 * np.pi)
+    tw_curve = np.zeros_like(som_curve)
+    tilt_curve = np.zeros_like(som_curve)
+
+    def fake_compute_angles_over_jump(_root_q, _start, _end, rotation_sequence="yxz", angle_mode="euler"):
+        return som_curve, tw_curve, tilt_curve
+
+    monkeypatch.setattr("judging.dd_analysis.compute_angles_over_jump", fake_compute_angles_over_jump)
+    jump = analyze_single_jump(
+        np.zeros((3, 6), dtype=float),
+        JumpSegment(start=0, end=2, peak_index=1),
+        points_3d=_body_shape_points(),
+    )
+
+    assert jump.body_shape == "grouped"
+    np.testing.assert_allclose(np.rad2deg(jump.hip_flex_curve_rad), np.array([11.30993247, 90.0, 90.0]), atol=1e-6)
+    np.testing.assert_allclose(np.rad2deg(jump.knee_flex_curve_rad), np.array([0.0, 90.0, 0.0]), atol=1e-6)
+    assert jump.grouped_mask.tolist() == [False, True, False]
+    assert jump.piked_mask.tolist() == [False, False, True]
+
+
 def test_analyze_dd_session_ignores_first_frames_and_keeps_only_complete_jumps():
     fps = 10.0
     root_q = np.zeros((60, 6), dtype=float)
@@ -91,6 +135,39 @@ def test_analyze_dd_session_ignores_first_frames_and_keeps_only_complete_jumps()
     assert len(analysis.jump_segments) == 1
     assert analysis.jump_segments[0].start > 10
     assert analysis.jump_segments[0].end < len(height) - 1
+
+
+def test_analyze_dd_session_threshold_ignores_null_prefix_before_analysis_window():
+    fps = 10.0
+    root_q = np.zeros((80, 6), dtype=float)
+    height = np.ones(80, dtype=float) * 1.2
+    # Null prefix would collapse the relative threshold if we looked at the full sequence.
+    height[:10] = 0.0
+    # Two contact valleys and one final incomplete jump.
+    height[12:20] = 2.8
+    height[20:24] = 1.15
+    height[24:34] = 2.7
+    height[34:38] = 1.18
+    height[38:48] = 2.9
+    height[48:52] = 1.16
+    height[52:79] = 2.6
+    root_q[:, 2] = height
+
+    analysis = analyze_dd_session(
+        root_q,
+        fps,
+        height_values=height,
+        smoothing_window_s=0.0,
+        min_airtime_s=0.2,
+        min_gap_s=0.0,
+        min_peak_prominence_m=0.2,
+        contact_window_s=0.2,
+        analysis_start_frame=10,
+        require_complete_jumps=True,
+    )
+
+    assert analysis.height_threshold >= 1.5
+    assert len(analysis.jump_segments) == 2
 
 
 def test_body_shape_phase_masks_separate_grouped_and_piked_frames():

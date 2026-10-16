@@ -24,14 +24,24 @@ from kinematics.root_kinematics import (
     centered_finite_difference,
     extract_root_from_q,
     normalize,
+    normalize_root_unwrap_mode,
     root_z_correction_angle_from_points,
+    stabilize_root_rotations,
     unwrap_with_gaps,
+)
+from reconstruction.flip_lr_agr6 import (
+    CANDIDATE_SMOOTH_WINDOW,
+    FLIP_AGR6_METHOD,
+    FLIP_AGR6_SCORING_VERSION,
+    flip_agr6_parameters,
 )
 from reconstruction.reconstruction_dataset import load_trc_root_kinematics_sidecar
 from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
 from reconstruction.reconstruction_timings import make_timing_stage
 from vitpose_ekf_pipeline import (
     COCO17,
+    DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    DEFAULT_BACK_PRIOR_MODE,
     DEFAULT_BIORBD_KALMAN_ERROR_FACTOR,
     DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     DEFAULT_BIORBD_KALMAN_NOISE_FACTOR,
@@ -39,8 +49,11 @@ from vitpose_ekf_pipeline import (
     DEFAULT_CAMERA_FPS,
     DEFAULT_COHERENCE_CONFIDENCE_FLOOR,
     DEFAULT_COHERENCE_METHOD,
+    DEFAULT_EKF2D_UPDATE_METHOD,
     DEFAULT_EPIPOLAR_THRESHOLD_PX,
+    DEFAULT_FLIGHT_DETECTION,
     DEFAULT_FLIGHT_HEIGHT_THRESHOLD_M,
+    DEFAULT_FLIGHT_HYSTERESIS_M,
     DEFAULT_FLIGHT_MIN_CONSECUTIVE_FRAMES,
     DEFAULT_FLIP_IMPROVEMENT_RATIO,
     DEFAULT_FLIP_MIN_GAIN_PX,
@@ -51,21 +64,32 @@ from vitpose_ekf_pipeline import (
     DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
     DEFAULT_FLIP_TEMPORAL_TAU_PX,
     DEFAULT_FLIP_TEMPORAL_WEIGHT,
+    DEFAULT_HEAD_MARKER_MODEL,
+    DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
     DEFAULT_KEYPOINTS,
     DEFAULT_MEASUREMENT_NOISE_SCALE,
     DEFAULT_MIN_CAMERAS_FOR_TRIANGULATION,
     DEFAULT_MIN_FRAME_COHERENCE_FOR_UPDATE,
+    DEFAULT_PROCESS_NOISE_JERK_PSD,
+    DEFAULT_PROCESS_NOISE_MODEL,
     DEFAULT_REPROJECTION_THRESHOLD_PX,
+    DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
     DEFAULT_SUBJECT_MASS_KG,
     DEFAULT_TRIANGULATION_METHOD,
     DEFAULT_TRIANGULATION_WORKERS,
+    DEFAULT_UPPER_BACK_PSEUDO_STD_RAD,
+    DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
     KP_INDEX,
     CameraCalibration,
     PoseData,
     ReconstructionResult,
+    SegmentLengths,
     apply_left_right_flip_corrections,
     apply_left_right_flip_to_points,
     build_biomod,
+    calibration_signature,
     canonical_coherence_method,
     canonical_triangulation_method,
     compute_ekf2d_initial_state,
@@ -80,7 +104,10 @@ from vitpose_ekf_pipeline import (
     load_reconstruction_cache,
     marker_name_list,
     metadata_cache_matches,
+    model_stage_cache_matches,
     model_stage_metadata,
+    normalize_back_prior_mode,
+    normalize_head_marker_model,
     pose_data_signature,
     reconstruction_cache_metadata,
     run_biorbd_marker_kalman_with_parameters,
@@ -100,6 +127,8 @@ SUPPORTED_EKF2D_3D_SOURCE_MODES = ("full_triangulation", "first_frame_only")
 
 @dataclass
 class BundleBuildResult:
+    """Pair one exported bundle payload with its JSON summary."""
+
     payload: dict[str, np.ndarray]
     summary: dict[str, object]
 
@@ -109,11 +138,15 @@ def _jsonable_metadata(metadata: dict[str, object]) -> dict[str, object]:
 
 
 def cache_key(metadata: dict[str, object]) -> str:
+    """Return a stable short hash for one JSON-serializable cache metadata blob."""
+
     canonical = json.dumps(_jsonable_metadata(metadata), sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def dataset_cache_root(output_dir: Path) -> Path:
+    """Return the shared cache root associated with one dataset output directory."""
+
     output_dir = Path(output_dir)
     if output_dir.name in {"models", "reconstructions", "figures"}:
         dataset_dir = output_dir.parent
@@ -125,6 +158,8 @@ def dataset_cache_root(output_dir: Path) -> Path:
 
 
 def cache_entry_dir(output_dir: Path, category: str, metadata: dict[str, object], prefix: str) -> Path:
+    """Create or reuse the cache directory dedicated to one metadata signature."""
+
     cache_dir = dataset_cache_root(output_dir) / category / f"{prefix}_{cache_key(metadata)}"
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / "metadata.json").write_text(json.dumps(_jsonable_metadata(metadata), indent=2), encoding="utf-8")
@@ -140,8 +175,11 @@ def epipolar_cache_metadata(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
+    calibrations: dict[str, CameraCalibration],
 ) -> dict[str, object]:
-    return {
+    """Build the cache metadata describing one epipolar-coherence computation."""
+
+    metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
@@ -154,11 +192,15 @@ def epipolar_cache_metadata(
         "pose_amplitude_lower_percentile": float(pose_amplitude_lower_percentile),
         "pose_amplitude_upper_percentile": float(pose_amplitude_upper_percentile),
     }
+    metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    return metadata
 
 
 def save_epipolar_cache(
     cache_path: Path, epipolar_coherence: np.ndarray, metadata: dict[str, object], compute_time_s: float
 ) -> None:
+    """Persist one epipolar-coherence array and its metadata to disk."""
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         cache_path,
@@ -169,6 +211,8 @@ def save_epipolar_cache(
 
 
 def load_epipolar_cache(cache_path: Path) -> tuple[np.ndarray, float]:
+    """Load cached epipolar coherence and its compute time."""
+
     with np.load(cache_path, allow_pickle=True) as data:
         epipolar_coherence = np.asarray(data["epipolar_coherence"], dtype=float)
         compute_time_s = float(np.asarray(data["compute_time_s"]).item()) if "compute_time_s" in data else 0.0
@@ -188,6 +232,8 @@ def load_or_compute_epipolar_cache(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> tuple[np.ndarray, float, Path, str]:
+    """Reuse or compute the epipolar-coherence support for one reconstruction."""
+
     coherence_method = canonical_coherence_method(coherence_method)
     support_method = support_coherence_method_for_runtime(coherence_method)
     distance_mode = "symmetric" if support_method == "epipolar_fast" else "sampson"
@@ -200,6 +246,7 @@ def load_or_compute_epipolar_cache(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "epipolar", metadata, prefix="epipolar")
     cache_path = cache_dir / "epipolar_coherence.npz"
@@ -245,8 +292,11 @@ def flip_cache_metadata(
     temporal_weight: float,
     temporal_tau_px: float,
     temporal_min_valid_keypoints: int,
+    calibrations: dict[str, CameraCalibration],
 ) -> dict[str, object]:
-    return {
+    """Build the cache metadata describing one left/right flip-detection run."""
+
+    metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
         "frame_signature": frame_signature(pose_data.frames),
@@ -279,6 +329,14 @@ def flip_cache_metadata(
             5 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
         ),
     }
+    if str(method) == FLIP_AGR6_METHOD:
+        # A6 uses its own fixed rule (ratio, gain, candidates); the generic ratio/gain arguments above are not used.
+        metadata["epipolar_distance_mode"] = "sampson"
+        metadata["epipolar_flip_scoring_version"] = FLIP_AGR6_SCORING_VERSION
+        metadata["temporal_smoothing_window"] = CANDIDATE_SMOOTH_WINDOW
+        metadata["flip_agr6_parameters"] = flip_agr6_parameters()
+    metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
+    return metadata
 
 
 def save_flip_cache(
@@ -289,6 +347,8 @@ def save_flip_cache(
     compute_time_s: float,
     detail_arrays: dict[str, np.ndarray] | None = None,
 ) -> None:
+    """Persist left/right flip diagnostics and optional detail arrays."""
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, np.ndarray] = {
         "suspect_mask": np.asarray(suspect_mask, dtype=bool),
@@ -303,6 +363,8 @@ def save_flip_cache(
 
 
 def load_flip_cache(cache_path: Path) -> tuple[np.ndarray, dict[str, object], float]:
+    """Load cached flip-detection outputs."""
+
     with np.load(cache_path, allow_pickle=True) as data:
         suspect_mask = np.asarray(data["suspect_mask"], dtype=bool)
         diagnostics = json.loads(str(np.asarray(data["diagnostics"]).item()))
@@ -332,6 +394,8 @@ def load_or_compute_left_right_flip_cache(
     temporal_tau_px: float = DEFAULT_FLIP_TEMPORAL_TAU_PX,
     temporal_min_valid_keypoints: int = DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
 ) -> tuple[np.ndarray, dict[str, object], float, Path, str]:
+    """Reuse or compute left/right flip diagnostics for one pose-data variant."""
+
     metadata = flip_cache_metadata(
         pose_data,
         method=method,
@@ -350,6 +414,7 @@ def load_or_compute_left_right_flip_cache(
         temporal_weight=float(temporal_weight),
         temporal_tau_px=float(temporal_tau_px),
         temporal_min_valid_keypoints=int(temporal_min_valid_keypoints),
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "flip", metadata, prefix=f"flip_{method}")
     cache_path = cache_dir / "flip_diagnostics.npz"
@@ -384,6 +449,8 @@ def load_or_compute_left_right_flip_cache(
 
 
 def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) -> PoseData:
+    """Extract one frame subset from a ``PoseData`` instance."""
+
     idx = np.asarray(frame_indices, dtype=int)
     return PoseData(
         camera_names=list(pose_data.camera_names),
@@ -405,6 +472,7 @@ def slice_pose_data(pose_data: PoseData, frame_indices: list[int] | np.ndarray) 
 def pose_variant_cache_metadata(
     pose_data: PoseData,
     *,
+    calibrations: dict[str, CameraCalibration],
     correction_mode: str,
     pose_data_mode: str,
     pose_filter_window: int,
@@ -423,6 +491,12 @@ def pose_variant_cache_metadata(
     temporal_tau_px: float | None = None,
     temporal_min_valid_keypoints: int | None = None,
 ) -> dict[str, object]:
+    """Build the cache metadata for one corrected or annotated pose-data variant.
+
+    The calibration signature is recorded only for flip-corrected variants, the
+    only ones whose content depends on camera geometry.
+    """
+
     metadata = {
         "camera_names": list(pose_data.camera_names),
         "n_frames": int(pose_data.frames.shape[0]),
@@ -452,6 +526,7 @@ def pose_variant_cache_metadata(
         )
         if tau_px is not None:
             metadata["tau_px"] = float(tau_px)
+        metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 
 
@@ -464,6 +539,8 @@ def save_pose_variant_cache(
     suspect_mask: np.ndarray | None = None,
     compute_time_s: float = 0.0,
 ) -> None:
+    """Persist one derived ``PoseData`` variant and its diagnostics."""
+
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, np.ndarray] = {
         "camera_names": np.asarray(list(pose_data.camera_names), dtype=object),
@@ -485,6 +562,8 @@ def save_pose_variant_cache(
 
 
 def load_pose_variant_cache(cache_path: Path) -> tuple[PoseData, dict[str, object], np.ndarray | None, float]:
+    """Load one cached pose-data variant together with diagnostics and timing."""
+
     with np.load(cache_path, allow_pickle=True) as data:
         pose_data = PoseData(
             camera_names=[str(name) for name in np.asarray(data["camera_names"], dtype=object).tolist()],
@@ -526,6 +605,8 @@ def load_or_compute_pose_data_variant_cache(
     temporal_tau_px: float = DEFAULT_FLIP_TEMPORAL_TAU_PX,
     temporal_min_valid_keypoints: int = DEFAULT_FLIP_TEMPORAL_MIN_VALID_KEYPOINTS,
 ) -> tuple[PoseData, dict[str, object] | None, float, Path, str]:
+    """Reuse or compute one corrected 2D pose-data variant."""
+
     metadata = pose_variant_cache_metadata(
         pose_data,
         correction_mode=correction_mode,
@@ -545,6 +626,7 @@ def load_or_compute_pose_data_variant_cache(
         temporal_weight=temporal_weight if flip_method is not None else None,
         temporal_tau_px=temporal_tau_px if flip_method is not None else None,
         temporal_min_valid_keypoints=temporal_min_valid_keypoints if flip_method is not None else None,
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(output_dir, "pose2d", metadata, prefix=f"pose2d_{correction_mode}")
     cache_path = cache_dir / "pose_data_variant.npz"
@@ -624,6 +706,8 @@ def reconstruction_with_full_frame_support(
     coherence_method: str,
     bootstrap_frame_global_idx: int,
 ) -> ReconstructionResult:
+    """Expand a one-frame bootstrap reconstruction back onto the full frame axis."""
+
     n_frames = pose_data.frames.shape[0]
     n_cams = len(pose_data.camera_names)
     points_3d = np.full((n_frames, len(COCO17), 3), np.nan, dtype=float)
@@ -665,6 +749,8 @@ def reconstruction_with_full_frame_support(
 
 
 def estimate_segment_lengths_first_frame(reconstruction: ReconstructionResult) -> tuple[SegmentLengths, int]:
+    """Estimate segment lengths from the earliest frame with valid 3D support."""
+
     for frame_idx in range(reconstruction.points_3d.shape[0]):
         frame_points = reconstruction.points_3d[frame_idx : frame_idx + 1]
         if np.any(np.isfinite(frame_points)):
@@ -697,7 +783,7 @@ def load_or_compute_triangulation_cache(
     calibrations: dict[str, CameraCalibration],
     coherence_method: str,
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     triangulation_workers: int,
@@ -707,6 +793,8 @@ def load_or_compute_triangulation_cache(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> tuple[ReconstructionResult, Path, Path, str]:
+    """Reuse or compute the triangulation support for one reconstruction run."""
+
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
@@ -721,6 +809,7 @@ def load_or_compute_triangulation_cache(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations=calibrations,
     )
     cache_dir = cache_entry_dir(
         output_dir, "triangulation", metadata, prefix=f"triang_{effective_triangulation_method}"
@@ -771,7 +860,12 @@ def load_or_build_model_cache(
     initial_rotation_correction: bool,
     lengths_mode: str,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> tuple[SegmentLengths, Path, Path, int, float, str]:
+    """Reuse or build the biomechanical model stage associated with one run."""
+
+    build_start = time.perf_counter()
     if lengths_mode == "first_frame_only":
         lengths, bootstrap_frame_idx = estimate_segment_lengths_first_frame(reconstruction)
     else:
@@ -785,17 +879,18 @@ def load_or_build_model_cache(
         subject_mass_kg,
         initial_rotation_correction,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
+        head_marker_model=head_marker_model,
     )
     metadata["lengths_mode"] = lengths_mode
     metadata["bootstrap_frame_idx"] = int(bootstrap_frame_idx)
     cache_dir = cache_entry_dir(output_dir, "model", metadata, prefix="model")
     cache_path = cache_dir / "model_stage.npz"
     biomod_cache_path = cache_dir / "vitpose_chain.bioMod"
-    if metadata_cache_matches(cache_path, metadata) and biomod_cache_path.exists():
+    if model_stage_cache_matches(cache_path, metadata, biomod_cache_path):
         cached_lengths, _biomod_path, compute_time_s = load_model_stage(cache_path)
         return cached_lengths, biomod_cache_path, cache_path, int(bootstrap_frame_idx), float(compute_time_s), "cache"
 
-    build_start = time.perf_counter()
     build_biomod(
         lengths,
         biomod_cache_path,
@@ -803,6 +898,8 @@ def load_or_build_model_cache(
         reconstruction=reconstruction,
         apply_initial_root_rotation_correction=initial_rotation_correction,
         model_variant=model_variant,
+        symmetrize_limbs=symmetrize_limbs,
+        head_marker_model=head_marker_model,
     )
     compute_time_s = time.perf_counter() - build_start
     save_model_stage(cache_path, lengths, biomod_cache_path, metadata, compute_time_s=compute_time_s)
@@ -815,7 +912,7 @@ def prepare_pose_data_for_reconstruction(
     pose_data: PoseData,
     calibrations: dict[str, CameraCalibration],
     coherence_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     epipolar_threshold_px: float,
     pose_data_mode: str,
     pose_filter_window: int,
@@ -834,6 +931,8 @@ def prepare_pose_data_for_reconstruction(
     flip_temporal_min_valid_keypoints: int,
     flip_method: str | None = None,
 ) -> tuple[PoseData, dict[str, object] | None, Path | None, str]:
+    """Prepare the effective 2D observations used by one reconstruction family."""
+
     coherence_method = canonical_coherence_method(coherence_method)
     if not flip_left_right:
         return pose_data, None, None, "computed_now"
@@ -882,6 +981,8 @@ def prepare_pose_data_for_reconstruction(
 
 
 def with_version_info(summary: dict[str, object], family: str) -> dict[str, object]:
+    """Attach schema and algorithm-version metadata to one bundle summary."""
+
     latest = latest_version_for_family(family)
     enriched = dict(summary)
     enriched["bundle_schema_version"] = int(BUNDLE_SCHEMA_VERSION)
@@ -983,6 +1084,8 @@ def parse_trc_points(trc_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray
 
 
 def q_names_from_model(model) -> np.ndarray:
+    """Return the generalized-coordinate names for one ``biorbd`` model."""
+
     names = [
         f"{model.segment(i_seg).name().to_string()}:{model.segment(i_seg).nameDof(i_dof).to_string()}"
         for i_seg in range(model.nbSegment())
@@ -992,6 +1095,8 @@ def q_names_from_model(model) -> np.ndarray:
 
 
 def should_apply_initial_rotation_correction(points_3d: np.ndarray) -> bool:
+    """Return whether geometric root-yaw snapping would have a non-zero effect."""
+
     angle = root_z_correction_angle_from_points(
         points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1006,7 +1111,11 @@ def extract_root_from_points(
     points_3d: np.ndarray,
     apply_initial_rotation_correction: bool,
     unwrap_rotations: bool,
+    unwrap_mode: str | None = None,
+    translation_origin: str = "pelvis",
 ) -> tuple[np.ndarray, bool]:
+    """Extract root translation and orientation directly from 3D trunk markers."""
+
     correction_angle = root_z_correction_angle_from_points(
         points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1020,6 +1129,7 @@ def extract_root_from_points(
         right_hip_idx=KP_INDEX["right_hip"],
         left_shoulder_idx=KP_INDEX["left_shoulder"],
         right_shoulder_idx=KP_INDEX["right_shoulder"],
+        translation_origin=translation_origin,
     )
     correction_detected = abs(correction_angle) > 1e-8
     correction_applied = bool(apply_initial_rotation_correction and correction_detected)
@@ -1037,8 +1147,9 @@ def extract_root_from_points(
             degrees=False,
         )
 
-    if unwrap_rotations:
-        root_q[:, ROOT_ROTATION_SLICE] = unwrap_with_gaps(root_q[:, ROOT_ROTATION_SLICE])
+    effective_unwrap_mode = normalize_root_unwrap_mode(unwrap_mode, legacy_unwrap=unwrap_rotations)
+    if effective_unwrap_mode != "off":
+        root_q[:, ROOT_ROTATION_SLICE] = stabilize_root_rotations(root_q[:, ROOT_ROTATION_SLICE], effective_unwrap_mode)
     return root_q, correction_applied
 
 
@@ -1051,6 +1162,7 @@ def root_kinematics_from_trc(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "off",
 ) -> tuple[np.ndarray, np.ndarray, bool, str]:
     """Resolve root kinematics for one imported TRC file.
 
@@ -1076,12 +1188,20 @@ def root_kinematics_from_trc(
                 "trc_root_kinematics_sidecar",
             )
 
-    q_root, correction_applied = extract_root_from_points(points_3d, initial_rotation_correction, unwrap_root)
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
+    q_root, correction_applied = extract_root_from_points(
+        points_3d,
+        initial_rotation_correction,
+        unwrap_rotations=(effective_root_unwrap_mode != "off"),
+        unwrap_mode=effective_root_unwrap_mode,
+    )
     qdot_root = centered_finite_difference(q_root, 1.0 / fps)
     return q_root, qdot_root, correction_applied, "geometric_trc_markers"
 
 
 def align_points_to_frames(points_3d: np.ndarray, point_frames: np.ndarray, target_frames: np.ndarray) -> np.ndarray:
+    """Align frame-indexed 3D points onto a target frame axis."""
+
     aligned = np.full((len(target_frames), points_3d.shape[1], 3), np.nan, dtype=float)
     frame_to_index = {int(frame): idx for idx, frame in enumerate(np.asarray(point_frames, dtype=int))}
     for out_idx, frame in enumerate(np.asarray(target_frames, dtype=int)):
@@ -1098,6 +1218,8 @@ def compute_points_reprojection_error_per_view(
     calibrations: dict[str, CameraCalibration],
     pose_data: PoseData,
 ) -> np.ndarray:
+    """Compute per-view reprojection errors for raw 3D marker trajectories."""
+
     aligned_points = align_points_to_frames(points_3d, point_frames, pose_data.frames)
     errors = np.full((pose_data.frames.shape[0], len(COCO17), len(pose_data.camera_names)), np.nan, dtype=float)
     for cam_idx, cam_name in enumerate(pose_data.camera_names):
@@ -1121,6 +1243,8 @@ def compute_model_reprojection_error_per_view(
     calibrations: dict[str, CameraCalibration],
     pose_data: PoseData,
 ) -> np.ndarray:
+    """Compute per-view reprojection errors for model-driven 3D marker trajectories."""
+
     marker_names = marker_name_list(model)
     marker_kp_pairs = [(marker_name, KP_INDEX[marker_name]) for marker_name in marker_names if marker_name in KP_INDEX]
     errors = np.full((pose_data.keypoints.shape[1], len(COCO17), len(pose_data.camera_names)), np.nan, dtype=float)
@@ -1146,6 +1270,8 @@ def compute_model_reprojection_error_per_view(
 
 
 def compute_model_marker_points_3d(model, q_trajectory: np.ndarray) -> np.ndarray:
+    """Evaluate the model markers corresponding to the COCO17 support for one q trajectory."""
+
     marker_names = marker_name_list(model)
     marker_kp_pairs = [(marker_name, KP_INDEX[marker_name]) for marker_name in marker_names if marker_name in KP_INDEX]
     points_3d = np.full((q_trajectory.shape[0], len(COCO17), 3), np.nan, dtype=float)
@@ -1158,11 +1284,35 @@ def compute_model_marker_points_3d(model, q_trajectory: np.ndarray) -> np.ndarra
 
 
 def summarize_reprojection_errors(errors: np.ndarray, camera_names: list[str]) -> dict[str, object]:
+    """Aggregate reprojection errors by keypoint and by camera."""
+
+    def _nanmean_without_warning(values: np.ndarray, axis: tuple[int, ...]) -> np.ndarray:
+        values = np.asarray(values, dtype=float)
+        finite_counts = np.sum(np.isfinite(values), axis=axis)
+        sums = np.nansum(values, axis=axis)
+        means = np.full(sums.shape, np.nan, dtype=float)
+        valid = finite_counts > 0
+        means[valid] = sums[valid] / finite_counts[valid]
+        return means
+
+    def _nanstd_without_warning(values: np.ndarray, axis: tuple[int, ...]) -> np.ndarray:
+        means = _nanmean_without_warning(values, axis=axis)
+        expanded_means = means
+        for current_axis in sorted(axis):
+            expanded_means = np.expand_dims(expanded_means, axis=current_axis)
+        centered = np.asarray(values, dtype=float) - expanded_means
+        squared = np.where(np.isfinite(values), centered**2, np.nan)
+        variances = _nanmean_without_warning(squared, axis=axis)
+        std = np.full(variances.shape, np.nan, dtype=float)
+        finite = np.isfinite(variances)
+        std[finite] = np.sqrt(variances[finite])
+        return std
+
     finite = errors[np.isfinite(errors)]
-    per_key_mean = np.nanmean(errors, axis=(0, 2))
-    per_key_std = np.nanstd(errors, axis=(0, 2))
-    per_camera_mean = np.nanmean(errors, axis=(0, 1))
-    per_camera_std = np.nanstd(errors, axis=(0, 1))
+    per_key_mean = _nanmean_without_warning(errors, axis=(0, 2))
+    per_key_std = _nanstd_without_warning(errors, axis=(0, 2))
+    per_camera_mean = _nanmean_without_warning(errors, axis=(0, 1))
+    per_camera_std = _nanstd_without_warning(errors, axis=(0, 1))
     per_keypoint = {
         keypoint_name: {
             "mean_px": float(per_key_mean[idx]) if np.isfinite(per_key_mean[idx]) else None,
@@ -1190,12 +1340,38 @@ def summarize_reprojection_errors(errors: np.ndarray, camera_names: list[str]) -
     }
 
 
+def summarize_view_usage(excluded_views: np.ndarray | None, camera_names: list[str]) -> dict[str, object]:
+    """Summarize how often each camera was kept or excluded during triangulation."""
+
+    if excluded_views is None:
+        return {"included_ratio": None, "excluded_ratio": None, "per_camera": {}}
+    mask = np.asarray(excluded_views, dtype=bool)
+    if mask.ndim != 3 or mask.shape[2] != len(camera_names):
+        return {"included_ratio": None, "excluded_ratio": None, "per_camera": {}}
+    included = ~mask
+    per_camera: dict[str, object] = {}
+    for idx, camera_name in enumerate(camera_names):
+        included_ratio = float(np.mean(included[:, :, idx])) if included[:, :, idx].size else None
+        excluded_ratio = float(np.mean(mask[:, :, idx])) if mask[:, :, idx].size else None
+        per_camera[camera_name] = {
+            "included_ratio": included_ratio,
+            "excluded_ratio": excluded_ratio,
+        }
+    return {
+        "included_ratio": float(np.mean(included)) if included.size else None,
+        "excluded_ratio": float(np.mean(mask)) if mask.size else None,
+        "per_camera": per_camera,
+    }
+
+
 def make_reconstruction_from_points(
     frames: np.ndarray,
     points_3d: np.ndarray,
     n_cameras: int,
     coherence_method: str,
 ) -> ReconstructionResult:
+    """Wrap raw 3D points into a minimal ``ReconstructionResult`` container."""
+
     n_frames = points_3d.shape[0]
     return ReconstructionResult(
         frames=np.asarray(frames, dtype=int),
@@ -1214,6 +1390,8 @@ def make_reconstruction_from_points(
 
 
 def empty_pose_data() -> PoseData:
+    """Return an empty ``PoseData`` container with the expected tensor layout."""
+
     return PoseData(
         camera_names=[],
         frames=np.array([], dtype=int),
@@ -1223,6 +1401,8 @@ def empty_pose_data() -> PoseData:
 
 
 def duration_from_time(time_s: np.ndarray) -> float:
+    """Return the duration covered by one time vector."""
+
     if time_s.size == 0:
         return 0.0
     return float(time_s[-1] - time_s[0]) if time_s.size > 1 else 0.0
@@ -1245,7 +1425,10 @@ def build_bundle_payload(
     reprojection_errors: np.ndarray,
     summary: dict[str, object],
     support_points_3d: np.ndarray | None = None,
+    excluded_views: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
+    """Assemble the NPZ payload written for one reconstruction bundle."""
+
     if q is None:
         q = np.empty((len(frames), 0), dtype=float)
     if qdot is None:
@@ -1276,12 +1459,16 @@ def build_bundle_payload(
         "reprojection_error_per_camera_std": np.asarray(reprojection_stats["per_camera_std"], dtype=float),
         "bundle_summary_json": np.asarray(json.dumps(summary), dtype=object),
     }
+    if excluded_views is not None:
+        payload["excluded_views"] = np.asarray(excluded_views, dtype=bool)
     if support_points_3d is not None:
         payload["support_points_3d"] = np.asarray(support_points_3d, dtype=float)
     return payload
 
 
 def write_bundle(output_dir: Path, payload: dict[str, np.ndarray], summary: dict[str, object]) -> None:
+    """Write the bundle NPZ and its JSON summaries to disk."""
+
     output_dir.mkdir(parents=True, exist_ok=True)
     np.savez(output_dir / "reconstruction_bundle.npz", **payload)
     summary_json = json.dumps(summary, indent=2)
@@ -1293,9 +1480,10 @@ def save_legacy_triangulation(
     output_dir: Path,
     reconstruction: ReconstructionResult,
     pose_data: PoseData,
+    calibrations: dict[str, CameraCalibration],
     *,
     triangulation_method: str,
-    error_threshold_px: float,
+    error_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     pose_data_mode: str,
@@ -1304,6 +1492,8 @@ def save_legacy_triangulation(
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
 ) -> Path:
+    """Write the legacy triangulation cache files expected by older tooling."""
+
     triangulation_method = canonical_triangulation_method(triangulation_method)
     if triangulation_method == "once":
         cache_name = "triangulation_pose2sim_like_once.npz"
@@ -1323,6 +1513,7 @@ def save_legacy_triangulation(
         pose_outlier_threshold_ratio,
         pose_amplitude_lower_percentile,
         pose_amplitude_upper_percentile,
+        calibrations=calibrations,
     )
     save_reconstruction_cache(cache_path, reconstruction, metadata)
     return cache_path
@@ -1335,6 +1526,8 @@ def save_legacy_ekf_2d(
     flip: bool,
     marker_points_3d: np.ndarray | None = None,
 ) -> None:
+    """Write the legacy EKF2D NPZ files expected by comparison scripts."""
+
     save_single_ekf_state(output_dir / f"ekf_states_{'flip_' if flip else ''}{predictor}.npz", result)
     key_prefix = f"q_ekf_2d_{'flip_' if flip else ''}{predictor}"
     qdot_prefix = f"qdot_ekf_2d_{'flip_' if flip else ''}{predictor}"
@@ -1361,6 +1554,8 @@ def save_legacy_ekf_3d(
     reprojection_stats: dict[str, object],
     marker_points_3d: np.ndarray | None = None,
 ) -> None:
+    """Write the legacy EKF3D comparison NPZ expected by older scripts."""
+
     np.savez(
         output_dir / "kalman_comparison.npz",
         q_ekf_3d=result["q"],
@@ -1391,7 +1586,16 @@ def build_pose_data(
     pose_outlier_threshold_ratio: float,
     pose_amplitude_lower_percentile: float,
     pose_amplitude_upper_percentile: float,
+    annotations_path: Path | None = None,
+    undistort_keypoints: bool = False,
 ) -> PoseData:
+    """Load one ``PoseData`` object from keypoints, smoothing, and annotations settings.
+
+    With ``undistort_keypoints``, callers must also use calibrations returned by
+    ``calibrations_with_undistorted_keypoints`` so that geometric caches are keyed
+    on this mode (see ``calibration_signature``).
+    """
+
     return load_pose_data(
         keypoints_path,
         calibrations,
@@ -1402,7 +1606,15 @@ def build_pose_data(
         outlier_threshold_ratio=pose_outlier_threshold_ratio,
         lower_percentile=pose_amplitude_lower_percentile,
         upper_percentile=pose_amplitude_upper_percentile,
+        annotations_path=annotations_path,
+        undistort_keypoints=undistort_keypoints,
     )
+
+
+def keypoints_undistorted(calibrations: dict[str, CameraCalibration]) -> bool:
+    """Return whether the calibrations are flagged for keypoints undistorted at load time."""
+
+    return any(bool(getattr(calibration, "keypoints_undistorted", False)) for calibration in calibrations.values())
 
 
 def pose_effective_fps(pose_data: PoseData, source_fps: float) -> float:
@@ -1413,6 +1625,8 @@ def pose_effective_fps(pose_data: PoseData, source_fps: float) -> float:
 
 
 def print_step(step_idx: int, step_total: int, label: str) -> None:
+    """Print one pipeline step label in the CLI-friendly step format."""
+
     print(f"[STEP {step_idx}/{step_total}] {label}", flush=True)
 
 
@@ -1427,7 +1641,10 @@ def build_pose2sim_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "off",
 ) -> BundleBuildResult:
+    """Build and export the standardized bundle for a Pose2Sim TRC import."""
+
     print_step(2, 2, "TRC file import + export bundle")
     t0 = time.perf_counter()
     frames, time_s, points_3d, trc_rate = parse_trc_points(pose2sim_trc)
@@ -1439,6 +1656,7 @@ def build_pose2sim_bundle(
         fps=fps,
         initial_rotation_correction=initial_rotation_correction,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
     )
     reprojection_errors = compute_points_reprojection_error_per_view(points_3d, frames, calibrations, pose_data)
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
@@ -1496,6 +1714,7 @@ def build_pose2sim_bundle(
         },
     }
     summary = with_version_info(summary, "triangulation")
+    excluded_views = np.zeros((len(frames), len(COCO17), len(pose_data.camera_names)), dtype=bool)
     payload = build_bundle_payload(
         name=name,
         family="pose2sim",
@@ -1511,6 +1730,7 @@ def build_pose2sim_bundle(
         qdot_root=qdot_root,
         reprojection_errors=reprojection_errors,
         summary=summary,
+        excluded_views=excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)
@@ -1526,8 +1746,9 @@ def build_triangulation_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -1549,6 +1770,8 @@ def build_triangulation_bundle(
     flip_temporal_min_valid_keypoints: int,
     flip_method: str | None = None,
 ) -> tuple[BundleBuildResult, ReconstructionResult]:
+    """Build and export a triangulation-only reconstruction bundle."""
+
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
@@ -1606,6 +1829,7 @@ def build_triangulation_bundle(
         output_dir,
         reconstruction,
         pose_data_used,
+        calibrations,
         triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -1617,12 +1841,17 @@ def build_triangulation_bundle(
         pose_amplitude_upper_percentile=pose_amplitude_upper_percentile,
     )
     time_s = reconstruction.frames / float(fps)
+    effective_root_unwrap_mode = normalize_root_unwrap_mode(root_unwrap_mode, legacy_unwrap=unwrap_root)
     q_root, correction_applied = extract_root_from_points(
-        reconstruction.points_3d, initial_rotation_correction, unwrap_root
+        reconstruction.points_3d,
+        initial_rotation_correction,
+        unwrap_rotations=(effective_root_unwrap_mode != "off"),
+        unwrap_mode=effective_root_unwrap_mode,
     )
     qdot_root = centered_finite_difference(q_root, 1.0 / effective_fps)
     reprojection_errors = reconstruction.reprojection_error_per_view
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data.camera_names)
     correction_angle = root_z_correction_angle_from_points(
         reconstruction.points_3d,
         left_hip_idx=KP_INDEX["left_hip"],
@@ -1691,8 +1920,10 @@ def build_triangulation_bundle(
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "left_right_flip_diagnostics": flip_diagnostics,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -1705,6 +1936,7 @@ def build_triangulation_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": time.perf_counter() - t0,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -1754,8 +1986,9 @@ def build_ekf_3d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -1782,7 +2015,13 @@ def build_ekf_3d_bundle(
     biorbd_kalman_init_method: str = DEFAULT_BIORBD_KALMAN_INIT_METHOD,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> BundleBuildResult:
+    """Build and export the standardized EKF3D reconstruction bundle."""
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
+
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     effective_triangulation_method = triangulation_method_from_coherence_method(coherence_method, triangulation_method)
@@ -1841,6 +2080,7 @@ def build_ekf_3d_bundle(
         output_dir,
         reconstruction,
         pose_data_used,
+        calibrations,
         triangulation_method=effective_triangulation_method,
         error_threshold_px=reprojection_threshold_px,
         min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -1873,6 +2113,8 @@ def build_ekf_3d_bundle(
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode="full_triangulation",
                 model_variant=model_variant,
+                symmetrize_limbs=symmetrize_limbs,
+                head_marker_model=head_marker_model,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -1890,12 +2132,18 @@ def build_ekf_3d_bundle(
         noise_factor=biorbd_kalman_noise_factor,
         error_factor=biorbd_kalman_error_factor,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
         initial_state_method=biorbd_kalman_init_method,
     )
     ekf3d_s = time.perf_counter() - ekf3d_start
     result["q_names"] = q_names_from_model(model)
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
-    q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
+    q_root = extract_root_from_q(
+        result["q_names"],
+        result["q"],
+        unwrap_rotations=unwrap_root,
+        unwrap_mode=root_unwrap_mode,
+    )
     qdot_root = extract_root_from_q(
         result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
     )
@@ -1910,6 +2158,7 @@ def build_ekf_3d_bundle(
         model_points_3d, reconstruction.frames, calibrations, pose_data_used
     )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data_used.camera_names)
     save_legacy_ekf_3d(output_dir, result, reprojection_stats, model_points_3d)
     print_step(5, 5, "Export bundle EKF 3D")
 
@@ -1986,8 +2235,10 @@ def build_ekf_3d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "flip_left_right": bool(flip_left_right),
         "triangulation_method": effective_triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "cache_paths": {
             "triangulation": str(reconstruction_cache_path),
@@ -1997,6 +2248,8 @@ def build_ekf_3d_bundle(
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
+        "head_marker_model": None if selected_biomod_path is not None else head_marker_model,
         "filter_parameters": {
             "noise_factor": float(biorbd_kalman_noise_factor),
             "error_factor": float(biorbd_kalman_error_factor),
@@ -2010,6 +2263,7 @@ def build_ekf_3d_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": triangulation_s,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -2048,6 +2302,7 @@ def build_ekf_3d_bundle(
         reprojection_errors=reprojection_errors,
         summary=summary,
         support_points_3d=reconstruction.points_3d,
+        excluded_views=reconstruction.excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)
@@ -2063,8 +2318,9 @@ def build_ekf_2d_bundle(
     fps: float,
     initial_rotation_correction: bool,
     unwrap_root: bool,
+    root_unwrap_mode: str = "off",
     triangulation_method: str,
-    reprojection_threshold_px: float,
+    reprojection_threshold_px: float | None,
     min_cameras_for_triangulation: int,
     epipolar_threshold_px: float,
     coherence_method: str,
@@ -2098,9 +2354,33 @@ def build_ekf_2d_bundle(
     skip_low_coherence_updates: bool,
     flight_height_threshold_m: float,
     flight_min_consecutive_frames: int,
+    upper_back_sagittal_gain: float = DEFAULT_UPPER_BACK_SAGITTAL_GAIN,
+    upper_back_pseudo_std_deg: float = np.rad2deg(DEFAULT_UPPER_BACK_PSEUDO_STD_RAD),
+    back_prior_mode: str = DEFAULT_BACK_PRIOR_MODE,
+    ankle_bed_pseudo_obs: bool = False,
+    ankle_bed_pseudo_std_m: float = DEFAULT_ANKLE_BED_PSEUDO_STD_M,
+    ekf2d_update_method: str = DEFAULT_EKF2D_UPDATE_METHOD,
+    process_noise_model: str = DEFAULT_PROCESS_NOISE_MODEL,
+    process_noise_jerk_psd: list[float] | tuple[float, ...] | None = None,
+    joint_prior: bool = False,
+    joint_prior_axial_std_deg: float = DEFAULT_JOINT_PRIOR_AXIAL_STD_DEG,
+    robust_mixture: bool = False,
+    robust_mixture_outlier_prob: float = DEFAULT_ROBUST_MIXTURE_OUTLIER_PROB,
+    robust_mixture_lock_fraction: float = DEFAULT_ROBUST_MIXTURE_LOCK_FRACTION,
+    robust_mixture_resume_fraction: float = DEFAULT_ROBUST_MIXTURE_RESUME_FRACTION,
+    flight_detection: str = DEFAULT_FLIGHT_DETECTION,
+    flight_hysteresis_m: float = DEFAULT_FLIGHT_HYSTERESIS_M,
+    flight_com_accel_tolerance: float | None = None,
     biomod_path: Path | None = None,
     model_variant: str = "single_trunk",
+    symmetrize_limbs: bool = True,
+    head_marker_model: str = DEFAULT_HEAD_MARKER_MODEL,
 ) -> BundleBuildResult:
+    """Build and export the standardized EKF2D reconstruction bundle."""
+
+    head_marker_model = normalize_head_marker_model(head_marker_model)
+    back_prior_mode = normalize_back_prior_mode(back_prior_mode)
+
     triangulation_method = canonical_triangulation_method(triangulation_method)
     coherence_method = canonical_coherence_method(coherence_method, triangulation_method)
     support_coherence_method = support_coherence_method_for_runtime(coherence_method)
@@ -2173,6 +2453,7 @@ def build_ekf_2d_bundle(
             output_dir,
             reconstruction,
             pose_data_used,
+            calibrations,
             triangulation_method=effective_triangulation_method,
             error_threshold_px=reprojection_threshold_px,
             min_cameras_for_triangulation=min_cameras_for_triangulation,
@@ -2250,6 +2531,8 @@ def build_ekf_2d_bundle(
                 initial_rotation_correction=initial_rotation_correction,
                 lengths_mode=ekf2d_3d_source,
                 model_variant=model_variant,
+                symmetrize_limbs=symmetrize_limbs,
+                head_marker_model=head_marker_model,
             )
         )
         shutil.copy2(biomod_cache_path, output_biomod_path)
@@ -2279,6 +2562,20 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
+        back_prior_mode=back_prior_mode,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
     )
     initial_state_s = time.perf_counter() - initial_state_start
     print_step(4, 5, f"EKF 2D {predictor.upper()}")
@@ -2296,10 +2593,12 @@ def build_ekf_2d_bundle(
         coherence_confidence_floor=coherence_confidence_floor,
         epipolar_threshold_px=epipolar_threshold_px,
         enable_dof_locking=enable_dof_locking,
-        root_flight_dynamics=(predictor == "dyn"),
+        root_flight_dynamics=(predictor in {"dyn", "dyn_history3"}),
+        predictor_mode=predictor,
         flight_height_threshold_m=flight_height_threshold_m,
         flight_min_consecutive_frames=flight_min_consecutive_frames,
         unwrap_root=unwrap_root,
+        root_unwrap_mode=root_unwrap_mode,
         model=model,
         initial_state=initial_state,
         flip_method=("ekf_prediction_gate" if use_runtime_flip_gate else None),
@@ -2307,10 +2606,32 @@ def build_ekf_2d_bundle(
         flip_min_gain_px=flip_min_gain_px,
         flip_error_threshold_px=epipolar_threshold_px,
         flip_error_delta_threshold_px=flip_min_gain_px,
+        upper_back_sagittal_gain=upper_back_sagittal_gain,
+        upper_back_pseudo_std_rad=np.deg2rad(float(upper_back_pseudo_std_deg)),
+        back_prior_mode=back_prior_mode,
+        ankle_bed_pseudo_obs=ankle_bed_pseudo_obs,
+        ankle_bed_pseudo_std_m=ankle_bed_pseudo_std_m,
+        update_method=ekf2d_update_method,
+        process_noise_model=process_noise_model,
+        process_noise_jerk_psd=process_noise_jerk_psd,
+        joint_prior=joint_prior,
+        joint_prior_axial_std_deg=joint_prior_axial_std_deg,
+        robust_mixture=robust_mixture,
+        robust_mixture_outlier_prob=robust_mixture_outlier_prob,
+        robust_mixture_lock_fraction=robust_mixture_lock_fraction,
+        robust_mixture_resume_fraction=robust_mixture_resume_fraction,
+        flight_detection=flight_detection,
+        flight_hysteresis_m=flight_hysteresis_m,
+        flight_com_accel_tolerance=flight_com_accel_tolerance,
     )
     ekf_s = time.perf_counter() - ekf_start
     model_points_3d = compute_model_marker_points_3d(model, result["q"])
-    q_root = extract_root_from_q(result["q_names"], result["q"], unwrap_rotations=unwrap_root)
+    q_root = extract_root_from_q(
+        result["q_names"],
+        result["q"],
+        unwrap_rotations=unwrap_root,
+        unwrap_mode=root_unwrap_mode,
+    )
     qdot_root = extract_root_from_q(
         result["q_names"], result["qdot"], unwrap_rotations=False, renormalize_rotations=False
     )
@@ -2325,6 +2646,7 @@ def build_ekf_2d_bundle(
         model_points_3d, reconstruction.frames, calibrations, pose_data_used
     )
     reprojection_stats = summarize_reprojection_errors(reprojection_errors, pose_data_used.camera_names)
+    view_usage_stats = summarize_view_usage(reconstruction.excluded_views, pose_data_used.camera_names)
     save_legacy_ekf_2d(output_dir, result, predictor, flip_left_right, model_points_3d)
     print_step(5, 5, "Export bundle EKF 2D")
 
@@ -2497,7 +2819,9 @@ def build_ekf_2d_bundle(
         "initial_rotation_correction_applied": bool(initial_rotation_correction and abs(correction_angle) > 1e-8),
         "initial_rotation_correction_angle_rad": float(correction_angle),
         "pose_data_mode": pose_data_mode,
+        "undistort_keypoints": keypoints_undistorted(calibrations),
         "triangulation_method": effective_triangulation_method,
+        "reprojection_threshold_px": reprojection_threshold_px,
         "coherence_method": coherence_method,
         "ekf2d_3d_source": ekf2d_3d_source,
         "ekf2d_initial_state_method": ekf2d_initial_state_method,
@@ -2514,20 +2838,52 @@ def build_ekf_2d_bundle(
         },
         "selected_model": None if selected_biomod_path is None else str(selected_biomod_path),
         "model_variant": str(model_variant),
+        "symmetrize_limbs": bool(symmetrize_limbs),
+        "head_marker_model": None if selected_biomod_path is not None else head_marker_model,
         "filter_parameters": {
             "measurement_noise_scale": float(measurement_noise_scale),
             "process_noise_scale": float(process_noise_scale),
             "coherence_confidence_floor": float(coherence_confidence_floor),
+            "upper_back_sagittal_gain": float(upper_back_sagittal_gain),
+            "upper_back_pseudo_std_deg": float(upper_back_pseudo_std_deg),
+            "back_prior_mode": str(back_prior_mode),
+            "ankle_bed_pseudo_obs": bool(ankle_bed_pseudo_obs),
+            "ankle_bed_pseudo_std_m": float(ankle_bed_pseudo_std_m),
+            "update_method": str(result.get("update_method", ekf2d_update_method)),
+            "process_noise_model": str(process_noise_model),
+            "process_noise_jerk_psd": [
+                float(value) for value in (process_noise_jerk_psd or DEFAULT_PROCESS_NOISE_JERK_PSD)
+            ],
             "min_frame_coherence_for_update": float(min_frame_coherence_for_update),
             "skip_low_coherence_updates": bool(skip_low_coherence_updates),
             "flight_height_threshold_m": float(flight_height_threshold_m),
             "flight_min_consecutive_frames": int(flight_min_consecutive_frames),
+            "flight_detection": str(flight_detection),
+            "flight_hysteresis_m": float(flight_hysteresis_m),
+            "flight_com_accel_tolerance": (
+                None if flight_com_accel_tolerance is None else float(flight_com_accel_tolerance)
+            ),
+            "joint_prior": bool(joint_prior),
+            "joint_prior_axial_std_deg": float(joint_prior_axial_std_deg),
+            "robust_mixture": bool(robust_mixture),
+            "robust_mixture_outlier_prob": float(robust_mixture_outlier_prob),
+            "robust_mixture_lock_fraction": float(robust_mixture_lock_fraction),
+            "robust_mixture_resume_fraction": float(robust_mixture_resume_fraction),
             "flip_method": str(flip_method or "epipolar"),
         },
+        "joint_prior_counts": result.get("joint_prior_counts"),
+        "back_prior": result.get("back_prior"),
+        "robust_mixture_stats": result.get("robust_mixture_stats"),
         "bootstrap_frame_idx": int(
             model_bootstrap_frame_idx if ekf2d_3d_source == "first_frame_only" else bootstrap_frame_idx
         ),
         "update_status_counts": {str(key): int(value) for key, value in result.get("update_status_counts", {}).items()},
+        "update_solver_counts": {str(key): int(value) for key, value in result.get("update_solver_counts", {}).items()},
+        "dyn_active_frames": (
+            None
+            if result.get("dyn_active_per_frame") is None
+            else int(np.count_nonzero(np.asarray(result["dyn_active_per_frame"], dtype=bool)))
+        ),
         "left_right_flip_diagnostics": flip_diagnostics,
         "reprojection_px": {
             "mean": reprojection_stats["mean_px"],
@@ -2535,6 +2891,7 @@ def build_ekf_2d_bundle(
             "per_keypoint": reprojection_stats["per_keypoint"],
             "per_camera": reprojection_stats["per_camera"],
         },
+        "view_usage": view_usage_stats,
         "stage_timings_s": {
             "triangulation_s": triangulation_s,
             "epipolar_coherence_s": float(reconstruction.epipolar_coherence_compute_time_s),
@@ -2597,6 +2954,7 @@ def build_ekf_2d_bundle(
         reprojection_errors=reprojection_errors,
         summary=summary,
         support_points_3d=reconstruction.points_3d,
+        excluded_views=reconstruction.excluded_views,
     )
     write_bundle(output_dir, payload, summary)
     return BundleBuildResult(payload=payload, summary=summary)

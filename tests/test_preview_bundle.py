@@ -68,7 +68,9 @@ def test_assemble_dataset_preview_bundle_aligns_frames_and_keeps_q_root():
     assert "pose2sim" in bundle["recon_3d"]
     assert "ekf_3d" in bundle["recon_q_root"]
     assert np.all(np.isnan(bundle["recon_3d"]["ekf_3d"][0]))
-    np.testing.assert_allclose(bundle["recon_q_root"]["ekf_3d"][1], np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1.0]), atol=1e-12)
+    np.testing.assert_allclose(
+        bundle["recon_q_root"]["ekf_3d"][1], np.array([0.5, 0.6, 0.7, 0.8, 0.9, 1.0]), atol=1e-12
+    )
 
 
 def test_assemble_dataset_preview_bundle_rebuilds_markers_when_needed():

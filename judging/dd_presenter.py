@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis
+from judging.dd_analysis import DDJumpAnalysis, DDSessionAnalysis, body_shape_display_label
 
 
 @dataclass
@@ -191,11 +191,12 @@ def jump_list_label(index: int, jump: DDJumpAnalysis) -> str:
 
 
 def jump_list_label_with_reference(index: int, jump: DDJumpAnalysis, expected_code: str | None = None) -> str:
-    """Build one jump-list label and append the expected DD code when available."""
+    """Build one jump-list label and append detected/expected DD codes when available."""
 
     label = jump_list_label(index, jump)
     if expected_code:
-        return f"{label} | ref {expected_code}"
+        detected_code = str(jump.code or "-")
+        return f"{label} | det {detected_code} | exp {expected_code}"
     return label
 
 
@@ -237,7 +238,7 @@ def format_dd_summary(
             f"{jump.classification}"
         )
         code_text = jump.code if jump.code is not None else "-"
-        body_shape = jump.body_shape if jump.body_shape is not None else "-"
+        body_shape = body_shape_display_label(jump.body_shape) if jump.body_shape is not None else "-"
         lines.append(f"  body shape={body_shape} | code={code_text}")
         expected_code = (expected_codes_by_jump or {}).get(idx)
         if expected_code:

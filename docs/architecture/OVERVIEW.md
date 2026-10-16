@@ -1,0 +1,408 @@
+# Architecture actuelle
+
+## Statut et sources
+
+Cette vue decrit l'architecture observee en septembre 2026. Le code source et
+les tests priment sur ce document. Les faits sont tires des modules et de la
+CI; les risques sont des points a verifier avant une modification, pas des
+defauts prouves.
+
+Le depot fournit une reconstruction biomecanique multi-camera de sequences de
+trampoline : inspection et correction des detections 2D, reconstruction 3D,
+construction de modele, EKF, analyse et exports. Python 3.11 est la version
+utilisee par `pyproject.toml` et la CI.
+
+## Flux principaux
+
+```text
+Calib.toml + keypoints JSON (+ annotations, TRC, images)
+    -> PoseData: 2D raw / cleaned / annotated
+    -> correction optionnelle des inversions gauche/droite
+    -> coherence epipolaire ou triangulation + reprojection
+    -> points 3D et/ou modele .bioMod
+    -> EKF 3D ou EKF 2D
+    -> reconstruction bundle, caches .npz, manifest/summary
+    -> GUI, analyses cinematiques, QA calibration, DD, exports GIF/XLSX
+```
+
+Les points d'entree sont `pipeline_gui.py` (GUI Tk),
+`export_reconstruction_bundle.py` (un bundle),
+`run_reconstruction_profiles.py` (profils nommes), `batch_run.py` (lots) et
+`vitpose_ekf_pipeline.py` (CLI historique et algorithmes centraux).
+
+## Responsabilites des modules
+
+| Zone | Responsabilite observee |
+| --- | --- |
+| `vitpose_ekf_pipeline.py` | structures `PoseData`/`ReconstructionResult`, nettoyage 2D, geometrie epipolaire, triangulation, modele bioMod, EKF et sorties historiques |
+| `reconstruction/` | profils, registre de noms, construction de bundles, caches, manifestes et compatibilite des sorties |
+| `annotation/` | stockage d'annotations 2D eparses, navigation, rendu et assistance cinematique |
+| `calibration_qc.py`, `camera_tools/` | QA epipolaire/reprojection et selection de cameras |
+| `pipeline_gui.py` | integration Tk de la selection de donnees, caches, profils, reconstructions et analyses |
+| `preview/` | chargement, navigation et rendu des bundles dans le GUI |
+| `kinematics/`, `judging/`, `observability/`, `analysis/`, `animation/` | analyses et exports derives |
+
+`pipeline_gui.py` et `vitpose_ekf_pipeline.py` sont de grands modules
+integrateurs. Preferer une extension dans un sous-package existant lorsqu'elle
+respecte une responsabilite deja isolee; eviter un refactoring transversal sans
+objectif explicite.
+
+## Contrats de donnees et invariants
+
+- `PoseData.keypoints` est organise comme `(camera, frame, keypoint, xy)` et
+  `PoseData.scores` comme `(camera, frame, keypoint)`; les keypoints suivent
+  l'ordre `COCO17`.
+- Les observations 2D et erreurs epipolaires/reprojection sont en pixels. Les
+  trajectoires 3D, longueurs de segment et pseudo-observations de contact sont
+  exprimees en metres; les rotations et ecarts angulaires en radians, sauf les
+  parametres explicitement libelles en degres.
+- Les donnees manquantes sont representees par `NaN`; les scores nuls et les
+  masques de vues exclues font partie du contrat. Ne pas les remplacer
+  silencieusement par des zeros numeriques.
+- La calibration fixe projection, distorsion et repere monde. La racine
+  geometrique utilise la convention Euler `YXZ`; la correction initiale de
+  rotation et l'unwrapping doivent etre preserves dans les comparaisons.
+- Le FPS est transporte dans les bundles; le defaut camera est 120 Hz. Un
+  changement de stride modifie le FPS effectif et les derivees temporelles.
+
+## Corrections 2D, coherence et reconstruction
+
+Le nettoyage temporel et le rejet d'outliers sont implementes dans
+`filter_pose_keypoints`. Les corrections L/R sont calculees puis mises en cache
+par `reconstruction.reconstruction_bundle`; elles sont des entrees logiques des
+stages suivants. La coherence epipolaire utilise des matrices fondamentales et
+des erreurs de Sampson ou une distance symetrique selon la methode selectionnee.
+
+Les variantes `epipolar_fast`, `epipolar_fast_framewise` (coherence) et
+`epipolar_fast`, `epipolar_fast_viterbi` (flip) ne different de leurs
+equivalents Sampson (`epipolar`, `epipolar_framewise`, `epipolar_viterbi`) que
+par la distance epipolaire symetrique, mesuree +3,7 % pire que Sampson sur
+donnees reelles. Les profils existants ne sont pas modifies ; utiliser le mode
+sans `_fast` pour Sampson (aucune option supplementaire necessaire).
+`export_reconstruction_bundle.py` affiche une note (`epipolar_fast_notice`)
+quand un mode symetrique est choisi.
+
+`--flip-method epipolar_agr6` (variante « A6 », opt-in ; `--flip-left-right`
+reste desactive et la methode par defaut reste `epipolar`) est implemente dans
+`reconstruction/flip_lr_agr6.py` (numpy seul, appele par
+`detect_left_right_flip_diagnostics`, meme contrat : masque `(n_cam, n_frames)`
+bool, diagnostics, tableaux de detail). Le cout d'une vue est la moyenne des
+couts de Sampson (pixels) de 6 paires symetriques (epaules, coudes, poignets,
+hanches, genoux, chevilles), nominal contre gauche/droite permutes ; regle
+ratio 0,7 et gain 3 px sur les candidats du depot ; aucun terme temporel (le FPS
+n'intervient pas) ; `NaN`/score <= 0 = point absent. Ratio, gain et candidats sont
+fixes dans le module (les options `--flip-improvement-ratio`/`--flip-min-gain-px`
+n'agissent pas) et enregistres dans `flip_agr6_parameters` des metadonnees du
+cache flip. Mesures PRELIMINAIRES (leave-one-sequence-out, 83 vrais flips, memes
+donnees pour choisir et tester) : precision 75 % / rappel 54 % / F1 0,63 contre
+78 % / 35 % / 0,48 pour `epipolar` ; ~0,29 ms/image (numpy vectorise) contre
+2,84 ms (boucle Python du depot), ecart melant algorithme et implementation ;
+effet aval sur l'EKF 3D faible et de signe variable (figures retrouvees base
+11/17 sans flip, 10/17 `epipolar`, 13/17 A6) ; erreurs poolees inchangees. A6
+est donc propose comme alerte/diagnostic, pas comme correction automatique.
+
+La triangulation propose `once`, `greedy` et `exhaustive`; le cout augmente avec
+le nombre de cameras, particulierement pour `exhaustive`. Les bundles portent
+des erreurs de reprojection par vue, des coherences et des masques d'exclusion.
+Les profils de reconstruction sont donc des parametres scientifiques, pas de la
+simple configuration d'interface.
+
+## EKF 2D
+
+`MultiViewKinematicEKF` (etat `[q, qdot, qddot]`, `nx = 3 nq`) corrige dans
+l'espace image avec `H = [H_q, 0, 0]` et `R` diagonal (variances en px^2,
+`inf` pour une mesure exclue, qui n'entre pas dans les blocs). Le solveur de
+correction est choisi par `update_method` (`--ekf2d-update-method`, champ de
+profil `ekf2d_update_method`, trace dans `summary.filter_parameters` et
+`update_solver_counts`) :
+
+- `woodbury` (defaut) : forme information, `G = H_q^T R^-1 H_q`,
+  `C = (I + G P_qq)^-1`, `x+ = x + P_q C g`, Joseph reduit ; aucun inverse de
+  `P_qq` (DoF verrouilles et `P_qq` singulier geres). Equivalent a `legacy` a
+  l'arrondi pres (tests `tests/test_ekf2d_woodbury_update.py`), repli
+  automatique sur `legacy` si le systeme reduit echoue.
+- `legacy` : espace innovation, sequentiel par camera, ou batch si des
+  pseudo-observations sont actives.
+
+Le predicteur `dyn`/`dyn_history3` remplace l'acceleration racine par la
+dynamique flottante quand un critere de vol est vrai (`flight_detection`,
+`--flight-detection`, champ de profil) :
+
+- `triangulation` (defaut, historique) : tous les points 3D triangules finis
+  des `flight_min_consecutive_frames` frames precedentes au-dessus de
+  `flight_height_threshold_m`. Avec `ekf2d_3d_source=first_frame_only` les
+  points sont `NaN` apres la frame 0 et `dyn` ne s'active jamais (0/900 frames
+  mesurees sur `1_partie_0429`).
+- `ekf_state` (opt-in) : plus bas marqueur du modele a l'etat EKF corrige de la
+  frame precedente au-dessus du seuil pendant `flight_min_consecutive_frames`
+  frames, sortie sous `seuil - flight_hysteresis_m` (defaut 0.05 m), garde
+  optionnelle `|CoMddot_z - g_z| <= flight_com_accel_tolerance`. Le masque
+  d'activation reel est exporte (`dyn_active_per_frame`, `dyn_active_frames`).
+
+Bruit de processus (`process_noise_model`, `--process-noise-model`, champ de
+profil, trace dans `summary.filter_parameters`) :
+
+- `legacy` (defaut) : `diag(1e-4, 5e-3, 5e-2) * process_noise_scale` pour
+  `(q, qdot, qddot)`, independant de `dt` (donc du stride/FPS effectif).
+- `white_jerk` (opt-in) : jerk blanc continu discretise exactement,
+  `Q(dt) = q_c [[dt^5/20, dt^4/8, dt^3/6], [dt^4/8, dt^3/3, dt^2/2],
+  [dt^3/6, dt^2/2, dt]]` par DoF, avec `q_c` par groupe (translation racine
+  m^2/s^5, rotation racine et articulations rad^2/s^5 ;
+  `--process-noise-jerk-psd`, defaut `200 1000 10000`, valeur calee par une
+  analyse independante : synthetique 3 graines -13,4 % d'erreur marqueurs,
+  reel `1_partie_0429` en leave-one-camera-out -3 %). Aucun calage automatique
+  dans le code. Sur les 240 premieres frames reelles, la reprojection mediane
+  passe de 12,91 px (`legacy`) a 12,26 px (l'ancien defaut `6 6 6` donnait
+  21,86 px).
+
+A priori articulaire (`joint_prior`, `--ekf2d-joint-prior`, opt-in ; convention
+du modele : genou flechi `SHANK:RotY > 0`, coude flechi `FOREARM:RotY < 0`).
+Les marqueurs distaux etant sur l'axe du segment, `(RotZ + pi, -RotY)` pour
+`FOREARM` et `(THIGH:RotZ + pi, -SHANK:RotY)` pour le genou donnent exactement les
+memes marqueurs : ces branches miroir sont inobservables.
+
+1. Apres chaque correction : une flexion du mauvais cote de plus de 5 deg est
+   reflechie dans l'autre branche (symetrie exacte, `x <- T x + c`,
+   `P <- T P T^T`) ; une violation residuelle de la borne (coude <= -1 deg,
+   genou >= +1 deg) declenche une pseudo-observation d'inegalite
+   `RotY = borne` (sigma 0,5 deg), active seulement si violee.
+2. Pseudo-observations lineaires `FOREARM:RotZ` et `THIGH:RotZ ~ N(0, sigma^2)`
+   (`--ekf2d-joint-prior-axial-std-deg`, defaut 30 deg), ajoutees aux blocs de
+   pseudo-observations (chemin Woodbury par defaut ; `legacy` bascule en batch).
+3. Export (`run_ekf`) : `canonicalize_joint_mirror_branches` ramene q (et le
+   signe de qdot/qddot de la flexion) dans la branche canonique et replie
+   `RotZ` dans `[-pi, pi)` ; formats et formes inchanges.
+
+Sur `1_partie_0429` (900 frames, triangulation exhaustive, `acc`) : frames en
+miroir (au moins un membre) 98,3 % -> 0 % (par membre ~48 % -> 0 %), amplitude
+max de `FOREARM:RotZ` 2115 -> 251 deg (45 deg : 356 deg), reprojection mediane
+11,86 -> 12,07 px.
+
+Melange robuste (`robust_mixture`, `--ekf2d-robust-mixture`, opt-in) : pour
+chaque keypoint, `S_k = H_k P_qq H_k^T + r_k I` (2x2, etat predit),
+`w_k = pi_in N(y_k; 0, S_k) / (pi_in N + pi_out / A_img)` avec
+`pi_out = 0.03` (`--ekf2d-robust-outlier-prob`) et `A_img` = largeur x hauteur de
+la calibration ; variance effective = diagonale de `S_k / w_k - H_k P_qq H_k^T`
+(diagonale pour les solveurs, >= `r_k`, `w_k >= 1e-6`). Independant de l'ordre
+des cameras et identique pour `woodbury` et `legacy`. Statistiques dans
+`robust_mixture_stats`. Sur 900 frames reelles : 6,3 % des keypoints ont
+`w < 0,5`, reprojection mediane 11,86 -> 11,66 px (moyenne 20,43 -> 22,36 px :
+les outliers ne sont plus suivis).
+
+Garde-fou anti-verrouillage du melange (actif des que `robust_mixture`) : le
+melange juge chaque mesure contre la prediction ; si la prediction est fausse
+(graine IK du bootstrap a ~240 px, membre parti dans une mauvaise pose), il
+rejette precisement les detections qui la corrigeraient et le filtre
+s'auto-confirme. Sur `1_partie_0429_001` (detecteur `best`, 120 Hz), le bootstrap
+avec melange restait sur la graine (2/3 des keypoints a `w < 0,5`, etat faux de
+~1,7 m) ; avec `white_jerk`, `P_qq` se contracte plus vite et le filtre ne se
+recalait jamais (96 % de `w < 0,5`, 2238 px / 56 m aux frames annotees) ; un `R`
+plus petit (scores eleves) aggrave le risque (`R x 4` : recalage ; `ECCV`/`base`
+avec `R / 4` : divergence). Deux regles, independantes de l'ordre des cameras et
+du solveur : (1) frame : si la fraction de `w < 0,5` depasse
+`robust_mixture_lock_fraction` (0,5, `--ekf2d-robust-lock-fraction`), la frame
+est corrigee avec les variances nominales jusqu'a ce que la fraction redescende
+a `robust_mixture_resume_fraction` (0,25) ; chaque EKF, bootstrap compris,
+demarre suspendu ; (2) keypoint : un keypoint rejete dans plus de
+`lock_fraction` de ses vues (au moins 2) reprend sa variance nominale (une erreur
+de detecteur est propre a une vue ; un rejet majoritaire signale un point 3D
+predit faux). `1 1` restaure le melange non garde. Compteurs :
+`suspended_frames`, `lock_events`, `keypoint_guard_restored`,
+`applied_downweighted_below_0_5` dans `robust_mixture_stats` (et dans les
+diagnostics du bootstrap). `white_jerk` + melange donne alors 8,61 px / 38,2 mm
+(`white_jerk` seul : 8,59 px / 38,4 mm) ; la combinaison `white_jerk` +
+`undistort` + `joint_prior` + melange, 8,41 px / 42,5 mm, et aucune
+divergence avec les detecteurs `best`, `ECCV` et `base` (sans melange :
+resultats identiques au bit pres).
+
+Pseudo-observation du dos (variantes `back_flexion_1d`, `back_3dof` a racine
+basse = bassin, segment `UPPER_BACK` ; `upper_root_back_flexion_1d`,
+`upper_root_back_3dof` a racine haute, segment `LOWER_TRUNK` porteur des
+hanches ; sans effet sur `single_trunk`). Avec les marqueurs COCO17, le tangage
+du bassin et la flexion du dos sont inobservables au premier ordre (les deux
+hanches sont sur l'axe y du bassin) : la pseudo-observation fixe donc la
+posture du dos. Conventions verifiees avec biorbd sur les modeles de
+`build_biomod` : `THIGH:RotY > 0` = extension de hanche, `UPPER_BACK:RotY > 0`
+= flexion du dos, `LOWER_TRUNK:RotY > 0` = extension du dos. Option
+`back_prior_mode` (`--ekf2d-back-prior-mode`, champ de profil
+`back_prior_mode`, suffixe de nom `bp_consistent`, familles `ekf_2d`) ; gain `g`
+et ecart-type `s` restent `--upper-back-sagittal-gain` (0,2) et
+`--upper-back-pseudo-std-deg` (10 deg) :
+
+- `legacy` (defaut, resultats identiques au bit pres) : cible
+  `RotY_dos = g * moyenne(RotY et RotX des deux cuisses)`, `H = e_dos`. Trois
+  defauts : (1) les RotX G/D s'annulent en abduction symetrique, le gain
+  effectif sur la flexion est `g/2` et les asymetries fuient dans le dos ;
+  (2) la cible depend des hanches mais `H` ne contient que le DoF du dos ;
+  (3) signe : hanches flechies a 90 deg, la cible vaut -9 deg de flexion
+  geometrique (extension) pour `back_*` et +9 deg pour `upper_root_*`.
+- `consistent` : flexion anatomique du dos = `g` x flexion de hanche moyenne,
+  soit `RotY_dos - c * moyenne(a_G, a_D) ~ N(0, s^2)` avec `c = -g`
+  (`UPPER_BACK`) ou `+g` (`LOWER_TRUNK`) (`BACK_FLEXION_SIGN_BY_SEGMENT`,
+  `THIGH_ROTY_HIP_FLEXION_SIGN`), `a = atan2(sin RotY cos RotX, cos RotY cos RotX)`
+  (RotY de la cuisse independante de la branche d'Euler YXZ equivalente
+  `(RotY + pi, pi - RotX, RotZ + pi)`, observee en reel), residu replie dans
+  `[-pi, pi)`, `H` exact : 1 sur le DoF du dos, `-c/2` sur chaque `THIGH:RotY`.
+
+Les a priori nuls sur RotX/RotZ du dos (meme `s`) sont inchanges dans les deux
+modes. Il n'y a pas de cache EKF ; le stage modele n'est pas concerne ; le mode
+est trace dans `summary.filter_parameters.back_prior_mode` et
+`summary.back_prior` (DoF, hanches, coefficient, `full_jacobian`), et dans les
+sorties de `run_ekf`. Basculer le defaut = changer `DEFAULT_BACK_PRIOR_MODE`
+dans `vitpose_ekf_pipeline.py` et `reconstruction/reconstruction_profiles.py`
+(un test impose leur egalite) ; les profils prendraient alors le suffixe
+`bp_legacy` pour l'ancien mode. Test cible :
+`pytest -q tests/test_ekf2d_back_prior.py`.
+
+Impact mesure (verite terrain, `head_marker_model=anthropometric`, configs d et
+x, 4 variantes ; `1_partie_0429_001` best/ECCV/base et `3_partie_0429_001` best ;
+32 paires, IC95 bootstrap par frame annotee ; angles geometriques des reperes
+de segments, groupe = 10 % des frames de plus forte flexion de hanche) :
+
+- Erreurs : `1_partie_0429_001`/best, aucune difference significative de la
+  mediane (|d| <= 0,07 px, <= 0,9 mm). Sur les 32 paires, 3 differences
+  globales significatives de la mediane 2D : -0,53 px (`base`/d/
+  `back_flexion_1d`), -1,19 px (`3_partie_0429_001`/d/`back_flexion_1d`, dont le
+  run `legacy` diverge en extension a -80 deg) et +1,20 px
+  (`3_partie_0429_001`/x/`upper_root_back_3dof`, torsion instable dans les deux
+  modes).
+- Posture : flexion du dos en groupe `back_*` -10 a -35 deg (extension) ->
+  +16 a +26 deg ; `upper_root_*` +12 a +35 deg -> +12 a +32 deg ; p95 de la
+  flexion de hanche `back_*` 137-145 deg -> 119-127 deg (`upper_root_*`
+  114-127 -> 115-123 deg). Temps EKF sans ecart systematique (4 a 12 s par run).
+
+Limites : la flexion du dos reste determinee par l'a priori (evaluation
+precedente par borne de Cramer-Rao : 8 a 16 % de l'information vient des
+donnees ; posture a +-25-35 deg pres selon `g` et `s`) ; aucune borne ni a
+priori nouveau sur l'inclinaison et la torsion du dos : avec `back_3dof`/`upper_root_back_3dof` en config x, la
+torsion fait des tours complets sur `3_partie_0429_001` (environ 2 tours,
+sauts de ~350 deg) dans les deux modes ; non corrige ici.
+
+Limite connue non corrigee : en `dyn`, `history3` et `dyn_history3`, la moyenne
+predite est recalculee (dynamique ou extrapolation d'historique) mais la
+covariance reste propagee avec le `F` a acceleration constante ; `P` n'est donc
+pas coherente avec la prediction de la moyenne.
+
+## Marqueurs de tete du modele
+
+`build_biomod` place nez, yeux et oreilles dans le segment `HEAD`, dont
+l'origine (pivot, 3 rotations `XYZ`) est le centre des epaules pour toutes les
+variantes (`single_trunk`, `back_*`, `upper_root_*`) ; a `q = 0` ses axes sont x
+avant, y gauche, z haut. `h = head_length` est la mediane de
+`|nez - centre des epaules|` (`estimate_segment_lengths`, 2 premieres secondes).
+Option `head_marker_model` (`--head-marker-model`, champ de profil, familles
+`ekf_2d`/`ekf_3d`, sans effet avec `--biomod`) :
+
+- `legacy` (defaut) : nez en `(h, 0, h)`, donc a `sqrt(2) h` du pivot (258 mm au
+  lieu de 182 mm sur `1_partie_0429_001`), yeux `(h - eye_offset_x,
+  +-eye_offset_y, h)`, oreilles `(0, +-ear_offset_y, 0.7 h)` a la verticale du
+  pivot (nez-oreilles 191 mm contre ~110 mm en GT). Fichier octet pour octet
+  identique a l'historique.
+- `anthropometric` : positions fixes `ANTHROPOMETRIC_HEAD_MARKER_RATIOS * h` :
+  nez `(0.706, 0, 0.706)`, yeux `(0.613, +-0.113, 0.842)`, oreilles
+  `(0.190, +-0.339, 0.762)` (nez-pivot 0.998 h, nez-milieu des oreilles 0.519 h).
+  Provenance : analyse procrustes en rotation autour du pivot (sans translation
+  ni echelle, forme = mediane, 2e passe sans les frames > p90 du residu) des TRC
+  pose2sim continus de 3 sequences x 3 detecteurs ViTPose (`1_partie_0429_001`,
+  `3_partie_0429_001`, `3_partie_0429_004` ; `best`, `ECCV`, `base`), normalisee
+  par `h` de chaque TRC, symetrisee G/D, moyenne des detecteurs puis des
+  sequences. Jauge (rotation globale inobservable) : direction pivot -> nez a
+  45 deg dans le plan sagittal comme `legacy` (angles de tete comparables),
+  axe oreille droite -> gauche selon +y. Validation croisee en laissant une
+  sequence de cote (residu 3D median de l'ajustement de la tete par frame,
+  frames >= 4 s, moyenne des 9 couples) : `legacy` 57,7 mm, population des 2
+  autres sequences 25,0 mm, forme propre de la sequence (oracle) 22,2 mm ; les
+  ratios des trois plis different de moins de 0,025 h.
+
+Les metadonnees du stage modele n'incluent `head_marker_model` et
+`head_marker_geometry_signature` (SHA-1 des ratios) que hors `legacy` : cle,
+repertoire et caches existants inchanges ; `biomod_signature` (contenu du
+fichier) et le cache Kalman `biorbd` suivent automatiquement le bioMod ;
+`reconstruction_signature` (points triangules) n'est pas concernee. Le resume des
+bundles porte `head_marker_model` (`None` avec un bioMod fourni). Les noms, ordre
+et parents des marqueurs COCO17, les formes `PoseData` et les autres segments
+sont inchanges. Le GUI n'expose pas l'option. Test cible :
+`pytest -q tests/test_head_marker_model.py`.
+
+Verite terrain (EKF 2D, configs c = defauts, d = `white_jerk`, x =
+`white_jerk` + `undistort` + `joint_prior` + sigma(score) calibre, sans melange ;
+IC95 bootstrap par frame annotee, `anthropometric - legacy`) :
+
+- `1_partie_0429_001` (21 frames) : `best` c 9,21 -> 7,90 px (-1,31
+  [-1,67 ; -0,97]) et 42,3 -> 33,7 mm ; d 8,59 -> 7,32 px, 38,4 -> 29,8 mm ;
+  x 7,68 -> 6,54 px, 40,2 -> 30,8 mm. Visage -4,2 a -4,8 px, reste du corps non
+  significatif. `ECCV` -1,34 a -1,78 px, -13 mm ; `base` c -1,57 px, d et x
+  -0,3 px (non significatif, visage -3,2 a -3,8 px significatif).
+- `3_partie_0429_001` (17 frames, GT 2D + 3D) : -1,35 a -2,90 px (7 sur 9
+  significatifs) ; `ECCV`/x -1,41 [-2,33 ; +0,56] et `base`/d +0,92
+  [-0,18 ; +3,47] non significatifs ; 3D -30 a +6 mm, IC larges.
+- `3_partie_0429_004` (33 frames, GT 2D seule, vue a l'entrainement probable) :
+  -0,42 a -1,12 px, toutes significatives.
+
+Une calibration par sequence (`fitted`, 4 premieres secondes de triangulation)
+n'a pas ete retenue : sur `1_partie_0429_001` (3 detecteurs x 3 configs) elle
+ne fait jamais significativement mieux que `anthropometric` sur le visage
+(ecarts -0,35 a +0,24 px) ; elle est moins bonne avec `best` (+0,09 a
++0,20 px) et les seuls gains globaux (`base` d et x, -0,67 et -0,82 px) portent
+sur le reste du corps, pas sur la tete.
+
+## Caches et effets de bord
+
+Les caches de pose corrigee, flip, coherence epipolaire, triangulation, modele
+et EKF se trouvent sous `output/<dataset>/...`, avec des metadonnees destinees a
+invalider une sortie incompatible. Toute nouvelle option qui affecte un resultat
+doit etre incluse dans la cle ou les metadonnees du cache correspondant et etre
+couverte par un test de non-reutilisation.
+
+Le GUI a aussi des caches en memoire pour calibration, pose, apercus et analyses
+de saut, centralises dans un etat partage. Les onglets de commande lancent des
+sous-processus. Une interaction GUI peut lire/ecrire des profils, annotations,
+caches et sorties; les tests unitaires n'equivalent pas a un smoke test Tk.
+
+## Validation existante
+
+La CI GitHub Actions utilise Python 3.11, installe `pip install -e .[test]`, puis
+execute `isort --check-only`, `black --check`, `flake8` et `pytest -q`. Les tests
+couvrent notamment les hotspots du pipeline, caches de reconstruction, profils,
+QA calibration, annotations, preview et GUI. Les smoke tests GUI necessitent
+`RUN_PIPELINE_GUI_SMOKE=1`, Tk et un affichage disponible.
+
+## Risques et limites observes
+
+- Les dependances Conda scientifiques (`biorbd`, OpenCV, `biobuddy`, etc.) ne
+  sont pas toutes declarees dans `pyproject.toml`; la CI n'exerce donc pas tout
+  le workflow de reconstruction scientifique.
+- Les projections et Jacobiennes suivent le modele pinhole alors que les
+  calibrations chargent aussi une distortion (OpenCV `k1, k2, p1, p2[, k3..k6]`).
+  Par defaut les keypoints ne sont pas dedistordus (comportement historique).
+  L'option opt-in `undistort_keypoints` (`--undistort-keypoints`, champ de
+  profil, `load_pose_data(..., undistort_keypoints=True)`) dedistord une fois au
+  chargement (Newton vectorise, equivalent `cv2.undistortPoints(..., P=K)`)
+  les keypoints bruts et annotes avant nettoyage, coherence, triangulation et
+  EKF. Les calibrations sont alors marquees `keypoints_undistorted=True` via
+  `calibrations_with_undistorted_keypoints`, ce qui modifie
+  `calibration_signature` (qui contient deja `dist`) et invalide les caches
+  geometriques; la signature par defaut est inchangee. Les overlays 2D sur les
+  images brutes (GUI) restent en coordonnees distordues et ne sont pas
+  compatibles avec des bundles produits avec cette option; le GUI n'expose pas
+  encore l'option.
+- Les metadonnees des caches geometriques (epipolaire, flip, pose corrigee par
+  flip, triangulation) exigent les calibrations et stockent
+  `calibration_signature`, calculee sur les parametres parses de chaque camera.
+  Le stage modele stocke `reconstruction_signature` et `biomod_signature`, et
+  n'est reutilise que si le `.bioMod` existe et n'a pas change; le cache Kalman
+  `biorbd` stocke aussi ces deux signatures. Un ancien cache sans ces champs est
+  rejete et recalcule.
+- Cote GUI, la cle du cache de calibration, la cle du cache de pose et le cache
+  d'apercu q0 incluent une signature du contenu de `Calib.toml`. Le fichier de
+  keypoints reste identifie par son chemin seulement dans le cache de pose du
+  GUI : une modification en place pendant une session doit etre rechargee
+  explicitement.
+- Deux fichiers `environment*.yml` partagent le nom d'environnement
+  `vitpose-ekf` mais different par leurs dependances. Ne pas les fusionner ou
+  remplacer sans une demande dediee.
+- Le README ne doit contenir que des chemins relatifs a la racine Git; ne pas
+  reintroduire de chemins absolus propres a une machine.
+- Les donnees versionnees de `inputs/` et `reconstruction_profiles*.json` peuvent
+  contenir du travail experimental local. Les traiter comme des artefacts a
+  proteger jusqu'a instruction contraire.
