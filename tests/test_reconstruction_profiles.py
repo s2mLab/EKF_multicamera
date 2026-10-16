@@ -484,6 +484,15 @@ def test_validate_profile_accepts_explicit_viterbi_flip_method():
     assert "flip_epipolar_fast_viterbi" in canonical_profile_name(profile)
 
 
+def test_validate_profile_accepts_epipolar_agr6_flip_method():
+    profile = validate_profile(
+        ReconstructionProfile(name="", family="ekf_2d", predictor="acc", flip=True, flip_method="epipolar_agr6")
+    )
+
+    assert profile.flip_method == "epipolar_agr6"
+    assert "flip_epipolar_agr6" in canonical_profile_name(profile)
+
+
 def test_validate_profile_accepts_ekf_prediction_gate_for_ekf2d_only():
     ekf2d_profile = validate_profile(
         ReconstructionProfile(

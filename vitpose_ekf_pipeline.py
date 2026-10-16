@@ -125,6 +125,7 @@ SUPPORTED_FLIP_METHODS = (
     "triangulation_once",
     "triangulation_greedy",
     "triangulation_exhaustive",
+    "epipolar_agr6",
 )
 DEFAULT_COHERENCE_CONFIDENCE_FLOOR = 0.35
 DEFAULT_SUBJECT_MASS_KG = 55.0
@@ -2559,6 +2560,16 @@ def detect_left_right_flip_diagnostics(
     fundamental_matrices = None
     pair_weights = None
     keypoint_weights = np.asarray([FLIP_PROXIMAL_KEYPOINT_WEIGHTS.get(name, 1.0) for name in COCO17], dtype=float)
+    if method == "epipolar_agr6":
+        from reconstruction.flip_lr_agr6 import detect_agr6
+
+        return detect_agr6(
+            pose_data,
+            calibrations,
+            build_fundamental_matrix_array,
+            build_flip_epipolar_pair_weight_array,
+            keypoint_weights,
+        )
     local_epipolar_methods = {"epipolar", "epipolar_fast"}
     viterbi_epipolar_methods = {"epipolar_viterbi", "epipolar_fast_viterbi"}
     epipolar_family = method in local_epipolar_methods | viterbi_epipolar_methods

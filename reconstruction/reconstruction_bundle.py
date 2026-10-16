@@ -29,6 +29,12 @@ from kinematics.root_kinematics import (
     stabilize_root_rotations,
     unwrap_with_gaps,
 )
+from reconstruction.flip_lr_agr6 import (
+    CANDIDATE_SMOOTH_WINDOW,
+    FLIP_AGR6_METHOD,
+    FLIP_AGR6_SCORING_VERSION,
+    flip_agr6_parameters,
+)
 from reconstruction.reconstruction_dataset import load_trc_root_kinematics_sidecar
 from reconstruction.reconstruction_registry import ALGORITHM_VERSIONS, BUNDLE_SCHEMA_VERSION, latest_version_for_family
 from reconstruction.reconstruction_timings import make_timing_stage
@@ -323,6 +329,12 @@ def flip_cache_metadata(
             5 if str(method) in {"epipolar", "epipolar_fast", "epipolar_viterbi", "epipolar_fast_viterbi"} else 1
         ),
     }
+    if str(method) == FLIP_AGR6_METHOD:
+        # A6 uses its own fixed rule (ratio, gain, candidates); the generic ratio/gain arguments above are not used.
+        metadata["epipolar_distance_mode"] = "sampson"
+        metadata["epipolar_flip_scoring_version"] = FLIP_AGR6_SCORING_VERSION
+        metadata["temporal_smoothing_window"] = CANDIDATE_SMOOTH_WINDOW
+        metadata["flip_agr6_parameters"] = flip_agr6_parameters()
     metadata["calibration_signature"] = calibration_signature(calibrations, pose_data.camera_names)
     return metadata
 

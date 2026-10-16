@@ -3109,6 +3109,7 @@ FLIP_METHOD_DISPLAY_NAMES = {
     "epipolar_fast": "Epipolar fast (local)",
     "epipolar_viterbi": "Epipolar (Viterbi)",
     "epipolar_fast_viterbi": "Epipolar fast (Viterbi)",
+    "epipolar_agr6": "Epipolar A6 (alerts)",
     "ekf_prediction_gate": "EKF prediction gate",
     "triangulation_once": "Triangulation once",
     "triangulation_greedy": "Triangulation greedy",

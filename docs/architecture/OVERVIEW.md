@@ -82,6 +82,25 @@ sans `_fast` pour Sampson (aucune option supplementaire necessaire).
 `export_reconstruction_bundle.py` affiche une note (`epipolar_fast_notice`)
 quand un mode symetrique est choisi.
 
+`--flip-method epipolar_agr6` (variante « A6 », opt-in ; `--flip-left-right`
+reste desactive et la methode par defaut reste `epipolar`) est implemente dans
+`reconstruction/flip_lr_agr6.py` (numpy seul, appele par
+`detect_left_right_flip_diagnostics`, meme contrat : masque `(n_cam, n_frames)`
+bool, diagnostics, tableaux de detail). Le cout d'une vue est la moyenne des
+couts de Sampson (pixels) de 6 paires symetriques (epaules, coudes, poignets,
+hanches, genoux, chevilles), nominal contre gauche/droite permutes ; regle
+ratio 0,7 et gain 3 px sur les candidats du depot ; aucun terme temporel (le FPS
+n'intervient pas) ; `NaN`/score <= 0 = point absent. Ratio, gain et candidats sont
+fixes dans le module (les options `--flip-improvement-ratio`/`--flip-min-gain-px`
+n'agissent pas) et enregistres dans `flip_agr6_parameters` des metadonnees du
+cache flip. Mesures PRELIMINAIRES (leave-one-sequence-out, 83 vrais flips, memes
+donnees pour choisir et tester) : precision 75 % / rappel 54 % / F1 0,63 contre
+78 % / 35 % / 0,48 pour `epipolar` ; ~0,29 ms/image (numpy vectorise) contre
+2,84 ms (boucle Python du depot), ecart melant algorithme et implementation ;
+effet aval sur l'EKF 3D faible et de signe variable (figures retrouvees base
+11/17 sans flip, 10/17 `epipolar`, 13/17 A6) ; erreurs poolees inchangees. A6
+est donc propose comme alerte/diagnostic, pas comme correction automatique.
+
 La triangulation propose `once`, `greedy` et `exhaustive`; le cout augmente avec
 le nombre de cameras, particulierement pour `exhaustive`. Les bundles portent
 des erreurs de reprojection par vue, des coherences et des masques d'exclusion.
